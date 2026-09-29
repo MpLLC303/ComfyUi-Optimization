@@ -1,6 +1,6 @@
 # ComfyUI Optimization Kit for an RTX 3090 (Wan 2.2 14B)
 
-This kit speeds up ComfyUI Windows Portable on an RTX 3090 (24 GB, Ampere sm_86) running Wan 2.2 14B video. It is built against ComfyUI 0.37.0 master as of 2026-09-28.
+This kit speeds up ComfyUI Windows Portable on an RTX 3090 (24 GB, Ampere sm_86) running Wan 2.2 14B video. It is built against ComfyUI 0.37.0 master as of 2026-09-28. The optimizer updates to the stable channel, and stable **v0.37.4** has identical CLI flags, the same cu130 gating, and the same comfy-kitchen INT8 attention (0.2.35 ships the same sm_75/80/89/120 kernels as 0.2.36).
 
 It contains one idempotent PowerShell script, a benchmark harness, and an on-GPU probe. The probe measures each speed flag on **your** card before the flag is turned on.
 
