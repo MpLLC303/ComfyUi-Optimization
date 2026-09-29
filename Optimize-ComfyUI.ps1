@@ -320,6 +320,19 @@ if ($running.Count -gt 0) {
     }
     Write-Info "ComfyUI is running (PID $($running.Id -join ', ')); the GPU probe will be skipped"
 }
+# Another ComfyUI (a different install, ComfyUI Desktop, an elevated window...) may hold the port and VRAM.
+if ($IsWin) {
+    try {
+        foreach ($conn in @(Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction Stop)) {
+            $owner = Get-Process -Id $conn.OwningProcess -ErrorAction SilentlyContinue
+            $opath = "(path hidden: elevated process?)"
+            if ($owner) { try { if ($owner.Path) { $opath = $owner.Path } } catch { } }
+            Write-Warn2 ("port $Port is in use by PID {0} {1} {2}. Close it (or: Stop-Process -Id {0}) before the probe/benchmark; it also holds VRAM." -f `
+                    $conn.OwningProcess, $(if ($owner) { $owner.ProcessName } else { "?" }), $opath)
+        }
+    }
+    catch { }
+}
 
 # curl.exe ships with Windows 10 1803+ (bare 'curl' is an alias for Invoke-WebRequest in PS 5.1)
 $script:Curl = $null
@@ -688,8 +701,9 @@ else {
         $content = ($launchers[$k] -replace "`r?`n", "`r`n")
         $flagged = $k -in @("run_optimized.bat", "run_optimized_no_int8attn.bat", "run_remote_tailscale.bat")
         $exists = Test-Path -LiteralPath $path
-        if ($flagged -and $autoMode -and -not $probeOk -and $exists) {
-            Write-Warn2 "GPU probe did not complete; keeping the existing $k instead of regenerating it without measured flags"
+        if ($flagged -and $autoMode -and -not $probeOk) {
+            if ($exists) { Write-Warn2 "GPU probe did not complete; keeping the existing $k (re-run with ComfyUI closed to measure flags)" }
+            else { Write-Warn2 "GPU probe did not complete; not writing $k yet (re-run with ComfyUI closed to measure flags)" }
             continue
         }
         if ($exists) {
