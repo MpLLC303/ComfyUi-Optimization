@@ -340,6 +340,8 @@ def write_csv(path, rows):
 
 
 def cmd_compare(a):
+    if not os.path.exists(a.csv):
+        sys.exit("no results in %s (every run failed or none ran; see the FAILED lines above)" % a.csv)
     with open(a.csv, newline="", encoding="utf-8") as f:
         rows = [r for r in csv.DictReader(f)
                 if r["phase"] == "timed" and r.get("fully_cached", "False") != "True"]
@@ -353,6 +355,12 @@ def cmd_compare(a):
     for (label, wf), rs in groups.items():
         if label == a.baseline:
             baseline[wf] = statistics.median(float(r["wall_s"]) for r in rs)
+    # --any-workflow: compare every label against the baseline label even when the workflow file
+    # differs (experimental variants are separate files derived from the same baseline graph)
+    any_base = None
+    if getattr(a, "any_workflow", False) and baseline:
+        any_base = statistics.median(
+            float(r["wall_s"]) for (label, wf), rs in groups.items() if label == a.baseline for r in rs)
 
     print("%-24s %-36s %3s %9s %9s %9s %10s %8s" % (
         "label", "workflow", "n", "median_s", "best_s", "exec_med", "peakVRAM", "speedup"))
@@ -361,7 +369,8 @@ def cmd_compare(a):
         execs = [float(r["exec_s"]) for r in rs if r.get("exec_s")]
         vram = [int(float(r["peak_vram_mib"])) for r in rs if r.get("peak_vram_mib")]
         med = statistics.median(walls)
-        speed = ("%.2fx" % (baseline[wf] / med)) if wf in baseline and med else "-"
+        ref = baseline.get(wf, any_base)
+        speed = ("%.2fx" % (ref / med)) if ref and med else "-"
         print("%-24s %-36s %3d %9.1f %9.1f %9s %10s %8s" % (
             label[:24], wf[:36], len(walls), med, min(walls),
             ("%.1f" % statistics.median(execs)) if execs else "-",
@@ -424,6 +433,8 @@ def main():
     c = sub.add_parser("compare", help="summarize a results CSV")
     c.add_argument("csv", nargs="?", default="bench_results.csv")
     c.add_argument("--baseline", default="baseline", help="label to compute speedups against")
+    c.add_argument("--any-workflow", action="store_true",
+                   help="compute speedups vs the baseline label even for a different workflow file")
     c.set_defaults(func=cmd_compare)
 
     a = p.parse_args()

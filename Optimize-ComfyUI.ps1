@@ -778,8 +778,8 @@ foreach ($f in $script:Findings) { $lines.Add("- $f") }
 $lines.Add("")
 $lines.Add("## Next")
 $lines.Add("1. In the Wan 2.2 14B template, set 'Enable 4steps LoRA?' (I2V) / 'Enable Lightning LoRA' (T2V) to true (off by default: 20 steps).")
-$lines.Add("2. Baseline: start run_nvidia_gpu.bat, then in a 2nd window: run_bench.bat baseline. Close ComfyUI.")
-$lines.Add("3. Optimized: start run_optimized.bat, then run_bench.bat optimized. Compare the table AND watch the videos for artifacts.")
+$lines.Add("2. Measure everything in one go: powershell -ExecutionPolicy Bypass -File .\Run-FullTest.ps1 -InstallDir `"$Root`" (ComfyUI closed, ~20-40 min).")
+$lines.Add("3. Paste the report it copies to the clipboard back into the chat, and watch the videos in ComfyUI\output\bench for artifacts.")
 $report = $lines -join "`r`n"
 $rp = Join-Path $OptDir "report-$($script:Stamp).md"
 Write-TextFile -Path $rp -Content $report

@@ -146,6 +146,19 @@ After starting `run_optimized.bat`, look for these lines:
 
 ## Measure, don't trust
 
+**One command (recommended):** close ComfyUI, then run
+
+```
+powershell -ExecutionPolicy Bypass -File .\Run-FullTest.ps1 -InstallDir "<your ComfyUI_windows_portable>"
+```
+
+It runs the probe, then starts ComfyUI itself on port 8189: first with stock flags, then with `run_optimized.bat`'s flags plus every experimental variant, all on the same seeds. It stops each server afterwards and writes `optimizer\full-test-<stamp>.txt`, which is also copied to your clipboard; paste it back into the chat for analysis.
+- It takes about 20-40 minutes and installs or changes nothing.
+- Videos land in `ComfyUI\output\bench\`, named by configuration, so you can compare quality side by side.
+- Options: `-Kind t2v`, `-Runs 3`, `-SkipExperimental`, `-SkipBaseline`.
+
+Manual version:
+
 ```
 run_probe.bat                     :: kernel level: fp16-acc GEMM, CK/Sage attention (random + hard case), INT8 weight GEMM
 run_nvidia_gpu.bat                :: stock launcher. In a 2nd window:
@@ -203,6 +216,7 @@ tokens = (W/16) x (H/16) x ((frames-1)/4 + 1). Linear layers scale with tokens; 
 ## Repo layout
 
 ```
+Run-FullTest.ps1            one-command probe + stock vs optimized vs experimental benchmark -> one pasteable report
 Optimize-ComfyUI.ps1        idempotent optimizer (Windows PowerShell 5.1 + 7; PSScriptAnalyzer-clean for 5.1 syntax)
 bench/kernel_probe.py       on-GPU probe (fp16-acc GEMM, INT8 attention random + hard case, INT8 weight GEMM)
 bench/comfy_bench.py        API benchmark harness (stdlib only): run / quick / compare
