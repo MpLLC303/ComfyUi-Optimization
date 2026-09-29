@@ -15,6 +15,8 @@ Runs on the ComfyUI portable interpreter; no pip installs needed:
 
     python_embeded\\python.exe bench\\comfy_bench.py compare bench_results.csv
 
+    python_embeded\\python.exe bench\\comfy_bench.py quick optimized --set WanImageToVideo.width=832
+
 Workflow file: File > Export (API) from the ComfyUI menu, or one of the files
 in ../workflows. Both the raw prompt dict and {"prompt": {...}} are accepted.
 """
@@ -199,8 +201,8 @@ def run_once(base, wf, timeout_s, sampler):
         detail = e.read().decode("utf-8", "replace")
         raise RuntimeError("server rejected workflow (HTTP %d): %s" % (e.code, detail[:2000]))
     if resp.get("node_errors"):
-        sampler.stop()
-        raise RuntimeError("node_errors: " + json.dumps(resp["node_errors"])[:2000])
+        # HTTP 200 + node_errors: some outputs failed validation but the rest of the prompt is queued
+        print("\n  warning: partial prompt, some outputs failed validation: " + json.dumps(resp["node_errors"])[:500])
     prompt_id = resp["prompt_id"]
 
     entry = None
@@ -218,7 +220,13 @@ def run_once(base, wf, timeout_s, sampler):
     sampler.stop()
 
     if entry is None:
-        raise RuntimeError("timed out after %ds waiting for prompt %s" % (timeout_s, prompt_id))
+        # don't leave a runaway job on the GPU: dequeue it if pending, interrupt it if running
+        for path, payload in (("/queue", {"delete": [prompt_id]}), ("/interrupt", {"prompt_id": prompt_id})):
+            try:
+                http_json(base + path, payload)
+            except Exception:
+                pass
+        raise RuntimeError("timed out after %ds waiting for prompt %s (interrupted)" % (timeout_s, prompt_id))
 
     status = entry.get("status", {})
     msgs = {m[0]: m[1] for m in status.get("messages", []) if isinstance(m, list) and len(m) == 2}
@@ -281,6 +289,7 @@ def cmd_run(a):
             print(" FAILED\n  " + str(e))
             if a.keep_going:
                 continue
+            write_csv(a.csv, rows)  # keep the runs that did complete
             sys.exit(2)
         res.update(sampler.summary())
         print(" wall %.1fs exec %ss %s%s" % (
@@ -306,6 +315,7 @@ def cmd_run(a):
 
     write_csv(a.csv, rows)
     timed = [r["wall_s"] for r in rows if r["phase"] == "timed" and not r["fully_cached"]]
+    return rows
     if timed:
         print("\n%s: median %.1fs over %d timed runs (min %.1f, max %.1f) -> %s"
               % (a.label, statistics.median(timed), len(timed), min(timed), max(timed), a.csv))
@@ -319,6 +329,8 @@ FIELDNAMES = [
 
 
 def write_csv(path, rows):
+    if not rows:
+        return
     new = not os.path.exists(path)
     with open(path, "a", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=FIELDNAMES, extrasaction="ignore")
@@ -358,26 +370,56 @@ def cmd_compare(a):
         print("\n(no rows labelled '%s'; pass --baseline LABEL to compute speedups)" % a.baseline)
 
 
-def main():
-    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    sub = p.add_subparsers(dest="cmd", required=True)
+def cmd_quick(a):
+    """run + compare with kit defaults; what run_bench.bat calls (all args pass through %*)."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    kit = os.path.dirname(here)
+    a.workflow = a.workflow or os.path.join(kit, "workflows", "wan22_i2v_4step_api.json")
+    a.csv = a.csv or os.path.join(kit, "bench_results.csv")
+    if a.seed is None:
+        a.seed = 1234  # same seeds for every label -> apples-to-apples comparison
+    try:
+        cmd_run(a)
+    finally:
+        if os.path.exists(a.csv):
+            print()
+            a.baseline = "baseline"
+            cmd_compare(a)
 
-    r = sub.add_parser("run", help="benchmark a workflow")
-    r.add_argument("workflow", help="API-format workflow JSON")
+
+def add_run_args(r, quick=False):
+    if quick:
+        r.add_argument("label", nargs="?", default="run", help="name for this configuration, e.g. baseline, optimized")
+        r.add_argument("--workflow", default=None, help="API-format workflow JSON (default: kit's wan22_i2v_4step_api.json)")
+        r.add_argument("--csv", default=None, help="results CSV (default: <kit>/bench_results.csv)")
+    else:
+        r.add_argument("workflow", help="API-format workflow JSON")
+        r.add_argument("--label", default="run", help="name for this configuration, e.g. baseline, sage")
+        r.add_argument("--csv", default="bench_results.csv")
     r.add_argument("--host", default="127.0.0.1:8188")
-    r.add_argument("--label", default="run", help="name for this configuration, e.g. baseline, sage")
     r.add_argument("--runs", type=int, default=3, help="timed runs (default 3)")
     r.add_argument("--warmup", type=int, default=1, help="untimed warmup runs (default 1; loads models)")
     r.add_argument("--cold", action="store_true", help="unload models before every run (measures load time)")
     r.add_argument("--seed", type=int, default=None, help="base seed; run i uses seed+i (default random)")
     r.add_argument("--set", action="append", metavar="NODE.input=value",
                    help="override an input by node id or class_type, repeatable")
-    r.add_argument("--csv", default="bench_results.csv")
     r.add_argument("--gpu", type=int, default=0, help="nvidia-smi GPU index")
     r.add_argument("--no-gpu-stats", action="store_true")
     r.add_argument("--timeout", type=int, default=3600, help="seconds per run")
     r.add_argument("--keep-going", action="store_true", help="continue after a failed run")
+
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    r = sub.add_parser("run", help="benchmark a workflow")
+    add_run_args(r)
     r.set_defaults(func=cmd_run)
+
+    q = sub.add_parser("quick", help="run with kit defaults, then compare (used by run_bench.bat)")
+    add_run_args(q, quick=True)
+    q.set_defaults(func=cmd_quick)
 
     c = sub.add_parser("compare", help="summarize a results CSV")
     c.add_argument("csv", nargs="?", default="bench_results.csv")
