@@ -14,10 +14,12 @@ What it measures, at Wan 2.2 14B shapes (hidden 5120, 40 heads x 128, 640x640x81
   * fp16 GEMM with fp32 vs fp16 accumulation  -> justifies --fast fp16_accumulation
   * attention: PyTorch SDPA vs comfy-kitchen INT8 (Sage-style) vs sageattention
     (if installed), with output error vs SDPA  -> justifies --use-ck-attention
+  * INT8 weight GEMM (comfy-kitchen W8A8 ConvRot) vs fp16 GEMM at the FFN shapes
+    -> tells you whether converting Wan to int8_convrot checkpoints is worth it
   * prerequisites for dynamic VRAM (torch >= 2.8, 2.12+ recommended; comfy_aimdo)
     and the comfy-kitchen CUDA backend (torch built for CUDA >= 13)
 
-Peak VRAM is ~2.5 GB. It refuses to run while a ComfyUI server answers on
+Peak VRAM is ~3 GB. It refuses to run while a ComfyUI server answers on
 --comfy-port (default 8188) unless --force is given, so it cannot push a live
 render out of VRAM. Random-data error is a sanity check, not a quality guarantee:
 always eyeball real output with the new flags.
@@ -31,7 +33,7 @@ import sys
 import time
 import urllib.request
 
-RESULT = {"ok": True, "notes": [], "env": {}, "gemm": {}, "attention": {}, "recommended_flags": []}
+RESULT = {"ok": True, "notes": [], "env": {}, "gemm": {}, "attention": {}, "int8_linear": {}, "recommended_flags": []}
 DEVICE = "cuda"
 ERR_ROWS = 2048  # rows used for the float64 error check (full-size fp32 copies would cost ~8 GB)
 
@@ -208,13 +210,23 @@ def probe_attention(iters, tokens, heads=40, dim=128):
     t = cuda_time(lambda: F.scaled_dot_product_attention(q, k, v), iters)
     res["pytorch_sdpa"] = {"ms": round(t, 2), "tflops": round(flops / t / 1e9, 1)}
 
+    # Hard case: i.i.d. randn gives a near-uniform softmax that hides INT8 V/P quantization error.
+    # Real DiT attention is peaky and V has outlier tokens, so also test that shape of input.
+    qh = q[:, :, :rows] * 2.5
+    kh = k * 2.5
+    vh = v.clone()
+    vh[:, :, ::max(1, tokens // 16)] *= 25.0
+    ref_hard = F.scaled_dot_product_attention(qh, kh, vh)
+
     try:
         import comfy_kitchen
         if comfy_kitchen.int8_attention_is_available(q.device):
             out = comfy_kitchen.int8_attention(q[:, :, :rows], k, v)
+            out_hard = comfy_kitchen.int8_attention(qh, kh, vh)
             tc = cuda_time(lambda: comfy_kitchen.int8_attention(q, k, v), iters)
             res["comfy_kitchen_int8"] = {"ms": round(tc, 2), "tflops": round(flops / tc / 1e9, 1),
-                                         "speedup_vs_sdpa": round(t / tc, 2), "error": rel_err(out, ref)}
+                                         "speedup_vs_sdpa": round(t / tc, 2), "error": rel_err(out, ref),
+                                         "error_hard": rel_err(out_hard, ref_hard)}
         else:
             res["comfy_kitchen_int8"] = {"available": False}
             note("comfy-kitchen INT8 attention unavailable on this GPU/torch: do NOT pass --use-ck-attention "
@@ -225,13 +237,48 @@ def probe_attention(iters, tokens, heads=40, dim=128):
     try:
         from sageattention import sageattn
         out = sageattn(q[:, :, :rows], k, v, tensor_layout="HND")
+        out_hard = sageattn(qh, kh, vh, tensor_layout="HND")
         ts = cuda_time(lambda: sageattn(q, k, v, tensor_layout="HND"), iters)
         res["sageattention"] = {"ms": round(ts, 2), "tflops": round(flops / ts / 1e9, 1),
-                                "speedup_vs_sdpa": round(t / ts, 2), "error": rel_err(out, ref)}
+                                "speedup_vs_sdpa": round(t / ts, 2), "error": rel_err(out, ref),
+                                "error_hard": rel_err(out_hard, ref_hard)}
     except ImportError:
         pass
     except Exception as e:
         res["sageattention"] = {"available": False, "error_msg": str(e)[:300]}
+    return res
+
+
+def probe_int8_linear(iters, m=33600):
+    """W8A8 ConvRot (what an int8_convrot Wan checkpoint runs) vs fp16 GEMM with fp16 accumulation."""
+    import torch
+    import comfy_kitchen as ck
+    from comfy_kitchen.tensor import TensorWiseINT8Layout
+    res = {}
+    has_acc = hasattr(torch.backends.cuda.matmul, "allow_fp16_accumulation")
+    prev = torch.backends.cuda.matmul.allow_fp16_accumulation if has_acc else None
+    try:
+        if has_acc:
+            torch.backends.cuda.matmul.allow_fp16_accumulation = True
+        for name, k, n in (("ffn_up", 5120, 13824), ("ffn_down", 13824, 5120)):
+            x = torch.randn(m, k, device=DEVICE, dtype=torch.float16)
+            w = (torch.randn(n, k, device=DEVICE) * 0.02).to(torch.float16)
+            qw, prm = TensorWiseINT8Layout.quantize(w, is_weight=True, per_channel=True, convrot=True, convrot_groupsize=256)
+            rows = min(ERR_ROWS, m)
+            ref = torch.nn.functional.linear(x[:rows], w)
+            out = ck.int8_linear(x[:rows], qw, prm.scale, None, torch.float16, convrot=True, convrot_groupsize=256)
+            t16 = cuda_time(lambda: torch.nn.functional.linear(x, w), iters)
+            t8 = cuda_time(lambda: ck.int8_linear(x, qw, prm.scale, None, torch.float16, convrot=True, convrot_groupsize=256), iters)
+            res[name] = {"shape": [m, k, n], "fp16acc_ms": round(t16, 2), "int8_ms": round(t8, 2),
+                         "speedup": round(t16 / t8, 2), "error": rel_err(out, ref)}
+            x = w = qw = prm = ref = out = None  # free before the next shape
+            if DEVICE == "cuda":
+                torch.cuda.empty_cache()
+    finally:
+        if has_acc:
+            torch.backends.cuda.matmul.allow_fp16_accumulation = prev
+    sp = [v["speedup"] for v in res.values()]
+    res["int8_weights_worth_testing"] = bool(sp) and min(sp) >= 1.3
     return res
 
 
@@ -242,12 +289,15 @@ def recommend(r):
         rec.append("--fast fp16_accumulation")
     attn = r.get("attention") or {}
     ck = attn.get("comfy_kitchen_int8") or {}
-    if (ck.get("speedup_vs_sdpa") or 0) >= 1.2 and ((ck.get("error") or {}).get("cosine") or 0) > 0.995:
+    def attn_ok(d):
+        e = d.get("error") or {}
+        h = d.get("error_hard") or {}
+        return ((d.get("speedup_vs_sdpa") or 0) >= 1.2 and (e.get("cosine") or 0) > 0.995
+                and (e.get("rel_l2") if e.get("rel_l2") is not None else 1) < 0.05 and (h.get("cosine") or 0) > 0.99)
+    if attn_ok(ck):
         rec.append("--use-ck-attention")
-    else:
-        sa = attn.get("sageattention") or {}
-        if (sa.get("speedup_vs_sdpa") or 0) >= 1.2 and ((sa.get("error") or {}).get("cosine") or 0) > 0.995:
-            rec.append("--use-sage-attention")
+    elif attn_ok(attn.get("sageattention") or {}):
+        rec.append("--use-sage-attention")
     return rec
 
 
@@ -272,10 +322,22 @@ def human(r):
             if "ms" in v:
                 extra = ""
                 if "speedup_vs_sdpa" in v:
-                    extra = " | %.2fx vs SDPA | cos %s relL2 %s" % (v["speedup_vs_sdpa"], v["error"]["cosine"], v["error"]["rel_l2"])
+                    extra = " | %.2fx vs SDPA | cos %s relL2 %s | hard-case cos %s relL2 %s" % (
+                        v["speedup_vs_sdpa"], v["error"]["cosine"], v["error"]["rel_l2"],
+                        v.get("error_hard", {}).get("cosine"), v.get("error_hard", {}).get("rel_l2"))
                 print("  %-20s %8.2f ms  %6.1f TFLOPS%s" % (name, v["ms"], v["tflops"], extra))
             else:
                 print("  %-20s unavailable %s" % (name, v.get("error_msg", "")))
+    il = r.get("int8_linear")
+    if il:
+        print("-" * 72)
+        for name in ("ffn_up", "ffn_down"):
+            v = il.get(name)
+            if v:
+                print("INT8 W8A8 %-8s %s  fp16-acc %.2f ms | int8 %.2f ms | %.2fx | cos %s"
+                      % (name, "x".join(map(str, v["shape"])), v["fp16acc_ms"], v["int8_ms"], v["speedup"], v["error"]["cosine"]))
+        print("  -> int8_convrot Wan checkpoints %s" % ("WORTH an A/B test (see README, lever T5)"
+              if il.get("int8_weights_worth_testing") else "NOT worth converting on this GPU (<1.3x)"))
     print("-" * 72)
     for n in r["notes"]:
         print("NOTE: " + n)
@@ -331,6 +393,12 @@ def main():
         except Exception as e:
             RESULT["attention"] = {}
             note("attention probe failed: %s" % str(e)[:300])
+        torch.cuda.empty_cache()
+        try:
+            RESULT["int8_linear"] = probe_int8_linear(a.iters)
+        except Exception as e:
+            RESULT["int8_linear"] = {}
+            note("INT8 linear probe failed (informational only): %s" % str(e)[:300])
         torch.cuda.empty_cache()
         RESULT["probe_seconds"] = round(time.time() - t0, 1)
         # a probe only counts as complete if both baselines were measured

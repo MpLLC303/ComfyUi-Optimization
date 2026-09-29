@@ -315,10 +315,10 @@ def cmd_run(a):
 
     write_csv(a.csv, rows)
     timed = [r["wall_s"] for r in rows if r["phase"] == "timed" and not r["fully_cached"]]
-    return rows
     if timed:
         print("\n%s: median %.1fs over %d timed runs (min %.1f, max %.1f) -> %s"
               % (a.label, statistics.median(timed), len(timed), min(timed), max(timed), a.csv))
+    return rows
 
 
 FIELDNAMES = [

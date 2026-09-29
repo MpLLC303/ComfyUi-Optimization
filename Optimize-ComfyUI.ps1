@@ -578,7 +578,7 @@ foreach ($m in @(
 # --------------------------------------------------------------------------------------------- #
 Write-Step "On-GPU kernel probe"
 if (-not $ReportOnly) {
-    foreach ($sub in @("bench", "workflows")) {
+    foreach ($sub in @("bench", "workflows", (Join-Path "workflows" "experimental"))) {
         $src = Join-Path $Kit $sub
         $dst = Join-Path $OptDir $sub
         if (Test-Path -LiteralPath $src) {
@@ -596,7 +596,7 @@ else {
     $pr = Invoke-KitPython "kernel_probe.py" @("--json", "--comfy-port", "$Port")
     $probe = $pr.Parsed
     if ($probe) {
-        Write-TextFile -Path (Join-Path $OptDir "probe-$($script:Stamp).json") -Content ($probe | ConvertTo-Json -Depth 8)
+        if (-not $ReportOnly) { Write-TextFile -Path (Join-Path $OptDir "probe-$($script:Stamp).json") -Content ($probe | ConvertTo-Json -Depth 8) }
         $g = Get-Prop $probe "gemm"
         if (Get-Prop $g "speedup") {
             Write-Ok ("fp16 GEMM: fp32-accum {0} TFLOPS -> fp16-accum {1} TFLOPS ({2}x, cosine {3})" -f `
