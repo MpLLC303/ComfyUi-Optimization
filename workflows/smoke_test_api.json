@@ -1,0 +1,42 @@
+{
+  "1": {
+    "class_type": "EmptyImage",
+    "inputs": {
+      "width": 256,
+      "height": 256,
+      "batch_size": 16,
+      "color": 3355443
+    }
+  },
+  "2": {
+    "class_type": "ImageInvert",
+    "inputs": {
+      "image": [
+        "1",
+        0
+      ]
+    }
+  },
+  "3": {
+    "class_type": "CreateVideo",
+    "inputs": {
+      "images": [
+        "2",
+        0
+      ],
+      "fps": 16
+    }
+  },
+  "4": {
+    "class_type": "SaveVideo",
+    "inputs": {
+      "video": [
+        "3",
+        0
+      ],
+      "filename_prefix": "bench/smoke",
+      "format": "auto",
+      "format.codec": "auto"
+    }
+  }
+}
