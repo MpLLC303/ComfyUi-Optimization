@@ -116,6 +116,18 @@ def cascade(wf, kind, low=480, high=640):
     return wf
 
 
+def int8_weights(wf, kind):
+    """INT8 W8A8 ConvRot experts with the lightx2v LoRA baked in (made by Convert-WanInt8.ps1).
+    The LoRA loader nodes are removed: the 4-step LoRA is already inside the weights."""
+    for nid, stage in (("1", "high"), ("2", "low")):
+        wf[nid]["inputs"]["unet_name"] = "wan2.2_%s_%s_noise_14B_int8convrot_lx2v.safetensors" % (kind, stage)
+    wf.pop("3", None)
+    wf.pop("4", None)
+    wf["9"]["inputs"]["model"] = ["1", 0]
+    wf["10"]["inputs"]["model"] = ["2", 0]
+    return wf
+
+
 def easycache(wf):
     """20-step reference only: EasyCache on both experts (skips near-duplicate steps; no effect at 4 steps)."""
     for nid, src in (("18", "9"), ("19", "10")):
@@ -142,6 +154,17 @@ def main():
                         ("perexpert_attn", per_expert_attention)):
             out[os.path.join(EXP, "wan22_%s_4step_%s_api.json" % (kind, tag))] = prefix(fn(copy.deepcopy(base4)), tag)
         out[os.path.join(EXP, "wan22_%s_4step_cascade480_api.json" % kind)] = prefix(cascade(copy.deepcopy(base4), kind), "cascade480")
+        # combinations (node ids of the two patches do not collide: cascade uses 18/19 only for
+        # LatentUpscale/low-res latent, so sparse attention goes on 20/21 here)
+        combo = cascade(copy.deepcopy(base4), kind)
+        for nid, src, sampler in (("20", "9", "13"), ("21", "10", "14")):
+            combo[nid] = copy.deepcopy(sparse_attention(copy.deepcopy(base4))["18"])
+            combo[nid]["inputs"]["model"] = [src, 0]
+            combo[sampler]["inputs"]["model"] = [nid, 0]
+        out[os.path.join(EXP, "wan22_%s_4step_cascade480_sparse_api.json" % kind)] = prefix(combo, "cascade480_sparse")
+        out[os.path.join(EXP, "wan22_%s_4step_int8_api.json" % kind)] = prefix(int8_weights(copy.deepcopy(base4), kind), "int8")
+        mx = int8_weights(copy.deepcopy(combo), kind)
+        out[os.path.join(EXP, "wan22_%s_4step_int8_cascade480_sparse_api.json" % kind)] = prefix(mx, "int8_cascade480_sparse")
     t2v20 = load("wan22_t2v_20step_reference_api.json")
     out[os.path.join(EXP, "wan22_t2v_20step_easycache_api.json")] = prefix(easycache(copy.deepcopy(t2v20)), "easycache")
     out[os.path.join(EXP, "wan22_t2v_20step_lowcfg1_api.json")] = prefix(low_cfg1(copy.deepcopy(t2v20)), "lowcfg1")

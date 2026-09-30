@@ -94,9 +94,16 @@ if (-not $Workflow) {
 }
 $variants = @()
 if (-not $SkipExperimental -and $Kind -ne "auto") {
-    foreach ($v in @("cascade480", "3step", "sparse", "taedecode")) {
+    foreach ($v in @("cascade480", "3step", "sparse", "cascade480_sparse", "taedecode", "int8", "int8_cascade480_sparse")) {
         $f = Join-Path $ExpDir "wan22_${Kind}_4step_${v}_api.json"
         if (-not (Test-Path -LiteralPath $f)) { continue }
+        if ($v -like "int8*") {
+            $i8 = Join-Path $dm "wan2.2_${Kind}_high_noise_14B_int8convrot_lx2v.safetensors"
+            if (-not (Test-Path -LiteralPath $i8)) {
+                if ($v -eq "int8") { Write-Host "    [info] skipping int8 variants: run Convert-WanInt8.ps1 first to create the INT8 experts" }
+                continue
+            }
+        }
         if ($v -eq "taedecode") {
             $va = Join-Path (Join-Path $ComfyDir "models") "vae_approx"
             if (-not (Get-ChildItem -LiteralPath $va -Filter "lighttaew2_1.*" -ErrorAction SilentlyContinue)) {

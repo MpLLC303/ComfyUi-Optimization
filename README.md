@@ -48,11 +48,33 @@ run_bench.bat cascade --workflow optimizer\workflows\experimental\wan22_t2v_4ste
 | **T2 Tiny Wan VAE decode** (`lighttaew2_1`) | `_4step_taedecode` | **-8 to -22 s per clip** (decode ~1-3 s instead of ~10-25 s) | Softer texture, possible flicker or colour shift. Best as a draft decoder; re-decode keepers with the full VAE (the latent is cached, so it costs only the decode). |
 | **T3 3-step lightx2v** (2 high + 1 low) | `_4step_3step` | **-18 to -22% end-to-end** | Moderate to high quality risk (the LoRA was distilled for 4 steps) |
 | **T4 Model Sparse Attention** (core node, `sol-attn`, tau 1.3, step 0 dense) | `_4step_sparse` | 1.1-1.2x end-to-end | Training-free sparsity on a 4-step distilled model has no quality evidence. Check the log for `BlockSparseAttention: sparse (1, 33600, 40, 128)`. |
-| **T5 INT8 W8A8 weights** (`int8_convrot` checkpoints, run natively on sm_86) | none: needs converted models | 1.05-1.2x end-to-end, **only if** `run_probe.bat` reports "int8_convrot WORTH an A/B test" (≥ 1.3x on both FFN shapes) | There is no official Wan 2.2 int8 file. Convert with `python_embeded\python.exe -m pip install convert_to_quant==1.3.4`, then `python_embeded\python.exe -m convert_to_quant.convert_to_quant -i <fp16 expert> -o <out> --wan --comfy_quant --save-quant-metadata --int8 --scaling-mode row --convrot --convrot-group-size 256 --simple --low-memory --output-dtype float16` (it also needs `prodigy-plus-schedule-free`). The kernel heuristics were tuned on Ada, so GA102 may underperform. |
+| **T5 INT8 W8A8 weights** (`int8_convrot`, INT8 tensor cores on sm_86) | `_4step_int8` (+ `_4step_int8_cascade480_sparse`) | **Measured on your 3090: 1.53x on the FFN GEMMs** (fp16-acc 38.8 ms -> INT8 25.2 ms). Est. 1.1-1.25x end-to-end on top of the two flags | Run `Convert-WanInt8.ps1` (ComfyUI closed, ~16 GB disk and ~30 GB RAM peak per expert). It writes `*_int8convrot_lx2v.safetensors` next to your fp8 files, with the lightx2v LoRA baked in, using ComfyUI's own quantization classes (verified to load as WAN21/int8_tensorwise, 0.3% error vs full precision on a test model). Originals are untouched. Kernel heuristics were tuned on Ada, so check the end-to-end number. |
+| **T1+T4 combined** (cascade + sparse attention) | `_4step_cascade480_sparse` | Both measured separately at 1.34x / 1.45x over stock (no flags); combined, not yet measured | Quality risks of both |
 | **T6 Per-expert attention backend** (core `ModelAttentionBackend`) | `_4step_perexpert_attn` | 0% on clean prompts | This is a quality switch, not a speed one. If one prompt artifacts, set node 18 (high) or 19 (low) to `pytorch attention`, keeping INT8 on the other expert, without restarting ComfyUI. |
 | **T7 20-step reference only**: CFG 1 on the low-noise half, or EasyCache | `_20step_lowcfg1`, `_20step_easycache` | ~1.25x / 1.1-1.5x on the 20-step path | Changes the "reference" output. EasyCache does **nothing** at 4 steps. |
 
 Regenerate the variants after editing a baseline with `python workflows\make_variants.py`.
+
+## Measured on the target machine (RTX 3090, Ryzen 9 9950X3D, 62 GB RAM, 990 PRO NVMe)
+
+First `Run-FullTest.ps1` run, 2026-09-29: T2V, 640x640x81, 4-step lightx2v, warm server. The "optimized" server had no flags yet, so it equals stock.
+
+| Config | Time per clip | vs stock |
+|---|---|---|
+| Stock (ComfyUI 0.37.4, cu130, dynamic VRAM on) | 113.7 s | 1.00x |
+| Model Sparse Attention (T4) | 78.6 s | 1.45x |
+| 480->640 cascade (T1) | 84.7 s | 1.34x |
+| 3-step (T3) | 87.7 s | 1.30x |
+
+GPU probe on the same card:
+
+| Probe | Result |
+|---|---|
+| fp16 GEMM | 75.5 -> 126.2 TFLOPS with fp16 accumulation (**1.67x**, cosine 0.999997) |
+| Attention | SDPA 489 ms -> CK INT8 155 ms (**3.15x**). Error is tiny on random inputs (cos 0.99986), relL2 11% on the hard case |
+| INT8 weight GEMM | 1.53x |
+
+Projection from these kernels: attention is about 2/3 of the ~26 s steps, so both flags should give ~1.8-2x per clip (~55-65 s). That is not yet measured end to end.
 
 ## Tier 3: don't (verified in source)
 
@@ -216,12 +238,14 @@ tokens = (W/16) x (H/16) x ((frames-1)/4 + 1). Linear layers scale with tokens; 
 ## Repo layout
 
 ```
+Convert-WanInt8.ps1         INT8 W8A8 copies of your Wan experts (lightx2v baked in) for the INT8 tensor cores
 Run-FullTest.ps1            one-command probe + stock vs optimized vs experimental benchmark -> one pasteable report
 Optimize-ComfyUI.ps1        idempotent optimizer (Windows PowerShell 5.1 + 7; PSScriptAnalyzer-clean for 5.1 syntax)
 bench/kernel_probe.py       on-GPU probe (fp16-acc GEMM, INT8 attention random + hard case, INT8 weight GEMM)
 bench/comfy_bench.py        API benchmark harness (stdlib only): run / quick / compare
 bench/env_info.py           environment JSON for the optimizer (never raises)
 bench/make_start_image.py   start frame for the I2V benchmark
+bench/wan_int8_convert.py   the converter behind Convert-WanInt8.ps1 (ComfyUI's own quantization classes)
 workflows/*.json            baseline + prompt-cache API workflows
 workflows/experimental/     Tier 2 A/B variants (generated by workflows/make_variants.py)
 ```
