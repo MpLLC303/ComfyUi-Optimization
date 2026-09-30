@@ -167,6 +167,16 @@ function Invoke-Bench([string]$Label, [string]$Wf, [int]$Warmup, [int]$N) {
 Write-Step "1/3 GPU kernel probe"
 $probe = Invoke-Native $Py @("-s", $ProbePy, "--comfy-port", "$Port")
 $probe.Output | Out-Host
+if (-not $optFlags) {
+    # run_optimized.bat has no measured flags (e.g. the optimizer's probe was skipped): use what the
+    # probe just measured, so the "optimized" run is not a second copy of stock
+    $recLine = @(($probe.Output -split "`n") | Where-Object { $_ -like "RECOMMENDED FLAGS:*" }) | Select-Object -Last 1
+    if ($recLine -and $recLine -notmatch "\(none") {
+        $optFlags = @(($recLine -replace "^RECOMMENDED FLAGS:\s*", "").Trim() -split "\s+" | Where-Object { $_ })
+        Write-Host "    [info] using the probe's recommended flags for the optimized run: $($optFlags -join ' ')" -ForegroundColor Yellow
+        Write-Host "    [info] re-run Optimize-ComfyUI.ps1 (ComfyUI closed) to write them into run_optimized.bat" -ForegroundColor Yellow
+    }
+}
 
 # ---- 2. baseline
 $srv = $null
