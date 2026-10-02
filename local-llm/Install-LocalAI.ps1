@@ -384,7 +384,9 @@ Invoke-Stage 'Preflight' {
     elseif ($State.flags.ContainsKey('modelDir')) { $target = $State.flags['modelDir'] }
     elseif ($envModels) { $target = $envModels }
     else {
-        $needAll = ($catalogAll.Models | Measure-Object -Property DownloadGB -Sum).Sum + 10
+        # Catalog entries are hashtables; Windows PowerShell 5.1's Measure-Object -Property can't read their keys.
+        $needAll = 10
+        foreach ($cm in $catalogAll.Models) { $needAll += [double]$cm.DownloadGB }
         $hasExisting = (Test-Path -LiteralPath (Join-Path $defaultModels 'manifests'))
         if (-not $hasExisting -and (Get-FreeGB $env:SystemDrive) -lt ($needAll + 40)) {
             $best = Get-CimInstance Win32_LogicalDisk -Filter 'DriveType=3' | Where-Object { $_.DeviceID -ne $env:SystemDrive } |
