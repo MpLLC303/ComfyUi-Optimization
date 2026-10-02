@@ -1,0 +1,22 @@
+# SearXNG settings for the local AI stack. The installer copies this file to
+# C:\AI\Stack\searxng\settings.yml and replaces __SEARXNG_SECRET__ with a random key.
+# Everything not listed here falls back to SearXNG's defaults.
+use_default_settings: true
+
+general:
+  instance_name: "LocalAI Search"
+
+search:
+  safe_search: 0
+  autocomplete: ""
+  # Open WebUI talks to SearXNG over its JSON API, which is disabled by default.
+  formats:
+    - html
+    - json
+
+server:
+  secret_key: "__SEARXNG_SECRET__"
+  # The bot limiter needs a Valkey/Redis instance; this instance is loopback-only, so it is off.
+  limiter: false
+  public_instance: false
+  image_proxy: false
