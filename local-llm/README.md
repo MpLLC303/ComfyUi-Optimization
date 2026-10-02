@@ -19,12 +19,11 @@ Pick one. In each case you get **one UAC prompt**, and then the installer runs u
 1. **Double-click** `local-llm\Install-LocalAI.cmd` in a downloaded copy of this repository.
 2. **PowerShell**, from the `local-llm` folder:
    `powershell -NoProfile -ExecutionPolicy Bypass -File .\Install-LocalAI.ps1`
-3. **No download needed.** Paste into a normal PowerShell window (set `LOCALAI_REF` to the branch to install from):
-   ```powershell
-   $env:LOCALAI_REF = 'main'
-   [Net.ServicePointManager]::SecurityProtocol = 'Tls12'
-   irm https://raw.githubusercontent.com/MpLLC303/ComfyUi-Optimization/refs/heads/$env:LOCALAI_REF/local-llm/Get-LocalAI.ps1 | iex
-   ```
+3. **No download needed (public repositories only).** This repository is private, so GitHub answers
+   anonymous `raw.githubusercontent.com` requests with **404** and the `irm ... | iex` bootstrap
+   (`Get-LocalAI.ps1`) will not work. Use option 1 or 2 with a copy you download while signed in:
+   https://github.com/MpLLC303/ComfyUi-Optimization/archive/refs/heads/main.zip
+   (or `git clone https://github.com/MpLLC303/ComfyUi-Optimization`, which prompts you to sign in).
 
 Expect about 30-90 minutes. Most of that is about 67 GB of model downloads plus the Docker
 image. If WSL or Docker needs a reboot, the script warns you 60 seconds ahead (`shutdown /a`

@@ -1,4 +1,5 @@
 # Bootstrap: downloads this repository as a ZIP and starts Install-LocalAI.ps1.
+# Only works while the repository is PUBLIC; a private repo returns 404 to anonymous requests.
 # Paste into a normal (non-admin) PowerShell window:
 #
 #   $env:LOCALAI_REF = 'main'
