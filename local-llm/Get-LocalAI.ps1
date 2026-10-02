@@ -3,7 +3,7 @@
 #
 #   $env:LOCALAI_REF = 'main'
 #   [Net.ServicePointManager]::SecurityProtocol = 'Tls12'
-#   irm https://raw.githubusercontent.com/MpLLC303/ComfyUi-Optimization/main/local-llm/Get-LocalAI.ps1 | iex
+#   irm https://raw.githubusercontent.com/MpLLC303/ComfyUi-Optimization/refs/heads/main/local-llm/Get-LocalAI.ps1 | iex
 #
 # LOCALAI_REF selects the branch to install from. Everything runs inside a script block so the
 # settings below do not leak into your PowerShell session.

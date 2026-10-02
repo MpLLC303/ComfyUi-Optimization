@@ -23,7 +23,7 @@ Pick one. In each case you get **one UAC prompt**, and then the installer runs u
    ```powershell
    $env:LOCALAI_REF = 'main'
    [Net.ServicePointManager]::SecurityProtocol = 'Tls12'
-   irm https://raw.githubusercontent.com/MpLLC303/ComfyUi-Optimization/$env:LOCALAI_REF/local-llm/Get-LocalAI.ps1 | iex
+   irm https://raw.githubusercontent.com/MpLLC303/ComfyUi-Optimization/refs/heads/$env:LOCALAI_REF/local-llm/Get-LocalAI.ps1 | iex
    ```
 
 Expect about 30-90 minutes. Most of that is about 67 GB of model downloads plus the Docker
