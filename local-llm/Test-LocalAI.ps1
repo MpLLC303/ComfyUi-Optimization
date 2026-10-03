@@ -201,7 +201,7 @@ if ($script:token) {
 
 Add-Check 'Backups' {
     $dir = Join-Path $AIRoot 'Backups'
-    $newest = Get-ChildItem -LiteralPath $dir -Filter 'open-webui-*.tar.gz' -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+    $newest = Get-ChildItem -LiteralPath $dir -Filter 'open-webui-*.tar.gz' -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 1  # lai-ok: objects
     if (-not $newest) { return (Fail "no archive in $dir") }
     $age = (Get-Date) - $newest.LastWriteTime
     $detail = '{0} ({1:N1} MB, {2:N0} h old)' -f $newest.Name, ($newest.Length / 1MB), $age.TotalHours

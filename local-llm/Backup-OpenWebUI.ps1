@@ -88,7 +88,7 @@ try {
     Write-BackupLog OK ("Backup {0} ({1:N1} MB){2}" -f $archive, ($size / 1MB), $(if ($stopped) { '; container was paused for consistency' } else { '' }))
 
     # Retention: drop archives older than N days, but never the newest three.
-    $all = @(Get-ChildItem -LiteralPath $backupDir -Filter 'open-webui-*.tar.gz' | Sort-Object LastWriteTime -Descending)
+    $all = @(Get-ChildItem -LiteralPath $backupDir -Filter 'open-webui-*.tar.gz' | Sort-Object LastWriteTime -Descending)  # lai-ok: objects
     $cutoff = (Get-Date).AddDays(-$RetentionDays)
     foreach ($old in ($all | Select-Object -Skip 3 | Where-Object { $_.LastWriteTime -lt $cutoff })) {
         Remove-Item -LiteralPath $old.FullName -Force
