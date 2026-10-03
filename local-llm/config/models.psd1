@@ -30,7 +30,7 @@
             MaxContext      = 40960
             Vision          = $false
             Think           = $false
-            MinTokensPerSec = 25
+            MinTokensPerSec = 40
             Parameters      = @{ temperature = 0.6; top_p = 0.95; top_k = 20; min_p = 0.0 }
             Description     = 'Qwen3 14B abliterated (dense, hybrid reasoning). Thinking is off by default; turn it on in Chat Controls for step-by-step answers.'
         }
@@ -46,7 +46,7 @@
             MaxContext      = 65536
             Vision          = $false
             Think           = $null
-            MinTokensPerSec = 45
+            MinTokensPerSec = 95
             Parameters      = @{ temperature = 0.7; top_p = 0.8; top_k = 20; min_p = 0.0 }
             Description     = 'Qwen3 30B-A3B Instruct 2507 abliterated (mixture of experts, ~3B active per token). Default daily driver.'
         }
@@ -62,7 +62,7 @@
             MaxContext      = 32768
             Vision          = $true
             Think           = $null
-            MinTokensPerSec = 40
+            MinTokensPerSec = 90
             Parameters      = @{ temperature = 0.7; top_p = 0.8; top_k = 20; min_p = 0.0 }
             Description     = 'Qwen3-VL 30B-A3B Instruct abliterated. Use this preset when you attach images.'
         }
@@ -78,7 +78,7 @@
             MaxContext      = 65536
             Vision          = $false
             Think           = $null
-            MinTokensPerSec = 45
+            MinTokensPerSec = 90
             Parameters      = @{ temperature = 0.7; top_p = 0.8; top_k = 20; min_p = 0.0; repeat_penalty = 1.05 }
             Description     = 'Qwen3-Coder 30B-A3B Instruct abliterated. Coding and agentic-coding specialist.'
         }

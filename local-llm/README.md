@@ -65,20 +65,28 @@ head dim 128; Qwen3-14B: 40 layers, 8 KV heads) and Ollama v0.35.1's source code
 installer **measures** the real values on your machine and writes them to
 `C:\AI\install-report.md`.
 
+Measured on the first real install (RTX 3090, driver 617.14, Windows 11 25H2, about 2.3 GB of VRAM
+used by the desktop and open apps):
+
+| Preset | Model | Context (tokens) | VRAM with cache | Generation |
+|---|---|---:|---:|---:|
+| Local Main | Qwen3 30B-A3B 2507 | 65,536 | 20.6 GiB | **188.5 tok/s** |
+| Local Code | Qwen3-Coder 30B-A3B | 65,536 | 20.6 GiB | 178.5 tok/s |
+| Local Vision | Qwen3-VL 30B-A3B | 32,768 | 19.2 GiB | 184.8 tok/s |
+| Local Fast | Qwen3 14B (dense) | 40,960 (its maximum) | 11.6 GiB | 79 tok/s |
+
 1. **The context is measured, not guessed.** The guide starts the 30B at 8K. The KV cache costs
    2 × 48 × 4 × 128 values per token. That's 96 KiB/token at f16, or about 51 KiB/token with the q8_0 KV cache the
-   installer turns on. With roughly 17.3 GiB of weights and about 22.5 GiB of usable VRAM, that leaves room
-   for roughly **48K-64K tokens** on the 30B. The tuner tries 64K → 8K and keeps the largest size that is still
-   100% on the GPU with at least 768 MiB free. Confidence that 30B lands at ≥32K: high. Confidence that it lands at 64K:
-   about 50/50; it depends on how much VRAM your desktop is using.
+   installer turns on, which is what lets the 30B reach 64K. The tuner tries 64K → 8K and keeps the largest size that is still
+   100% on the GPU with at least 768 MiB free. It landed on 64K with 874 MiB to spare, so the margin is thin: a busy
+   browser or another GPU app can push it into slow shared memory (see Troubleshooting).
 2. **The 14B can't use 64K.** Qwen3-14B was trained to 40,960 positions, and Ollama silently caps
    `num_ctx` there. The guide's "later try 65536" is a no-op, so the tuner caps at 40,960.
-3. **"Local Fast" is probably *not* faster than "Local Main".** The 30B-A3B is a mixture of experts with
-   about 3.3B parameters active per token. The 14B is dense, with 14.8B active. Token generation is
-   memory-bandwidth bound, so expect about 90-140 tok/s from Main and about 50-65 tok/s from Fast on a 3090
-   (estimate ±30%; the installer prints your real numbers). Fast also has reasoning ("thinking") on by default,
-   which delays the first token. The installer turns it off in the preset; you can turn it back on per chat. Use Fast
-   for its smaller VRAM footprint (it can run next to ComfyUI) or for step-by-step reasoning, not for speed.
+3. **"Local Fast" is *not* faster than "Local Main": it is about 2.4× slower.** The 30B-A3B is a mixture of experts
+   with about 3.3B parameters active per token; the 14B is dense, with 14.8B active, and generation speed tracks the
+   active parameters. My pre-install estimates (90-140 and 50-65 tok/s) were too low on both counts. Fast also reasons
+   ("thinks") by default, which delays the first token; the preset turns that off and you can turn it back on per chat.
+   Use Fast for its smaller VRAM footprint (11.6 GiB, so it can sit next to a small ComfyUI job) or for step-by-step reasoning.
 4. **`num_ctx` is baked into Ollama aliases, not set in Open WebUI.** Open WebUI's background tasks
    (titles, tags, search queries) don't always send the chat's `num_ctx`. When two callers ask for
    different contexts, Ollama reloads the 19 GB model each time. Baking the context into the model means everyone asks for the same size.
@@ -152,7 +160,7 @@ deliberately not inside the backup archives.
 | Symptom | Likely cause | Fix |
 |---|---|---|
 | Installer stops: "only N% on the GPU even at 8K" | Another app holds VRAM (ComfyUI, Forge, a game), or the driver/Ollama is stale | Close the GPU apps (or run `Release-GPU.ps1`), quit Ollama from the tray, re-run. Update the driver if it's old. |
-| Main runs at well under 45 tok/s | The desktop or browser grew its VRAM use, so the driver is spilling into system RAM | Run `Release-GPU.ps1` and close GPU-heavy apps, or re-run with `-Retune`. Optionally set NVIDIA Control Panel → *CUDA - Sysmem Fallback Policy* → *Prefer No Sysmem Fallback* for `ollama.exe` so it fails loudly instead of crawling. Plugging the monitor into the motherboard (the Ryzen iGPU) frees about 0.5-1 GB. |
+| Main runs well under ~150 tok/s (normal is ~188) | The desktop or browser grew its VRAM use, so the driver is spilling into system RAM | Run `Release-GPU.ps1` and close GPU-heavy apps, or re-run with `-Retune`. Optionally set NVIDIA Control Panel → *CUDA - Sysmem Fallback Policy* → *Prefer No Sysmem Fallback* for `ollama.exe` so it fails loudly instead of crawling. Plugging the monitor into the motherboard (the Ryzen iGPU) frees about 0.5-1 GB. |
 | ComfyUI OOM or slow right after chatting | An Ollama model is still resident | Run `Release-GPU.ps1`, or install with `-KeepAlive 5m` |
 | Open WebUI lists no models | Ollama isn't running | Start Ollama from the Start menu, then run `Test-LocalAI.ps1 -Quick` |
 | "Docker engine did not start" | Licence prompt, virtualization off, or WSL broken | Open Docker Desktop once. Enable **SVM Mode** in the BIOS. Run `wsl --update`. Re-run. |
@@ -169,8 +177,9 @@ deliberately not inside the backup archives.
   and no file write access: those capabilities are turned off in every preset. Shell access (Open
   Terminal in a Docker sandbox, scoped to `C:\AI\Workspace`) is V2 and should keep the guide's
   permission levels A-F.
-- **Nothing listens beyond 127.0.0.1**, and `Test-LocalAI.ps1` checks this. For phone access, use
-  `tailscale serve 3000` (HTTPS on your tailnet only) rather than port forwarding or binding to `0.0.0.0`.
+- **Nothing listens beyond 127.0.0.1**, and `Test-LocalAI.ps1` checks this. For phone access run
+  `C:\AI\Scripts\Enable-TailscaleAccess.ps1`: HTTPS at `https://<this-pc>.<tailnet>.ts.net`, tailnet only, survives
+  reboots, nothing opened on the LAN (`-Disable` removes it). Never port-forward or bind to `0.0.0.0`.
 - **Secrets** live in `C:\AI\Secrets` and `C:\AI\Stack\.env`, readable only by you, SYSTEM and
   Administrators. The bootstrap admin password is removed from the container environment after
   the first login.

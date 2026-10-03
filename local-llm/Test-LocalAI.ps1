@@ -92,6 +92,12 @@ if (-not $Quick) {
             if ($tuning.ContainsKey($m.Key) -and [int]$tuning[$m.Key]['Context'] -ne $load.Context) {
                 return (Warn "$detail, but the installer tuned $($tuning[$m.Key]['Context']); re-run the installer")
             }
+            # 100% GPU can still be slow on Windows when the driver quietly pages VRAM to system RAM.
+            $speed = Measure-LaiOllamaSpeed -BaseUrl $ollamaUrl -Name $m.Alias -Tokens 64
+            $detail += ", $speed tok/s"
+            if ($m.MinTokensPerSec -and $speed -lt $m.MinTokensPerSec) {
+                return (Warn "$detail - below $($m.MinTokensPerSec) tok/s: VRAM is probably spilling to system RAM; close GPU apps or run Release-GPU.ps1")
+            }
             Pass $detail
         }
     }
