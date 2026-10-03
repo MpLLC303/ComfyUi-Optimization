@@ -94,7 +94,7 @@ Assert-That ($free -eq 'FREE') "and as free after release (got '$free')"
 # ---- shortcuts -----------------------------------------------------------------------------------
 Write-Host "`n=== Start-menu shortcuts ===" -ForegroundColor Cyan
 $specs = @(Get-LaiShortcutSpecs -AIRoot "C:\It's AI" -WebUIPort 3001)
-Assert-That ($specs.Count -eq 5) "five shortcut specs (got $($specs.Count))"
+Assert-That ($specs.Count -eq 6) "six shortcut specs (got $($specs.Count))"
 foreach ($sc in ($specs | Where-Object { $_.Kind -eq 'lnk' })) {
     $cmd = $sc.Arguments.Substring($sc.Arguments.IndexOf('"') + 1).TrimEnd('"')
     $errs = $null
@@ -142,6 +142,30 @@ Assert-That ($r.Code -eq 0) "Uninstall -WhatIf on an empty root exits 0 (got $($
 $r = Invoke-Child 'Stop-LocalAI.ps1' @('-AIRoot', $aiRoot, '-PauseHours', '1')
 Assert-That ($r.Code -eq 0) "Stop-LocalAI with nothing running exits 0 (got $($r.Code))"
 if ($r.Code -ne 0 -or $failures -gt 0) { Write-Host $r.Text }
+
+Write-Host "`n=== diagnostics bundle: redaction ===" -ForegroundColor Cyan
+$dRoot = Join-Path $Work 'diagroot'
+foreach ($d in 'Secrets', 'Stack', 'Logs') { New-Item -ItemType Directory -Force -Path (Join-Path $dRoot $d) | Out-Null }
+$pw = 'Pw-' + [guid]::NewGuid().ToString('N').Substring(0, 16)
+$key = ([guid]::NewGuid().ToString('N') + [guid]::NewGuid().ToString('N'))
+ConvertTo-Json @{ email = 'someone@example.org'; password = $pw } | Set-Content -LiteralPath (Join-Path (Join-Path $dRoot 'Secrets') 'openwebui-admin.json')
+Set-Content -LiteralPath (Join-Path (Join-Path $dRoot 'Stack') '.env') -Value @("WEBUI_SECRET_KEY=$key", 'OPEN_WEBUI_VERSION=v0.11.4')
+Set-Content -LiteralPath (Join-Path (Join-Path $dRoot 'Logs') 'install-20990101-000000.log') -Value @("Admin password: $pw", "secret $key", 'login someone@example.org', 'Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.abcdefghijklmnop')
+ConvertTo-Json @{ WebUIPort = 39999; OllamaUrl = 'http://127.0.0.1:39997' } | Set-Content -LiteralPath (Join-Path $dRoot 'localai-config.json')
+$outDir = Join-Path $Work 'diagout'
+$r = Invoke-Child 'Get-LocalAIDiagnostics.ps1' @('-AIRoot', $dRoot, '-OutDir', $outDir)
+$zipFile = Get-ChildItem -LiteralPath $outDir -Filter 'diagnostics-*.zip' -ErrorAction SilentlyContinue | Select-Object -First 1
+Assert-That ($r.Code -eq 0 -and $null -ne $zipFile) "diagnostics runs with nothing installed and writes a zip (exit $($r.Code))"
+if ($zipFile) {
+    $x = Join-Path $Work 'diagx'
+    Expand-Archive -LiteralPath $zipFile.FullName -DestinationPath $x -Force
+    $all = (Get-ChildItem -LiteralPath $x -Recurse -File | ForEach-Object { Get-Content -LiteralPath $_.FullName -Raw }) -join "`n"
+    Assert-That ($all -notmatch [regex]::Escape($pw)) 'admin password redacted'
+    Assert-That ($all -notmatch $key) 'secret key redacted'
+    Assert-That ($all -notmatch 'someone@example\.org') 'admin e-mail redacted'
+    Assert-That ($all -notmatch 'eyJhbGci') 'bearer token redacted'
+    Assert-That ($all -match '\[REDACTED\]') 'redaction markers present'
+}
 
 if ($failures -eq 0) { Write-Host "`nWINDOWS UNIT TESTS PASSED" -ForegroundColor Green } else { Write-Host "`nWINDOWS UNIT TESTS FAILED ($failures)" -ForegroundColor Red }
 exit $failures

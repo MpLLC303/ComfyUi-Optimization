@@ -993,6 +993,7 @@ function Get-LaiShortcutSpecs {
         @{ Name = 'Local AI - Start again'; Script = 'Start-LocalAI.ps1'; Extra = '' }
         @{ Name = 'Local AI - Health check'; Script = 'Test-LocalAI.ps1'; Extra = ' -Quick' }
         @{ Name = 'ComfyUI (free GPU first)'; Script = 'Start-ComfyUI.ps1'; Extra = '' }
+        @{ Name = 'Local AI - Diagnostics (redacted zip)'; Script = 'Get-LocalAIDiagnostics.ps1'; Extra = ' -RunTests' }
     )
     $specs = @([pscustomobject]@{ Name = 'Local AI (Open WebUI)'; Kind = 'url'; Target = "http://localhost:$WebUIPort/"; Arguments = '' })
     foreach ($i in $items) {
