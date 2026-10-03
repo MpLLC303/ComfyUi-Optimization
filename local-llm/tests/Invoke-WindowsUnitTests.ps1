@@ -52,11 +52,11 @@ if ($onWindows) {
     $listener.Prefixes.Add("http://127.0.0.1:$port/")
     $listener.Start()
     $async = $listener.BeginGetContext($null, $null)
-    $job = Start-Job -ScriptBlock {
-        param($mod, $port)
-        Import-Module $mod -Force
-        Invoke-LaiApi -Method POST -Uri "http://127.0.0.1:$port/echo" -Body @{ text = "caf$([char]0xE9) $([char]0x2713)" } -TimeoutSec 20
-    } -ArgumentList (Join-Path (Join-Path $src 'lib') 'LocalAI.psm1'), $port
+    # The client runs in its own Windows PowerShell process, exactly as the scripts do.
+    $client = Join-Path $Work 'client.ps1'
+    Set-Content -LiteralPath $client -Value (("Import-Module '{0}' -Force`n" -f (Join-Path (Join-Path $src 'lib') 'LocalAI.psm1')) +
+        ('Invoke-LaiApi -Method POST -Uri "http://127.0.0.1:{0}/echo" -Body @{{ text = "caf$([char]0xE9) $([char]0x2713)" }} -TimeoutSec 20' -f $port))
+    $proc = Start-Process -FilePath $childExe -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $client) -PassThru -WindowStyle Hidden
     if ($async.AsyncWaitHandle.WaitOne(30000)) {
         $ctx = $listener.EndGetContext($async)
         $ms = New-Object System.IO.MemoryStream
@@ -69,7 +69,7 @@ if ($onWindows) {
         $ctx.Response.Close()
         Assert-That ($text -like "*caf$([char]0xE9)*$([char]0x2713)*") "request body is UTF-8 ($($bytes.Length) bytes)"
     } else { Assert-That $false 'request arrived at the test listener' }
-    $null = Wait-Job $job -Timeout 30; Remove-Job $job -Force
+    if (-not $proc.WaitForExit(30000)) { $proc.Kill() }
     $listener.Stop()
 } else { Skip 'HttpListener test runs on Windows only' }
 
