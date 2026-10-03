@@ -163,7 +163,7 @@ try { $names = @(Get-LaiOllamaModelNames -BaseUrl $OllamaUrl) } catch { $ollamaU
 if ($ollamaUp) {
     $toRemove = @($names | Where-Object { $_ -like 'localai-*' })
     if ($RemoveModels) {
-        $catalog = Get-LaiCatalog -Path (Join-Path (Join-Path $PSScriptRoot 'config') 'models.psd1')
+        $catalog = Get-LaiCatalog -Path (Join-Path (Join-Path $PSScriptRoot 'config') 'models.psd1') -IncludeTrials
         foreach ($m in $catalog.Models) {
             $full = Resolve-LaiModelName $m.Source
             if ($names -contains $full) { $toRemove += $full }

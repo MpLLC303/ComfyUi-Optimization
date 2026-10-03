@@ -146,7 +146,7 @@ function global:docker {
 
 # ---- phase 1: fresh install until WSL needs a reboot ----------------------------------------
 Write-Host "`n=== PHASE 1: fresh run (expects reboot request) ===" -ForegroundColor Cyan
-& $inst -AIRoot $aiRoot -SkipTests
+& $inst -AIRoot $aiRoot -SkipTests -TrialModels trial-ok, trial-missing
 $code1 = $LASTEXITCODE
 $state = Get-Content -Raw (Join-Path $aiRoot 'install-state.json') | ConvertFrom-Json
 Assert-That ($code1 -eq 3010) "phase 1 exits 3010 for reboot (got $code1)"
@@ -168,6 +168,17 @@ $envFile = Get-Content (Join-Path $aiRoot 'Stack/.env')
 Assert-That ($code2 -eq 0) "phase 2 completes (exit $code2)"
 foreach ($s in 'Preflight', 'Ollama', 'Models', 'Tuning', 'WSL', 'Docker', 'Stack', 'Configure', 'Backup') { Assert-That ($null -ne $state.stages.$s) "stage $s recorded" }
 Assert-That (-not $global:Tasks.ContainsKey('LocalAI-Install-Resume')) 'resume task removed at the end'
+$sel = @($state.flags.selectedModels)
+Assert-That ($sel -contains 'trial-ok') 'trial model that works was added (passed through the reboot/resume)'
+Assert-That ($sel -notcontains 'trial-missing') 'trial model with a missing tag was skipped, not fatal'
+Assert-That ((Get-Content -Raw (Get-ChildItem (Join-Path $aiRoot 'Logs') -Filter 'install-*.log' | Sort-Object LastWriteTime | Select-Object -Last 1).FullName) -match 'Trial Trial: missing tag .* skipped') 'the skip came from the failed pull (Models stage), not the disk planner'
+Assert-That ($null -ne $state.tuning.'trial-ok') 'trial model was tuned like the others'
+function Get-TestPreset([string]$Id) {
+    $tok = (Invoke-RestMethod -Method Post -Uri 'http://127.0.0.1:3000/api/v1/auths/signin' -ContentType 'application/json' -Body (ConvertTo-Json @{ email = $Email; password = $Password })).token
+    try { return Invoke-RestMethod -Uri "http://127.0.0.1:3000/api/v1/models/model?id=$Id" -Headers @{ Authorization = "Bearer $tok" } } catch { return $null }
+}
+$tp = Get-TestPreset 'trial-standin'
+Assert-That ($tp -and -not $tp.meta.hidden) 'trial preset created in Open WebUI and visible'
 Assert-That ($global:Tasks.ContainsKey('LocalAI-Backup-OpenWebUI')) 'daily backup task registered'
 $guardAfter = [int](Invoke-RestMethod $guardStatus -TimeoutSec 5).stats.requests
 Assert-That (($guardAfter - $guardBefore) -ge 1) "Open WebUI reaches Ollama through the render guard ($($guardAfter - $guardBefore) requests)"
@@ -211,6 +222,16 @@ $cfgAfter = Get-Content -Raw $cfgFile | ConvertFrom-Json
 Assert-That ($cfgAfter.ComfyUIPath -eq 'D:\ComfyUI\run_nvidia_gpu.bat') 're-run keeps ComfyUIPath in the config'
 Assert-That ($cfgAfter.OpenWebUIVersion -eq 'v0.99.0' -and $cfgAfter.RenderGuard -eq 'off') 'config reflects the kept version and mode'
 Assert-That ([string]$cfgAfter.WebUIOllamaUrl -ne '') 'config records the Ollama URL Open WebUI was given'
+
+Assert-That (@((Get-Content -Raw (Join-Path $aiRoot 'install-state.json') | ConvertFrom-Json).flags.selectedModels) -contains 'trial-ok') 're-run without -TrialModels keeps the chosen trial'
+
+# ---- phase 4: drop the trial again ---------------------------------------------------------------
+Write-Host "`n=== PHASE 4: re-run with -TrialModels none ===" -ForegroundColor Cyan
+& (Join-Path $aiRoot 'Scripts/Install-LocalAI.ps1') -AIRoot $aiRoot -SkipTests -TrialModels none
+Assert-That ($LASTEXITCODE -eq 0) "phase 4 completes (exit $LASTEXITCODE)"
+Assert-That (@((Get-Content -Raw (Join-Path $aiRoot 'install-state.json') | ConvertFrom-Json).flags.selectedModels) -notcontains 'trial-ok') '-TrialModels none deselects the trial'
+$tp = Get-TestPreset 'trial-standin'
+Assert-That ($tp -and $tp.meta.hidden -eq $true) 'deselected trial preset is hidden (kept for old chats)'
 
 & /usr/bin/docker rm -f open-webui 2>$null | Out-Null
 & /usr/bin/docker ps -aq --filter 'name=^/open-webui-legacy-' | ForEach-Object { & /usr/bin/docker rm -f $_ | Out-Null }

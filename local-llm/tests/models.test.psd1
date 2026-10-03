@@ -36,5 +36,39 @@
             Parameters      = @{ temperature = 0.6; top_p = 0.95; top_k = 20; min_p = 0.0 }
             Description     = 'Integration-test stand-in for the 14B.'
         }
+        @{
+            Key             = 'trial-ok'
+            Order           = 5
+            Display         = 'Trial: stand-in'
+            Preset          = 'trial-standin'
+            Alias           = 'localai-trial-standin'
+            Source          = 'testorg/qwen3-abliterated:1.7b'
+            Optional        = $true
+            Trial           = $true
+            DownloadGB      = 1.1
+            MaxContext      = 8192
+            Vision          = $false
+            Think           = $false
+            MinTokensPerSec = 1
+            Parameters      = @{ temperature = 0.6; top_p = 0.95; top_k = 20; min_p = 0.0 }
+            Description     = 'Trial preset that works.'
+        }
+        @{
+            Key             = 'trial-missing'
+            Order           = 6
+            Display         = 'Trial: missing tag'
+            Preset          = 'trial-missing'
+            Alias           = 'localai-trial-missing'
+            Source          = 'testorg/does-not-exist:1b'
+            Optional        = $true
+            Trial           = $true
+            DownloadGB      = 0   # 0 so the disk planner admits it and the pull itself must fail
+            MaxContext      = 8192
+            Vision          = $false
+            Think           = $false
+            MinTokensPerSec = 1
+            Parameters      = @{ temperature = 0.6 }
+            Description     = 'Trial whose tag cannot be pulled; must be skipped, not fatal.'
+        }
     )
 }

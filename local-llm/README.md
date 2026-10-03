@@ -43,6 +43,7 @@ Options are in the config block at the top of `Install-LocalAI.ps1`. The common 
 | `-NoReboot` | Print "reboot now" instead of rebooting. It still resumes at the next sign-in. |
 | `-MaxBusyVramMiB 3500` / `-GpuWaitMinutes 10` | Before loading or tuning models, wait for other GPU apps (ComfyUI, Forge, games) to free VRAM; stop with their names if they don't. |
 | `-KeepAlive 5m` | How long an idle model stays in VRAM (default 15m). |
+| `-TrialModels trial-fast,trial-gemma4` | Also install newer models as extra **Trial** presets, next to the four measured ones (which stay as they are): `trial-fast` Qwen3.5 9B (6.6 GB), `trial-gemma4` Gemma 4 26B MoE with vision (18 GB), `trial-code27b` Qwen3.6 27B dense (17 GB, slow and careful). Each goes through the same 100%-GPU checkpoint and context tuner. One that can't be pulled, that this Ollama can't load, or that doesn't fit is skipped with a warning. `-TrialModels none` hides them again |
 | `-RenderGuard off` | Don't move chats to the CPU while ComfyUI renders (the proxy then just passes requests through). |
 
 ## What the installer does (guide part → stage)

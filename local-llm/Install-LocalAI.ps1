@@ -34,6 +34,10 @@ param(
     # Optional models (each ~19-20 GB). They are also skipped automatically when disk space is short.
     [switch]$SkipVision,
     [switch]$SkipCoder,
+    # Opt-in newer models (keys marked Trial in config\models.psd1, e.g. trial-fast, trial-gemma4,
+    # trial-code27b), added as extra presets next to the four measured ones; 'none' removes them.
+    # Omitted on a re-run = keep the trials chosen before.
+    [string[]]$TrialModels = @(),
     # Loopback ports (never exposed to the LAN). A busy port is replaced by the next free one.
     [int]$WebUIPort = 3000,
     [int]$SearxngPort = 8888,
@@ -414,7 +418,15 @@ Invoke-Stage 'Preflight' {
     }
 
     # Disk planning: decide where models go and whether the optional models fit.
-    $catalogAll = Get-LaiCatalog -Path $CatalogPath
+    $catalogAll = Get-LaiCatalog -Path $CatalogPath -IncludeTrials
+    $trialWanted = @()
+    if ($PSBoundParameters.ContainsKey('TrialModels') -or $script:BoundParams.ContainsKey('TrialModels')) {
+        $trialWanted = @($TrialModels | Where-Object { $_ -and $_ -ne 'none' })
+    } elseif ($State.flags.ContainsKey('selectedModels')) {
+        $trialWanted = @($State.flags['selectedModels'] | Where-Object { $_ -like 'trial-*' })
+    }
+    $trialKeys = @($catalogAll.Models | Where-Object { $_.Trial } | ForEach-Object { $_.Key })
+    foreach ($t in $trialWanted) { if ($trialKeys -notcontains $t) { Write-LaiLog WARN "Unknown trial model '$t' (known: $($trialKeys -join ', '))" } }
     $defaultModels = Join-Path $env:USERPROFILE '.ollama\models'
     $envModels = [Environment]::GetEnvironmentVariable('OLLAMA_MODELS', 'User')
     $target = $defaultModels
@@ -424,7 +436,7 @@ Invoke-Stage 'Preflight' {
     else {
         # Catalog entries are hashtables; Windows PowerShell 5.1's Measure-Object -Property can't read their keys.
         $needAll = 10
-        foreach ($cm in $catalogAll.Models) { $needAll += [double]$cm.DownloadGB }
+        foreach ($cm in $catalogAll.Models) { if (-not $cm.Trial -or $trialWanted -contains $cm.Key) { $needAll += [double]$cm.DownloadGB } }
         $hasExisting = (Test-Path -LiteralPath (Join-Path $defaultModels 'manifests'))
         if (-not $hasExisting -and (Get-FreeGB $env:SystemDrive) -lt ($needAll + 40)) {
             $best = Get-CimInstance Win32_LogicalDisk -Filter 'DriveType=3' | Where-Object { $_.DeviceID -ne $env:SystemDrive } |
@@ -445,6 +457,7 @@ Invoke-Stage 'Preflight' {
     $budget = $freeGB - 15
     foreach ($m in ($catalogAll.Models | Sort-Object { $_.Optional })) {
         $need = $m.DownloadGB
+        if ($m.Trial -and $trialWanted -notcontains $m.Key) { continue }
         if ($present -contains (Resolve-LaiModelName $m.Source)) { $need = 0 }
         if ($m.Optional) {
             if (($m.Key -eq 'vision' -and $SkipVision) -or ($m.Key -eq 'code' -and $SkipCoder)) { Write-LaiLog INFO "Skipping $($m.Display) (switch)"; continue }
@@ -551,7 +564,9 @@ Invoke-Stage 'Models' {
     $env:OLLAMA_HOST = '127.0.0.1:11434'
     Stop-LaiOllamaModels -BaseUrl $OllamaUrl
     Wait-LaiGpuIdle -MaxUsedMiB $MaxBusyVramMiB -TimeoutSec ($GpuWaitMinutes * 60) | Out-Null
+    $droppedTrials = @()
     foreach ($m in ($Catalog.Models | Sort-Object { $_.Optional }, { $_.DownloadGB })) {
+      try {
         if (Test-LaiOllamaModel -BaseUrl $OllamaUrl -Name $m.Source) {
             Write-LaiLog OK "$($m.Source) already installed"
         } else {
@@ -575,6 +590,21 @@ Invoke-Stage 'Models' {
         }
         if (-not $answer.response) { throw "$($m.Source) loaded but returned an empty answer." }
         Write-LaiLog OK "  $($m.Display) answers on 100% GPU: $(([string]$answer.response).Trim() -replace '\s+', ' ')"
+      } catch {
+        # A trial must never stop the install: the tag may be gone, this Ollama may not know the
+        # architecture yet, or it may not fit. The measured models still fail loudly.
+        if (-not $m.Trial) { throw }
+        $why = Get-LaiHttpErrorText $_
+        if (-not $why) { $why = $_.Exception.Message }
+        Write-LaiLog WARN "Trial $($m.Display) ($($m.Source)) skipped: $why"
+        $droppedTrials += $m.Key
+        try { Stop-LaiOllamaModels -BaseUrl $OllamaUrl } catch { Write-Verbose 'unload failed' }
+      }
+    }
+    if ($droppedTrials.Count -gt 0) {
+        $State.flags['selectedModels'] = @($State.flags['selectedModels'] | Where-Object { $droppedTrials -notcontains $_ })
+        Save-State
+        $script:Catalog = Get-LaiCatalog -Path $CatalogPath -IncludeKeys @($State.flags['selectedModels'])
     }
     Stop-LaiOllamaModels -BaseUrl $OllamaUrl
 }
@@ -865,6 +895,14 @@ Invoke-Stage 'Configure' {
     if (-not $script:WebUIOllamaUrl) { $script:WebUIOllamaUrl = 'http://render-guard:11434' }
     if (Set-LaiWebUIOllamaUrl -BaseUrl $WebUIUrl -Token $token -OllamaUrl $script:WebUIOllamaUrl) {
         Write-LaiLog OK "Open WebUI now reaches Ollama through $($script:WebUIOllamaUrl)"
+    }
+
+    # Trial presets that are no longer selected are hidden, not deleted (chats that used them stay readable).
+    foreach ($tm in ((Get-LaiCatalog -Path $CatalogPath -IncludeTrials).Models | Where-Object { $_.Trial })) {
+        if (@($State.flags['selectedModels']) -notcontains $tm.Key -and (Get-LaiWebUIModel -BaseUrl $WebUIUrl -Token $token -Id $tm.Preset)) {
+            Hide-LaiWebUIModel -BaseUrl $WebUIUrl -Token $token -Id $tm.Preset | Out-Null
+            Write-LaiLog INFO "Trial preset '$($tm.Display)' hidden (not selected)"
+        }
     }
 
     Invoke-LaiWebUISetup -BaseUrl $WebUIUrl -Token $token -Models $Catalog.Models -ModelResults $State.tuning `

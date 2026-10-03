@@ -783,11 +783,13 @@ function Test-LaiWebUIWebSearch {
 #region High-level setup (shared by the installer and the Linux integration harness) -----
 
 function Get-LaiCatalog {
-    # Loads config/models.psd1. -IncludeKeys filters to the models selected for this install.
-    param([Parameter(Mandatory)][string]$Path, [string[]]$IncludeKeys = @())
+    # Loads config/models.psd1. -IncludeKeys filters to the models selected for this install;
+    # without it, opt-in trial models are left out unless -IncludeTrials.
+    param([Parameter(Mandatory)][string]$Path, [string[]]$IncludeKeys = @(), [switch]$IncludeTrials)
     $data = Import-PowerShellDataFile -Path $Path
     $models = @($data.Models)
     if ($IncludeKeys.Count -gt 0) { $models = @($models | Where-Object { $IncludeKeys -contains $_.Key }) }
+    elseif (-not $IncludeTrials) { $models = @($models | Where-Object { -not $_.Trial }) }
     return [pscustomobject]@{
         DefaultPreset     = $data.DefaultPreset
         ContextCandidates = @($data.ContextCandidates)
