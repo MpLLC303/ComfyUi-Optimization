@@ -117,7 +117,7 @@ used by the desktop and open apps):
   sits idle in VRAM, the model is unloaded. If ComfyUI is idle but still caches models in VRAM, the
   guard asks ComfyUI to free them before a chat loads. Expect roughly 15-25 tok/s for Local Main
   on the CPU, and a slow first token with long web or RAG context. That's an estimate, not measured
-  on your PC. Check it with `ollama ps` ("100% CPU") and `docker logs render-guard`. Turn it off
+  on your PC. Measure it with `C:\AI\Scripts\Test-LocalAI.ps1 -Quick -CpuCheck` (close ComfyUI first; it reports CPU tok/s, prompt speed and the VRAM the CPU mode still takes), and see the guard's decisions in `docker logs render-guard`. Turn it off
   with `Install-LocalAI.ps1 -RenderGuard off`.
 - **Memory vs knowledge:** memory holds durable facts and preferences (Settings → Personalization →
   Memory, or just say "remember that…"). Manuals and PDFs go into **Workspace → Knowledge** collections,

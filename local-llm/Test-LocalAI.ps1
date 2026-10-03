@@ -17,6 +17,12 @@
 
 .PARAMETER Quick
     Skip the model loads and chat/memory/RAG/web tests (takes seconds instead of minutes).
+
+.PARAMETER CpuCheck
+    Also measure what the render guard does while ComfyUI renders: load the default preset's model
+    with num_gpu 0 (CPU only), and report generation speed, prompt-processing speed for a ~1,500-token
+    prompt, and how much VRAM the CPU load still takes. Close ComfyUI first so the reading is
+    clean. The first CPU load reads the whole model into RAM (about 19 GB for Local Main).
 #>
 param(
     [string]$AIRoot = 'C:\AI',
@@ -24,7 +30,8 @@ param(
     # Defaults to config\models.psd1 next to this script.
     [string]$CatalogPath = '',
     # For the Linux integration harness, where Open WebUI is not a container.
-    [switch]$NoContainers
+    [switch]$NoContainers,
+    [switch]$CpuCheck
 )
 $ErrorActionPreference = 'Stop'
 Import-Module (Join-Path (Join-Path $PSScriptRoot 'lib') 'LocalAI.psm1') -Force
@@ -102,6 +109,42 @@ if (-not $Quick) {
         }
     }
     try { Stop-LaiOllamaModels -BaseUrl $ollamaUrl } catch { Write-Verbose 'unload failed' }
+}
+
+if ($CpuCheck) {
+    Add-Check 'CPU fallback (render guard)' {
+        $m = $catalog.Models | Where-Object { $_.Preset -eq $catalog.DefaultPreset } | Select-Object -First 1
+        if (-not $m) { $m = @($catalog.Models)[0] }
+        Stop-LaiOllamaModels -BaseUrl $ollamaUrl
+        Start-Sleep -Seconds 2
+        $before = Get-LaiGpuInfo
+        # ~1,500 tokens of context, like a chat with web-search results attached.
+        $filler = ('The quick brown fox jumps over the lazy dog while the river keeps flowing past the old mill. ' * 75)
+        $body = @{
+            model   = $m.Alias
+            prompt  = $filler + "`nSummarize the text above in one sentence."
+            stream  = $false
+            options = @{ num_gpu = 0; num_predict = 64; temperature = 0 }
+        }
+        $info = Get-LaiOllamaModelInfo -BaseUrl $ollamaUrl -Name $m.Alias
+        if ($info.Capabilities -contains 'thinking') { $body['think'] = $false }
+        $r = Invoke-LaiApi -Method POST -Uri "$ollamaUrl/api/generate" -Body $body -TimeoutSec 1800
+        $after = Get-LaiGpuInfo
+        $gen = 0; $pp = 0
+        if ($r.eval_duration -and [double]$r.eval_duration -gt 0) { $gen = [Math]::Round([double]$r.eval_count / ([double]$r.eval_duration / 1e9), 1) }
+        if ($r.prompt_eval_duration -and [double]$r.prompt_eval_duration -gt 0) { $pp = [Math]::Round([double]$r.prompt_eval_count / ([double]$r.prompt_eval_duration / 1e9), 0) }
+        $loadS = 0
+        if ($r.load_duration) { $loadS = [Math]::Round([double]$r.load_duration / 1e9, 1) }
+        $detail = "$($m.Display) on CPU: $gen tok/s generation, $pp tok/s prompt ($($r.prompt_eval_count) tokens), load $loadS s"
+        try { Stop-LaiOllamaModels -BaseUrl $ollamaUrl } catch { Write-Verbose 'unload failed' }
+        if ($before -and $after) {
+            $delta = $after.UsedMiB - $before.UsedMiB
+            $detail += ", VRAM +$delta MiB"
+            if ($delta -gt 1024) { return (Warn "$detail - the CPU mode still takes VRAM; a render near the 24 GB limit may notice") }
+        }
+        if ($gen -lt 5) { return (Warn "$detail - very slow; chats during renders will crawl (consider -RenderGuard off and pausing renders)") }
+        Pass $detail
+    }
 }
 
 $dockerCmd = Get-Command docker -ErrorAction SilentlyContinue
