@@ -173,6 +173,22 @@ function Wait-LaiHttp {
     throw "Timed out after $TimeoutSec s waiting for $Uri ($last)"
 }
 
+function Enter-LaiVolumeLock {
+    # Machine-wide lock so the scheduled backup and a restore never touch the volume at the same time.
+    # Re-entrant on the same thread (Restore calls Backup for its safety copy). Returns the mutex.
+    param([int]$TimeoutSec = 600)
+    $m = New-Object System.Threading.Mutex($false, 'Global\LocalAI-OpenWebUI-Volume')
+    try { $got = $m.WaitOne([TimeSpan]::FromSeconds($TimeoutSec)) }
+    catch [System.Threading.AbandonedMutexException] { $got = $true }
+    if (-not $got) { $m.Dispose(); throw "Another backup/restore of the Open WebUI volume is still running (waited $TimeoutSec s)." }
+    return $m
+}
+
+function Exit-LaiVolumeLock {
+    param($Mutex)
+    if ($Mutex) { try { $Mutex.ReleaseMutex() } catch { Write-Verbose 'lock already released' }; $Mutex.Dispose() }
+}
+
 #endregion
 
 #region GPU -------------------------------------------------------------------------------

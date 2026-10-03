@@ -26,6 +26,9 @@ param(
     [string]$Tag = '',
     # Archive the running container instead of stopping it (used before replacing a manual install).
     [switch]$NoStop,
+    # Used by Restore-OpenWebUI.ps1: never delete or mirror anything while a restore is in progress.
+    [switch]$NoPrune,
+    [switch]$NoMirror,
     [string]$Volume = 'open-webui',
     [string]$Container = 'open-webui',
     [string]$HelperImage = 'alpine:3.20'
@@ -68,7 +71,9 @@ $archive = Join-Path $backupDir $name
 $stopped = $false
 $exitCode = 0
 
+$lock = $null
 try {
+    $lock = Enter-LaiVolumeLock
     if ((Invoke-Docker -Arguments @('volume', 'inspect', $Volume) -AllowFail).ExitCode -ne 0) { throw "Docker volume '$Volume' does not exist." }
     $running = (Invoke-Docker -Arguments @('inspect', '-f', '{{.State.Running}}', $Container) -AllowFail).Text.Trim() -eq 'true'
     if ($running -and -not $NoStop) {
@@ -84,24 +89,36 @@ try {
 
     $size = (Get-Item -LiteralPath $archive).Length
     $listing = (Invoke-Docker -Arguments @('run', '--rm', '-v', "${backupDir}:/backup:ro", $HelperImage, 'tar', 'tzf', "/backup/$name")).Text
-    if ($size -lt 100 -or $listing -notmatch 'webui\.db') { throw "Archive $name looks incomplete ($size bytes, webui.db missing)." }
+    if ($size -lt 100 -or $listing -notmatch '(?m)^(\./)?webui\.db\s*$') { throw "Archive $name looks incomplete ($size bytes, webui.db missing)." }
     Write-BackupLog OK ("Backup {0} ({1:N1} MB){2}" -f $archive, ($size / 1MB), $(if ($stopped) { '; container was paused for consistency' } else { '' }))
 
-    # Retention: drop archives older than N days, but never the newest three.
-    $all = @(Get-ChildItem -LiteralPath $backupDir -Filter 'open-webui-*.tar.gz' | Sort-Object LastWriteTime -Descending)  # lai-ok: objects
-    $cutoff = (Get-Date).AddDays(-$RetentionDays)
-    foreach ($old in ($all | Select-Object -Skip 3 | Where-Object { $_.LastWriteTime -lt $cutoff })) {
-        Remove-Item -LiteralPath $old.FullName -Force
-        Write-BackupLog INFO "Pruned $($old.Name)"
+    # Retention: daily (untagged) archives older than N days go, but the newest three daily ones always
+    # stay. Tagged archives (pre-compose, pre-restore, before-<version>) never count toward those three.
+    if (-not $NoPrune) {
+        $all = @(Get-ChildItem -LiteralPath $backupDir -Filter 'open-webui-*.tar.gz')
+        $daily = @($all | Where-Object { $_.Name -match '^open-webui-\d{8}-\d{6}\.tar\.gz$' } | Sort-Object LastWriteTime -Descending)  # lai-ok: objects
+        $tagged = @($all | Where-Object { $_.Name -notmatch '^open-webui-\d{8}-\d{6}\.tar\.gz$' })
+        $cutoff = (Get-Date).AddDays(-$RetentionDays)
+        foreach ($old in (@($daily | Select-Object -Skip 3) + $tagged | Where-Object { $_.LastWriteTime -lt $cutoff -and $_.FullName -ne $archive })) {
+            Remove-Item -LiteralPath $old.FullName -Force
+            Write-BackupLog INFO "Pruned $($old.Name)"
+        }
     }
 
-    if ($Mirror) {
-        if (-not (Test-Path -LiteralPath $Mirror)) { New-Item -ItemType Directory -Force -Path $Mirror | Out-Null }
-        Copy-Item -LiteralPath $archive -Destination $Mirror -Force
-        Write-BackupLog OK "Mirrored to $Mirror"
+    if ($Mirror -and -not $NoMirror) {
+        try {
+            if (-not (Test-Path -LiteralPath $Mirror)) { New-Item -ItemType Directory -Force -Path $Mirror | Out-Null }
+            Copy-Item -LiteralPath $archive -Destination $Mirror -Force
+            Write-BackupLog OK "Mirrored to $Mirror"
+        } catch {
+            # The local archive is complete and verified; an offline NAS must not fail the backup.
+            Write-BackupLog WARN "Mirror copy to $Mirror failed: $($_.Exception.Message)"
+        }
     }
 } catch {
     Write-BackupLog FAIL $_.Exception.Message
     $exitCode = 1
+} finally {
+    Exit-LaiVolumeLock $lock
 }
 exit $exitCode

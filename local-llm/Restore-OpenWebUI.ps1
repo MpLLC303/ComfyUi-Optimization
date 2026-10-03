@@ -4,18 +4,22 @@
     Restores an Open WebUI backup archive (made by Backup-OpenWebUI.ps1) into the open-webui volume.
 
 .DESCRIPTION
-    1. Picks the archive (newest in <AIRoot>\Backups unless -Archive is given) and checks it contains webui.db.
-    2. Takes a safety backup of the current volume (tag "pre-restore"), so a restore can itself be undone.
-    3. Stops the open-webui container, replaces the volume contents with the archive, starts it again
-       and waits until Open WebUI answers.
-
-    Chats, memories, users, presets, settings and uploaded documents return to the archive's state.
-    Ollama models are not touched.
+    Built so that a failed restore can never leave you with an empty or half-written volume:
+      1. Picks the archive (newest daily backup unless -Archive is given), copies it into
+         <AIRoot>\Backups\restore-staging (also makes NAS/UNC archives usable by Docker), and checks
+         that webui.db sits at the top level.
+      2. Takes a verified safety backup of the current volume (tag "pre-restore"; never pruned or
+         mirrored during the restore).
+      3. Stops every container using the volume, extracts the archive into a staging folder *inside*
+         the volume, and only after webui.db is confirmed there swaps it in.
+      4. If anything fails after the old data was touched, it puts the safety backup back. If even that
+         fails, the container is left stopped and the exact recovery command is printed.
+    A machine-wide lock stops the scheduled backup from running at the same time.
 
 .EXAMPLE
-    .\Restore-OpenWebUI.ps1                                   # newest backup
+    .\Restore-OpenWebUI.ps1                                   # newest daily backup
 .EXAMPLE
-    .\Restore-OpenWebUI.ps1 -Archive C:\AI\Backups\open-webui-20261002-175511.tar.gz
+    .\Restore-OpenWebUI.ps1 -Archive \\nas\backups\open-webui-20261002-175511.tar.gz
 #>
 param(
     [string]$AIRoot = 'C:\AI',
@@ -27,6 +31,7 @@ param(
 )
 $ErrorActionPreference = 'Stop'
 Import-Module (Join-Path (Join-Path $PSScriptRoot 'lib') 'LocalAI.psm1') -Force
+$img = $HelperImage
 
 function Invoke-Docker {
     param([string[]]$Arguments, [switch]$AllowFail)
@@ -38,45 +43,124 @@ function Invoke-Docker {
     return [pscustomobject]@{ ExitCode = $code; Text = ($out -join "`n") }
 }
 
-# 1. Which archive?
-if (-not $Archive) {
-    $newest = Get-ChildItem -LiteralPath (Join-Path $AIRoot 'Backups') -Filter 'open-webui-*.tar.gz' -ErrorAction SilentlyContinue |
-        Where-Object { $_.Name -notlike '*-pre-restore.tar.gz' } | Sort-Object LastWriteTime -Descending | Select-Object -First 1  # lai-ok: objects
-    if (-not $newest) { throw "No backups found in $(Join-Path $AIRoot 'Backups')." }
-    $Archive = $newest.FullName
-}
-$item = Get-Item -LiteralPath $Archive
-$dir = $item.DirectoryName
-$name = $item.Name
-$listing = (Invoke-Docker -Arguments @('run', '--rm', '-v', "${dir}:/backup:ro", $HelperImage, 'tar', 'tzf', "/backup/$name")).Text
-if ($listing -notmatch 'webui\.db') { throw "$name does not look like an Open WebUI backup (no webui.db inside)." }
-Write-LaiLog INFO ("Restoring {0} ({1:N1} MB, {2})" -f $name, ($item.Length / 1MB), $item.LastWriteTime.ToString('yyyy-MM-dd HH:mm'))
+# The archive is always mounted as /restore.tar.gz, so its file name never reaches the shell.
+# No double quotes anywhere in this script: Windows PowerShell 5.1 mangles them in native arguments.
+$swapScript = 'set -e; rm -rf /data/.restore-staging; mkdir /data/.restore-staging; ' +
+    'tar xzf /restore.tar.gz -C /data/.restore-staging; test -f /data/.restore-staging/webui.db; ' +
+    'find /data -mindepth 1 -maxdepth 1 ! -name .restore-staging -exec rm -rf {} +; ' +
+    'cd /data/.restore-staging; find . -mindepth 1 -maxdepth 1 -exec mv {} /data/ \; ; ' +
+    'cd /; rmdir /data/.restore-staging'
 
-# 2. Safety backup of what is there now.
-$volumeExists = (Invoke-Docker -Arguments @('volume', 'inspect', $Volume) -AllowFail).ExitCode -eq 0
-if ($volumeExists -and -not $SkipSafetyBackup) {
-    & (Join-Path $PSScriptRoot 'Backup-OpenWebUI.ps1') -AIRoot $AIRoot -Volume $Volume -Container $Container -Tag 'pre-restore'
-    if ($LASTEXITCODE -ne 0) { throw 'Safety backup failed; nothing was changed. Use -SkipSafetyBackup to restore anyway.' }
+function Invoke-Swap {
+    param([string]$ArchivePath)
+    Invoke-Docker -Arguments @('run', '--rm', '-v', "${Volume}:/data", '-v', "${ArchivePath}:/restore.tar.gz:ro", $img, 'sh', '-c', $swapScript) | Out-Null
 }
-if (-not $volumeExists) { Invoke-Docker -Arguments @('volume', 'create', $Volume) | Out-Null }
 
-# 3. Swap the contents with the container stopped.
-$running = (Invoke-Docker -Arguments @('inspect', '-f', '{{.State.Running}}', $Container) -AllowFail).Text.Trim() -eq 'true'
-if ($running) { Invoke-Docker -Arguments @('stop', '-t', '30', $Container) | Out-Null }
+function Test-Archive {
+    param([string]$ArchivePath)
+    $r = Invoke-Docker -Arguments @('run', '--rm', '-v', "${ArchivePath}:/restore.tar.gz:ro", $img, 'tar', 'tzf', '/restore.tar.gz') -AllowFail
+    return ($r.ExitCode -eq 0 -and $r.Text -match '(?m)^(\./)?webui\.db\s*$')
+}
+
+$backupDir = Join-Path $AIRoot 'Backups'
+$stagingDir = Join-Path $backupDir 'restore-staging'
+$lock = $null
+$stoppedContainers = @()
+$volumeTouched = $false
+$safety = $null
+
 try {
-    Invoke-Docker -Arguments @('run', '--rm', '-v', "${Volume}:/data", '-v', "${dir}:/backup:ro", $HelperImage,
-        'sh', '-c', "find /data -mindepth 1 -delete && tar xzf '/backup/$name' -C /data") | Out-Null
-} finally {
-    if ($running) { Invoke-Docker -Arguments @('start', $Container) | Out-Null }
-}
-Write-LaiLog OK "Volume '$Volume' now holds $name"
+    $lock = Enter-LaiVolumeLock
 
-# 4. Wait for Open WebUI (only if the container exists and was running).
-if ($running) {
+    # 1. Archive selection and staging copy.
+    if (-not $Archive) {
+        $newest = Get-ChildItem -LiteralPath $backupDir -Filter 'open-webui-*.tar.gz' -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -match '^open-webui-\d{8}-\d{6}\.tar\.gz$' } | Sort-Object LastWriteTime -Descending | Select-Object -First 1  # lai-ok: objects
+        if (-not $newest) { throw "No daily backups found in $backupDir. Pass -Archive <file>." }
+        $Archive = $newest.FullName
+    }
+    $source = Get-Item -LiteralPath $Archive
+    if (-not (Test-Path -LiteralPath $stagingDir)) { New-Item -ItemType Directory -Force -Path $stagingDir | Out-Null }
+    $staged = Join-Path $stagingDir 'restore.tar.gz'
+    Copy-Item -LiteralPath $source.FullName -Destination $staged -Force
+    if (-not (Test-Archive $staged)) { throw "$($source.Name) is not a valid Open WebUI backup (unreadable, or no top-level webui.db)." }
+    Write-LaiLog INFO ("Restoring {0} ({1:N1} MB, {2})" -f $source.Name, ($source.Length / 1MB), $source.LastWriteTime.ToString('yyyy-MM-dd HH:mm'))
+
+    # The named container, if it exists, must actually use this volume for its data.
+    $mounts = Invoke-Docker -Arguments @('inspect', '--type', 'container', '--format', '{{range .Mounts}}{{.Name}}|{{.Destination}}{{println}}{{end}}', $Container) -AllowFail
+    if ($mounts.ExitCode -eq 0 -and $mounts.Text -notmatch ('(?m)^' + [regex]::Escape($Volume) + '\|/app/backend/data\s*$')) {
+        throw "Container '$Container' does not keep its data in volume '$Volume'; refusing to restore into the wrong place."
+    }
+
+    # 2. Safety backup (verified, never pruned or mirrored here).
+    $volumeExists = (Invoke-Docker -Arguments @('volume', 'inspect', $Volume) -AllowFail).ExitCode -eq 0
+    if (-not $volumeExists) {
+        Write-LaiLog INFO "Volume '$Volume' does not exist yet; creating it (nothing to back up)."
+        Invoke-Docker -Arguments @('volume', 'create', $Volume) | Out-Null
+    } elseif ($SkipSafetyBackup) {
+        Write-LaiLog WARN 'No safety backup (-SkipSafetyBackup): the current data cannot be recovered if this restore is wrong.'
+    } else {
+        $before = @(Get-ChildItem -LiteralPath $backupDir -Filter '*-pre-restore.tar.gz' -ErrorAction SilentlyContinue | ForEach-Object { $_.FullName })
+        & (Join-Path $PSScriptRoot 'Backup-OpenWebUI.ps1') -AIRoot $AIRoot -Volume $Volume -Container $Container -Tag 'pre-restore' -NoPrune -NoMirror
+        $safety = Get-ChildItem -LiteralPath $backupDir -Filter '*-pre-restore.tar.gz' | Where-Object { $before -notcontains $_.FullName } |
+            Sort-Object LastWriteTime -Descending | Select-Object -First 1  # lai-ok: objects
+        if ($LASTEXITCODE -ne 0 -or -not $safety -or -not (Test-Archive $safety.FullName)) {
+            throw 'Safety backup failed; nothing was changed. Fix the error above (or use -SkipSafetyBackup).'
+        }
+    }
+
+    # 3. Stop everything that uses the volume, then swap.
+    $users = @((Invoke-Docker -Arguments @('ps', '-q', '--filter', "volume=$Volume")).Text -split "`n" | Where-Object { $_ })
+    foreach ($id in $users) {
+        $policy = (Invoke-Docker -Arguments @('inspect', '-f', '{{.HostConfig.RestartPolicy.Name}}', $id) -AllowFail).Text.Trim()
+        if (-not $policy) { $policy = 'no' }
+        Invoke-Docker -Arguments @('update', '--restart', 'no', $id) -AllowFail | Out-Null   # keep it down even across a reboot
+        Invoke-Docker -Arguments @('stop', '-t', '30', $id) | Out-Null
+        $stoppedContainers += [pscustomobject]@{ Id = $id; Policy = $policy }
+    }
+    if (@((Invoke-Docker -Arguments @('ps', '-q', '--filter', "volume=$Volume")).Text -split "`n" | Where-Object { $_ }).Count -gt 0) {
+        throw "Something restarted a container on volume '$Volume'; aborting before any change."
+    }
+    $volumeTouched = $true
+    Invoke-Swap $staged
+    Write-LaiLog OK "Volume '$Volume' now holds $($source.Name)"
+} catch {
+    $failure = $_.Exception.Message
+    Write-LaiLog FAIL $failure
+    if ($volumeTouched) {
+        if ($safety) {
+            Write-LaiLog WARN "Rolling back to the safety backup $($safety.Name)"
+            try { Invoke-Swap $safety.FullName; Write-LaiLog OK 'Rollback complete: the volume is as it was before the restore.' }
+            catch {
+                Write-LaiLog FAIL "Rollback failed too: $($_.Exception.Message)"
+                Write-LaiLog FAIL "Open WebUI is left STOPPED. Recover with: .\Restore-OpenWebUI.ps1 -Archive '$($safety.FullName)' -SkipSafetyBackup"
+                $stoppedContainers = @()
+            }
+        } else {
+            Write-LaiLog FAIL 'No safety backup exists; Open WebUI is left STOPPED so it cannot start on a damaged volume.'
+            $stoppedContainers = @()
+        }
+    }
+    $script:restoreFailed = $true
+} finally {
+    foreach ($c in $stoppedContainers) {
+        try {
+            Invoke-Docker -Arguments @('update', '--restart', $c.Policy, $c.Id) -AllowFail | Out-Null
+            Invoke-Docker -Arguments @('start', $c.Id) | Out-Null
+        } catch { Write-LaiLog WARN "Could not restart container $($c.Id): $($_.Exception.Message)" }
+    }
+    if ($staged -and (Test-Path -LiteralPath $staged)) { Remove-Item -LiteralPath $staged -Force -ErrorAction SilentlyContinue }
+    Exit-LaiVolumeLock $lock
+}
+if ($script:restoreFailed) { exit 1 }
+
+# 4. Wait for Open WebUI.
+if ($stoppedContainers.Count -gt 0) {
     $config = Read-LaiState -Path (Join-Path $AIRoot 'localai-config.json')
     $port = 3000
     if ($config.ContainsKey('WebUIPort')) { $port = [int]$config['WebUIPort'] }
-    Wait-LaiWebUI -BaseUrl "http://127.0.0.1:$port" -TimeoutSec 300
-    Write-LaiLog OK "Open WebUI is back on http://localhost:$port"
+    try { Wait-LaiWebUI -BaseUrl "http://127.0.0.1:$port" -TimeoutSec 300; Write-LaiLog OK "Open WebUI is back on http://localhost:$port" }
+    catch { Write-LaiLog WARN "Data restored, but Open WebUI did not answer within 5 minutes: check 'docker logs --tail 100 $Container'." }
 }
-Write-LaiLog INFO 'The admin login is whatever it was when that backup was taken; if C:\AI\Secrets\openwebui-admin.json no longer matches, run Set-OpenWebUIPassword.ps1 after signing in, or restore the matching secrets file.'
+Write-LaiLog INFO ("The admin login is whatever it was when that backup was taken. If {0} no longer matches, sign in with the old password and run Set-OpenWebUIPassword.ps1." -f (Join-Path (Join-Path $AIRoot 'Secrets') 'openwebui-admin.json'))
+exit 0

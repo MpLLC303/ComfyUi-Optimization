@@ -140,7 +140,7 @@ The exit code is the number of failures.
 | Back up now | `C:\AI\Scripts\Backup-OpenWebUI.ps1` (add `-Mirror E:\Backups` or set `-BackupMirror` at install for a second copy) |
 | Re-tune after a driver/GPU change | `C:\AI\Scripts\Install-LocalAI.ps1 -Retune` |
 | Add or swap a model | Edit `config\models.psd1`, then re-run the installer |
-| Restore a backup | `docker stop open-webui` → `docker run --rm -v open-webui:/data -v C:\AI\Backups:/backup alpine:3.20 sh -c "rm -rf /data/* && tar xzf /backup/<file>.tar.gz -C /data"` → `docker start open-webui` |
+| Restore a backup | `C:\AI\Scripts\Restore-OpenWebUI.ps1` (newest daily backup) or `-Archive <file>` (local, NAS or UNC path). It takes a verified safety backup first, swaps the data only after the archive checks out, and rolls back automatically if anything fails |
 
 Keep a copy of `C:\AI\Secrets` (session key and admin login) in your password manager. It's
 deliberately not inside the backup archives.
