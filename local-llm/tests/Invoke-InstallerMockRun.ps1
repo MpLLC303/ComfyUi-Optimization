@@ -171,7 +171,7 @@ Assert-That (-not $global:Tasks.ContainsKey('LocalAI-Install-Resume')) 'resume t
 $sel = @($state.flags.selectedModels)
 Assert-That ($sel -contains 'trial-ok') 'trial model that works was added (passed through the reboot/resume)'
 Assert-That ($sel -notcontains 'trial-missing') 'trial model with a missing tag was skipped, not fatal'
-Assert-That ((Get-Content -Raw (Get-ChildItem (Join-Path $aiRoot 'Logs') -Filter 'install-*.log' | Sort-Object LastWriteTime | Select-Object -Last 1).FullName) -match 'Trial Trial: missing tag .* skipped') 'the skip came from the failed pull (Models stage), not the disk planner'
+Assert-That ((Get-Content -Raw (Get-ChildItem (Join-Path $aiRoot 'Logs') -Filter 'install-*.log' | Sort-Object LastWriteTime | Select-Object -Last 1).FullName) -match 'Trial Trial: missing tag .* skipped') 'the skip came from the failed pull (Models stage), not the disk planner'  # lai-ok: objects
 Assert-That ($null -ne $state.tuning.'trial-ok') 'trial model was tuned like the others'
 function Get-TestPreset([string]$Id) {
     $tok = (Invoke-RestMethod -Method Post -Uri 'http://127.0.0.1:3000/api/v1/auths/signin' -ContentType 'application/json' -Body (ConvertTo-Json @{ email = $Email; password = $Password })).token
