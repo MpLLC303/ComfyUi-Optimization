@@ -98,7 +98,7 @@ installer **measures** the real values on your machine and writes them to
 ## Daily use
 
 - **Local Main** for everything, **Local Vision** when you attach images, **Local Code** for code.
-- **Before ComfyUI/Forge:** run `C:\AI\Scripts\Release-GPU.ps1`. Ollama keeps the last model in
+- **Before ComfyUI/Forge:** start ComfyUI with `C:\AI\Scripts\Start-ComfyUI.ps1` (add `-CreateShortcut` once for a desktop icon). It unloads Ollama, shows free VRAM and launches Comfy Desktop or the portable build. For Forge or anything else, run `C:\AI\Scripts\Release-GPU.ps1`. Ollama keeps the last model in
   VRAM for 15 minutes, and a resident 19 GB model plus Wan 2.2 doesn't fit in 24 GB. On Windows, the
   driver then spills into system RAM instead of failing, so renders slow to a crawl without any error. A chat sent
   during a render reloads the model, so finish chatting first.
