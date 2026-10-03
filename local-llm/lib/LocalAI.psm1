@@ -267,6 +267,16 @@ function Get-LaiOllamaModelNames {
     return @($r.models | ForEach-Object { $_.name })
 }
 
+function Get-LaiOllamaDigest {
+    # Manifest digest of an installed model ('' if missing); changes whenever a pull brings new content.
+    param([string]$BaseUrl = 'http://127.0.0.1:11434', [Parameter(Mandatory)][string]$Name)
+    $r = Invoke-LaiApi -Uri "$BaseUrl/api/tags" -TimeoutSec 30
+    $want = Resolve-LaiModelName $Name
+    $m = @($r.models | Where-Object { $_.name -eq $want }) | Select-Object -First 1
+    if ($m) { return [string]$m.digest }
+    return ''
+}
+
 function Test-LaiOllamaModel {
     param([string]$BaseUrl = 'http://127.0.0.1:11434', [Parameter(Mandatory)][string]$Name)
     return (Get-LaiOllamaModelNames -BaseUrl $BaseUrl) -contains (Resolve-LaiModelName $Name)
