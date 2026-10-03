@@ -48,10 +48,12 @@ $cfgLine = (& /usr/bin/docker logs ollama-test 2>&1 | Where-Object { "$_" -match
 Set-Content (Join-Path $env:LOCALAPPDATA 'Ollama/server.log') "$cfgLine"
 # A "manual install" container + volume, as left behind by the guide's docker run.
 & /usr/bin/docker rm -f open-webui 2>$null | Out-Null
-& /usr/bin/docker volume rm open-webui 2>$null | Out-Null
-& /usr/bin/docker volume create open-webui | Out-Null
-& /usr/bin/docker run --rm -v open-webui:/data alpine:3.20 sh -c 'head -c 65536 /dev/urandom > /data/webui.db' | Out-Null
-& /usr/bin/docker run -d --name open-webui -v open-webui:/app/backend/data alpine:3.20 sleep 3600 | Out-Null
+& /usr/bin/docker ps -aq --filter 'name=^/open-webui-legacy-' | ForEach-Object { & /usr/bin/docker rm -f $_ | Out-Null }
+# It uses a differently named volume ('owui-old'), so the installer has to find and copy the data.
+& /usr/bin/docker volume rm open-webui owui-old 2>$null | Out-Null
+& /usr/bin/docker volume create owui-old | Out-Null
+& /usr/bin/docker run --rm -v owui-old:/data alpine:3.20 sh -c 'head -c 65536 /dev/urandom > /data/webui.db; echo legacy-marker > /data/marker.txt' | Out-Null
+& /usr/bin/docker run -d --restart always --name open-webui -v owui-old:/app/backend/data alpine:3.20 sleep 3600 | Out-Null
 
 # ---- patched installer copy ----------------------------------------------------------------
 $inst = Join-Path $copy 'Install-LocalAI.ps1'
@@ -160,7 +162,9 @@ Assert-That ($global:Tasks.ContainsKey('LocalAI-Backup-OpenWebUI')) 'daily backu
 Assert-That (($envFile -contains 'WEBUI_ADMIN_PASSWORD=') -and ($envFile -match '^WEBUI_SECRET_KEY=[0-9a-f]{64}$')) '.env: bootstrap password blanked, 64-hex secret key'
 Assert-That (@(Get-ChildItem (Join-Path $aiRoot 'Backups') -Filter 'open-webui-*-pre-compose.tar.gz').Count -eq 1) 'legacy container volume backed up before replacement'
 Assert-That (@(Get-ChildItem (Join-Path $aiRoot 'Backups') -Filter 'open-webui-*.tar.gz').Count -ge 2) 'scheduled-style backup created too'
-Assert-That ($null -eq (& /usr/bin/docker ps -a --filter 'name=^/open-webui$' --format '{{.ID}}')) 'legacy open-webui container removed'
+Assert-That ((& /usr/bin/docker run --rm -v open-webui:/d:ro alpine:3.20 cat /d/marker.txt) -eq 'legacy-marker') 'old data copied from the legacy volume into open-webui'
+Assert-That ((& /usr/bin/docker inspect -f '{{.HostConfig.RestartPolicy.Name}}' (& /usr/bin/docker ps -aq --filter 'name=^/open-webui-legacy-')) -eq 'no') 'legacy container restart policy disabled'
+Assert-That ($null -eq (& /usr/bin/docker ps -a --filter 'name=^/open-webui$' --format '{{.ID}}') -and (& /usr/bin/docker ps -a --filter 'name=^/open-webui-legacy-' --format '{{.Status}}') -match 'Exited') 'legacy container stopped and renamed (kept)'
 Assert-That (@($global:Calls | Where-Object { $_ -like 'docker compose*up -d*' }).Count -ge 2) 'compose up ran (initial + after password removal)'
 Assert-That (Test-Path (Join-Path $env:USERPROFILE '.wslconfig')) '.wslconfig created'
 Assert-That ((Get-Content -Raw (Join-Path $aiRoot 'Stack/searxng/settings.yml')) -notmatch '__SEARXNG_SECRET__') 'SearXNG secret filled in'
@@ -176,5 +180,6 @@ Assert-That ($code3 -eq 0) "re-run completes (exit $code3) in $([int]$sw.Elapsed
 Assert-That (@(Get-ChildItem (Join-Path $aiRoot 'Backups') -Filter '*pre-compose*').Count -eq 1) 'no second legacy migration on re-run'
 
 & /usr/bin/docker rm -f open-webui 2>$null | Out-Null
+& /usr/bin/docker ps -aq --filter 'name=^/open-webui-legacy-' | ForEach-Object { & /usr/bin/docker rm -f $_ | Out-Null }
 if ($failures -eq 0) { Write-Host "`nMOCK RUN PASSED" -ForegroundColor Green } else { Write-Host "`nMOCK RUN FAILED ($failures)" -ForegroundColor Red }
 exit $failures

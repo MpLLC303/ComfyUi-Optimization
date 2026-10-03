@@ -657,13 +657,42 @@ Invoke-Stage 'Stack' {
     $legacy = Invoke-Native -File 'docker' -Arguments @('ps', '-a', '--filter', 'name=^/open-webui$', '--format', '{{.ID}}|{{.Label "com.docker.compose.project"}}') -Capture -AllowFail
     $secretFile = Join-Path $P.Secrets 'openwebui-secret.txt'
     if ($legacy.Text -and $legacy.Text -notmatch '\|localai$') {
-        Write-LaiLog WARN 'Found an existing open-webui container from a manual install; backing up its volume and replacing the container (data is kept).'
+        Write-LaiLog WARN 'Found an existing open-webui container from a manual install; migrating its data into the managed stack.'
         $envDump = Invoke-Native -File 'docker' -Arguments @('inspect', '--format', '{{range .Config.Env}}{{println .}}{{end}}', 'open-webui') -Capture -AllowFail
         $oldKey = ($envDump.Output | Where-Object { $_ -like 'WEBUI_SECRET_KEY=*' } | Select-Object -First 1)
         if ($oldKey -and -not (Test-Path -LiteralPath $secretFile)) { Set-Content -LiteralPath $secretFile -Value $oldKey.Substring(17) -NoNewline }
-        & (Join-Path $SourceRoot 'Backup-OpenWebUI.ps1') -AIRoot $AIRoot -NoStop -Tag 'pre-compose'
-        if ($LASTEXITCODE -ne 0) { Write-LaiLog WARN 'Pre-migration backup failed; continuing (the data stays in the open-webui volume either way).' }
-        Invoke-Native -File 'docker' -Arguments @('rm', '-f', 'open-webui') -Capture | Out-Null
+        # Where did that container keep /app/backend/data? (No double quotes in the template: PS 5.1 mangles them for native args.)
+        $mounts = Invoke-Native -File 'docker' -Arguments @('inspect', '--format', '{{range .Mounts}}{{.Type}}|{{.Name}}|{{.Source}}|{{.Destination}}{{println}}{{end}}', 'open-webui') -Capture -AllowFail
+        $data = $mounts.Output | Where-Object { $_ -like '*|/app/backend/data' } | Select-Object -First 1
+        $managedExists = (Invoke-Native -File 'docker' -Arguments @('volume', 'inspect', 'open-webui') -Capture -AllowFail).ExitCode -eq 0
+        $from = $null
+        if ($data) {
+            $f = $data.Split('|')
+            if ($f[0] -eq 'volume' -and $f[1] -eq 'open-webui') {
+                & (Join-Path $SourceRoot 'Backup-OpenWebUI.ps1') -AIRoot $AIRoot -NoStop -Tag 'pre-compose'
+            } elseif ($f[0] -eq 'volume') {
+                & (Join-Path $SourceRoot 'Backup-OpenWebUI.ps1') -AIRoot $AIRoot -NoStop -Tag 'pre-compose' -Volume $f[1]
+                $from = "$($f[1]):/from:ro"
+            } elseif ($f[0] -eq 'bind') {
+                $from = "$($f[2]):/from:ro"
+            }
+        } else {
+            Write-LaiLog WARN 'The old container kept its data inside the container itself (no volume); it is kept (stopped, renamed) so nothing is lost.'
+        }
+        if ($from -and -not $managedExists) {
+            Invoke-Native -File 'docker' -Arguments @('volume', 'create', 'open-webui') -Capture | Out-Null
+            Invoke-Native -File 'docker' -Arguments @('run', '--rm', '-v', $from, '-v', 'open-webui:/to', 'alpine:3.20', 'sh', '-c', 'cp -a /from/. /to/') -Capture | Out-Null
+            Write-LaiLog OK "Copied the old Open WebUI data (from $($from -replace ':/from:ro$', '')) into the open-webui volume"
+        } elseif ($from) {
+            Write-LaiLog WARN "Both the old data ($from) and an open-webui volume exist; leaving both untouched. See README > Troubleshooting to merge."
+        }
+        # Keep the old container (stopped, renamed) instead of deleting it.
+        # (restart policy off first, or the guide's --restart always would bring it back after a reboot)
+        $legacyName = 'open-webui-legacy-' + (Get-Date -Format 'yyyyMMddHHmmss')
+        Invoke-Native -File 'docker' -Arguments @('update', '--restart', 'no', 'open-webui') -Capture -AllowFail | Out-Null
+        Invoke-Native -File 'docker' -Arguments @('stop', 'open-webui') -Capture -AllowFail | Out-Null
+        Invoke-Native -File 'docker' -Arguments @('rename', 'open-webui', $legacyName) -Capture | Out-Null
+        Write-LaiLog OK "Old container kept (stopped) as $legacyName; remove it with 'docker rm $legacyName' once you are happy."
     }
 
     # Secrets: reuse the guide's key file if present so existing sessions stay valid.
@@ -846,6 +875,7 @@ Write-Host ''
 Write-Host "Open WebUI:  http://localhost:$($script:WebUIPortEffective)" -ForegroundColor Green
 Write-Host "Login:       $($cred.email)" -ForegroundColor Green
 Write-Host "Password:    $($cred.password)   (also in $($P.Secrets)\openwebui-admin.json)" -ForegroundColor Green
+Write-Host 'Open a NEW terminal to use the ollama command (windows opened before the install do not see the PATH change).' -ForegroundColor Gray
 Start-AsUser "http://localhost:$($script:WebUIPortEffective)"
 exit $testExit
 #endregion
