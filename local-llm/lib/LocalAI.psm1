@@ -197,6 +197,9 @@ function Get-LaiGpuInfo {
     # First NVIDIA GPU via nvidia-smi, or $null when nvidia-smi is unavailable.
     $smi = Get-Command nvidia-smi -ErrorAction SilentlyContinue
     if (-not $smi) { return $null }
+    # Local 'Continue': in Windows PowerShell 5.1 a native command's stderr becomes a terminating error
+    # under the caller's 'Stop' preference, even when redirected.
+    $ErrorActionPreference = 'Continue'
     $out = & $smi --query-gpu=name,driver_version,memory.total,memory.used,memory.free --format=csv,noheader,nounits 2>$null
     if ($LASTEXITCODE -ne 0 -or -not $out) { return $null }
     $f = (@($out)[0]).Split(',') | ForEach-Object { $_.Trim() }
@@ -206,6 +209,38 @@ function Get-LaiGpuInfo {
         TotalMiB      = [int]$f[2]
         UsedMiB       = [int]$f[3]
         FreeMiB       = [int]$f[4]
+    }
+}
+
+function Get-LaiGpuApps {
+    # Names of processes holding a CUDA context (memory is N/A under Windows WDDM, names are not).
+    $smi = Get-Command nvidia-smi -ErrorAction SilentlyContinue
+    if (-not $smi) { return @() }
+    $ErrorActionPreference = 'Continue'
+    $out = & $smi --query-compute-apps=pid,process_name --format=csv,noheader 2>$null
+    if ($LASTEXITCODE -ne 0 -or -not $out) { return @() }
+    return @($out | ForEach-Object { ($_ -split ',', 2)[1].Trim() } | Where-Object { $_ } | ForEach-Object { Split-Path -Leaf $_ } | Select-Object -Unique)
+}
+
+function Wait-LaiGpuIdle {
+    # Waits until VRAM used by everything else is at most -MaxUsedMiB (desktop + light apps), so model
+    # placement and context tuning are measured against a quiet card. Returns the last GPU reading.
+    # Throws after -TimeoutSec with the names of the GPU processes still running.
+    param([int]$MaxUsedMiB = 3500, [int]$TimeoutSec = 600, [int]$PollSec = 10)
+    $deadline = (Get-Date).AddSeconds($TimeoutSec)
+    $warned = $false
+    while ($true) {
+        $gpu = Get-LaiGpuInfo
+        if (-not $gpu -or $gpu.UsedMiB -le $MaxUsedMiB) { return $gpu }
+        $apps = Get-LaiGpuApps
+        if ((Get-Date) -ge $deadline) {
+            throw ("{0} MiB of VRAM is in use by other programs (limit {1} MiB). GPU compute processes: {2}. Close them (ComfyUI/Forge/games), then re-run." -f $gpu.UsedMiB, $MaxUsedMiB, $(if ($apps) { $apps -join ', ' } else { 'none listed' }))
+        }
+        if (-not $warned) {
+            Write-LaiLog WARN ("{0} MiB of VRAM is in use by other programs ({1}); waiting up to {2} min for it to drop below {3} MiB..." -f $gpu.UsedMiB, $(if ($apps) { $apps -join ', ' } else { 'unknown' }), [Math]::Ceiling($TimeoutSec / 60), $MaxUsedMiB)
+            $warned = $true
+        }
+        Start-Sleep -Seconds $PollSec
     }
 }
 

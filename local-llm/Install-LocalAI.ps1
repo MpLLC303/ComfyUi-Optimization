@@ -49,6 +49,9 @@ param(
     [ValidateRange(0, 1024)][int]$GpuOverheadMiB = 512,
     # The context tuner requires at least this much VRAM still free with the model loaded.
     [int]$MinFreeVramMiB = 768,
+    # Before loading/tuning models, wait until other programs use at most this much VRAM (desktop is ~1.5-2.5 GB).
+    [int]$MaxBusyVramMiB = 3500,
+    [int]$GpuWaitMinutes = 10,
     # How long an idle model stays in VRAM. Run Release-GPU.ps1 before ComfyUI/Forge sessions.
     [string]$KeepAlive = '15m',
     [string[]]$KnowledgeCollections = @('PC & Electronics', '3D Printing', 'Property', 'School', 'Home Projects', 'General References'),
@@ -511,6 +514,8 @@ Invoke-Stage 'Ollama' {
 Invoke-Stage 'Models' {
     # The ollama CLI is a client of the local server; never let it target 0.0.0.0 (LAN fallback mode).
     $env:OLLAMA_HOST = '127.0.0.1:11434'
+    Stop-LaiOllamaModels -BaseUrl $OllamaUrl
+    Wait-LaiGpuIdle -MaxUsedMiB $MaxBusyVramMiB -TimeoutSec ($GpuWaitMinutes * 60) | Out-Null
     foreach ($m in ($Catalog.Models | Sort-Object { $_.Optional }, { $_.DownloadGB })) {
         if (Test-LaiOllamaModel -BaseUrl $OllamaUrl -Name $m.Source) {
             Write-LaiLog OK "$($m.Source) already installed"
@@ -542,7 +547,9 @@ Invoke-Stage 'Models' {
 
 #region 4. Context tuning + tuned aliases (guide Parts 5, 10, 27 automated) ---------------
 Invoke-Stage 'Tuning' {
-    $gpu = Get-LaiGpuInfo
+    Stop-LaiOllamaModels -BaseUrl $OllamaUrl
+    $gpu = Wait-LaiGpuIdle -MaxUsedMiB $MaxBusyVramMiB -TimeoutSec ($GpuWaitMinutes * 60)
+    if (-not $gpu) { $gpu = Get-LaiGpuInfo }
     $fingerprint = "driver=$($gpu.DriverVersion);kv=$KvCacheType;overhead=$GpuOverheadMiB;free=$MinFreeVramMiB"
     $results = Invoke-LaiModelSetup -BaseUrl $OllamaUrl -Models $Catalog.Models -Candidates $Catalog.ContextCandidates `
         -SystemPrompt $SystemPrompt -Previous $State.tuning -Fingerprint $fingerprint -MinFreeMiB $MinFreeVramMiB -Retune:$Retune -AllowCpu:$AllowCpu

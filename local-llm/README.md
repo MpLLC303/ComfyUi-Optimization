@@ -40,6 +40,7 @@ Options are in the config block at the top of `Install-LocalAI.ps1`. The common 
 | `-ModelDir D:\AI\OllamaModels` | Put the models on another drive. This is chosen automatically when C: is short on space. |
 | `-Retune` | Re-measure the context sizes after a driver or hardware change. |
 | `-NoReboot` | Print "reboot now" instead of rebooting. It still resumes at the next sign-in. |
+| `-MaxBusyVramMiB 3500` / `-GpuWaitMinutes 10` | Before loading or tuning models, wait for other GPU apps (ComfyUI, Forge, games) to free VRAM; stop with their names if they don't. |
 | `-KeepAlive 5m` | How long an idle model stays in VRAM (default 15m). |
 
 ## What the installer does (guide part → stage)
