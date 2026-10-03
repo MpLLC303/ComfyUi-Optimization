@@ -159,7 +159,7 @@ The exit code is the number of failures.
 | Update models / Ollama | `C:\AI\Scripts\Update-Models.ps1` re-pulls every model and re-tunes only those whose upstream tag changed; `-UpdateOllama` upgrades Ollama first |
 | Re-tune after a driver/GPU change | `C:\AI\Scripts\Install-LocalAI.ps1 -Retune` |
 | Add or swap a model | Edit `config\models.psd1`, then re-run the installer |
-| Health watch | Task `LocalAI-Watch` runs `C:\AI\Scripts\Watch-LocalAI.ps1` every 15 minutes while you're signed in: checks Ollama, Open WebUI, SearXNG and backup freshness, restarts a stopped container or Ollama, and shows a Windows notification only when a problem persists for two checks in a row (and once when it's fixed). History in `C:\AI\Logs\watch.log`; run it by hand with `-NoHeal -Verbose` |
+| Health watch | Task `LocalAI-Watch` runs `C:\AI\Scripts\Watch-LocalAI.ps1` every 15 minutes while you're signed in: checks Ollama, the Docker engine, Open WebUI, SearXNG, the render guard, backup freshness and free disk space (models, backups, Docker data; warns under 10 GB), restarts a stopped container or Ollama (never Docker Desktop itself, in case you quit it on purpose), and shows a Windows notification only when a problem persists for two checks in a row (and once when it's fixed). History in `C:\AI\Logs\watch.log`; run it by hand with `-NoHeal -Verbose` |
 | Restore a backup | `C:\AI\Scripts\Restore-OpenWebUI.ps1` (newest daily backup) or `-Archive <file>` (local, NAS or UNC path). It takes a verified safety backup first, swaps the data only after the archive checks out, and rolls back automatically if anything fails |
 
 Every backup is also opened with SQLite in a throwaway volume (integrity check plus user/chat counts in

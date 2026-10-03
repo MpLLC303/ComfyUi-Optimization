@@ -5,10 +5,12 @@
 
 .DESCRIPTION
     Checks, in about a second and without loading any model or signing in:
-      Ollama API, Open WebUI /health, SearXNG /healthz, the two containers, and the newest backup
-      (younger than 50 h and not quarantined as -CORRUPT).
+      Ollama API, Docker engine, Open WebUI /health, SearXNG /healthz, the render-guard container,
+      the newest backup (younger than 50 h and not quarantined as -CORRUPT), and free disk space on
+      the drives holding the models, backups and Docker's data (at least -MinFreeGB).
     Self-heals what is safe to heal (starts a stopped container, relaunches the Ollama tray app) unless
-    -NoHeal. Shows a Windows notification once when a check has failed on two runs in a row (and once
+    -NoHeal. Docker Desktop is never started by the watch (you may have quit it on purpose to free
+    RAM); a stopped engine is reported once instead. Shows a Windows notification once when a check has failed on two runs in a row (and once
     when it recovers), so neither a slow Docker start nor a lasting outage spams you. Log: <AIRoot>\Logs\watch.log.
 
 .EXAMPLE
@@ -20,7 +22,9 @@
 param(
     [string]$AIRoot = 'C:\AI',
     [switch]$NoHeal,
-    [switch]$NoNotify
+    [switch]$NoNotify,
+    # Warn when the drive with the models, backups or Docker's data has less than this free.
+    [int]$MinFreeGB = 10
 )
 $ErrorActionPreference = 'Stop'
 Import-Module (Join-Path (Join-Path $PSScriptRoot 'lib') 'LocalAI.psm1') -Force
@@ -35,6 +39,31 @@ $logFile = Join-Path $logDir 'watch.log'
 $statePath = Join-Path $AIRoot 'watch-state.json'
 $onWindows = ($env:OS -eq 'Windows_NT')
 $notify = $onWindows -and -not $NoNotify
+
+function Test-DockerEngine {
+    if (-not (Get-Command docker -ErrorAction SilentlyContinue)) { return $null }
+    $prev = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
+    try { & docker version --format '{{.Server.Version}}' 2>$null | Out-Null; $code = $LASTEXITCODE } finally { $ErrorActionPreference = $prev }
+    return ($code -eq 0)
+}
+
+function Get-FreeSpaceProblem {
+    # Returns '' when every relevant drive has room, else e.g. 'C:\ 7.2 GB free'.
+    param([string[]]$Paths, [int]$MinGB)
+    $seen = @{}; $low = @()
+    foreach ($p in $Paths) {
+        if (-not $p) { continue }
+        $root = $null
+        try { $root = [System.IO.Path]::GetPathRoot([System.IO.Path]::GetFullPath($p)) } catch { continue }
+        if (-not $root -or $seen.ContainsKey($root)) { continue }
+        $seen[$root] = $true
+        try { $d = New-Object System.IO.DriveInfo($root) } catch { continue }
+        if (-not $d.IsReady) { continue }
+        $gb = [math]::Round($d.AvailableFreeSpace / 1GB, 1)
+        if ($gb -lt $MinGB) { $low += ('{0} {1} GB free' -f $root, $gb) }
+    }
+    return ($low -join ', ')
+}
 
 function Test-Url {
     param([string]$Uri)
@@ -75,6 +104,7 @@ function Send-Notification {
 
 # ---- checks ---------------------------------------------------------------------------------
 $results = [ordered]@{}
+$details = @{}
 $healed = @()
 
 $results['Ollama'] = Test-Url "$ollamaUrl/api/version"
@@ -86,35 +116,51 @@ if (-not $results['Ollama'] -and -not $NoHeal -and $onWindows) {
     }
 }
 
-foreach ($c in @(@{ Name = 'open-webui'; Url = "http://127.0.0.1:$webPort/health"; Key = 'Open WebUI' },
-                 @{ Name = 'searxng'; Url = "http://127.0.0.1:$searxPort/healthz"; Key = 'SearXNG' })) {
-    $ok = Test-Url $c.Url
-    if (-not $ok -and -not $NoHeal) {
-        $state = Get-ContainerState $c.Name
-        if ($state -eq 'exited' -or $state -eq 'created') {
-            Start-Container $c.Name
-            try { Wait-LaiHttp -Uri $c.Url -TimeoutSec 180 | Out-Null; $ok = $true; $healed += $c.Key } catch { Write-Verbose "$($c.Key) did not come back" }
+$engine = Test-DockerEngine
+if ($engine -eq $false) {
+    # Everything in the stack is down with it; report the cause once instead of three symptoms.
+    $results['Docker'] = $false
+    $details['Docker'] = 'engine not running - start Docker Desktop'
+} else {
+    foreach ($c in @(@{ Name = 'open-webui'; Url = "http://127.0.0.1:$webPort/health"; Key = 'Open WebUI' },
+                     @{ Name = 'searxng'; Url = "http://127.0.0.1:$searxPort/healthz"; Key = 'SearXNG' })) {
+        $ok = Test-Url $c.Url
+        if (-not $ok -and -not $NoHeal) {
+            $state = Get-ContainerState $c.Name
+            if ($state -eq 'exited' -or $state -eq 'created') {
+                Start-Container $c.Name
+                try { Wait-LaiHttp -Uri $c.Url -TimeoutSec 180 | Out-Null; $ok = $true; $healed += $c.Key } catch { Write-Verbose "$($c.Key) did not come back" }
+            }
         }
+        $results[$c.Key] = $ok
     }
-    $results[$c.Key] = $ok
-}
 
-# The render guard has no host port (only Open WebUI talks to it); if it is down, chats fail.
-$rgState = Get-ContainerState 'render-guard'
-if ($rgState -ne 'no-docker' -and $rgState -ne 'missing') {
-    $rgOk = ($rgState -eq 'running')
-    if (-not $rgOk -and -not $NoHeal -and ($rgState -eq 'exited' -or $rgState -eq 'created')) {
-        Start-Container 'render-guard'
-        Start-Sleep -Seconds 3
-        $rgOk = ((Get-ContainerState 'render-guard') -eq 'running')
-        if ($rgOk) { $healed += 'Render guard' }
+    # The render guard has no host port (only Open WebUI talks to it); if it is down, chats fail.
+    $rgState = Get-ContainerState 'render-guard'
+    if ($rgState -ne 'no-docker' -and $rgState -ne 'missing') {
+        $rgOk = ($rgState -eq 'running')
+        if (-not $rgOk -and -not $NoHeal -and ($rgState -eq 'exited' -or $rgState -eq 'created')) {
+            Start-Container 'render-guard'
+            Start-Sleep -Seconds 3
+            $rgOk = ((Get-ContainerState 'render-guard') -eq 'running')
+            if ($rgOk) { $healed += 'Render guard' }
+        }
+        $results['Render guard'] = $rgOk
     }
-    $results['Render guard'] = $rgOk
 }
 
 $backupDir = Join-Path $AIRoot 'Backups'
 $all = @(Get-ChildItem -LiteralPath $backupDir -Filter 'open-webui-*.tar.gz' -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending)  # lai-ok: objects
 $results['Backups'] = ($all.Count -gt 0) -and ($all[0].Name -notlike '*-CORRUPT.tar.gz') -and (((Get-Date) - $all[0].LastWriteTime).TotalHours -le 50)
+
+$modelDir = ''
+if ($config.ContainsKey('ModelDir') -and $config['ModelDir']) { $modelDir = [string]$config['ModelDir'] }
+elseif ($env:USERPROFILE) { $modelDir = Join-Path $env:USERPROFILE '.ollama' }
+$dockerData = ''
+if ($onWindows -and $env:LOCALAPPDATA) { $dockerData = Join-Path $env:LOCALAPPDATA 'Docker' }
+$diskProblem = Get-FreeSpaceProblem -Paths @($AIRoot, $modelDir, $dockerData) -MinGB $MinFreeGB
+$results['Disk space'] = (-not $diskProblem)
+if ($diskProblem) { $details['Disk space'] = $diskProblem }
 
 # ---- report ---------------------------------------------------------------------------------
 # Two strikes before a notification: right after sign-in Docker Desktop needs a minute or two, and
@@ -129,18 +175,20 @@ $toNotify = @($failed | Where-Object { ($prevFailed -contains $_) -and ($prevNot
 $notified = @($failed | Where-Object { ($prevNotified -contains $_) -or ($toNotify -contains $_) })
 $recovered = @($prevNotified | Where-Object { $failed -notcontains $_ })
 
-$line = '{0} {1}{2}' -f (Get-Date -Format 's'), $(if ($failed.Count) { 'FAIL ' + ($failed -join ', ') } else { 'OK' }), $(if ($healed.Count) { ' (restarted: ' + ($healed -join ', ') + ')' } else { '' })
+$failedText = @($failed | ForEach-Object { if ($details.ContainsKey($_)) { '{0} ({1})' -f $_, $details[$_] } else { $_ } }) -join ', '
+$line = '{0} {1}{2}' -f (Get-Date -Format 's'), $(if ($failed.Count) { 'FAIL ' + $failedText } else { 'OK' }), $(if ($healed.Count) { ' (restarted: ' + ($healed -join ', ') + ')' } else { '' })
 Add-Content -LiteralPath $logFile -Value $line
 Write-Verbose $line
 
 if ($toNotify.Count -gt 0) {
-    Send-Notification 'Local AI: problem detected' ("Not working: {0}. Run {1} for details." -f ($failed -join ', '), (Join-Path $AIRoot 'Scripts\Test-LocalAI.ps1'))
-} elseif ($failed.Count -eq 0 -and ($recovered.Count -gt 0 -or $healed.Count -gt 0)) {
+    Send-Notification 'Local AI: problem detected' ("Not working: {0}. Run {1} for details." -f $failedText, (Join-Path $AIRoot 'Scripts\Test-LocalAI.ps1'))
+} elseif ($recovered.Count -gt 0 -or ($healed.Count -gt 0 -and $failed.Count -eq 0)) {
     $parts = @()
     if ($healed.Count -gt 0) { $parts += 'restarted ' + ($healed -join ', ') }
     $other = @($recovered | Where-Object { $healed -notcontains $_ })
     if ($other.Count -gt 0) { $parts += 'recovered ' + ($other -join ', ') }
-    Send-Notification 'Local AI: back to normal' (($parts -join '; ') + '.')
+    if ($failed.Count -eq 0) { Send-Notification 'Local AI: back to normal' (($parts -join '; ') + '.') }
+    else { Send-Notification 'Local AI: partly recovered' ((($parts -join '; ') + '. Still not working: ' + $failedText + '.')) }
 }
 
 Save-LaiState -State @{ failed = $failed; notified = $notified; checked = (Get-Date).ToString('s') } -Path $statePath
