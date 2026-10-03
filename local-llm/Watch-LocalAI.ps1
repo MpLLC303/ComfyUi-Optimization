@@ -17,6 +17,10 @@
     .\Watch-LocalAI.ps1              # one check, as the scheduled task runs it
 .EXAMPLE
     .\Watch-LocalAI.ps1 -NoHeal -Verbose
+.EXAMPLE
+    .\Watch-LocalAI.ps1 -PauseMinutes 240   # quiet for 4 hours (gaming, stack stopped on purpose)
+.EXAMPLE
+    .\Watch-LocalAI.ps1 -Unpause
 #>
 [CmdletBinding()]
 param(
@@ -24,7 +28,10 @@ param(
     [switch]$NoHeal,
     [switch]$NoNotify,
     # Warn when the drive with the models, backups or Docker's data has less than this free.
-    [int]$MinFreeGB = 10
+    [int]$MinFreeGB = 10,
+    # Silence the watch (no checks, restarts or notifications) for this many minutes, then exit.
+    [int]$PauseMinutes = 0,
+    [switch]$Unpause
 )
 $ErrorActionPreference = 'Stop'
 Import-Module (Join-Path (Join-Path $PSScriptRoot 'lib') 'LocalAI.psm1') -Force
@@ -99,6 +106,32 @@ function Send-Notification {
         [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier($appId).Show([Windows.UI.Notifications.ToastNotification]::new($xml))
     } catch {
         Write-Verbose "toast failed: $($_.Exception.Message)"
+    }
+}
+
+# ---- pause ----------------------------------------------------------------------------------
+if ($PauseMinutes -gt 0 -or $Unpause) {
+    $st = Read-LaiState -Path $statePath
+    if ($Unpause) {
+        $st.Remove('pausedUntil')
+        $msg = 'watch resumed'
+    } else {
+        $st['pausedUntil'] = (Get-Date).AddMinutes($PauseMinutes).ToString('s')
+        $msg = "watch paused until $($st['pausedUntil'])"
+    }
+    Save-LaiState -State $st -Path $statePath
+    Add-Content -LiteralPath $logFile -Value ('{0} {1}' -f (Get-Date -Format 's'), $msg)
+    Write-LaiLog OK $msg
+    exit 0
+}
+$pauseState = Read-LaiState -Path $statePath
+if ($pauseState.ContainsKey('pausedUntil') -and $pauseState['pausedUntil']) {
+    # PowerShell 7's ConvertFrom-Json already turns ISO strings into dates; 5.1 leaves strings.
+    $until = $pauseState['pausedUntil']
+    if ($until -isnot [datetime]) { $until = [datetime]::Parse([string]$until, [Globalization.CultureInfo]::InvariantCulture) }
+    if ((Get-Date) -lt $until) {
+        Write-Verbose "paused until $until"
+        exit 0
     }
 }
 
