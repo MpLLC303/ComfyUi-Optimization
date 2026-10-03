@@ -152,6 +152,10 @@ The exit code is the number of failures.
 | Add or swap a model | Edit `config\models.psd1`, then re-run the installer |
 | Restore a backup | `C:\AI\Scripts\Restore-OpenWebUI.ps1` (newest daily backup) or `-Archive <file>` (local, NAS or UNC path). It takes a verified safety backup first, swaps the data only after the archive checks out, and rolls back automatically if anything fails |
 
+Every backup is also opened with SQLite in a throwaway volume (integrity check plus user/chat counts in
+`C:\AI\Logs\backup.log`). An archive that fails is kept as `...-CORRUPT.tar.gz`, never replaces a good one, and makes
+`Test-LocalAI.ps1` fail so you notice.
+
 Keep a copy of `C:\AI\Secrets` (session key and admin login) in your password manager. It's
 deliberately not inside the backup archives.
 

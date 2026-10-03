@@ -207,7 +207,11 @@ if ($script:token) {
 
 Add-Check 'Backups' {
     $dir = Join-Path $AIRoot 'Backups'
-    $newest = Get-ChildItem -LiteralPath $dir -Filter 'open-webui-*.tar.gz' -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 1  # lai-ok: objects
+    $all = @(Get-ChildItem -LiteralPath $dir -Filter 'open-webui-*.tar.gz' -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending)  # lai-ok: objects
+    $newest = $all | Where-Object { $_.Name -notlike '*-CORRUPT.tar.gz' } | Select-Object -First 1
+    if ($all.Count -gt 0 -and $all[0].Name -like '*-CORRUPT.tar.gz') {
+        return (Fail "the newest backup $($all[0].Name) failed its database check; the live Open WebUI data may be damaged (restore from $(if ($newest) { $newest.Name } else { 'an older archive' }))")
+    }
     if (-not $newest) { return (Fail "no archive in $dir") }
     $age = (Get-Date) - $newest.LastWriteTime
     $detail = '{0} ({1:N1} MB, {2:N0} h old)' -f $newest.Name, ($newest.Length / 1MB), $age.TotalHours
