@@ -1,0 +1,43 @@
+# Runs the local-llm scripts' checks on real Windows PowerShell 5.1, which the scripts target
+# (the development sandbox only has PowerShell 7 on Linux).
+name: local-llm (Windows PowerShell 5.1)
+
+on:
+  push:
+    branches: [main, 'claude/**']
+    paths: ['local-llm/**', '.github/workflows/local-llm-windows.yml']
+  pull_request:
+    paths: ['local-llm/**', '.github/workflows/local-llm-windows.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows-ps51:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: PowerShell version
+        shell: powershell
+        run: $PSVersionTable | Format-Table -AutoSize | Out-String | Write-Host
+
+      - name: Static checks (5.1 parser, ASCII, PSScriptAnalyzer 5.1 profile, 5.1 pitfall scan)
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if (-not (Get-Module -ListAvailable PSScriptAnalyzer)) {
+            Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Force -Scope CurrentUser | Out-Null
+            Install-Module PSScriptAnalyzer -Force -Scope CurrentUser -AllowClobber
+          }
+          Import-Module PSScriptAnalyzer
+          & .\local-llm\tests\Invoke-StaticChecks.ps1 -PssaPath 'not-used'
+          exit $LASTEXITCODE
+
+      - name: Windows unit tests (mutex ACL, .lnk, UTF-8 bodies, watch/uninstall/stop smoke)
+        shell: powershell
+        run: |
+          & .\local-llm\tests\Invoke-WindowsUnitTests.ps1
+          exit $LASTEXITCODE
