@@ -431,7 +431,7 @@ Invoke-Stage 'Preflight' {
     # Keep a stable copy of the scripts for scheduled tasks and the resume task.
     if ($SourceRoot.TrimEnd('\') -ne $P.Scripts.TrimEnd('\')) {
         if (-not (Test-Path -LiteralPath $P.Scripts)) { New-Item -ItemType Directory -Force -Path $P.Scripts | Out-Null }
-        foreach ($item in @('Install-LocalAI.ps1', 'Install-LocalAI.cmd', 'Test-LocalAI.ps1', 'Backup-OpenWebUI.ps1', 'Update-OpenWebUI.ps1', 'Release-GPU.ps1', 'Set-OpenWebUIPassword.ps1', 'Restore-OpenWebUI.ps1', 'Update-Models.ps1', 'Start-ComfyUI.ps1', 'Enable-TailscaleAccess.ps1', 'Watch-LocalAI.ps1', 'README.md', 'lib', 'config', 'stack')) {
+        foreach ($item in @('Install-LocalAI.ps1', 'Install-LocalAI.cmd', 'Test-LocalAI.ps1', 'Backup-OpenWebUI.ps1', 'Update-OpenWebUI.ps1', 'Release-GPU.ps1', 'Set-OpenWebUIPassword.ps1', 'Restore-OpenWebUI.ps1', 'Update-Models.ps1', 'Start-ComfyUI.ps1', 'Enable-TailscaleAccess.ps1', 'Watch-LocalAI.ps1', 'Uninstall-LocalAI.ps1', 'README.md', 'lib', 'config', 'stack')) {
             $src = Join-Path $SourceRoot $item
             if (Test-Path -LiteralPath $src) { Copy-Item -LiteralPath $src -Destination $P.Scripts -Recurse -Force }
         }
