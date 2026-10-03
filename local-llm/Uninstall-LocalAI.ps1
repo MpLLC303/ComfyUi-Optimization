@@ -10,7 +10,7 @@
       3. The containers (open-webui, searxng, render-guard) and their network (docker compose down).
       4. The Tailscale HTTPS mapping to Open WebUI, if there is one.
       5. The tuned Ollama aliases (localai-*; they share weights with the source models, ~0 GB).
-      6. The "ComfyUI (free GPU first)" desktop shortcut.
+      6. The "ComfyUI (free GPU first)" desktop shortcut and the "Local AI" Start-menu folder.
     Kept unless asked: the Open WebUI data volume (chats, memories, knowledge), the downloaded models
     (~67 GB), the Ollama settings, the backups, and everything outside C:\AI. Ollama, Docker Desktop
     and WSL are never uninstalled (other programs may use them; remove them in Settings > Apps).
@@ -83,7 +83,7 @@ $volumeExists = $dockerUp -and ((Invoke-Docker @('volume', 'inspect', 'open-webu
 
 # ---- plan + confirmation ------------------------------------------------------------------------
 $plan = @('scheduled tasks (backup, health watch, install resume)', 'containers open-webui, searxng, render-guard',
-    'Tailscale mapping to Open WebUI (if any)', 'tuned Ollama aliases localai-*', 'ComfyUI desktop shortcut')
+    'Tailscale mapping to Open WebUI (if any)', 'tuned Ollama aliases localai-*', 'shortcuts (desktop ComfyUI, Start-menu Local AI folder)')
 $kept = @()
 if ($RemoveData) { $plan += 'Open WebUI data volume (chats, memories, knowledge) and C:\AI stack/scripts/secrets/logs' } else { $kept += 'Open WebUI data volume (re-run Install-LocalAI.ps1 and everything comes back)' }
 if ($RemoveModels) { $plan += 'downloaded models from the catalog' } else { $kept += 'downloaded models' }
@@ -205,6 +205,11 @@ $desktop = [Environment]::GetFolderPath('Desktop')
 if ($desktop) {
     $lnk = Join-Path $desktop 'ComfyUI (free GPU first).lnk'
     if (Test-Path -LiteralPath $lnk) { Invoke-Step 'desktop shortcut' { Remove-Item -LiteralPath $lnk -Force; Write-LaiLog OK 'Removed desktop shortcut' } }
+}
+
+if ($env:ProgramData) {
+    $menu = Join-Path $env:ProgramData 'Microsoft\Windows\Start Menu\Programs\Local AI'
+    if (Test-Path -LiteralPath $menu) { Invoke-Step 'Start-menu folder' { Remove-Item -LiteralPath $menu -Recurse -Force; Write-LaiLog OK "Removed Start-menu folder 'Local AI'" } }
 }
 
 if ($RemoveData) {

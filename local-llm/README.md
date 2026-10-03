@@ -107,6 +107,7 @@ used by the desktop and open apps):
 ## Daily use
 
 - **Local Main** for everything, **Local Vision** when you attach images, **Local Code** for code.
+- **Start menu → Local AI:** opens Open WebUI, has *Gaming mode (free GPU)*, *Start again*, *Health check*, and *ComfyUI (free GPU first)*. Each script window stays open until you press Enter, so you can read the result.
 - **Before ComfyUI/Forge:** start ComfyUI with `C:\AI\Scripts\Start-ComfyUI.ps1` (add `-CreateShortcut` once for a desktop icon). It unloads Ollama, shows free VRAM and launches Comfy Desktop or the portable build. For Forge or anything else, run `C:\AI\Scripts\Release-GPU.ps1`. Ollama keeps the last model in
   VRAM for 15 minutes, and a resident 19 GB model plus Wan 2.2 doesn't fit in 24 GB. On Windows, the
   driver then spills into system RAM instead of failing, so renders slow to a crawl without any error.

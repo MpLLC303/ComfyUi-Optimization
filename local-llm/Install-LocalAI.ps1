@@ -876,6 +876,32 @@ Invoke-Stage 'Backup' {
     Register-ScheduledTask -TaskName $WatchTask -Action $watchAction -Trigger $watchTrigger -Principal $watchPrincipal -Settings $watchSettings -Force | Out-Null
     Write-LaiLog OK "Scheduled task '$WatchTask' checks the stack every 15 minutes (log: $(Join-Path $P.Logs 'watch.log'))"
 
+    # Start-menu folder with one-click shortcuts (all users: the installer runs elevated and may
+    # be a different admin account than the person who signs in).
+    if ($env:ProgramData) {
+        $menu = Join-Path $env:ProgramData 'Microsoft\Windows\Start Menu\Programs\Local AI'
+        try {
+            if (-not (Test-Path -LiteralPath $menu)) { New-Item -ItemType Directory -Force -Path $menu | Out-Null }
+            $shell = $null
+            try { $shell = New-Object -ComObject WScript.Shell } catch { Write-Verbose 'WScript.Shell unavailable' }
+            $made = @()
+            foreach ($sc in (Get-LaiShortcutSpecs -AIRoot $AIRoot -WebUIPort $script:WebUIPortEffective)) {
+                if ($sc.Kind -eq 'url') {
+                    [System.IO.File]::WriteAllText((Join-Path $menu ($sc.Name + '.url')), "[InternetShortcut]`r`nURL=$($sc.Target)`r`n")
+                    $made += $sc.Name
+                } elseif ($shell) {
+                    $lnk = $shell.CreateShortcut((Join-Path $menu ($sc.Name + '.lnk')))
+                    $lnk.TargetPath = Join-Path $env:WINDIR 'System32\WindowsPowerShell\v1.0\powershell.exe'
+                    $lnk.Arguments = $sc.Arguments
+                    $lnk.WorkingDirectory = $P.Scripts
+                    $lnk.Save()
+                    $made += $sc.Name
+                }
+            }
+            Write-LaiLog OK "Start menu folder 'Local AI': $($made -join '; ')"
+        } catch { Write-LaiLog WARN "Could not create the Start-menu shortcuts: $($_.Exception.Message)" }
+    }
+
     & $backupScript -AIRoot $AIRoot
     if ($LASTEXITCODE -ne 0) { throw 'The first backup failed; see the messages above.' }
 }

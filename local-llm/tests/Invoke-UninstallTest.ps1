@@ -106,6 +106,8 @@ ThreadingHTTPServer(('127.0.0.1', $fakePort), H).serve_forever()
 "@ | Set-Content $fakeOllama
 $fake = Start-Process -FilePath python3 -ArgumentList $fakeOllama -PassThru
 Start-Sleep -Seconds 1
+$env:ProgramData = Join-Path $Work 'ProgramData'
+$menuDir = Join-Path $env:ProgramData 'Microsoft\Windows\Start Menu\Programs\Local AI'
 $renamed = $false
 if (Test-Container 'searxng') { Invoke-DockerQuiet -DockerArgs @('rename', 'searxng', 'searxng-uninstall-test-keep') | Out-Null; $renamed = $true }
 
@@ -120,6 +122,8 @@ try {
     Assert-That (@(Get-ChildItem (Join-Path $aiRoot 'Backups')).Count -eq 0) 'WhatIf: no backup taken'
 
     Write-Host "`n=== 2. default removal ===" -ForegroundColor Cyan
+    New-Item -ItemType Directory -Force -Path $menuDir | Out-Null
+    'x' | Set-Content (Join-Path $menuDir 'Local AI (Open WebUI).url')
     $code = Invoke-Uninstall @('-Force')
     Assert-That ($code -eq 0) "default exits 0 (got $code)"
     $bk = @(Get-ChildItem (Join-Path $aiRoot 'Backups') -Filter '*-pre-uninstall.tar.gz')
@@ -133,6 +137,7 @@ try {
     $t = @(); if (Test-Path $tasksLog) { $t = @(Get-Content $tasksLog) }
     Assert-That (($t -contains 'LocalAI-Watch') -and ($t -contains 'LocalAI-Backup-OpenWebUI')) 'scheduled tasks unregistered'
     Assert-That ((Test-Path (Join-Path $aiRoot 'Stack')) -and (Test-Path (Join-Path $aiRoot 'Secrets'))) 'files kept without -RemoveData'
+    Assert-That (-not (Test-Path $menuDir)) 'Start-menu folder removed'
 
     Write-Host "`n=== 3. -RemoveData -RemoveModels ===" -ForegroundColor Cyan
     New-Stack

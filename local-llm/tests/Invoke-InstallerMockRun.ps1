@@ -38,6 +38,7 @@ $env:ProgramFiles = Join-Path $Work 'ProgramFiles'
 $env:WINDIR = Join-Path $Work 'Windows'
 $env:USERPROFILE = Join-Path $Work 'Users/testuser'
 $env:SystemDrive = 'C:'
+$env:ProgramData = Join-Path $Work 'ProgramData'
 $env:LOCALAI_TEST_CATALOG = Join-Path $copy 'tests/models.test.psd1'
 $env:LOCALAI_TEST_ALLOW_CPU = '1'
 # Open WebUI talks to Ollama through the real render guard, as in the stack (started here with the
@@ -171,6 +172,8 @@ Assert-That ($global:Tasks.ContainsKey('LocalAI-Backup-OpenWebUI')) 'daily backu
 $guardAfter = [int](Invoke-RestMethod $guardStatus -TimeoutSec 5).stats.requests
 Assert-That (($guardAfter - $guardBefore) -ge 1) "Open WebUI reaches Ollama through the render guard ($($guardAfter - $guardBefore) requests)"
 Assert-That (Test-Path (Join-Path $aiRoot 'Stack/render-guard/render_guard.py')) 'render guard copied into the stack folder'
+$urlFile = Get-ChildItem -Path (Join-Path $Work 'ProgramData') -Recurse -Filter 'Local AI (Open WebUI).url' -ErrorAction SilentlyContinue | Select-Object -First 1
+Assert-That ($urlFile -and ((Get-Content -Raw $urlFile.FullName) -match 'URL=http://localhost:\d+/')) 'Start-menu Open WebUI shortcut written'
 Assert-That ($global:Tasks.ContainsKey('LocalAI-Watch') -and $global:Tasks['LocalAI-Watch'] -like '*Watch-LocalAI.ps1*') 'health watch task registered'
 Assert-That (($envFile -contains 'WEBUI_ADMIN_PASSWORD=') -and ($envFile -match '^WEBUI_SECRET_KEY=[0-9a-f]{64}$')) '.env: bootstrap password blanked, 64-hex secret key'
 Assert-That (@(Get-ChildItem (Join-Path $aiRoot 'Backups') -Filter 'open-webui-*-pre-compose.tar.gz').Count -eq 1) 'legacy container volume backed up before replacement'
