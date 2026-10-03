@@ -1,4 +1,5 @@
-# Local AI stack: Open WebUI (chat, memory, RAG, tools) + SearXNG (private web search).
+# Local AI stack: Open WebUI (chat, memory, RAG, tools) + SearXNG (private web search)
+# + render-guard (keeps chats off the GPU while ComfyUI renders).
 # Ollama is NOT in here on purpose: it runs natively on Windows so it gets the RTX 3090 directly.
 #
 # Managed by Install-LocalAI.ps1 / Update-OpenWebUI.ps1. Secrets and versions come from the
@@ -30,7 +31,8 @@ services:
       WEBUI_ADMIN_EMAIL: ${WEBUI_ADMIN_EMAIL:-}
       WEBUI_ADMIN_PASSWORD: ${WEBUI_ADMIN_PASSWORD:-}
       WEBUI_ADMIN_NAME: ${WEBUI_ADMIN_NAME:-Admin}
-      OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://host.docker.internal:11434}
+      # First-boot default only; the installer sets the live value through the API.
+      OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://render-guard:11434}
       ENABLE_OPENAI_API: "false"
       # First-boot defaults. Open WebUI copies these into its database on first start and
       # ignores them afterwards; the installer re-applies them through the API on every run.
@@ -52,6 +54,37 @@ services:
       SCARF_NO_ANALYTICS: "true"
     depends_on:
       - searxng
+      - render-guard
+
+  # Pass-through proxy in front of Ollama (stack/render-guard/render_guard.py, standard library
+  # only). While ComfyUI has a job running or queued, chats run on the CPU (num_gpu 0) instead of
+  # pushing the render out of VRAM; when ComfyUI is idle but still caches models in VRAM, it asks
+  # ComfyUI to free them first. Reuses the Python inside the already-pulled SearXNG image (no
+  # extra download). Not published on any host port; only Open WebUI talks to it.
+  render-guard:
+    image: searxng/searxng:${SEARXNG_VERSION:-2026.10.2-19ffbcd30}
+    container_name: render-guard
+    restart: always
+    entrypoint: ["python3", "-u", "/guard/render_guard.py"]
+    user: "65534:65534"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ./render-guard:/guard:ro
+    environment:
+      UPSTREAM: ${OLLAMA_UPSTREAM:-http://host.docker.internal:11434}
+      # Comfy Desktop listens on 8000, the portable build on 8188 (both on 127.0.0.1).
+      COMFYUI_URLS: ${COMFYUI_URLS:-http://host.docker.internal:8188,http://host.docker.internal:8000}
+      RENDER_GUARD_MODE: ${RENDER_GUARD_MODE:-cpu}
+      FREE_COMFYUI_WHEN_IDLE: ${FREE_COMFYUI_WHEN_IDLE:-1}
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request;urllib.request.urlopen('http://127.0.0.1:11434/render-guard/status',timeout=5)"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
 
   searxng:
     image: searxng/searxng:${SEARXNG_VERSION:-2026.10.2-19ffbcd30}

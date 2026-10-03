@@ -54,6 +54,9 @@ param(
     [int]$GpuWaitMinutes = 10,
     # How long an idle model stays in VRAM. Run Release-GPU.ps1 before ComfyUI/Forge sessions.
     [string]$KeepAlive = '15m',
+    # While ComfyUI has a job running or queued, answer chats on the CPU instead of taking VRAM from
+    # the render (stack/render-guard). 'off' = plain pass-through to Ollama.
+    [ValidateSet('cpu', 'off')][string]$RenderGuard = 'cpu',
     [string[]]$KnowledgeCollections = @('PC & Electronics', '3D Printing', 'Property', 'School', 'Home Projects', 'General References'),
     # Nightly backup of the Open WebUI volume (chats, memories, settings, knowledge).
     [string]$BackupTime = '03:30',
@@ -655,6 +658,9 @@ Invoke-Stage 'Stack' {
     $searxDir = Join-Path $P.Stack 'searxng'
     if (-not (Test-Path -LiteralPath $searxDir)) { New-Item -ItemType Directory -Force -Path $searxDir | Out-Null }
     Copy-Item -LiteralPath (Join-Path $SourceRoot 'stack\docker-compose.yml') -Destination $P.Stack -Force
+    $guardDir = Join-Path $P.Stack 'render-guard'
+    if (-not (Test-Path -LiteralPath $guardDir)) { New-Item -ItemType Directory -Force -Path $guardDir | Out-Null }
+    Copy-Item -LiteralPath (Join-Path $SourceRoot 'stack\render-guard\render_guard.py') -Destination $guardDir -Force
     $searxSettings = Join-Path $searxDir 'settings.yml'
     if (-not (Test-Path -LiteralPath $searxSettings)) {
         $tpl = Get-Content -LiteralPath (Join-Path $SourceRoot 'stack\searxng\settings.yml') -Raw
@@ -729,7 +735,8 @@ Invoke-Stage 'Stack' {
         WEBUI_SECRET_KEY   = (Get-Content -LiteralPath $secretFile -Raw).Trim()
         WEBUI_ADMIN_EMAIL  = $cred.email
         WEBUI_ADMIN_PASSWORD = ''
-        OLLAMA_BASE_URL    = 'http://host.docker.internal:11434'
+        OLLAMA_BASE_URL    = 'http://render-guard:11434'
+        RENDER_GUARD_MODE  = $RenderGuard
     }
     if (-not $State.flags['adminVerified']) { $envValues['WEBUI_ADMIN_PASSWORD'] = $cred.password }
     Write-StackEnv -Values $envValues
@@ -763,6 +770,22 @@ Invoke-Stage 'Stack' {
         if ($r.Text -notmatch '"version"') { throw "Open WebUI still cannot reach Ollama at host.docker.internal:11434. Output: $($r.Text)" }
     }
     Write-LaiLog OK 'Open WebUI container reaches Ollama at host.docker.internal:11434'
+
+    # Same check through the render guard; fall back to the direct connection if it is broken.
+    $script:WebUIOllamaUrl = 'http://render-guard:11434'
+    $gProbe = "import urllib.request;print(urllib.request.urlopen('http://render-guard:11434/api/version',timeout=5).read().decode())"
+    $r = $null
+    for ($i = 0; $i -lt 10; $i++) {
+        $r = Invoke-Native -File 'docker' -Arguments @('exec', 'open-webui', 'python', '-c', $gProbe) -Capture -AllowFail
+        if ($r.Text -match '"version"') { break }
+        Start-Sleep -Seconds 3
+    }
+    if ($r.Text -match '"version"') { Write-LaiLog OK "Render guard is up (mode: $RenderGuard)" }
+    else {
+        Write-LaiLog WARN "Render guard is not answering; Open WebUI will talk to Ollama directly. See: docker logs render-guard"
+        $script:WebUIOllamaUrl = 'http://host.docker.internal:11434'
+    }
+    if ($env:LOCALAI_TEST_WEBUI_OLLAMA_URL) { $script:WebUIOllamaUrl = $env:LOCALAI_TEST_WEBUI_OLLAMA_URL }
 }
 $WebUIUrl = "http://127.0.0.1:$($script:WebUIPortEffective)"
 #endregion
@@ -808,6 +831,11 @@ Invoke-Stage 'Configure' {
         Write-LaiLog OK 'Bootstrap admin password removed from the container environment'
     }
 
+    if (-not $script:WebUIOllamaUrl) { $script:WebUIOllamaUrl = 'http://render-guard:11434' }
+    if (Set-LaiWebUIOllamaUrl -BaseUrl $WebUIUrl -Token $token -OllamaUrl $script:WebUIOllamaUrl) {
+        Write-LaiLog OK "Open WebUI now reaches Ollama through $($script:WebUIOllamaUrl)"
+    }
+
     Invoke-LaiWebUISetup -BaseUrl $WebUIUrl -Token $token -Models $Catalog.Models -ModelResults $State.tuning `
         -SystemPrompt $SystemPrompt -DefaultPreset $Catalog.DefaultPreset -Collections $KnowledgeCollections
 }
@@ -820,7 +848,7 @@ Invoke-Stage 'Backup' {
         OpenWebUIVersion = $OpenWebUIVersion; SearxngVersion = $SearxngVersion; OllamaUrl = $OllamaUrl
         ModelDir = $State.flags['modelDir']; SelectedModels = @($State.flags['selectedModels'])
         BackupRetentionDays = $BackupRetentionDays; BackupMirror = $BackupMirror; KeepAlive = $KeepAlive
-        MinFreeVramMiB = $MinFreeVramMiB; MaxBusyVramMiB = $MaxBusyVramMiB
+        MinFreeVramMiB = $MinFreeVramMiB; MaxBusyVramMiB = $MaxBusyVramMiB; RenderGuard = $RenderGuard
     }
     ConvertTo-Json -InputObject $config -Depth 5 | Set-Content -LiteralPath $P.Config -Encoding UTF8
 

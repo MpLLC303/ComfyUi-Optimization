@@ -42,6 +42,7 @@ Options are in the config block at the top of `Install-LocalAI.ps1`. The common 
 | `-NoReboot` | Print "reboot now" instead of rebooting. It still resumes at the next sign-in. |
 | `-MaxBusyVramMiB 3500` / `-GpuWaitMinutes 10` | Before loading or tuning models, wait for other GPU apps (ComfyUI, Forge, games) to free VRAM; stop with their names if they don't. |
 | `-KeepAlive 5m` | How long an idle model stays in VRAM (default 15m). |
+| `-RenderGuard off` | Don't move chats to the CPU while ComfyUI renders (the proxy then just passes requests through). |
 
 ## What the installer does (guide part → stage)
 
@@ -108,8 +109,16 @@ used by the desktop and open apps):
 - **Local Main** for everything, **Local Vision** when you attach images, **Local Code** for code.
 - **Before ComfyUI/Forge:** start ComfyUI with `C:\AI\Scripts\Start-ComfyUI.ps1` (add `-CreateShortcut` once for a desktop icon). It unloads Ollama, shows free VRAM and launches Comfy Desktop or the portable build. For Forge or anything else, run `C:\AI\Scripts\Release-GPU.ps1`. Ollama keeps the last model in
   VRAM for 15 minutes, and a resident 19 GB model plus Wan 2.2 doesn't fit in 24 GB. On Windows, the
-  driver then spills into system RAM instead of failing, so renders slow to a crawl without any error. A chat sent
-  during a render reloads the model, so finish chatting first.
+  driver then spills into system RAM instead of failing, so renders slow to a crawl without any error.
+- **Chatting during a render (render guard):** Open WebUI reaches Ollama through a small proxy
+  container, `render-guard`. While ComfyUI (port 8188 or Comfy Desktop's 8000) has a job running or
+  queued, and for 60 s afterwards, chats and Open WebUI's background calls (titles, web-search queries)
+  run **on the CPU** (`num_gpu 0`), so the render keeps the GPU. If a render starts while a chat model
+  sits idle in VRAM, the model is unloaded. If ComfyUI is idle but still caches models in VRAM, the
+  guard asks ComfyUI to free them before a chat loads. Expect roughly 15-25 tok/s for Local Main
+  on the CPU, and a slow first token with long web or RAG context. That's an estimate, not measured
+  on your PC. Check it with `ollama ps` ("100% CPU") and `docker logs render-guard`. Turn it off
+  with `Install-LocalAI.ps1 -RenderGuard off`.
 - **Memory vs knowledge:** memory holds durable facts and preferences (Settings → Personalization →
   Memory, or just say "remember that…"). Manuals and PDFs go into **Workspace → Knowledge** collections,
   which you attach in a chat with `#`.
@@ -174,6 +183,8 @@ deliberately not inside the backup archives.
 | Odd answers in Open WebUI but fine in `ollama run localai-main` | A preset or chat parameter was changed in the UI | Re-run the installer (it resets the presets) |
 | Ollama tray settings | The new Ollama app's **Expose to network**, **Context length** and **Model location** settings override the environment variables | Leave them at their defaults. The tuned aliases keep their own context either way. |
 | Port 3000 or 8888 already in use | Another local service | The installer picks the next free port and records it in `install-report.md` |
+| Chat is suddenly slow (CPU speed) | ComfyUI has a job queued or finished less than 60 s ago, so the render guard runs chats on the CPU | Expected. `docker logs render-guard` shows why. Wait for the render, or re-run the installer with `-RenderGuard off` |
+| Open WebUI: "render-guard: Ollama ... is not reachable" | Ollama isn't running | Start Ollama from the Start menu. To bypass the guard, set the Ollama URL to `http://host.docker.internal:11434` in Admin Settings, Connections |
 | Installer interrupted | Power loss, closed window | Run it again. It's idempotent, and tuning results are reused. |
 
 ## Security model (unchanged from the guide's Part 19-26 intent)

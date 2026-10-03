@@ -82,7 +82,7 @@ if ($after) {
     if ($before) { $msg += " (was {0} MiB)" -f $before.FreeMiB }
     if ($after.FreeMiB -lt 20000) { Write-LaiLog WARN "$msg - other apps still hold VRAM: $((Get-LaiGpuApps) -join ', ')" } else { Write-LaiLog OK $msg }
 }
-Write-LaiLog INFO 'Note: sending a chat in Open WebUI while ComfyUI renders loads a model again.'
+Write-LaiLog INFO 'Chats in Open WebUI run on the CPU while ComfyUI has a job queued (render guard), so renders keep the GPU.'
 
 # 2. Optional desktop shortcut that runs this launcher.
 if ($CreateShortcut) {

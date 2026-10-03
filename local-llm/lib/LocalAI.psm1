@@ -557,6 +557,34 @@ function Set-LaiWebUIRetrievalConfig {
     return Invoke-LaiApi -Method POST -Uri "$BaseUrl/api/v1/retrieval/config/update" -Body $body -Token $Token -TimeoutSec 120
 }
 
+function Set-LaiWebUIOllamaUrl {
+    # Points Open WebUI's Ollama connection at $OllamaUrl. OLLAMA_BASE_URL is only a first-boot
+    # default, so an existing install has to be changed through the API. Only connections this
+    # installer manages (host.docker.internal:11434, the render guard, or a localhost URL, which
+    # never works from inside a container) are rewritten; any other connection the user added is
+    # left alone. Returns $true when something changed.
+    param([string]$BaseUrl = 'http://127.0.0.1:3000', [Parameter(Mandatory)][string]$Token, [Parameter(Mandatory)][string]$OllamaUrl)
+    $cfg = ConvertTo-LaiHashtable (Invoke-LaiApi -Uri "$BaseUrl/ollama/config" -Token $Token)
+    $managed = @('http://host.docker.internal:11434', 'http://render-guard:11434', 'http://localhost:11434', 'http://127.0.0.1:11434')
+    $urls = @()
+    if ($cfg.ContainsKey('OLLAMA_BASE_URLS') -and $cfg['OLLAMA_BASE_URLS']) { $urls = @($cfg['OLLAMA_BASE_URLS']) }
+    $new = @(); $changed = $false
+    foreach ($u in $urls) {
+        $t = ([string]$u).TrimEnd('/')
+        if ($managed -contains $t -and $t -ne $OllamaUrl) { $new += $OllamaUrl; $changed = $true } else { $new += $t }
+    }
+    if ($new.Count -eq 0) { $new = @($OllamaUrl); $changed = $true }
+    if ($new -notcontains $OllamaUrl) { Write-LaiLog WARN "Open WebUI uses a custom Ollama connection ($($new -join ', ')); not changing it." }
+    $enabled = $true
+    if ($cfg.ContainsKey('ENABLE_OLLAMA_API') -and $cfg['ENABLE_OLLAMA_API'] -eq $false) { $changed = $true }
+    if (-not $changed) { return $false }
+    $apiConfigs = @{}
+    if ($cfg.ContainsKey('OLLAMA_API_CONFIGS') -and $cfg['OLLAMA_API_CONFIGS']) { $apiConfigs = $cfg['OLLAMA_API_CONFIGS'] }
+    $body = @{ ENABLE_OLLAMA_API = $enabled; OLLAMA_BASE_URLS = [object[]]$new; OLLAMA_API_CONFIGS = $apiConfigs }
+    Invoke-LaiApi -Method POST -Uri "$BaseUrl/ollama/config/update" -Body $body -Token $Token | Out-Null
+    return $true
+}
+
 function Get-LaiWebUIKnowledge {
     param([string]$BaseUrl = 'http://127.0.0.1:3000', [Parameter(Mandatory)][string]$Token)
     $all = @()

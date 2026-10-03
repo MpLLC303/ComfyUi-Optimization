@@ -116,7 +116,7 @@ if ($NoContainers) {
         if ($code -ne 0) { return (Fail 'engine not running - start Docker Desktop') }
         Pass "engine $v"
     }
-    foreach ($c in @('open-webui', 'searxng')) {
+    foreach ($c in @('open-webui', 'searxng', 'render-guard')) {
         Add-Check "Container $c" {
             $prev = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
             $s = (& docker inspect -f '{{.State.Status}} {{if .State.Health}}{{.State.Health.Status}}{{end}} {{.HostConfig.RestartPolicy.Name}}' $c 2>$null); $code = $LASTEXITCODE

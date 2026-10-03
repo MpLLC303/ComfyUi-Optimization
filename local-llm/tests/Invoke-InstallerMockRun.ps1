@@ -40,6 +40,15 @@ $env:USERPROFILE = Join-Path $Work 'Users/testuser'
 $env:SystemDrive = 'C:'
 $env:LOCALAI_TEST_CATALOG = Join-Path $copy 'tests/models.test.psd1'
 $env:LOCALAI_TEST_ALLOW_CPU = '1'
+# Open WebUI talks to Ollama through the real render guard, as in the stack (started here with the
+# local python3 because docker compose is mocked). Its request counter proves traffic went through it.
+$env:LOCALAI_TEST_WEBUI_OLLAMA_URL = 'http://127.0.0.1:11435'
+$guardStatus = 'http://127.0.0.1:11435/render-guard/status'
+try { Invoke-RestMethod $guardStatus -TimeoutSec 2 | Out-Null } catch {
+    & /bin/sh -c "UPSTREAM=http://127.0.0.1:11434 COMFYUI_URLS=http://127.0.0.1:18188 LISTEN_PORT=11435 setsid nohup python3 '$src/stack/render-guard/render_guard.py' > /tmp/render-guard-mock.log 2>&1 &"
+    Start-Sleep -Seconds 2
+}
+$guardBefore = [int](Invoke-RestMethod $guardStatus -TimeoutSec 5).stats.requests
 
 # The sandbox Open WebUI already has an admin; give the installer its credentials.
 ConvertTo-Json @{ email = $Email; password = $Password } | Set-Content (Join-Path $aiRoot 'Secrets/openwebui-admin.json')
@@ -159,6 +168,9 @@ Assert-That ($code2 -eq 0) "phase 2 completes (exit $code2)"
 foreach ($s in 'Preflight', 'Ollama', 'Models', 'Tuning', 'WSL', 'Docker', 'Stack', 'Configure', 'Backup') { Assert-That ($null -ne $state.stages.$s) "stage $s recorded" }
 Assert-That (-not $global:Tasks.ContainsKey('LocalAI-Install-Resume')) 'resume task removed at the end'
 Assert-That ($global:Tasks.ContainsKey('LocalAI-Backup-OpenWebUI')) 'daily backup task registered'
+$guardAfter = [int](Invoke-RestMethod $guardStatus -TimeoutSec 5).stats.requests
+Assert-That (($guardAfter - $guardBefore) -ge 1) "Open WebUI reaches Ollama through the render guard ($($guardAfter - $guardBefore) requests)"
+Assert-That (Test-Path (Join-Path $aiRoot 'Stack/render-guard/render_guard.py')) 'render guard copied into the stack folder'
 Assert-That ($global:Tasks.ContainsKey('LocalAI-Watch') -and $global:Tasks['LocalAI-Watch'] -like '*Watch-LocalAI.ps1*') 'health watch task registered'
 Assert-That (($envFile -contains 'WEBUI_ADMIN_PASSWORD=') -and ($envFile -match '^WEBUI_SECRET_KEY=[0-9a-f]{64}$')) '.env: bootstrap password blanked, 64-hex secret key'
 Assert-That (@(Get-ChildItem (Join-Path $aiRoot 'Backups') -Filter 'open-webui-*-pre-compose.tar.gz').Count -eq 1) 'legacy container volume backed up before replacement'

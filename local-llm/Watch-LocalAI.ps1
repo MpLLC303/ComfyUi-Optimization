@@ -99,6 +99,19 @@ foreach ($c in @(@{ Name = 'open-webui'; Url = "http://127.0.0.1:$webPort/health
     $results[$c.Key] = $ok
 }
 
+# The render guard has no host port (only Open WebUI talks to it); if it is down, chats fail.
+$rgState = Get-ContainerState 'render-guard'
+if ($rgState -ne 'no-docker' -and $rgState -ne 'missing') {
+    $rgOk = ($rgState -eq 'running')
+    if (-not $rgOk -and -not $NoHeal -and ($rgState -eq 'exited' -or $rgState -eq 'created')) {
+        Start-Container 'render-guard'
+        Start-Sleep -Seconds 3
+        $rgOk = ((Get-ContainerState 'render-guard') -eq 'running')
+        if ($rgOk) { $healed += 'Render guard' }
+    }
+    $results['Render guard'] = $rgOk
+}
+
 $backupDir = Join-Path $AIRoot 'Backups'
 $all = @(Get-ChildItem -LiteralPath $backupDir -Filter 'open-webui-*.tar.gz' -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending)  # lai-ok: objects
 $results['Backups'] = ($all.Count -gt 0) -and ($all[0].Name -notlike '*-CORRUPT.tar.gz') -and (((Get-Date) - $all[0].LastWriteTime).TotalHours -le 50)
