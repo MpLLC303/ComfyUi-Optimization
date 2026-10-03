@@ -13,7 +13,9 @@
 .EXAMPLE
     .\Update-OpenWebUI.ps1 -Version v0.11.5     # a specific release
 .EXAMPLE
-    .\Update-OpenWebUI.ps1 -Version v0.11.4     # roll back (restore a backup too if the DB was migrated)
+    .\Update-OpenWebUI.ps1 -Version v0.11.4 -SkipBackup   # roll back the image, then restore the
+                                                         # 'before-<version>' backup it printed:
+    .\Restore-OpenWebUI.ps1 -Archive C:\AI\Backups\open-webui-<timestamp>-before-<version>.tar.gz
 #>
 param(
     [string]$AIRoot = 'C:\AI',
@@ -48,21 +50,32 @@ $lines = @(Get-Content -LiteralPath $envPath)
 $current = ($lines | Where-Object { $_ -like 'OPEN_WEBUI_VERSION=*' } | Select-Object -First 1) -replace '^OPEN_WEBUI_VERSION=', ''
 if ($Version -and $Version -eq $current -and -not $SearxngVersion) { Write-LaiLog OK "Already on $current"; exit 0 }
 
-if (-not $SkipBackup) {
-    & (Join-Path $PSScriptRoot 'Backup-OpenWebUI.ps1') -AIRoot $AIRoot -Tag "before-$($Version -replace '[^\w\.-]', '')"
-    if ($LASTEXITCODE -ne 0) { throw 'Backup failed; not updating. Use -SkipBackup to override.' }
-}
+# Hold the volume lock for backup + swap, so the health watch does not restart the old container
+# halfway through and a scheduled backup does not run against a half-replaced stack.
+$lock = Enter-LaiVolumeLock -TimeoutSec 900
+try {
+    if (-not $SkipBackup) {
+        $tag = "before-$($Version -replace '[^\w\.-]', '')"
+        & (Join-Path $PSScriptRoot 'Backup-OpenWebUI.ps1') -AIRoot $AIRoot -Tag $tag
+        if ($LASTEXITCODE -ne 0) { throw 'Backup failed; not updating. Use -SkipBackup to override.' }
+        $pre = Get-ChildItem -LiteralPath (Join-Path $AIRoot 'Backups') -Filter "open-webui-*-$tag.tar.gz" -ErrorAction SilentlyContinue |
+            Sort-Object LastWriteTime -Descending | Select-Object -First 1  # lai-ok: objects
+        if ($pre) {
+            Write-LaiLog INFO ("To roll back later: Update-OpenWebUI.ps1 -Version {0} -SkipBackup, then Restore-OpenWebUI.ps1 -Archive '{1}'" -f $current, $pre.FullName)
+        }
+    }
 
-$new = foreach ($l in $lines) {
-    if ($Version -and $l -like 'OPEN_WEBUI_VERSION=*') { "OPEN_WEBUI_VERSION=$Version" }
-    elseif ($SearxngVersion -and $l -like 'SEARXNG_VERSION=*') { "SEARXNG_VERSION=$SearxngVersion" }
-    else { $l }
-}
-[System.IO.File]::WriteAllLines($envPath, [string[]]$new, (New-Object System.Text.UTF8Encoding($false)))
+    $new = foreach ($l in $lines) {
+        if ($Version -and $l -like 'OPEN_WEBUI_VERSION=*') { "OPEN_WEBUI_VERSION=$Version" }
+        elseif ($SearxngVersion -and $l -like 'SEARXNG_VERSION=*') { "SEARXNG_VERSION=$SearxngVersion" }
+        else { $l }
+    }
+    [System.IO.File]::WriteAllLines($envPath, [string[]]$new, (New-Object System.Text.UTF8Encoding($false)))
 
-$base = @('compose', '--project-directory', $stack, '-f', $compose)
-Invoke-Docker -Arguments ($base + @('pull'))
-Invoke-Docker -Arguments ($base + @('up', '-d', '--remove-orphans'))
+    $base = @('compose', '--project-directory', $stack, '-f', $compose)
+    Invoke-Docker -Arguments ($base + @('pull'))
+    Invoke-Docker -Arguments ($base + @('up', '-d', '--remove-orphans'))
+} finally { Exit-LaiVolumeLock $lock }
 
 $config = Read-LaiState -Path (Join-Path $AIRoot 'localai-config.json')
 $port = 3000; if ($config.ContainsKey('WebUIPort')) { $port = [int]$config['WebUIPort'] }

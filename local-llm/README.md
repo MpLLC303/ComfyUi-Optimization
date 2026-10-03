@@ -5,8 +5,9 @@ knowledge (RAG), private web search, and nightly backups. It's installed by **on
 script** that runs the whole "V1" build and checks every checkpoint along the way.
 
 ```
-Browser ──> Open WebUI (Docker, 127.0.0.1:3000) ──> Ollama (native Windows, 127.0.0.1:11434) ──> RTX 3090
-                 │  memory, knowledge/RAG, presets                ├─ localai-main   Qwen3 30B-A3B 2507 abliterated
+Browser ──> Open WebUI (Docker, 127.0.0.1:3000) ──> render-guard ──> Ollama (native Windows, 127.0.0.1:11434) ──> RTX 3090
+                 │  memory, knowledge/RAG, presets  (CPU while          ├─ localai-main   Qwen3 30B-A3B 2507 abliterated
+                 │                                   ComfyUI renders)   │
                  └─> SearXNG (Docker, 127.0.0.1:8888)             ├─ localai-fast   Qwen3 14B abliterated
                       private metasearch, no API key               ├─ localai-vision Qwen3-VL 30B-A3B abliterated (optional)
                                                                    └─ localai-code   Qwen3-Coder 30B-A3B abliterated (optional)
@@ -54,7 +55,7 @@ Options are in the config block at the top of `Install-LocalAI.ps1`. The common 
 | Tuning | 15, 25-27 | Finds the largest context that keeps each model 100% in VRAM with headroom left over. It then creates a tuned alias (`localai-*`) with that `num_ctx`, sampling parameters and the system prompt built in, and measures tokens/s. |
 | WSL | 6 | Turns on the Windows features, installs or updates WSL (no Linux distribution needed), checks WSL ≥ 2.1.5, and caps the WSL VM at 16 GB RAM if you have no `.wslconfig`. |
 | Docker | 7 | Installs Docker Desktop (WSL2 backend, licence accepted silently), adds you to `docker-users`, sets it to start at sign-in, waits for the engine, then runs `hello-world`. |
-| Stack | 8-9, 18, 26 | Starts Open WebUI and SearXNG with docker compose. Versions are pinned, every port is bound to 127.0.0.1, and the volume is the same `open-webui` volume the guide uses. The admin account is created headlessly. It also checks that the container can reach Ollama. |
+| Stack | 8-9, 18, 26 | Starts Open WebUI, SearXNG and the render guard with docker compose. Versions are pinned, every port is bound to 127.0.0.1, and the volume is the same `open-webui` volume the guide uses. The admin account is created headlessly. It also checks that the container can reach Ollama. |
 | Configure | 10-18 | Turns signup off and memories on. Creates the presets **Local Main / Fast / Vision / Code** (system prompt, native tool calling, memory, web search and knowledge tools), hides the raw models, makes Local Main the default, applies the RAG settings (token splitter, 2000/200, top-k 5), sets SearXNG web search, and creates your six knowledge collections. |
 | Backup | 22 | Takes a nightly consistent backup with a scheduled task, then runs the first backup and verifies the archive. Also registers `LocalAI-Watch`, a 15-minute health check (see Maintain). |
 | Verify | 28 | Runs `Test-LocalAI.ps1`, which executes the "finished V1" checklist for real (details below). |
@@ -136,7 +137,7 @@ C:\AI\Scripts\Test-LocalAI.ps1 -Quick   # config/health only (seconds)
 Every item on the guide's V1 list is a real test. It checks:
 - the GPU and driver
 - that both models are installed and 100% on the GPU at their tuned context
-- Docker and both containers
+- Docker and the containers (Open WebUI, SearXNG, render guard), and that Open WebUI talks to Ollama through the connection the installer set
 - that Open WebUI sees the models
 - the presets: system prompt and native tool calling
 - signup off and memories on
@@ -154,7 +155,7 @@ The exit code is the number of failures.
 
 | Task | Command |
 |---|---|
-| Update Open WebUI | `C:\AI\Scripts\Update-OpenWebUI.ps1 -Latest` (backs up, pulls, recreates the container, runs a quick test) |
+| Update Open WebUI | `C:\AI\Scripts\Update-OpenWebUI.ps1 -Latest` (backs up, pulls, recreates the container, runs a quick test). It prints the exact roll-back command (older version plus the `before-<version>` backup). Re-running the installer later keeps the updated version |
 | Change the admin password | `C:\AI\Scripts\Set-OpenWebUIPassword.ps1` (random) or `-Prompt` (type your own); updates the secrets file and signs out old sessions |
 | Back up now | `C:\AI\Scripts\Backup-OpenWebUI.ps1` (add `-Mirror E:\Backups` or set `-BackupMirror` at install for a second copy) |
 | Update models / Ollama | `C:\AI\Scripts\Update-Models.ps1` re-pulls every model and re-tunes only those whose upstream tag changed; `-UpdateOllama` upgrades Ollama first |
@@ -163,6 +164,7 @@ The exit code is the number of failures.
 | Health watch | Task `LocalAI-Watch` runs `C:\AI\Scripts\Watch-LocalAI.ps1` every 15 minutes while you're signed in: checks Ollama, the Docker engine, Open WebUI, SearXNG, the render guard, backup freshness and free disk space (models, backups, Docker data; warns under 10 GB), restarts a stopped container or Ollama (never Docker Desktop itself, in case you quit it on purpose), and shows a Windows notification only when a problem persists for two checks in a row (and once when it's fixed). History in `C:\AI\Logs\watch.log`; run it by hand with `-NoHeal -Verbose`; silence it with `-PauseMinutes 240` (gaming, stack stopped on purpose) and `-Unpause` |
 | Gaming / long render: free everything | `C:\AI\Scripts\Stop-LocalAI.ps1` unloads the models, stops the containers (data kept) and pauses the health watch for 12 h. Add `-QuitDocker` to also release the WSL VM's RAM (up to 16 GB), or `-QuitOllama`. `Start-LocalAI.ps1` brings it all back and resumes the watch |
 | Uninstall | `C:\AI\Scripts\Uninstall-LocalAI.ps1` (elevated; `-WhatIf` first to preview). It takes a verified final backup, then removes the scheduled tasks, containers, Tailscale mapping, `localai-*` aliases and shortcut. Chats and models are kept unless you add `-RemoveData` / `-RemoveModels`, and `-ResetOllamaSettings` also drops the OLLAMA_* variables. Backups are never deleted. If the final backup fails, nothing is removed |
+| After restoring an older backup | The restore puts this install's Ollama connection back. If the backup had a different admin password, run `Set-OpenWebUIPassword.ps1 -PromptCurrent` (type the old one), then re-run the installer to re-apply presets. `Test-LocalAI.ps1` warns if the connection is wrong |
 | Restore a backup | `C:\AI\Scripts\Restore-OpenWebUI.ps1` (newest daily backup) or `-Archive <file>` (local, NAS or UNC path). It takes a verified safety backup first, swaps the data only after the archive checks out, and rolls back automatically if anything fails |
 
 Every backup is also opened with SQLite in a throwaway volume (integrity check plus user/chat counts in
@@ -187,7 +189,7 @@ deliberately not inside the backup archives.
 | Ollama tray settings | The new Ollama app's **Expose to network**, **Context length** and **Model location** settings override the environment variables | Leave them at their defaults. The tuned aliases keep their own context either way. |
 | Port 3000 or 8888 already in use | Another local service | The installer picks the next free port and records it in `install-report.md` |
 | Chat is suddenly slow (CPU speed) | ComfyUI has a job queued or finished less than 60 s ago, so the render guard runs chats on the CPU | Expected. `docker logs render-guard` shows why. Wait for the render, or re-run the installer with `-RenderGuard off` |
-| Open WebUI: "render-guard: Ollama ... is not reachable" | Ollama isn't running | Start Ollama from the Start menu. To bypass the guard, set the Ollama URL to `http://host.docker.internal:11434` in Admin Settings, Connections |
+| Open WebUI: "render-guard: Ollama ... is not reachable" | Ollama isn't running | Start Ollama from the Start menu. To take the guard out of the path, re-run the installer with `-RenderGuard off` (changing the URL by hand in Admin Settings is undone by the next installer run) |
 | Installer interrupted | Power loss, closed window | Run it again. It's idempotent, and tuning results are reused. |
 
 ## Security model (unchanged from the guide's Part 19-26 intent)

@@ -12,11 +12,18 @@
     .\Set-OpenWebUIPassword.ps1                       # random new password
 .EXAMPLE
     .\Set-OpenWebUIPassword.ps1 -Prompt               # type your own (hidden input)
+.EXAMPLE
+    .\Set-OpenWebUIPassword.ps1 -PromptCurrent        # after restoring an older backup: type the
+                                                      # password that backup had; the stored one is replaced
 #>
 param(
     [string]$AIRoot = 'C:\AI',
     [string]$NewPassword = '',
     [switch]$Prompt,
+    # The password Open WebUI currently accepts, when it differs from the stored one (e.g. after a
+    # restore). -PromptCurrent asks for it without echoing or leaving it in the shell history.
+    [string]$CurrentPassword = '',
+    [switch]$PromptCurrent,
     [switch]$Quiet
 )
 $ErrorActionPreference = 'Stop'
@@ -41,8 +48,14 @@ if ($Prompt) {
 if (-not $NewPassword) { $NewPassword = New-LaiPassword }
 if ($NewPassword.Length -lt 12) { throw 'Use at least 12 characters.' }
 
-$token = Connect-LaiWebUI -BaseUrl $baseUrl -Email $cred.email -Password $cred.password
-$ok = Invoke-LaiApi -Method POST -Uri "$baseUrl/api/v1/auths/update/password" -Token $token -Body @{ password = $cred.password; new_password = $NewPassword }
+$current = [string]$cred.password
+if ($PromptCurrent) {
+    $c = Read-Host "Current Open WebUI password for $($cred.email)" -AsSecureString
+    $CurrentPassword = [Runtime.InteropServices.Marshal]::PtrToStringAuto([Runtime.InteropServices.Marshal]::SecureStringToBSTR($c))
+}
+if ($CurrentPassword) { $current = $CurrentPassword }
+$token = Connect-LaiWebUI -BaseUrl $baseUrl -Email $cred.email -Password $current
+$ok = Invoke-LaiApi -Method POST -Uri "$baseUrl/api/v1/auths/update/password" -Token $token -Body @{ password = $current; new_password = $NewPassword }
 if ($ok -ne $true) { throw 'Open WebUI refused the password change.' }
 Connect-LaiWebUI -BaseUrl $baseUrl -Email $cred.email -Password $NewPassword | Out-Null
 

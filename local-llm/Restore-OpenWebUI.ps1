@@ -101,7 +101,9 @@ try {
         Write-LaiLog WARN 'No safety backup (-SkipSafetyBackup): the current data cannot be recovered if this restore is wrong.'
     } else {
         $before = @(Get-ChildItem -LiteralPath $backupDir -Filter '*-pre-restore.tar.gz' -ErrorAction SilentlyContinue | ForEach-Object { $_.FullName })
-        & (Join-Path $PSScriptRoot 'Backup-OpenWebUI.ps1') -AIRoot $AIRoot -Volume $Volume -Container $Container -Tag 'pre-restore' -NoPrune -NoMirror
+        # No SQLite deep check here: when the live database is the thing that is broken, that check
+        # would quarantine the safety copy and block the very restore meant to fix it.
+        & (Join-Path $PSScriptRoot 'Backup-OpenWebUI.ps1') -AIRoot $AIRoot -Volume $Volume -Container $Container -Tag 'pre-restore' -NoPrune -NoMirror -SkipDeepVerify
         $safety = Get-ChildItem -LiteralPath $backupDir -Filter '*-pre-restore.tar.gz' | Where-Object { $before -notcontains $_.FullName } |
             Sort-Object LastWriteTime -Descending | Select-Object -First 1  # lai-ok: objects
         if ($LASTEXITCODE -ne 0 -or -not $safety -or -not (Test-Archive $safety.FullName)) {
@@ -159,8 +161,27 @@ if ($stoppedContainers.Count -gt 0) {
     $config = Read-LaiState -Path (Join-Path $AIRoot 'localai-config.json')
     $port = 3000
     if ($config.ContainsKey('WebUIPort')) { $port = [int]$config['WebUIPort'] }
-    try { Wait-LaiWebUI -BaseUrl "http://127.0.0.1:$port" -TimeoutSec 300; Write-LaiLog OK "Open WebUI is back on http://localhost:$port" }
+    $up = $false
+    try { Wait-LaiWebUI -BaseUrl "http://127.0.0.1:$port" -TimeoutSec 300; Write-LaiLog OK "Open WebUI is back on http://localhost:$port"; $up = $true }
     catch { Write-LaiLog WARN "Data restored, but Open WebUI did not answer within 5 minutes: check 'docker logs --tail 100 $Container'." }
+
+    # 5. The restored database carries the settings from when the backup was taken, including the
+    # Ollama connection: a backup from before the render guard points straight at Ollama. Put the
+    # connection this install uses back (the installer recorded it).
+    if ($up) {
+        $expected = 'http://render-guard:11434'
+        if ($config.ContainsKey('WebUIOllamaUrl') -and $config['WebUIOllamaUrl']) { $expected = [string]$config['WebUIOllamaUrl'] }
+        $credFile = Join-Path (Join-Path $AIRoot 'Secrets') 'openwebui-admin.json'
+        try {
+            $cred = Get-Content -LiteralPath $credFile -Raw | ConvertFrom-Json
+            $token = Connect-LaiWebUI -BaseUrl "http://127.0.0.1:$port" -Email $cred.email -Password $cred.password
+            if (Set-LaiWebUIOllamaUrl -BaseUrl "http://127.0.0.1:$port" -Token $token -OllamaUrl $expected) {
+                Write-LaiLog OK "Re-applied this install's Ollama connection ($expected) to the restored settings"
+            }
+        } catch {
+            Write-LaiLog WARN (("Could not sign in with {0}: the restored data has the admin password from when the backup was taken. " -f $credFile) +
+                'Run Set-OpenWebUIPassword.ps1 -PromptCurrent (type that old password), then re-run Install-LocalAI.ps1 to re-apply presets and the render guard.')
+        }
+    }
 }
-Write-LaiLog INFO ("The admin login is whatever it was when that backup was taken. If {0} no longer matches, sign in with the old password and run Set-OpenWebUIPassword.ps1." -f (Join-Path (Join-Path $AIRoot 'Secrets') 'openwebui-admin.json'))
 exit 0

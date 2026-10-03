@@ -189,11 +189,28 @@ Assert-That ((Get-Content -Raw (Join-Path $aiRoot 'localai-config.json') | Conve
 
 # ---- phase 3: idempotent re-run ----------------------------------------------------------------
 Write-Host "`n=== PHASE 3: re-run (idempotent) ===" -ForegroundColor Cyan
+# What changed after the first install must survive a re-run: an Update-OpenWebUI version bump, a
+# render-guard mode, a custom .env key, and keys other scripts keep in the config (ComfyUIPath).
+$envFile = Join-Path $aiRoot 'Stack/.env'
+$envLines = @(Get-Content $envFile | ForEach-Object { if ($_ -like 'OPEN_WEBUI_VERSION=*') { 'OPEN_WEBUI_VERSION=v0.99.0' } elseif ($_ -like 'RENDER_GUARD_MODE=*') { 'RENDER_GUARD_MODE=off' } else { $_ } }) + 'COMFYUI_URLS=http://host.docker.internal:8190'
+Set-Content -Path $envFile -Value $envLines
+$cfgFile = Join-Path $aiRoot 'localai-config.json'
+$cfgObj = Get-Content -Raw $cfgFile | ConvertFrom-Json
+$cfgObj | Add-Member -NotePropertyName ComfyUIPath -NotePropertyValue 'D:\ComfyUI\run_nvidia_gpu.bat' -Force
+$cfgObj | ConvertTo-Json -Depth 5 | Set-Content $cfgFile
 $sw = [Diagnostics.Stopwatch]::StartNew()
 & (Join-Path $aiRoot 'Scripts/Install-LocalAI.ps1') -AIRoot $aiRoot -SkipTests
 $code3 = $LASTEXITCODE
 Assert-That ($code3 -eq 0) "re-run completes (exit $code3) in $([int]$sw.Elapsed.TotalSeconds) s"
 Assert-That (@(Get-ChildItem (Join-Path $aiRoot 'Backups') -Filter '*pre-compose*').Count -eq 1) 'no second legacy migration on re-run'
+$envAfter = Get-Content $envFile
+Assert-That ($envAfter -contains 'OPEN_WEBUI_VERSION=v0.99.0') 're-run keeps the Open WebUI version set by Update-OpenWebUI'
+Assert-That ($envAfter -contains 'RENDER_GUARD_MODE=off') 're-run keeps the render-guard mode'
+Assert-That ($envAfter -contains 'COMFYUI_URLS=http://host.docker.internal:8190') 're-run keeps custom .env keys'
+$cfgAfter = Get-Content -Raw $cfgFile | ConvertFrom-Json
+Assert-That ($cfgAfter.ComfyUIPath -eq 'D:\ComfyUI\run_nvidia_gpu.bat') 're-run keeps ComfyUIPath in the config'
+Assert-That ($cfgAfter.OpenWebUIVersion -eq 'v0.99.0' -and $cfgAfter.RenderGuard -eq 'off') 'config reflects the kept version and mode'
+Assert-That ([string]$cfgAfter.WebUIOllamaUrl -ne '') 'config records the Ollama URL Open WebUI was given'
 
 & /usr/bin/docker rm -f open-webui 2>$null | Out-Null
 & /usr/bin/docker ps -aq --filter 'name=^/open-webui-legacy-' | ForEach-Object { & /usr/bin/docker rm -f $_ | Out-Null }

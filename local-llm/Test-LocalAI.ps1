@@ -159,7 +159,9 @@ if ($NoContainers) {
         if ($code -ne 0) { return (Fail 'engine not running - start Docker Desktop') }
         Pass "engine $v"
     }
-    foreach ($c in @('open-webui', 'searxng', 'render-guard')) {
+    $containers = @('open-webui', 'searxng')
+    if (-not ($config.ContainsKey('WebUIOllamaUrl') -and $config['WebUIOllamaUrl'] -and $config['WebUIOllamaUrl'] -notlike '*render-guard*')) { $containers += 'render-guard' }
+    foreach ($c in $containers) {
         Add-Check "Container $c" {
             $prev = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
             $s = (& docker inspect -f '{{.State.Status}} {{if .State.Health}}{{.State.Health.Status}}{{end}} {{.HostConfig.RestartPolicy.Name}}' $c 2>$null); $code = $LASTEXITCODE
@@ -203,6 +205,16 @@ if ($script:token) {
             if ($p.params.function_calling -ne 'native') { return (Warn "function calling = $($p.params.function_calling) (model template has no tool support)") }
             Pass 'system prompt set, native tool calling, memory/web/knowledge tools on'
         }
+    }
+    Add-Check 'Ollama connection' {
+        $expected = 'http://render-guard:11434'
+        if ($config.ContainsKey('WebUIOllamaUrl') -and $config['WebUIOllamaUrl']) { $expected = [string]$config['WebUIOllamaUrl'] }
+        $oc = Invoke-LaiApi -Uri "$webUrl/ollama/config" -Token $token
+        $urls = @($oc.OLLAMA_BASE_URLS | ForEach-Object { ([string]$_).TrimEnd('/') })
+        if ($urls -notcontains $expected) {
+            return (Warn "Open WebUI uses $($urls -join ', ') instead of $expected (e.g. after restoring an older backup) - re-run Install-LocalAI.ps1")
+        }
+        if ($expected -like '*render-guard*') { Pass "$expected (render guard)" } else { Pass "$expected (direct)" }
     }
     Add-Check 'Signup disabled, memories enabled' {
         $a = Invoke-LaiApi -Uri "$webUrl/api/v1/auths/admin/config" -Token $token
@@ -252,12 +264,15 @@ Add-Check 'Backups' {
     $dir = Join-Path $AIRoot 'Backups'
     $all = @(Get-ChildItem -LiteralPath $dir -Filter 'open-webui-*.tar.gz' -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending)  # lai-ok: objects
     $newest = $all | Where-Object { $_.Name -notlike '*-CORRUPT.tar.gz' } | Select-Object -First 1
+    # Age is judged on the nightly archives only, so a tagged one cannot hide a broken nightly task.
+    $daily = $all | Where-Object { $_.Name -match '^open-webui-\d{8}-\d{6}\.tar\.gz$' } | Select-Object -First 1
     if ($all.Count -gt 0 -and $all[0].Name -like '*-CORRUPT.tar.gz') {
         return (Fail "the newest backup $($all[0].Name) failed its database check; the live Open WebUI data may be damaged (restore from $(if ($newest) { $newest.Name } else { 'an older archive' }))")
     }
     if (-not $newest) { return (Fail "no archive in $dir") }
-    $age = (Get-Date) - $newest.LastWriteTime
-    $detail = '{0} ({1:N1} MB, {2:N0} h old)' -f $newest.Name, ($newest.Length / 1MB), $age.TotalHours
+    if (-not $daily) { return (Warn "no nightly archive yet (newest: $($newest.Name)); check the LocalAI-Backup-OpenWebUI task") }
+    $age = (Get-Date) - $daily.LastWriteTime
+    $detail = '{0} ({1:N1} MB, {2:N0} h old)' -f $daily.Name, ($daily.Length / 1MB), $age.TotalHours
     if ($onWindows -and -not (Get-ScheduledTask -TaskName 'LocalAI-Backup-OpenWebUI' -ErrorAction SilentlyContinue)) { return (Fail "$detail; daily task missing") }
     if ($age.TotalHours -gt 50) { return (Warn "$detail - older than two days") }
     Pass $detail

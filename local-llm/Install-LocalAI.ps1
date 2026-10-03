@@ -315,9 +315,17 @@ function Select-FreePort {
 }
 
 function Write-StackEnv {
+    # Writes the managed keys and keeps any other key already in .env (e.g. a custom COMFYUI_URLS).
     param([hashtable]$Values)
     $envPath = Join-Path $P.Stack '.env'
-    $lines = foreach ($k in ($Values.Keys | Sort-Object)) { "$k=$($Values[$k])" }
+    $all = @{}
+    if (Test-Path -LiteralPath $envPath) {
+        foreach ($line in (Get-Content -LiteralPath $envPath)) {
+            if ($line -match '^([A-Za-z_][A-Za-z0-9_]*)=(.*)$') { $all[$Matches[1]] = $Matches[2] }
+        }
+    }
+    foreach ($k in $Values.Keys) { $all[$k] = $Values[$k] }
+    $lines = foreach ($k in ($all.Keys | Sort-Object)) { "$k=$($all[$k])" }
     [System.IO.File]::WriteAllLines($envPath, [string[]]$lines, (New-Object System.Text.UTF8Encoding($false)))
     Protect-Path -Path $envPath
 }
@@ -347,6 +355,29 @@ $script:WebUIPortEffective = $WebUIPort
 if ($State.flags.ContainsKey('webuiPort')) { $script:WebUIPortEffective = [int]$State.flags['webuiPort'] }
 $script:SearxngPortEffective = $SearxngPort
 if ($State.flags.ContainsKey('searxngPort')) { $script:SearxngPortEffective = [int]$State.flags['searxngPort'] }
+
+# A re-run keeps what changed since the first install unless the parameter is passed explicitly:
+# image versions bumped by Update-OpenWebUI.ps1 (the volume is already migrated to them, so going
+# back to the installer's pin would break Open WebUI) and the render-guard mode.
+$PrevStackEnv = @{}
+$prevEnvPath = Join-Path $P.Stack '.env'
+if (Test-Path -LiteralPath $prevEnvPath) {
+    foreach ($line in (Get-Content -LiteralPath $prevEnvPath)) {
+        if ($line -match '^([A-Za-z_][A-Za-z0-9_]*)=(.*)$') { $PrevStackEnv[$Matches[1]] = $Matches[2] }
+    }
+}
+if (-not $PSBoundParameters.ContainsKey('OpenWebUIVersion') -and $PrevStackEnv['OPEN_WEBUI_VERSION'] -and $PrevStackEnv['OPEN_WEBUI_VERSION'] -ne $OpenWebUIVersion) {
+    Write-LaiLog INFO "Keeping the installed Open WebUI $($PrevStackEnv['OPEN_WEBUI_VERSION']) (this installer pins $OpenWebUIVersion; change versions with Update-OpenWebUI.ps1)"
+    $OpenWebUIVersion = $PrevStackEnv['OPEN_WEBUI_VERSION']
+}
+if (-not $PSBoundParameters.ContainsKey('SearxngVersion') -and $PrevStackEnv['SEARXNG_VERSION'] -and $PrevStackEnv['SEARXNG_VERSION'] -ne $SearxngVersion) {
+    Write-LaiLog INFO "Keeping the installed SearXNG $($PrevStackEnv['SEARXNG_VERSION'])"
+    $SearxngVersion = $PrevStackEnv['SEARXNG_VERSION']
+}
+if (-not $PSBoundParameters.ContainsKey('RenderGuard') -and @('cpu', 'off') -contains $PrevStackEnv['RENDER_GUARD_MODE'] -and $PrevStackEnv['RENDER_GUARD_MODE'] -ne $RenderGuard) {
+    Write-LaiLog INFO "Keeping render guard mode '$($PrevStackEnv['RENDER_GUARD_MODE'])' (pass -RenderGuard to change it)"
+    $RenderGuard = $PrevStackEnv['RENDER_GUARD_MODE']
+}
 
 Write-LaiLog STEP "Local AI installer - log: $($P.Logs)"
 if ($Resume) { Write-LaiLog INFO 'Resuming after reboot/sign-in.' }
@@ -843,13 +874,17 @@ Invoke-Stage 'Configure' {
 
 #region 9. Backups (guide Parts 22-23) -------------------------------------------------------
 Invoke-Stage 'Backup' {
-    $config = @{
+    # Merge into the existing file: other scripts keep their own keys there (e.g. ComfyUIPath).
+    $config = Read-LaiState -Path $P.Config
+    $managed = @{
         AIRoot = $AIRoot; WebUIPort = $script:WebUIPortEffective; SearxngPort = $script:SearxngPortEffective
         OpenWebUIVersion = $OpenWebUIVersion; SearxngVersion = $SearxngVersion; OllamaUrl = $OllamaUrl
         ModelDir = $State.flags['modelDir']; SelectedModels = @($State.flags['selectedModels'])
         BackupRetentionDays = $BackupRetentionDays; BackupMirror = $BackupMirror; KeepAlive = $KeepAlive
         MinFreeVramMiB = $MinFreeVramMiB; MaxBusyVramMiB = $MaxBusyVramMiB; RenderGuard = $RenderGuard
+        WebUIOllamaUrl = $script:WebUIOllamaUrl
     }
+    foreach ($k in $managed.Keys) { $config[$k] = $managed[$k] }
     ConvertTo-Json -InputObject $config -Depth 5 | Set-Content -LiteralPath $P.Config -Encoding UTF8
 
     $backupScript = Join-Path $P.Scripts 'Backup-OpenWebUI.ps1'
@@ -933,14 +968,14 @@ $report = @(
     "- Private search: http://localhost:$($script:SearxngPortEffective)"
     "- Ollama API: $OllamaUrl (models in $($State.flags['modelDir']))"
     "- Backups: $($P.Backups), daily at $BackupTime, kept $BackupRetentionDays days"
-    "- Scripts: $($P.Scripts) (Test-LocalAI, Backup-OpenWebUI, Update-OpenWebUI, Release-GPU)"
+    "- Scripts: $($P.Scripts) (Test-LocalAI, Stop-/Start-LocalAI, Start-ComfyUI, Release-GPU, Backup-/Restore-OpenWebUI, Update-OpenWebUI, Update-Models, Set-OpenWebUIPassword, Watch-LocalAI, Enable-TailscaleAccess, Uninstall-LocalAI); Start menu folder 'Local AI'"
     ''
     '| Preset | Model | Context (tokens) | On GPU | Tokens/s |'
     '|---|---|---:|---:|---:|'
 ) + $rows + @(
     ''
     'Context = largest value that kept the model 100% in VRAM with headroom, capped at the trained/configured maximum.'
-    'Before ComfyUI/Forge sessions run Release-GPU.ps1 so Ollama gives back the VRAM.'
+    'Start ComfyUI with Start-ComfyUI.ps1 (or Start menu > Local AI); chats during a render run on the CPU (render guard). For Forge or games run Release-GPU.ps1 or Stop-LocalAI.ps1.'
 )
 Set-Content -LiteralPath $P.Report -Value $report -Encoding UTF8
 Write-Host ''

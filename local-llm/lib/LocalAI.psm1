@@ -173,11 +173,47 @@ function Wait-LaiHttp {
     throw "Timed out after $TimeoutSec s waiting for $Uri ($last)"
 }
 
+function New-LaiVolumeMutex {
+    # The nightly backup runs elevated; a mutex it creates gets an admin-only DACL by default, and a
+    # non-elevated restore or the health watch could then not even open it. On Windows PowerShell
+    # create it so every signed-in user may wait on it. Falls back to the default (other platforms,
+    # or a mutex an older version already created) - then UnauthorizedAccessException means "busy".
+    $name = 'Global\LocalAI-OpenWebUI-Volume'
+    if ($PSVersionTable.PSEdition -eq 'Desktop') {
+        try {
+            $sec = New-Object System.Security.AccessControl.MutexSecurity
+            $sid = New-Object System.Security.Principal.SecurityIdentifier([System.Security.Principal.WellKnownSidType]::AuthenticatedUserSid, $null)
+            $rights = [System.Security.AccessControl.MutexRights]::Synchronize -bor [System.Security.AccessControl.MutexRights]::Modify
+            $sec.AddAccessRule((New-Object System.Security.AccessControl.MutexAccessRule($sid, $rights, [System.Security.AccessControl.AccessControlType]::Allow)))
+            $created = $false
+            return [System.Threading.Mutex]::new($false, $name, [ref]$created, $sec)
+        } catch [System.UnauthorizedAccessException] {
+            throw 'Another backup/restore of the Open WebUI volume is running with administrator rights. Wait for it to finish (or run this elevated).'
+        } catch { Write-Verbose "mutex ACL not applied: $($_.Exception.Message)" }
+    }
+    try { return (New-Object System.Threading.Mutex($false, $name)) }
+    catch [System.UnauthorizedAccessException] {
+        throw 'Another backup/restore of the Open WebUI volume is running with administrator rights. Wait for it to finish (or run this elevated).'
+    }
+}
+
+function Test-LaiVolumeLockBusy {
+    # $true while a backup/restore/update holds the volume lock (never waits).
+    $m = $null
+    try { $m = New-LaiVolumeMutex } catch { return $true }
+    try {
+        $got = $false
+        try { $got = $m.WaitOne(0) } catch [System.Threading.AbandonedMutexException] { $got = $true }
+        if ($got) { $m.ReleaseMutex(); return $false }
+        return $true
+    } finally { $m.Dispose() }
+}
+
 function Enter-LaiVolumeLock {
     # Machine-wide lock so the scheduled backup and a restore never touch the volume at the same time.
     # Re-entrant on the same thread (Restore calls Backup for its safety copy). Returns the mutex.
     param([int]$TimeoutSec = 600)
-    $m = New-Object System.Threading.Mutex($false, 'Global\LocalAI-OpenWebUI-Volume')
+    $m = New-LaiVolumeMutex
     try { $got = $m.WaitOne([TimeSpan]::FromSeconds($TimeoutSec)) }
     catch [System.Threading.AbandonedMutexException] { $got = $true }
     if (-not $got) { $m.Dispose(); throw "Another backup/restore of the Open WebUI volume is still running (waited $TimeoutSec s)." }

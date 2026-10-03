@@ -46,6 +46,7 @@ $logFile = Join-Path $logDir 'watch.log'
 $statePath = Join-Path $AIRoot 'watch-state.json'
 $onWindows = ($env:OS -eq 'Windows_NT')
 $notify = $onWindows -and -not $NoNotify
+$healAllowed = -not $NoHeal
 
 function Test-DockerEngine {
     if (-not (Get-Command docker -ErrorAction SilentlyContinue)) { return $null }
@@ -124,24 +125,26 @@ if ($PauseMinutes -gt 0 -or $Unpause) {
     Write-LaiLog OK $msg
     exit 0
 }
-$pauseState = Read-LaiState -Path $statePath
-if ($pauseState.ContainsKey('pausedUntil') -and $pauseState['pausedUntil']) {
+function Test-WatchPaused {
+    # Re-read every time: Stop-LocalAI.ps1 may pause the watch while this run is still going.
+    $st = Read-LaiState -Path $statePath
+    if (-not ($st.ContainsKey('pausedUntil') -and $st['pausedUntil'])) { return $false }
     # PowerShell 7's ConvertFrom-Json already turns ISO strings into dates; 5.1 leaves strings.
-    $until = $pauseState['pausedUntil']
+    $until = $st['pausedUntil']
     if ($until -isnot [datetime]) { $until = [datetime]::Parse([string]$until, [Globalization.CultureInfo]::InvariantCulture) }
-    if ((Get-Date) -lt $until) {
-        Write-Verbose "paused until $until"
-        exit 0
-    }
+    return ((Get-Date) -lt $until)
 }
+function Test-CanHeal { return ($healAllowed -and -not (Test-WatchPaused)) }
+if (Test-WatchPaused) { Write-Verbose 'paused'; exit 0 }
 
 # ---- checks ---------------------------------------------------------------------------------
 $results = [ordered]@{}
 $details = @{}
 $healed = @()
+$maintenance = $false
 
 $results['Ollama'] = Test-Url "$ollamaUrl/api/version"
-if (-not $results['Ollama'] -and -not $NoHeal -and $onWindows) {
+if (-not $results['Ollama'] -and $onWindows -and (Test-CanHeal)) {
     $app = Join-Path $env:LOCALAPPDATA 'Programs\Ollama\ollama app.exe'
     if (Test-Path -LiteralPath $app) {
         Start-Process -FilePath $app
@@ -158,7 +161,11 @@ if ($engine -eq $false) {
     foreach ($c in @(@{ Name = 'open-webui'; Url = "http://127.0.0.1:$webPort/health"; Key = 'Open WebUI' },
                      @{ Name = 'searxng'; Url = "http://127.0.0.1:$searxPort/healthz"; Key = 'SearXNG' })) {
         $ok = Test-Url $c.Url
-        if (-not $ok -and -not $NoHeal) {
+        if (-not $ok -and $c.Name -eq 'open-webui' -and (Test-LaiVolumeLockBusy)) {
+            # A backup, restore or update stopped it on purpose; starting it now could corrupt the data.
+            $ok = $true
+            $maintenance = $true
+        } elseif (-not $ok -and (Test-CanHeal)) {
             $state = Get-ContainerState $c.Name
             if ($state -eq 'exited' -or $state -eq 'created') {
                 Start-Container $c.Name
@@ -172,7 +179,7 @@ if ($engine -eq $false) {
     $rgState = Get-ContainerState 'render-guard'
     if ($rgState -ne 'no-docker' -and $rgState -ne 'missing') {
         $rgOk = ($rgState -eq 'running')
-        if (-not $rgOk -and -not $NoHeal -and ($rgState -eq 'exited' -or $rgState -eq 'created')) {
+        if (-not $rgOk -and ($rgState -eq 'exited' -or $rgState -eq 'created') -and (Test-CanHeal)) {
             Start-Container 'render-guard'
             Start-Sleep -Seconds 3
             $rgOk = ((Get-ContainerState 'render-guard') -eq 'running')
@@ -184,7 +191,10 @@ if ($engine -eq $false) {
 
 $backupDir = Join-Path $AIRoot 'Backups'
 $all = @(Get-ChildItem -LiteralPath $backupDir -Filter 'open-webui-*.tar.gz' -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending)  # lai-ok: objects
-$results['Backups'] = ($all.Count -gt 0) -and ($all[0].Name -notlike '*-CORRUPT.tar.gz') -and (((Get-Date) - $all[0].LastWriteTime).TotalHours -le 50)
+# Freshness counts only the nightly archives: a tagged one (pre-restore, before-update, ...) must not
+# hide a nightly task that stopped working.
+$daily = @($all | Where-Object { $_.Name -match '^open-webui-\d{8}-\d{6}\.tar\.gz$' })
+$results['Backups'] = ($all.Count -gt 0) -and ($all[0].Name -notlike '*-CORRUPT.tar.gz') -and ($daily.Count -gt 0) -and (((Get-Date) - $daily[0].LastWriteTime).TotalHours -le 50)
 
 $modelDir = ''
 if ($config.ContainsKey('ModelDir') -and $config['ModelDir']) { $modelDir = [string]$config['ModelDir'] }
@@ -210,6 +220,7 @@ $recovered = @($prevNotified | Where-Object { $failed -notcontains $_ })
 
 $failedText = @($failed | ForEach-Object { if ($details.ContainsKey($_)) { '{0} ({1})' -f $_, $details[$_] } else { $_ } }) -join ', '
 $line = '{0} {1}{2}' -f (Get-Date -Format 's'), $(if ($failed.Count) { 'FAIL ' + $failedText } else { 'OK' }), $(if ($healed.Count) { ' (restarted: ' + ($healed -join ', ') + ')' } else { '' })
+if ($maintenance) { $line += ' (Open WebUI stopped for a backup/restore/update; left alone)' }
 Add-Content -LiteralPath $logFile -Value $line
 Write-Verbose $line
 
@@ -224,5 +235,8 @@ if ($toNotify.Count -gt 0) {
     else { Send-Notification 'Local AI: partly recovered' ((($parts -join '; ') + '. Still not working: ' + $failedText + '.')) }
 }
 
-Save-LaiState -State @{ failed = $failed; notified = $notified; checked = (Get-Date).ToString('s') } -Path $statePath
+# Merge into the current file so a pause set while this run was busy survives.
+$final = Read-LaiState -Path $statePath
+$final['failed'] = $failed; $final['notified'] = $notified; $final['checked'] = (Get-Date).ToString('s')
+Save-LaiState -State $final -Path $statePath
 exit $failed.Count
