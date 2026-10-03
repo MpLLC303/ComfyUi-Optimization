@@ -135,6 +135,7 @@ $DockerExe = Join-Path $env:ProgramFiles 'Docker\Docker\Docker Desktop.exe'
 $DockerBin = Join-Path $env:ProgramFiles 'Docker\Docker\resources\bin'
 $ResumeTask = 'LocalAI-Install-Resume'
 $BackupTask = 'LocalAI-Backup-OpenWebUI'
+$WatchTask = 'LocalAI-Watch'
 $CurrentUser = [Security.Principal.WindowsIdentity]::GetCurrent().Name
 $CurrentUserSid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
 
@@ -427,7 +428,7 @@ Invoke-Stage 'Preflight' {
     # Keep a stable copy of the scripts for scheduled tasks and the resume task.
     if ($SourceRoot.TrimEnd('\') -ne $P.Scripts.TrimEnd('\')) {
         if (-not (Test-Path -LiteralPath $P.Scripts)) { New-Item -ItemType Directory -Force -Path $P.Scripts | Out-Null }
-        foreach ($item in @('Install-LocalAI.ps1', 'Install-LocalAI.cmd', 'Test-LocalAI.ps1', 'Backup-OpenWebUI.ps1', 'Update-OpenWebUI.ps1', 'Release-GPU.ps1', 'Set-OpenWebUIPassword.ps1', 'Restore-OpenWebUI.ps1', 'Update-Models.ps1', 'Start-ComfyUI.ps1', 'Enable-TailscaleAccess.ps1', 'README.md', 'lib', 'config', 'stack')) {
+        foreach ($item in @('Install-LocalAI.ps1', 'Install-LocalAI.cmd', 'Test-LocalAI.ps1', 'Backup-OpenWebUI.ps1', 'Update-OpenWebUI.ps1', 'Release-GPU.ps1', 'Set-OpenWebUIPassword.ps1', 'Restore-OpenWebUI.ps1', 'Update-Models.ps1', 'Start-ComfyUI.ps1', 'Enable-TailscaleAccess.ps1', 'Watch-LocalAI.ps1', 'README.md', 'lib', 'config', 'stack')) {
             $src = Join-Path $SourceRoot $item
             if (Test-Path -LiteralPath $src) { Copy-Item -LiteralPath $src -Destination $P.Scripts -Recurse -Force }
         }
@@ -830,6 +831,22 @@ Invoke-Stage 'Backup' {
     $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit (New-TimeSpan -Hours 1)
     Register-ScheduledTask -TaskName $BackupTask -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Force | Out-Null
     Write-LaiLog OK "Scheduled task '$BackupTask' runs daily at $BackupTime (missed runs catch up at next sign-in)"
+
+    # Health watch every 15 minutes while signed in: restarts a stopped container or Ollama and
+    # shows a notification only when something breaks or recovers. Runs non-elevated; conhost
+    # --headless (Windows 10 2004+) keeps a console window from flashing every 15 minutes.
+    $watchArgs = '-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "{0}" -AIRoot "{1}"' -f (Join-Path $P.Scripts 'Watch-LocalAI.ps1'), $AIRoot
+    $conhost = Join-Path $env:WINDIR 'System32\conhost.exe'
+    if ([Environment]::OSVersion.Version.Build -ge 19041 -and (Test-Path -LiteralPath $conhost)) {
+        $watchAction = New-ScheduledTaskAction -Execute $conhost -Argument ('--headless powershell.exe ' + $watchArgs)
+    } else {
+        $watchAction = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument $watchArgs
+    }
+    $watchTrigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(5) -RepetitionInterval (New-TimeSpan -Minutes 15)
+    $watchPrincipal = New-ScheduledTaskPrincipal -UserId $CurrentUser -LogonType Interactive -RunLevel Limited
+    $watchSettings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -MultipleInstances IgnoreNew -ExecutionTimeLimit (New-TimeSpan -Minutes 10)
+    Register-ScheduledTask -TaskName $WatchTask -Action $watchAction -Trigger $watchTrigger -Principal $watchPrincipal -Settings $watchSettings -Force | Out-Null
+    Write-LaiLog OK "Scheduled task '$WatchTask' checks the stack every 15 minutes (log: $(Join-Path $P.Logs 'watch.log'))"
 
     & $backupScript -AIRoot $AIRoot
     if ($LASTEXITCODE -ne 0) { throw 'The first backup failed; see the messages above.' }

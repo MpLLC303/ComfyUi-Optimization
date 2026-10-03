@@ -55,7 +55,7 @@ Options are in the config block at the top of `Install-LocalAI.ps1`. The common 
 | Docker | 7 | Installs Docker Desktop (WSL2 backend, licence accepted silently), adds you to `docker-users`, sets it to start at sign-in, waits for the engine, then runs `hello-world`. |
 | Stack | 8-9, 18, 26 | Starts Open WebUI and SearXNG with docker compose. Versions are pinned, every port is bound to 127.0.0.1, and the volume is the same `open-webui` volume the guide uses. The admin account is created headlessly. It also checks that the container can reach Ollama. |
 | Configure | 10-18 | Turns signup off and memories on. Creates the presets **Local Main / Fast / Vision / Code** (system prompt, native tool calling, memory, web search and knowledge tools), hides the raw models, makes Local Main the default, applies the RAG settings (token splitter, 2000/200, top-k 5), sets SearXNG web search, and creates your six knowledge collections. |
-| Backup | 22 | Takes a nightly consistent backup with a scheduled task, then runs the first backup and verifies the archive. |
+| Backup | 22 | Takes a nightly consistent backup with a scheduled task, then runs the first backup and verifies the archive. Also registers `LocalAI-Watch`, a 15-minute health check (see Maintain). |
 | Verify | 28 | Runs `Test-LocalAI.ps1`, which executes the "finished V1" checklist for real (details below). |
 
 ## Where I deviated from the guide, and why
@@ -150,6 +150,7 @@ The exit code is the number of failures.
 | Update models / Ollama | `C:\AI\Scripts\Update-Models.ps1` re-pulls every model and re-tunes only those whose upstream tag changed; `-UpdateOllama` upgrades Ollama first |
 | Re-tune after a driver/GPU change | `C:\AI\Scripts\Install-LocalAI.ps1 -Retune` |
 | Add or swap a model | Edit `config\models.psd1`, then re-run the installer |
+| Health watch | Task `LocalAI-Watch` runs `C:\AI\Scripts\Watch-LocalAI.ps1` every 15 minutes while you're signed in: checks Ollama, Open WebUI, SearXNG and backup freshness, restarts a stopped container or Ollama, and shows a Windows notification only when a problem persists for two checks in a row (and once when it's fixed). History in `C:\AI\Logs\watch.log`; run it by hand with `-NoHeal -Verbose` |
 | Restore a backup | `C:\AI\Scripts\Restore-OpenWebUI.ps1` (newest daily backup) or `-Archive <file>` (local, NAS or UNC path). It takes a verified safety backup first, swaps the data only after the archive checks out, and rolls back automatically if anything fails |
 
 Every backup is also opened with SQLite in a throwaway volume (integrity check plus user/chat counts in
