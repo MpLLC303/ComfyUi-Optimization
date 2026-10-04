@@ -18,8 +18,6 @@ jobs:
   linux-e2e:
     runs-on: ubuntu-latest
     timeout-minutes: 60
-    env:
-      OWUI_DATA: ${{ runner.temp }}/owui-data
     steps:
       - uses: actions/checkout@v5
 
@@ -52,6 +50,7 @@ jobs:
         run: |
           python -m venv "$RUNNER_TEMP/owui-venv"
           "$RUNNER_TEMP/owui-venv/bin/pip" install -q open-webui==0.11.4
+          OWUI_DATA="$RUNNER_TEMP/owui-data"
           mkdir -p "$OWUI_DATA"
           # Same settings as stack/docker-compose.yml; ollama embeddings keep the run small.
           DATA_DIR="$OWUI_DATA" WEBUI_SECRET_KEY=ci-only WEBUI_URL=http://localhost:3000 \
