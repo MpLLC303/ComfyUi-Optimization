@@ -184,6 +184,27 @@ try {
     Assert-That ($r.Code -eq 0 -and -not (Test-Path -LiteralPath $holdFile)) "recovery restore clears the hold (exit $($r.Code))"
     Assert-That ((Invoke-DockerText @('inspect', '-f', '{{.State.Status}} {{.HostConfig.RestartPolicy.Name}}', 'open-webui')) -eq 'running always') 'container running again with its original restart policy'
 
+    Write-Host "`n=== 5b. a restore killed mid-swap (window closed, power cut) ===" -ForegroundColor Cyan
+    $env:LOCALAI_TEST_KILL_IN_SWAP = '1'
+    $r = & $runScript 'Restore-OpenWebUI.ps1' @('-Archive', $good.FullName, '-Force', '-SkipSafetyBackup')
+    $env:LOCALAI_TEST_KILL_IN_SWAP = ''
+    $hk = Read-LaiState -Path $holdFile
+    Assert-That ($r.Code -eq 9 -and [string]$hk['Reason'] -match 'interrupted') "killed with no catch/finally: the hold was already there (exit $($r.Code))"
+    Assert-That ((Invoke-DockerText @('inspect', '-f', '{{.State.Status}} {{.HostConfig.RestartPolicy.Name}}', 'open-webui')) -eq 'exited no') 'Open WebUI stays down with auto-restart off'
+    $cfgTmp = Read-LaiState -Path $cfgPath; $cfgTmp['WebUIPort'] = 3999; Save-LaiState -State $cfgTmp -Path $cfgPath
+    & $runScript 'Watch-LocalAI.ps1' @() | Out-Null
+    Set-Content -LiteralPath $cfgPath -Value $cfgText -NoNewline
+    Assert-That ((Invoke-DockerText @('inspect', '-f', '{{.State.Status}}', 'open-webui')) -eq 'exited') 'the health watch does not start it on a half-swapped volume'
+    $r = & $runScript 'Restore-OpenWebUI.ps1' @('-Archive', $good.FullName, '-Force', '-SkipSafetyBackup')
+    Assert-That ($r.Code -eq 0 -and -not (Test-Path -LiteralPath $holdFile) -and (Invoke-DockerText @('inspect', '-f', '{{.State.Status}} {{.HostConfig.RestartPolicy.Name}}', 'open-webui')) -eq 'running always') 'running the restore again finishes it: hold cleared, auto-restart back'
+
+    Write-Host "`n=== 5c. a failed swap rolled back from the safety backup leaves no hold ===" -ForegroundColor Cyan
+    $env:LOCALAI_TEST_FAIL_SWAP_ONCE = '1'
+    $r = & $runScript 'Restore-OpenWebUI.ps1' @('-Archive', $good.FullName, '-Force')
+    $env:LOCALAI_TEST_FAIL_SWAP_ONCE = ''
+    Assert-That ($r.Code -ne 0 -and $r.Text -match 'Rollback complete' -and -not (Test-Path -LiteralPath $holdFile)) "failed swap, good rollback: no hold left behind (exit $($r.Code))"
+    Assert-That ((Invoke-DockerText @('inspect', '-f', '{{.State.Status}} {{.HostConfig.RestartPolicy.Name}}', 'open-webui')) -eq 'running always') 'and Open WebUI runs again as before'
+
     Write-Host "`n=== 6. admin password rotation (real Open WebUI) ===" -ForegroundColor Cyan
     $credPath = Join-Path (Join-Path $aiRoot 'Secrets') 'openwebui-admin.json'
     $r = & $runScript 'Set-OpenWebUIPassword.ps1' @('-NewPassword', 'Rotated-Password-456', '-Quiet')
@@ -204,6 +225,25 @@ try {
     ConvertTo-Json @{ email = 'admin@localhost'; password = 'Never-Applied-000' } | Set-Content -LiteralPath $pendingPath -Encoding UTF8
     $r = & $runScript 'Set-OpenWebUIPassword.ps1' @('-NewPassword', 'Test-Password-123', '-Quiet')
     Assert-That ($r.Code -eq 0 -and -not (Test-Path -LiteralPath $pendingPath) -and (Get-Content -Encoding UTF8 -LiteralPath $credPath -Raw | ConvertFrom-Json).password -eq 'Test-Password-123') 'a pending password that never applied is dropped'
+
+    Write-Host "`n=== 7. backup deep check: a real SQLite database, then a corrupted one ===" -ForegroundColor Cyan
+    # Any local image with python3 + sqlite3 can do the check; SearXNG's is in the sandbox and in CI.
+    $composeText = Get-Content -Encoding UTF8 -Raw (Join-Path (Join-Path $src 'stack') 'docker-compose.yml')
+    $verifyImage = 'searxng/searxng:' + [regex]::Match($composeText, 'searxng/searxng:\$\{SEARXNG_VERSION:-([^}]+)\}').Groups[1].Value
+    $dbDir = Join-Path $Work 'deepdb'
+    New-Item -ItemType Directory -Force -Path $dbDir | Out-Null
+    & python3 -c "import sqlite3;c=sqlite3.connect('$dbDir/webui.db');c.execute('create table user(id text)');c.execute('create table chat(id text, body text)');c.executemany('insert into user values(?)',[(str(i),) for i in range(3)]);c.executemany('insert into chat values(?,?)',[(str(i),'x'*3000) for i in range(40)]);c.commit();c.close()"
+    Invoke-DockerText @('volume', 'create', 'lai-deep-test') | Out-Null
+    Invoke-DockerText @('run', '--rm', '-v', 'lai-deep-test:/d', '-v', "${dbDir}:/src:ro", 'alpine:3.20', 'cp', '/src/webui.db', '/d/webui.db') | Out-Null
+    $b = & $runScript 'Backup-OpenWebUI.ps1' @('-Volume', 'lai-deep-test', '-Container', 'lai-no-such-container', '-Tag', 'deeptest', '-NoPrune', '-VerifyImage', $verifyImage)
+    Assert-That ($b.Code -eq 0 -and (Get-Content -Encoding UTF8 -Raw (Join-Path (Join-Path $aiRoot 'Logs') 'backup.log')) -match 'database OK \(3 users, 40 chats\)') "deep check opens the archived database: 3 users, 40 chats (exit $($b.Code))"
+    # Overwrite part of a data page in the middle: the file still opens, the integrity check fails.
+    Invoke-DockerText @('run', '--rm', '-v', 'lai-deep-test:/d', 'alpine:3.20', 'sh', '-c', 'dd if=/dev/urandom of=/d/webui.db bs=1 seek=40000 count=3000 conv=notrunc 2>/dev/null') | Out-Null
+    $b = & $runScript 'Backup-OpenWebUI.ps1' @('-Volume', 'lai-deep-test', '-Container', 'lai-no-such-container', '-Tag', 'deeptest', '-NoPrune', '-VerifyImage', $verifyImage)
+    $bad = @(Get-ChildItem -LiteralPath (Join-Path $aiRoot 'Backups') -Filter '*-deeptest-CORRUPT.tar.gz')
+    Assert-That ($b.Code -ne 0 -and $bad.Count -eq 1 -and $b.Text -match 'failed the SQLite check') "a damaged database is caught and kept as -CORRUPT (exit $($b.Code))"
+    Assert-That (@(Get-ChildItem -LiteralPath (Join-Path $aiRoot 'Backups') -Filter '*-deeptest.tar.gz').Count -eq 1) 'only the good archive keeps a normal name'
+    Invoke-DockerText @('volume', 'rm', 'lai-deep-test') | Out-Null
 } finally {
     # Never leave the shared sandbox Open WebUI with a changed admin password.
     try {

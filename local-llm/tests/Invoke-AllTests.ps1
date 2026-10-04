@@ -13,7 +13,7 @@
     pwsh tests/Invoke-AllTests.ps1 -Only Static, Mock
 #>
 param(
-    # Static, Unit, RenderGuard, Mock, ModelUpdate, UpdateWebUI, Uninstall, Integration, Acceptance
+    # Static, Unit, RenderGuard, Mock, ModelUpdate, UpdateWebUI, Uninstall, Watch, Integration, Acceptance
     [string[]]$Only = @(),
     [string]$LogDir = (Join-Path ([System.IO.Path]::GetTempPath()) 'lai-alltests'),
     [string]$SplitterForSandbox = 'character'
@@ -29,6 +29,7 @@ $suites = @(
     @{ Name = 'ModelUpdate'; File = (Join-Path $t 'Invoke-ModelUpdateTest.ps1'); Args = @() }
     @{ Name = 'UpdateWebUI'; File = (Join-Path $t 'Invoke-UpdateWebUITest.ps1'); Args = @() }
     @{ Name = 'Uninstall'; File = (Join-Path $t 'Invoke-UninstallTest.ps1'); Args = @() }
+    @{ Name = 'Watch'; File = (Join-Path $t 'Invoke-WatchTest.ps1'); Args = @() }
     @{ Name = 'Integration'; File = (Join-Path $t 'Invoke-IntegrationTest.ps1'); Args = @('-SandboxTextSplitter', $SplitterForSandbox) }
     @{ Name = 'Acceptance'; File = (Join-Path $src 'Test-LocalAI.ps1'); Args = @('-AIRoot', (Join-Path $LogDir 'acceptance-root'), '-CatalogPath', (Join-Path $t 'models.test.psd1'), '-NoContainers') }
 )

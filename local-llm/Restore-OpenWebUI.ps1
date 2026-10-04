@@ -56,6 +56,8 @@ $swapScript = 'set -e; rm -rf /data/.restore-staging; mkdir /data/.restore-stagi
 function Invoke-Swap {
     param([string]$ArchivePath)
     if ($env:LOCALAI_TEST_FAIL_SWAP) { throw 'Test hook: swap failed' }
+    if ($env:LOCALAI_TEST_KILL_IN_SWAP) { [Environment]::Exit(9) }   # test hook: killed mid-swap (no catch/finally)
+    if ($env:LOCALAI_TEST_FAIL_SWAP_ONCE) { $env:LOCALAI_TEST_FAIL_SWAP_ONCE = ''; throw 'Test hook: first swap failed' }
     Invoke-Docker -Arguments @('run', '--rm', '-v', "${Volume}:/data", '-v', "${ArchivePath}:/restore.tar.gz:ro", $img, 'sh', '-c', $swapScript) | Out-Null
 }
 
@@ -159,6 +161,15 @@ try {
     if (@((Invoke-Docker -Arguments @('ps', '-q', '--filter', "volume=$Volume")).Text -split "`n" | Where-Object { $_ }).Count -gt 0) {
         throw "Something restarted a container on volume '$Volume'; aborting before any change."
     }
+    # Recorded BEFORE the swap: if this window is closed or the PC loses power mid-swap, no catch or
+    # finally runs, and the volume may be half replaced. The hold then keeps the watch, Start again
+    # and the installer from starting Open WebUI on it, and says how to finish. Cleared on success.
+    $priorHold = Test-Path -LiteralPath $holdPath
+    if (-not $priorHold) {
+        $script:recoverCmd = "& '$(Join-Path $PSScriptRoot 'Restore-OpenWebUI.ps1')' -Archive '$((Get-Item -LiteralPath $Archive).FullName)' -SkipSafetyBackup"
+        if ($safety) { $script:holdArchive = $safety.FullName }
+        Set-Hold 'a restore was interrupted (or is still running)' $stoppedContainers
+    }
     $volumeTouched = $true
     Invoke-Swap $staged
     Write-LaiLog OK "Volume '$Volume' now holds $($source.Name)"
@@ -180,7 +191,12 @@ try {
     if ($volumeTouched) {
         if ($safety) {
             Write-LaiLog WARN "Rolling back to the safety backup $($safety.Name)"
-            try { Invoke-Swap $safety.FullName; Write-LaiLog OK 'Rollback complete: the volume is as it was before the restore.' }
+            try {
+                Invoke-Swap $safety.FullName
+                Write-LaiLog OK 'Rollback complete: the volume is as it was before the restore.'
+                # The data is good again: drop the in-progress hold this run wrote (not an older one).
+                if (-not $priorHold -and (Test-Path -LiteralPath $holdPath)) { Remove-Item -LiteralPath $holdPath -Force }
+            }
             catch {
                 Write-LaiLog FAIL "Rollback failed too: $($_.Exception.Message)"
                 $script:recoverCmd = "& '$(Join-Path $PSScriptRoot 'Restore-OpenWebUI.ps1')' -Archive '$($safety.FullName)' -SkipSafetyBackup"

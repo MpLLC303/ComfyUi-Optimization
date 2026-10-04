@@ -127,6 +127,12 @@ jobs:
           & ./local-llm/tests/Invoke-UninstallTest.ps1 -Work "$env:RUNNER_TEMP/uninstall-test"
           exit $LASTEXITCODE
 
+      - name: Health watch test (heal, pause, volume lock)
+        shell: pwsh
+        run: |
+          & ./local-llm/tests/Invoke-WatchTest.ps1 -Work "$env:RUNNER_TEMP/watch-test"
+          exit $LASTEXITCODE
+
       - name: Cross-platform unit tests
         shell: pwsh
         run: |
