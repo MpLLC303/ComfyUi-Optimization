@@ -81,7 +81,12 @@ function Set-Hold([string]$Why, [object[]]$Held) {
     $ids = @($list | ForEach-Object { $_['Id'] })
     $old = Get-LaiWebUIHold -AIRoot $AIRoot
     if ($old -and $old['Containers']) { foreach ($c in @($old['Containers'])) { if ($ids -notcontains $c['Id']) { $list += $c } } }
-    Save-LaiState -State @{ Reason = $Why; Recover = $script:recoverCmd; Archive = [string]$script:holdArchive; Containers = $list; Since = (Get-Date).ToString('s') } -Path $holdPath
+    $recover = $script:recoverCmd; $archive = [string]$script:holdArchive
+    # A failed recovery run (no safety backup of its own) must not replace the earlier hold's pointer
+    # to the safety archive: that one holds the newest data.
+    if (-not $archive -and $old -and $old['Archive']) { $archive = [string]$old['Archive']; $recover = [string]$old['Recover'] }
+    Save-LaiState -State @{ Reason = $Why; Recover = $recover; Archive = $archive; Containers = $list; Since = (Get-Date).ToString('s') } -Path $holdPath
+    if ($recover -ne $script:recoverCmd) { Write-LaiLog FAIL "The earlier recovery command still applies: $recover" }
 }
 
 # Pick and confirm the archive before taking the lock, so an unanswered prompt never blocks the

@@ -184,7 +184,17 @@ function Invoke-LaiApi {
         $params['Body'] = [System.Text.Encoding]::UTF8.GetBytes($json)
         $params['ContentType'] = 'application/json; charset=utf-8'
     }
-    return Invoke-RestMethod @params
+    # Decode the reply as UTF-8 ourselves: Open WebUI (FastAPI) sends 'application/json' without a
+    # charset, and Invoke-RestMethod on Windows PowerShell 5.1 then reads it as ISO-8859-1, so every
+    # read-modify-write of its settings would double-encode non-ASCII names and prompts.
+    # (No progress bar: on 5.1 it slows big transfers several-fold.)
+    $ProgressPreference = 'SilentlyContinue'
+    $resp = Invoke-WebRequest @params
+    $bytes = $resp.RawContentStream.ToArray()
+    if ($bytes.Length -eq 0) { return $null }
+    $text = [System.Text.Encoding]::UTF8.GetString($bytes)
+    if ($text.Length -gt 0 -and $text[0] -eq [char]0xFEFF) { $text = $text.Substring(1) }
+    try { return (ConvertFrom-Json -InputObject $text -ErrorAction Stop) } catch { return $text }
 }
 
 function Get-LaiHttpStatus {
@@ -610,15 +620,23 @@ function Resolve-LaiPendingPassword {
     $pending = Join-Path $secrets 'openwebui-admin.pending.json'
     $credFile = Join-Path $secrets 'openwebui-admin.json'
     if (-not (Test-Path -LiteralPath $pending)) { return 'none' }
-    $p = Get-Content -Encoding UTF8 -LiteralPath $pending -Raw | ConvertFrom-Json
+    $p = $null
+    try { $p = Get-Content -Encoding UTF8 -LiteralPath $pending -Raw | ConvertFrom-Json } catch { $p = $null }
+    if (-not $p -or -not $p.password) {
+        # Cut off while being written: the change request is only sent after the file is complete,
+        # so it never happened.
+        Remove-Item -LiteralPath $pending -Force
+        return 'dropped'
+    }
     try { Connect-LaiWebUI -BaseUrl $BaseUrl -Email $p.email -Password $p.password | Out-Null }
     catch {
-        if (Get-LaiHttpStatus $_) {
-            # Open WebUI answered and refused it: the change never happened.
+        # Only a clear 'wrong password' (400/401/403) proves the change never happened. A 5xx, a rate
+        # limit or no answer at all decides nothing: the pending file may be the only copy.
+        if (@(400, 401, 403) -contains [int](Get-LaiHttpStatus $_)) {
             Remove-Item -LiteralPath $pending -Force
             return 'dropped'
         }
-        return 'none'   # Open WebUI not reachable: decide another time
+        return 'none'
     }
     # Replace the content only, so the credentials file keeps its restricted permissions.
     Get-Content -Encoding UTF8 -LiteralPath $pending -Raw | Set-Content -LiteralPath $credFile -Encoding UTF8 -NoNewline -ErrorAction Stop
@@ -633,7 +651,19 @@ function Connect-LaiWebUI {
         [Parameter(Mandatory)][string]$Email,
         [Parameter(Mandatory)][string]$Password
     )
-    $r = Invoke-LaiApi -Method POST -Uri "$BaseUrl/api/v1/auths/signin" -Body @{ email = $Email; password = $Password } -TimeoutSec 60
+    # Open WebUI allows 15 sign-ins per e-mail per rolling 3 minutes (failed ones count too) and then
+    # answers 429. Running the installer, the health check and an update back to back can hit that,
+    # so wait it out (the window frees a minute's worth every 60 s) instead of failing.
+    $r = $null
+    for ($try = 1; $try -le 8; $try++) {
+        try { $r = Invoke-LaiApi -Method POST -Uri "$BaseUrl/api/v1/auths/signin" -Body @{ email = $Email; password = $Password } -TimeoutSec 60; break }
+        catch {
+            if ([int](Get-LaiHttpStatus $_) -ne 429 -or $try -eq 8) { throw }
+            if ($try -eq 1) { Write-LaiLog WARN 'Open WebUI is rate-limiting sign-ins (15 per 3 minutes); waiting for the limit to clear.' }
+            $wait = 30; if ($env:LOCALAI_TEST_SIGNIN_WAIT) { $wait = [int]$env:LOCALAI_TEST_SIGNIN_WAIT }
+            Start-Sleep -Seconds $wait
+        }
+    }
     if ($r.role -ne 'admin') { throw "Signed in as '$Email' but role is '$($r.role)', not admin." }
     return [string]$r.token
 }

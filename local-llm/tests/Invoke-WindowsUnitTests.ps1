@@ -61,33 +61,103 @@ Assert-That ((Read-LaiState -Path $statePath)['modelDir'] -eq $accented) 'non-AS
 Assert-That (((Get-Content -LiteralPath $statePath -Raw) | ConvertFrom-Json).modelDir -eq $accented) 'and a plain Get-Content (no -Encoding) reads it right too'  # lai-ok: encoding
 
 # ---- UTF-8 request bodies ----------------------------------------------------------------------
-Write-Host "`n=== Invoke-LaiApi UTF-8 body ===" -ForegroundColor Cyan
-if ($onWindows) {
-    $port = Get-Random -Minimum 20000 -Maximum 40000
-    $listener = New-Object System.Net.HttpListener
-    $listener.Prefixes.Add("http://127.0.0.1:$port/")
-    $listener.Start()
-    $async = $listener.BeginGetContext($null, $null)
-    # The client runs in its own Windows PowerShell process, exactly as the scripts do.
-    $client = Join-Path $Work 'client.ps1'
-    Set-Content -LiteralPath $client -Value (("Import-Module '{0}' -Force`n" -f (Join-Path (Join-Path $src 'lib') 'LocalAI.psm1')) +
-        ('Invoke-LaiApi -Method POST -Uri "http://127.0.0.1:{0}/echo" -Body @{{ text = "caf$([char]0xE9) $([char]0x2713)" }} -TimeoutSec 20' -f $port))
-    $proc = Start-Process -FilePath $childExe -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $client) -PassThru -WindowStyle Hidden
-    if ($async.AsyncWaitHandle.WaitOne(30000)) {
-        $ctx = $listener.EndGetContext($async)
-        $ms = New-Object System.IO.MemoryStream
-        $ctx.Request.InputStream.CopyTo($ms)
-        $bytes = $ms.ToArray()
-        $text = [System.Text.Encoding]::UTF8.GetString($bytes)
-        $ok = [System.Text.Encoding]::UTF8.GetBytes('{"ok":true}')
-        $ctx.Response.ContentType = 'application/json'
-        $ctx.Response.OutputStream.Write($ok, 0, $ok.Length)
-        $ctx.Response.Close()
-        Assert-That ($text -like "*caf$([char]0xE9)*$([char]0x2713)*") "request body is UTF-8 ($($bytes.Length) bytes)"
-    } else { Assert-That $false 'request arrived at the test listener' }
-    if (-not $proc.WaitForExit(30000)) { $proc.Kill() }
-    $listener.Stop()
-} else { Skip 'HttpListener test runs on Windows only' }
+Write-Host "`n=== Invoke-LaiApi UTF-8 both ways ===" -ForegroundColor Cyan
+# Both directions: the request body must be UTF-8, and a reply sent as plain 'application/json'
+# (no charset, as Open WebUI does) must be decoded as UTF-8, not ISO-8859-1 (5.1's default).
+$port = Get-Random -Minimum 20000 -Maximum 40000
+$listener = New-Object System.Net.HttpListener
+$listener.Prefixes.Add("http://127.0.0.1:$port/")
+$listener.Start()
+$async = $listener.BeginGetContext($null, $null)
+# The client runs in its own process, exactly as the scripts do.
+$client = Join-Path $Work 'client.ps1'
+$echoOut = Join-Path $Work 'echo.txt'
+Set-Content -LiteralPath $client -Value (("Import-Module '{0}' -Force`n" -f (Join-Path (Join-Path $src 'lib') 'LocalAI.psm1')) +
+    ('$r = Invoke-LaiApi -Method POST -Uri "http://127.0.0.1:{0}/echo" -Body @{{ text = "caf$([char]0xE9) $([char]0x2713)" }} -TimeoutSec 20' -f $port) + "`n" +
+    ("[System.IO.File]::WriteAllText('{0}', [string]`$r.echo, [System.Text.Encoding]::UTF8)" -f $echoOut))
+$spArgs = @{ FilePath = $childExe; ArgumentList = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $client); PassThru = $true }
+if ($onWindows) { $spArgs['WindowStyle'] = 'Hidden' }
+$proc = Start-Process @spArgs
+if ($async.AsyncWaitHandle.WaitOne(30000)) {
+    $ctx = $listener.EndGetContext($async)
+    $ms = New-Object System.IO.MemoryStream
+    $ctx.Request.InputStream.CopyTo($ms)
+    $bytes = $ms.ToArray()
+    $text = [System.Text.Encoding]::UTF8.GetString($bytes)
+    $sent = (ConvertFrom-Json -InputObject $text).text
+    $reply = [System.Text.Encoding]::UTF8.GetBytes((ConvertTo-Json -InputObject @{ echo = $sent } -Compress))
+    $ctx.Response.ContentType = 'application/json'
+    $ctx.Response.OutputStream.Write($reply, 0, $reply.Length)
+    $ctx.Response.Close()
+    Assert-That ($text -like "*caf$([char]0xE9)*$([char]0x2713)*") "request body is UTF-8 ($($bytes.Length) bytes)"
+} else { Assert-That $false 'request arrived at the test listener' }
+if (-not $proc.WaitForExit(30000)) { $proc.Kill() }
+$listener.Stop()
+$got = ''
+if (Test-Path -LiteralPath $echoOut) { $got = [System.IO.File]::ReadAllText($echoOut, [System.Text.Encoding]::UTF8) }
+Assert-That ($got -eq "caf$([char]0xE9) $([char]0x2713)") "reply without a charset is decoded as UTF-8 (got '$got')"
+
+Write-Host "`n=== pending admin password: only a clear refusal drops it ===" -ForegroundColor Cyan
+$pRoot = Join-Path $Work 'pending'
+New-Item -ItemType Directory -Force -Path (Join-Path $pRoot 'Secrets') | Out-Null
+$pendingFile = Join-Path (Join-Path $pRoot 'Secrets') 'openwebui-admin.pending.json'
+Set-Content -LiteralPath $pendingFile -Value '{"email": "admin@localhost", "password": "Pending-Password-1"}' -Encoding UTF8
+$port2 = Get-Random -Minimum 20000 -Maximum 40000
+$listener2 = New-Object System.Net.HttpListener
+$listener2.Prefixes.Add("http://127.0.0.1:$port2/")
+$listener2.Start()
+$pOut = Join-Path $Work 'pending-out.txt'
+$client2 = Join-Path $Work 'client2.ps1'
+Set-Content -LiteralPath $client2 -Value (("Import-Module '{0}' -Force`n" -f (Join-Path (Join-Path $src 'lib') 'LocalAI.psm1')) +
+    ("`$a = Resolve-LaiPendingPassword -AIRoot '{0}' -BaseUrl 'http://127.0.0.1:{1}'`n" -f $pRoot, $port2) +
+    ("`$kept = Test-Path -LiteralPath '{0}'`n" -f $pendingFile) +
+    ("`$b = Resolve-LaiPendingPassword -AIRoot '{0}' -BaseUrl 'http://127.0.0.1:{1}'`n" -f $pRoot, $port2) +
+    ("Set-Content -LiteralPath '{0}' -Value (`"`$a,`$kept,`$b,`" + (Test-Path -LiteralPath '{1}'))" -f $pOut, $pendingFile))
+$spArgs2 = @{ FilePath = $childExe; ArgumentList = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $client2); PassThru = $true }
+if ($onWindows) { $spArgs2['WindowStyle'] = 'Hidden' }
+$proc2 = Start-Process @spArgs2
+foreach ($status in 500, 400) {
+    $as = $listener2.BeginGetContext($null, $null)
+    if (-not $as.AsyncWaitHandle.WaitOne(30000)) { break }
+    $ctx = $listener2.EndGetContext($as)
+    $ctx.Response.StatusCode = $status
+    $msg = [System.Text.Encoding]::UTF8.GetBytes('{"detail":"x"}')
+    $ctx.Response.ContentType = 'application/json'
+    $ctx.Response.OutputStream.Write($msg, 0, $msg.Length)
+    $ctx.Response.Close()
+}
+if (-not $proc2.WaitForExit(30000)) { $proc2.Kill() }
+$listener2.Stop()
+$res = ''; if (Test-Path -LiteralPath $pOut) { $res = (Get-Content -LiteralPath $pOut -Raw).Trim() }
+# Open WebUI's sign-in rate limit (429) is waited out, not reported as a failure.
+$listener2 = New-Object System.Net.HttpListener
+$listener2.Prefixes.Add("http://127.0.0.1:$port2/")
+$listener2.Start()
+$client3 = Join-Path $Work 'client3.ps1'
+$tOut = Join-Path $Work 'token-out.txt'
+Set-Content -LiteralPath $client3 -Value (("Import-Module '{0}' -Force`n`$env:LOCALAI_TEST_SIGNIN_WAIT = '1'`n" -f (Join-Path (Join-Path $src 'lib') 'LocalAI.psm1')) +
+    ("Set-Content -LiteralPath '{0}' -Value (Connect-LaiWebUI -BaseUrl 'http://127.0.0.1:{1}' -Email 'a@b' -Password 'x')" -f $tOut, $port2))
+$spArgs3 = @{ FilePath = $childExe; ArgumentList = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $client3); PassThru = $true }
+if ($onWindows) { $spArgs3['WindowStyle'] = 'Hidden' }
+$proc3 = Start-Process @spArgs3
+foreach ($reply in @(@{ Code = 429; Body = '{"detail":"limited"}' }, @{ Code = 200; Body = '{"role":"admin","token":"tok-123"}' })) {
+    $as = $listener2.BeginGetContext($null, $null)
+    if (-not $as.AsyncWaitHandle.WaitOne(30000)) { break }
+    $ctx = $listener2.EndGetContext($as)
+    $ctx.Response.StatusCode = $reply.Code
+    $msg = [System.Text.Encoding]::UTF8.GetBytes($reply.Body)
+    $ctx.Response.ContentType = 'application/json'
+    $ctx.Response.OutputStream.Write($msg, 0, $msg.Length)
+    $ctx.Response.Close()
+}
+if (-not $proc3.WaitForExit(30000)) { $proc3.Kill() }
+$listener2.Stop()
+$tok = ''; if (Test-Path -LiteralPath $tOut) { $tok = (Get-Content -LiteralPath $tOut -Raw).Trim() }
+Assert-That ($tok -eq 'tok-123') "sign-in waits out a 429 rate limit and then succeeds (got '$tok')"
+Assert-That ($res -eq 'none,True,dropped,False') "a 500 keeps the pending password, a 400 drops it (got '$res')"
+Set-Content -LiteralPath $pendingFile -Value '{"email": "adm'
+$rv = Resolve-LaiPendingPassword -AIRoot $pRoot -BaseUrl 'http://127.0.0.1:1'
+Assert-That ($rv -eq 'dropped' -and -not (Test-Path -LiteralPath $pendingFile)) 'a pending file cut off mid-write is dropped instead of blocking every run'
 
 # ---- volume lock ---------------------------------------------------------------------------------
 Write-Host "`n=== volume lock ===" -ForegroundColor Cyan

@@ -52,7 +52,7 @@ if (Test-Path -LiteralPath $credFile) {
     try { $c = Get-Content -Encoding UTF8 -LiteralPath $credFile -Raw | ConvertFrom-Json; Add-Secret ([string]$c.password); if ($c.email) { [void]$names.Add([string]$c.email) } } catch { Write-Verbose 'cred file unreadable' }
 }
 $keyFile = Join-Path (Join-Path $AIRoot 'Secrets') 'openwebui-secret.txt'
-if (Test-Path -LiteralPath $keyFile) { Add-Secret ((Get-Content -LiteralPath $keyFile -Raw).Trim()) }
+if (Test-Path -LiteralPath $keyFile) { Add-Secret ((Get-Content -Encoding UTF8 -LiteralPath $keyFile -Raw).Trim()) }
 $envFile = Join-Path (Join-Path $AIRoot 'Stack') '.env'
 if (Test-Path -LiteralPath $envFile) {
     foreach ($line in (Get-Content -Encoding UTF8 -LiteralPath $envFile)) {
@@ -149,7 +149,7 @@ Add-Summary "Open WebUI: $owVer on port $webPort, health $health"
 # ---- files ----------------------------------------------------------------------------------------
 foreach ($f in @('localai-config.json', 'install-state.json', 'install-report.md', 'watch-state.json')) {
     $p = Join-Path $AIRoot $f
-    if (Test-Path -LiteralPath $p) { Save-Part $f (Get-Content -LiteralPath $p -Raw) }
+    if (Test-Path -LiteralPath $p) { Save-Part $f (Get-Content -Encoding UTF8 -LiteralPath $p -Raw) }
 }
 $logs = Join-Path $AIRoot 'Logs'
 Save-Part 'watch.log' (Get-Tail (Join-Path $logs 'watch.log') 150)

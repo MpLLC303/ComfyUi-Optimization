@@ -103,6 +103,12 @@ while ((Invoke-Docker -Arguments @('version', '--format', '{{.Server.Version}}')
 $lock = $null
 try {
     $lock = Enter-LaiVolumeLock
+    # Again under the lock: a restore that held it while this run waited may have failed meanwhile.
+    $hold = Get-LaiWebUIHold -AIRoot $AIRoot
+    if ($hold -and -not $Tag) {
+        Write-BackupLog WARN "Skipped: Open WebUI is held after a failed restore ($($hold['Reason'])). Recover first: $($hold['Recover'])"
+        exit 0   # 'finally' still releases the lock
+    }
     if ((Invoke-Docker -Arguments @('volume', 'inspect', $Volume) -AllowFail).ExitCode -ne 0) { throw "Docker volume '$Volume' does not exist." }
     $running = (Invoke-Docker -Arguments @('inspect', '-f', '{{.State.Running}}', $Container) -AllowFail).Text.Trim() -eq 'true'
     if ($running -and -not $NoStop) {

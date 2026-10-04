@@ -59,7 +59,7 @@ function Find-Pitfall([System.Management.Automation.Language.Ast]$Ast, [string[]
             foreach ($pn in 'LiteralPath', 'Path') { if (-not $pathArg -and $gb.BoundParameters.ContainsKey($pn)) { $pathArg = $gb.BoundParameters[$pn].Value } }
             # -Encoding is a provider (dynamic) parameter the static binder cannot see: look for it directly.
             $hasEnc = @($c.CommandElements | Where-Object { $_ -is [System.Management.Automation.Language.CommandParameterAst] -and 'encoding'.StartsWith($_.ParameterName.ToLower()) -and $_.ParameterName.Length -ge 3 }).Count -gt 0
-            if ($pathArg -and -not $hasEnc -and $pathArg.Extent.Text -match '(?i)env|json|cred|config|state|settings|hold|pending|\.yml') {
+            if ($pathArg -and -not $hasEnc -and $pathArg.Extent.Text -match '(?i)env|json|cred|secret|config|state|settings|hold|pending|\.yml') {
                 & $add 'ENCODING' $c "Get-Content $($pathArg.Extent.Text) without -Encoding UTF8: Windows PowerShell 5.1 reads BOM-less UTF-8 as ANSI"
             }
         }
@@ -129,6 +129,7 @@ $canaries = @(
     @{ Rule = 'ENCODING'; Fire = $true; Code = '$c = Get-Content -LiteralPath $credFile -Raw | ConvertFrom-Json' }
     @{ Rule = 'ENCODING'; Fire = $false; Code = '$c = Get-Content -LiteralPath $credFile -Raw -Encoding UTF8 | ConvertFrom-Json' }
     @{ Rule = 'ENCODING'; Fire = $false; Code = 'Get-Content -LiteralPath $logFile -Tail 50' }
+    @{ Rule = 'ENCODING'; Fire = $true; Code = '$k = (Get-Content -LiteralPath $secretFile -Raw).Trim()' }
     @{ Rule = 'MATCHES'; Fire = $true; Code = 'if ($l -match ''^(\w+)=(.*)$'' -and $Matches[1] -match ''KEY'') { Add-Secret $Matches[2] }' }
     @{ Rule = 'MATCHES'; Fire = $true; Code = 'if ($a -match ''x(\d)'' -and $b -match ''y'' -and $Matches[1]) { 1 }' }
     @{ Rule = 'MATCHES'; Fire = $false; Code = 'if ($l -match ''^(\w+)=(.*)$'') { $k = $Matches[1]; if ($k -match ''KEY'') { 1 } }' }

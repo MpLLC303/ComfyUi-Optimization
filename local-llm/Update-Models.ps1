@@ -84,6 +84,7 @@ function Hide-InWebUI([string]$Id) {
         $credFile = Join-Path (Join-Path $AIRoot 'Secrets') 'openwebui-admin.json'
         if (-not (Test-Path -LiteralPath $credFile)) { return }
         $port = 3000; if ($config.ContainsKey('WebUIPort')) { $port = [int]$config['WebUIPort'] }
+        Resolve-LaiPendingPassword -AIRoot $AIRoot -BaseUrl "http://127.0.0.1:$port" | Out-Null
         $cred = Get-Content -Encoding UTF8 -LiteralPath $credFile -Raw | ConvertFrom-Json
         $tok = Connect-LaiWebUI -BaseUrl "http://127.0.0.1:$port" -Email $cred.email -Password $cred.password
         Hide-LaiWebUIModel -BaseUrl "http://127.0.0.1:$port" -Token $tok -Id $Id | Out-Null

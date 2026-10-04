@@ -377,8 +377,8 @@ function Write-StackEnv {
 }
 
 function Get-AdminCredential {
-    $file = Join-Path $P.Secrets 'openwebui-admin.json'
-    if (Test-Path -LiteralPath $file) { return (Get-Content -LiteralPath $file -Raw | ConvertFrom-Json) }
+    $credFile = Join-Path $P.Secrets 'openwebui-admin.json'
+    if (Test-Path -LiteralPath $credFile) { return (Get-Content -Encoding UTF8 -LiteralPath $credFile -Raw | ConvertFrom-Json) }
     return $null
 }
 
@@ -883,7 +883,7 @@ Invoke-Stage 'Stack' {
         SEARXNG_VERSION    = $SearxngVersion
         WEBUI_PORT         = $script:WebUIPortEffective
         SEARXNG_PORT       = $script:SearxngPortEffective
-        WEBUI_SECRET_KEY   = (Get-Content -LiteralPath $secretFile -Raw).Trim()
+        WEBUI_SECRET_KEY   = (Get-Content -Encoding UTF8 -LiteralPath $secretFile -Raw).Trim()
         WEBUI_ADMIN_EMAIL  = $cred.email
         WEBUI_ADMIN_PASSWORD = ''
         OLLAMA_BASE_URL    = 'http://render-guard:11434'
@@ -965,6 +965,8 @@ Invoke-Stage 'Configure' {
         Invoke-Compose -Arguments @('up', '-d', '--force-recreate', 'open-webui') | Out-Null
         Wait-LaiWebUI -BaseUrl $WebUIUrl -TimeoutSec 300
     }
+    # An interrupted Set-OpenWebUIPassword run may have left the live password only in the pending file.
+    if ((Resolve-LaiPendingPassword -AIRoot $AIRoot -BaseUrl $WebUIUrl) -eq 'promoted') { $cred = Get-AdminCredential }
     try { $token = Connect-LaiWebUI -BaseUrl $WebUIUrl -Email $cred.email -Password $cred.password }
     catch {
         # Existing install whose admin was created by hand: ask once, then store it.

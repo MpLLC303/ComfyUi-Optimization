@@ -52,7 +52,7 @@ volumes:
   open-webui:
     name: open-webui
 '@ | Set-Content -LiteralPath (Join-Path $stack 'docker-compose.yml')
-Set-Content -LiteralPath (Join-Path $stack '.env') -Value @('OPEN_WEBUI_VERSION=3.19', 'SEARXNG_VERSION=x', 'RENDER_GUARD_MODE=cpu')
+Set-Content -LiteralPath (Join-Path $stack '.env') -Value @('OPEN_WEBUI_VERSION=3.19', 'SEARXNG_VERSION=x1', 'RENDER_GUARD_MODE=cpu')
 # WebUIOllamaUrl: restores re-apply it to the (real, shared) sandbox Open WebUI, so keep it pointing at Ollama.
 ConvertTo-Json @{ WebUIPort = 3000; OllamaUrl = 'http://127.0.0.1:11434'; WebUIOllamaUrl = 'http://127.0.0.1:11434' } | Set-Content -LiteralPath (Join-Path $aiRoot 'localai-config.json')
 ConvertTo-Json @{ email = 'admin@localhost'; password = 'Test-Password-123' } | Set-Content -LiteralPath (Join-Path (Join-Path $aiRoot 'Secrets') 'openwebui-admin.json')
@@ -152,10 +152,16 @@ try {
         $c = $LASTEXITCODE; $ErrorActionPreference = $prevPref
         return [pscustomobject]@{ Code = $c; Text = ($o -join "`n") }
     }
+    # The swap fails, and so does the rollback to the safety backup (same hook): the worst case.
     $env:LOCALAI_TEST_FAIL_SWAP = '1'
-    $r = & $runScript 'Restore-OpenWebUI.ps1' @('-Archive', $good.FullName, '-Force', '-SkipSafetyBackup')
+    $r = & $runScript 'Restore-OpenWebUI.ps1' @('-Archive', $good.FullName, '-Force')
+    $h1 = Read-LaiState -Path $holdFile
+    Assert-That ($r.Code -ne 0 -and [string]$h1['Archive'] -like '*pre-restore*') "failed restore and rollback record a hold naming the safety backup (exit $($r.Code))"
+    # Following the recovery command fails again (no safety backup of its own): the pointer must survive.
+    $r = & $runScript 'Restore-OpenWebUI.ps1' @('-Archive', [string]$h1['Archive'], '-Force', '-SkipSafetyBackup')
     $env:LOCALAI_TEST_FAIL_SWAP = ''
-    Assert-That ($r.Code -ne 0 -and (Test-Path -LiteralPath $holdFile)) "failed restore without a safety backup records a hold (exit $($r.Code))"
+    $h2 = Read-LaiState -Path $holdFile
+    Assert-That ($r.Code -ne 0 -and $h2['Archive'] -eq $h1['Archive'] -and $r.Text -match 'earlier recovery command still applies') 'a failed recovery keeps the pointer to the newest safety backup'
     Assert-That ((Invoke-DockerText @('inspect', '-f', '{{.State.Status}} {{.HostConfig.RestartPolicy.Name}}', 'open-webui')) -eq 'exited no') 'container left stopped, restart policy off'
     # The watch must not start it (point it at a dead port so the shared sandbox Open WebUI does not answer for it).
     $cfgPath = Join-Path $aiRoot 'localai-config.json'
@@ -174,7 +180,7 @@ try {
     Assert-That ($u.Code -ne 0 -and $u.Text -match 'kept stopped after a failed restore' -and (Invoke-DockerText @('inspect', '-f', '{{.State.Status}}', 'open-webui')) -eq 'exited') 'Update-OpenWebUI refuses while held'
     $hj = Read-LaiState -Path $holdFile
     Assert-That ([string]$hj['Recover'] -match [regex]::Escape((Join-Path $src 'Restore-OpenWebUI.ps1'))) 'recovery command has the full script path'
-    $r = & $runScript 'Restore-OpenWebUI.ps1' @('-Archive', $good.FullName, '-Force', '-SkipSafetyBackup')
+    $r = & $runScript 'Restore-OpenWebUI.ps1' @('-Archive', [string]$h1['Archive'], '-Force', '-SkipSafetyBackup')
     Assert-That ($r.Code -eq 0 -and -not (Test-Path -LiteralPath $holdFile)) "recovery restore clears the hold (exit $($r.Code))"
     Assert-That ((Invoke-DockerText @('inspect', '-f', '{{.State.Status}} {{.HostConfig.RestartPolicy.Name}}', 'open-webui')) -eq 'running always') 'container running again with its original restart policy'
 
