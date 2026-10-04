@@ -36,7 +36,8 @@ cancels it), reboots, and **continues by itself after you sign in**. At the end 
 http://localhost:3000 and prints the admin login (also saved in
 `C:\AI\Secrets\openwebui-admin.json`). The installer also allows typing script names such as
 `C:\AI\Scripts\Test-LocalAI.ps1` in PowerShell, by setting the execution policy to RemoteSigned.
-Every script also has a Start-menu shortcut under **Local AI**.
+The everyday ones (Open WebUI, Gaming mode, Start again, Health check, ComfyUI, Diagnostics, Update
+toolkit) have Start-menu shortcuts under **Local AI**; run the rest from `C:\AI\Scripts`.
 
 ### Update the toolkit (existing installs)
 
@@ -150,7 +151,7 @@ used by the desktop and open apps):
   guard asks ComfyUI to free them before a chat loads. Expect roughly 15-25 tok/s for Local Main
   on the CPU, and a slow first token with long web or RAG context. That's an estimate, not measured
   on your PC. Measure it with `C:\AI\Scripts\Test-LocalAI.ps1 -Quick -CpuCheck` (close ComfyUI first; it reports CPU tok/s, prompt speed and the VRAM the CPU mode still takes), and see the guard's decisions in `docker logs render-guard`. Turn it off
-  with `Install-LocalAI.ps1 -RenderGuard off`.
+  with `C:\AI\Scripts\Install-LocalAI.cmd -RenderGuard off`.
 - **Memory vs knowledge:** memory holds durable facts and preferences (Settings → Personalization →
   Memory, or just say "remember that…"). Manuals and PDFs go into **Workspace → Knowledge** collections,
   which you attach in a chat with `#`.

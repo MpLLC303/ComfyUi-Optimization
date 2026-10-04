@@ -35,6 +35,10 @@
     Get-ChildItem -LiteralPath $top.FullName -Recurse -File | Unblock-File
 
     & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $installer -AIRoot $root
+    $code = $LASTEXITCODE
     Write-Host ''
-    Write-Host 'The installer continues in the Administrator window that opened (after the UAC prompt).' -ForegroundColor Cyan
+    if ($code -eq 10) { Write-Host 'The installer continues in the Administrator window that opened.' -ForegroundColor Cyan }
+    elseif ($code -eq 1223) { Write-Host 'Administrator rights were declined; run the command again and click Yes.' -ForegroundColor Red }
+    elseif ($code -eq 3010) { Write-Host 'A restart is needed; the installer resumes by itself after you sign in again.' -ForegroundColor Cyan }
+    elseif ($code -ne 0) { Write-Host "The installer stopped with an error (code $code); see the messages above." -ForegroundColor Red }
 }

@@ -35,6 +35,12 @@ $suites = @(
 $Only = @($Only | ForEach-Object { $_ -split ',' } | ForEach-Object { $_.Trim() } | Where-Object { $_ })
 $unknown = @($Only | Where-Object { @($suites | ForEach-Object { $_.Name }) -notcontains $_ })
 if ($unknown.Count) { Write-Host "Unknown suite(s): $($unknown -join ', '). Known: $(($suites | ForEach-Object { $_.Name }) -join ', ')" -ForegroundColor Red; exit 100 }
+# The acceptance checklist needs the sandbox settings the integration test applies (character
+# splitter, host SearXNG URL); the mock run's installer replaces them with the production ones.
+if ($Only -contains 'Acceptance' -and $Only -notcontains 'Integration') {
+    $Only += 'Integration'
+    Write-Host 'Acceptance needs the sandbox settings from Integration: running that first.' -ForegroundColor Yellow
+}
 if ($Only.Count) { $suites = @($suites | Where-Object { $Only -contains $_.Name }) }
 
 New-Item -ItemType Directory -Force -Path $LogDir | Out-Null

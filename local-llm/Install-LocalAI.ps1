@@ -121,8 +121,15 @@ foreach ($kv in $PSBoundParameters.GetEnumerator()) { $script:BoundParams[$kv.Ke
 
 if (-not (Test-IsAdmin)) {
     Write-Host 'Requesting administrator rights (needed for WSL, Docker Desktop, scheduled tasks and the port audit)...' -ForegroundColor Cyan
-    Start-Process -FilePath 'powershell.exe' -Verb RunAs -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-NoExit', '-Command', (Get-RelaunchCommand))
-    exit 0
+    try { Start-Process -FilePath 'powershell.exe' -Verb RunAs -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-NoExit', '-Command', (Get-RelaunchCommand)) -ErrorAction Stop }
+    catch {
+        # 'No' at the UAC prompt (or closing it) lands here.
+        Write-Host 'Administrator rights were not granted, so nothing was installed. Run it again and click Yes at the prompt.' -ForegroundColor Red
+        exit 1223   # ERROR_CANCELLED
+    }
+    # Exit code 10 tells the wrappers (Install-LocalAI.cmd, Get-LocalAI.ps1) that the install goes on
+    # in the new Administrator window.
+    exit 10
 }
 
 #endregion

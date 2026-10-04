@@ -8,6 +8,9 @@ if not exist "%~dp0Install-LocalAI.ps1" (
   exit /b 1
 )
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0Install-LocalAI.ps1" %*
+set rc=%errorlevel%
 echo.
-echo The installer continues in the Administrator window that just opened. You can close this one.
+if "%rc%"=="10" echo The installer continues in the Administrator window that just opened. You can close this one.
+if "%rc%"=="1223" echo Administrator rights were declined. Run this file again and click Yes.
+if "%rc%"=="3010" echo A restart is needed; the installer resumes by itself after you sign in again.
 pause

@@ -655,12 +655,13 @@ function Connect-LaiWebUI {
     # answers 429. Running the installer, the health check and an update back to back can hit that,
     # so wait it out (the window frees a minute's worth every 60 s) instead of failing.
     $r = $null
+    # 8 tries 45 s apart (~5 min): rejected attempts may count too, so leave margin past the 3-minute window.
     for ($try = 1; $try -le 8; $try++) {
         try { $r = Invoke-LaiApi -Method POST -Uri "$BaseUrl/api/v1/auths/signin" -Body @{ email = $Email; password = $Password } -TimeoutSec 60; break }
         catch {
             if ([int](Get-LaiHttpStatus $_) -ne 429 -or $try -eq 8) { throw }
             if ($try -eq 1) { Write-LaiLog WARN 'Open WebUI is rate-limiting sign-ins (15 per 3 minutes); waiting for the limit to clear.' }
-            $wait = 30; if ($env:LOCALAI_TEST_SIGNIN_WAIT) { $wait = [int]$env:LOCALAI_TEST_SIGNIN_WAIT }
+            $wait = 45; if ($env:LOCALAI_TEST_SIGNIN_WAIT) { $wait = [int]$env:LOCALAI_TEST_SIGNIN_WAIT }
             Start-Sleep -Seconds $wait
         }
     }
