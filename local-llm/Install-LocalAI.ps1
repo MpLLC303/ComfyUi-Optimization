@@ -464,7 +464,7 @@ Invoke-Stage 'Preflight' {
     # Disk planning: decide where models go and whether the optional models fit.
     $catalogAll = Get-LaiCatalog -Path $CatalogPath -IncludeTrials
     $trialWanted = @()
-    if ($PSBoundParameters.ContainsKey('TrialModels') -or $script:BoundParams.ContainsKey('TrialModels')) {
+    if ($script:BoundParams.ContainsKey('TrialModels')) {
         $trialWanted = @($TrialModels | Where-Object { $_ -and $_ -ne 'none' })
     } elseif ($State.flags.ContainsKey('selectedModels')) {
         $trialWanted = @($State.flags['selectedModels'] | Where-Object { $_ -like 'trial-*' })
@@ -857,7 +857,10 @@ Invoke-Stage 'Stack' {
     Write-StackEnv -Values $envValues
 
     Write-LaiLog INFO "Pulling images (Open WebUI $OpenWebUIVersion is several GB on first install)"
-    Invoke-LaiRetry -What 'docker compose pull' -Attempts 3 -DelaySeconds 15 -Action { Invoke-Compose -Arguments @('pull') | Out-Null } | Out-Null
+    # Pinned versions: an image already on disk is the right one, so re-runs need no registry
+    # (Docker Hub rate-limits anonymous pulls). A floating tag (main, latest) is always re-pulled.
+    $pullPolicy = Get-LaiPullPolicy -Tags @($OpenWebUIVersion, $SearxngVersion)
+    Invoke-LaiRetry -What 'docker compose pull' -Attempts 3 -DelaySeconds 15 -Action { Invoke-Compose -Arguments @('pull', '--policy', $pullPolicy) | Out-Null } | Out-Null
     Invoke-Compose -Arguments @('up', '-d', '--remove-orphans') | Out-Null
     $webui = "http://127.0.0.1:$($script:WebUIPortEffective)"
     Write-LaiLog INFO "Waiting for Open WebUI on $webui (first start runs database migrations)"

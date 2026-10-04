@@ -195,6 +195,7 @@ Assert-That ((& /usr/bin/docker run --rm -v open-webui:/d:ro alpine:3.20 cat /d/
 Assert-That ((& /usr/bin/docker inspect -f '{{.HostConfig.RestartPolicy.Name}}' (& /usr/bin/docker ps -aq --filter 'name=^/open-webui-legacy-')) -eq 'no') 'legacy container restart policy disabled'
 Assert-That ($null -eq (& /usr/bin/docker ps -a --filter 'name=^/open-webui$' --format '{{.ID}}') -and (& /usr/bin/docker ps -a --filter 'name=^/open-webui-legacy-' --format '{{.Status}}') -match 'Exited') 'legacy container stopped and renamed (kept)'
 Assert-That (@($global:Calls | Where-Object { $_ -like 'docker compose*up -d*' }).Count -ge 2) 'compose up ran (initial + after password removal)'
+Assert-That (@($global:Calls | Where-Object { $_ -like 'docker compose*pull*' }).Count -ge 1 -and @($global:Calls | Where-Object { $_ -like 'docker compose*pull*' -and $_ -notlike '*--policy missing*' }).Count -eq 0) 'image pulls reuse local images (--policy missing)'
 Assert-That (Test-Path (Join-Path $env:USERPROFILE '.wslconfig')) '.wslconfig created'
 Assert-That ((Get-Content -Raw (Join-Path $aiRoot 'Stack/searxng/settings.yml')) -notmatch '__SEARXNG_SECRET__') 'SearXNG secret filled in'
 Assert-That (Test-Path (Join-Path $aiRoot 'install-report.md')) 'install report written'

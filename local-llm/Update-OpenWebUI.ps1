@@ -80,7 +80,7 @@ if ($Rollback) {
         # Old image first (it may not start on the migrated database; that is expected), then the
         # restore stops it, swaps in the pre-update data and starts it again.
         Set-EnvVersion -OpenWebUI $prevVer
-        Invoke-Docker -Arguments ($base + @('pull', 'open-webui'))
+        Invoke-Docker -Arguments ($base + @('pull', '--policy', (Get-LaiPullPolicy -Tags @($prevVer)), 'open-webui'))
         Invoke-Docker -Arguments ($base + @('up', '-d', 'open-webui'))
         & (Join-Path $PSScriptRoot 'Restore-OpenWebUI.ps1') -AIRoot $AIRoot -Archive $archive -Force
         if ($LASTEXITCODE -ne 0) { throw "The restore step failed; see above. The stack is set to $prevVer." }
@@ -133,7 +133,11 @@ try {
     $pulled = $false
     try {
         Set-EnvVersion -OpenWebUI $Version -Searxng $SearxngVersion
-        Invoke-Docker -Arguments ($base + @('pull'))
+        # Pinned versions already on disk are reused (no registry, no Docker Hub rate limit);
+        # floating tags (main, latest) are re-pulled.
+        $envNow = @{}
+        foreach ($l in (Get-Content -LiteralPath $envPath)) { if ($l -match '^([A-Z_]+)=(.*)$') { $envNow[$Matches[1]] = $Matches[2] } }
+        Invoke-Docker -Arguments ($base + @('pull', '--policy', (Get-LaiPullPolicy -Tags @($envNow['OPEN_WEBUI_VERSION'], $envNow['SEARXNG_VERSION']))))
         $pulled = $true
     } catch {
         throw "Could not pull the new image(s), nothing was changed: $($_.Exception.Message)"

@@ -132,6 +132,19 @@ foreach ($c in $cases) {
     $got = Get-LaiExecutionPolicyAction @a
     Assert-That ($got -eq $c.Want) "policy action for $(($a.GetEnumerator() | ForEach-Object { "$($_.Key)=$($_.Value)" }) -join ',') -> $got (want $($c.Want))"
 }
+
+Write-Host "`n=== image pull policy ===" -ForegroundColor Cyan
+foreach ($c in @(
+        @{ Tags = @('v0.11.4', '2026.10.2-19ffbcd30'); Want = 'missing' }
+        @{ Tags = @('v0.11.4-cuda', ''); Want = 'missing' }
+        @{ Tags = @('main', '2026.10.2-19ffbcd30'); Want = 'always' }
+        @{ Tags = @('v0.11.4', 'latest'); Want = 'always' }
+        @{ Tags = @('cuda'); Want = 'always' }
+        @{ Tags = @('latest-2'); Want = 'always' }
+    )) {
+    $got = Get-LaiPullPolicy -Tags $c.Tags
+    Assert-That ($got -eq $c.Want) "pull policy for $($c.Tags -join ',') -> $got (want $($c.Want))"
+}
 $isAdmin = $false
 if ($onWindows) { $isAdmin = (New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator) }
 if ($onWindows -and $isAdmin -and $PSVersionTable.PSEdition -eq 'Desktop') {

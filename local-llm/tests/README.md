@@ -31,12 +31,21 @@ pip install open-webui==0.11.4 && open-webui serve --port 3000
 # SearXNG straight from stack/docker-compose.yml
 docker compose -f stack/docker-compose.yml up -d searxng
 
-pwsh tests/Invoke-IntegrationTest.ps1 -SandboxTextSplitter character
-pwsh tests/Invoke-InstallerMockRun.ps1
-pwsh tests/Invoke-UninstallTest.ps1
-pwsh tests/Invoke-ModelUpdateTest.ps1
-pwsh tests/Invoke-UpdateWebUITest.ps1
+pwsh tests/Invoke-AllTests.ps1                 # every suite, one after another, one summary table
+pwsh tests/Invoke-AllTests.ps1 -Only Static,Mock   # a subset
 ```
+
+Run the suites through `Invoke-AllTests.ps1` (or one at a time). They share one Ollama, one Open WebUI and one
+Docker engine, so running two at once makes them unload each other's models and fight over the
+`open-webui` volume. The failures look like product bugs. The runner holds a lock file, so a second run refuses to start.
+
+`Invoke-StaticChecks.ps1` also scans for runtime pitfalls that parse cleanly. Each one was a real bug here:
+- `Measure/Sort/Select -Property <name>` on hashtables (fails on 5.1).
+- `Write-X ('...') -f $a`, where `-f` becomes a separate argument.
+- `$Matches` read after a second `-match` in the same condition.
+- `$PSBoundParameters` inside a `&`-invoked scriptblock, where it is empty.
+
+Built-in canaries check that every rule still fires.
 
 The sandbox blocks Hugging Face, the tiktoken CDN and the public search engines. So:
 - embeddings use an Ollama model instead of the default embedding model, which ships inside the official Docker image;

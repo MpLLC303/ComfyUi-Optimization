@@ -1007,6 +1007,21 @@ function Invoke-LaiWebUISetup {
 
 #endregion
 
+function Get-LaiPullPolicy {
+    <#
+    .SYNOPSIS
+        'missing' when every image tag is a pinned release (an image already on disk is the right one,
+        so re-runs need no registry), 'always' when any tag floats (main, latest, cuda, ...), which
+        would otherwise never be refreshed. A pinned tag carries a version number.
+    #>
+    param([string[]]$Tags)
+    foreach ($t in $Tags) {
+        if ([string]::IsNullOrWhiteSpace($t)) { continue }
+        if ($t -notmatch '\d' -or $t -match '^(latest|main|dev|nightly)(-|$)') { return 'always' }
+    }
+    return 'missing'
+}
+
 function Get-LaiExecutionPolicyAction {
     # What to do so typed script paths work. Pure function (unit-tested). Note: the effective policy
     # of the running process is useless here, because every entry point runs with -ExecutionPolicy
