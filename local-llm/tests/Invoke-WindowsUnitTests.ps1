@@ -159,6 +159,25 @@ Set-Content -LiteralPath $pendingFile -Value '{"email": "adm'
 $rv = Resolve-LaiPendingPassword -AIRoot $pRoot -BaseUrl 'http://127.0.0.1:1'
 Assert-That ($rv -eq 'dropped' -and -not (Test-Path -LiteralPath $pendingFile)) 'a pending file cut off mid-write is dropped instead of blocking every run'
 
+Write-Host "`n=== private ACLs (AI folder, read-only Scripts) ===" -ForegroundColor Cyan
+if ($onWindows) {
+    $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+    $aclRoot = Join-Path $Work 'aclroot'
+    $aclScripts = Join-Path $aclRoot 'Scripts'
+    New-Item -ItemType Directory -Force -Path $aclScripts | Out-Null
+    Set-Content -LiteralPath (Join-Path $aclScripts 'x.ps1') -Value '1'
+    $r1 = Set-LaiPrivateAcl -Path $aclRoot -UserSid $sid
+    $r2 = Set-LaiPrivateAcl -Path $aclScripts -UserSid $sid -UserAccess ReadOnly
+    $rules = { param($p) @((Get-Acl -LiteralPath $p).Access | ForEach-Object { [pscustomobject]@{ Sid = $_.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value; Rights = [string]$_.FileSystemRights; Inherited = $_.IsInherited } }) }
+    $rootRules = & $rules $aclRoot
+    $scriptRules = & $rules (Join-Path $aclScripts 'x.ps1')
+    $others = @('S-1-5-11', 'S-1-5-32-545', 'S-1-1-0')   # Authenticated Users, Users, Everyone
+    Assert-That ($r1.ExitCode -eq 0 -and (Get-Acl -LiteralPath $aclRoot).AreAccessRulesProtected -and @($rootRules | Where-Object { $others -contains $_.Sid }).Count -eq 0) 'AI folder: inheritance cut, no Users / Authenticated Users / Everyone'
+    $userOnScript = @($scriptRules | Where-Object { $_.Sid -eq $sid })
+    Assert-That ($r2.ExitCode -eq 0 -and $userOnScript.Count -ge 1 -and @($userOnScript | Where-Object { $_.Rights -match 'Write|Modify|FullControl' }).Count -eq 0) "Scripts: the user can read and run but not change files ($(($userOnScript | ForEach-Object { $_.Rights }) -join '; '))"
+    Assert-That (@($scriptRules | Where-Object { $_.Sid -eq 'S-1-5-32-544' -and $_.Rights -match 'FullControl' }).Count -ge 1) 'Scripts: Administrators keep full control (elevated updates still work)'
+} else { Skip 'ACL test runs on Windows only' }
+
 # ---- volume lock ---------------------------------------------------------------------------------
 Write-Host "`n=== volume lock ===" -ForegroundColor Cyan
 $m = New-LaiVolumeMutex
@@ -231,6 +250,24 @@ foreach ($c in @(
     $got = Get-LaiModelManifestPath -ModelDir $md -Name $c.Name
     $want = Join-Path $md ($c.Want -replace '/', $sep)
     Assert-That ($got -eq $want) "manifest path for $($c.Name)"
+}
+
+Write-Host "`n=== Ollama firewall block ranges ===" -ForegroundColor Cyan
+$ranges = @(Get-LaiBlockRange -Allowed @('127.0.0.0/8', '172.16.0.0/12', '192.168.50.7/20'))
+$toN = { param($ip) $o = @($ip.Split('.') | ForEach-Object { [long]$_ }); $o[0] * 16777216 + $o[1] * 65536 + $o[2] * 256 + $o[3] }
+$isBlocked = { param($ip) $n = & $toN $ip; @($ranges | Where-Object { $a, $b = $_.Split('-'); (& $toN $a) -le $n -and $n -le (& $toN $b) }).Count -gt 0 }
+foreach ($ip in '127.0.0.1', '172.17.0.2', '172.31.255.254', '192.168.48.1', '192.168.63.255') { Assert-That (-not (& $isBlocked $ip)) "not blocked: $ip (loopback / Docker / WSL)" }
+foreach ($ip in '192.168.1.20', '192.168.47.255', '192.168.64.0', '10.0.0.5', '100.101.102.103', '8.8.8.8', '0.0.0.0', '255.255.255.255', '172.15.255.255', '172.32.0.0') { Assert-That (& $isBlocked $ip) "blocked: $ip (LAN / Tailscale / internet)" }
+if ($onWindows -and (Get-Command New-NetFirewallRule -ErrorAction SilentlyContinue)) {
+    # The real cmdlet must accept the exact list the installer builds (IPv4 ranges + the IPv6 range).
+    $ruleName = 'LocalAI CI test - block ranges'
+    try {
+        $blockedList = @(Get-LaiBlockRange -Allowed @('127.0.0.0/8', '172.16.0.0/12')) + '::2-ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff'
+        New-NetFirewallRule -DisplayName $ruleName -Direction Inbound -Protocol TCP -LocalPort 11434 -Action Block -RemoteAddress $blockedList -Profile Any -Enabled False | Out-Null
+        $filter = Get-NetFirewallRule -DisplayName $ruleName | Get-NetFirewallAddressFilter
+        Assert-That (@($filter.RemoteAddress).Count -eq $blockedList.Count) "Windows Firewall accepts the block ranges ($(@($filter.RemoteAddress) -join ', '))"
+    } catch { Assert-That $false "Windows Firewall rejected the block ranges: $($_.Exception.Message)" }
+    finally { Get-NetFirewallRule -DisplayName $ruleName -ErrorAction SilentlyContinue | Remove-NetFirewallRule -ErrorAction SilentlyContinue }
 }
 
 Write-Host "`n=== image pull policy ===" -ForegroundColor Cyan
@@ -308,7 +345,7 @@ $pw = 'Pw-' + [guid]::NewGuid().ToString('N').Substring(0, 16)
 $key = ([guid]::NewGuid().ToString('N') + [guid]::NewGuid().ToString('N'))
 ConvertTo-Json @{ email = 'someone@example.org'; password = $pw } | Set-Content -LiteralPath (Join-Path (Join-Path $dRoot 'Secrets') 'openwebui-admin.json')
 Set-Content -LiteralPath (Join-Path (Join-Path $dRoot 'Stack') '.env') -Value @("WEBUI_SECRET_KEY=$key", 'OPEN_WEBUI_VERSION=v0.11.4')
-Set-Content -LiteralPath (Join-Path (Join-Path $dRoot 'Logs') 'install-20990101-000000.log') -Value @("Admin password: $pw", "secret $key", 'login someone@example.org', 'Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.abcdefghijklmnop')
+Set-Content -LiteralPath (Join-Path (Join-Path $dRoot 'Logs') 'install-20990101-000000.log') -Value @("Admin password: $pw", "secret $key", 'login someone@example.org', 'shared by other.person@family.example', "Machine: $env:COMPUTERNAME-TESTHOST", 'Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.abcdefghijklmnop')
 ConvertTo-Json @{ WebUIPort = 39999; OllamaUrl = 'http://127.0.0.1:39997' } | Set-Content -LiteralPath (Join-Path $dRoot 'localai-config.json')
 $outDir = Join-Path $Work 'diagout'
 $r = Invoke-Child 'Get-LocalAIDiagnostics.ps1' @('-AIRoot', $dRoot, '-OutDir', $outDir)
@@ -322,6 +359,8 @@ if ($zipFile) {
     Assert-That ($all -notmatch $key) 'secret key redacted'
     Assert-That ($all -notmatch 'someone@example\.org') 'admin e-mail redacted'
     Assert-That ($all -notmatch 'eyJhbGci') 'bearer token redacted'
+    Assert-That ($all -notmatch 'other\.person@family') 'any other e-mail address redacted'
+    if ($env:COMPUTERNAME) { Assert-That ($all -notmatch [regex]::Escape($env:COMPUTERNAME)) 'computer name redacted' }
     Assert-That ($all -match '\[REDACTED\]') 'redaction markers present'
 }
 

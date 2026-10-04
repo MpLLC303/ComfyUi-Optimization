@@ -105,6 +105,56 @@ function Save-LaiState {
     }
 }
 
+function Get-LaiBlockRange {
+    <#
+    .SYNOPSIS
+        Every IPv4 address EXCEPT the given CIDR blocks, as firewall ranges ("a.b.c.d-e.f.g.h"). Used
+        for the Ollama block rule: everything but loopback and the Docker/WSL subnets is blocked,
+        whichever adapter it arrives on (Wi-Fi, Ethernet, Tailscale, VPN, adapters added later).
+    #>
+    param([Parameter(Mandatory)][string[]]$Allowed)
+    $toLong = { param($ip) $o = @($ip.Split('.') | ForEach-Object { [long]$_ }); return ($o[0] * 16777216 + $o[1] * 65536 + $o[2] * 256 + $o[3]) }
+    $toIp = { param([long]$n) return ('{0}.{1}.{2}.{3}' -f [math]::Floor($n / 16777216), ([math]::Floor($n / 65536) % 256), ([math]::Floor($n / 256) % 256), ($n % 256)) }
+    $spans = @()
+    foreach ($c in $Allowed) {
+        $parts = $c.Split('/')
+        $bits = 32; if ($parts.Count -gt 1) { $bits = [int]$parts[1] }
+        $size = [long][math]::Pow(2, 32 - $bits)
+        $start = [long]([math]::Floor((& $toLong $parts[0]) / $size) * $size)
+        $spans += , @($start, ($start + $size - 1))
+    }
+    $spans = @($spans | Sort-Object { $_[0] })
+    $out = @()
+    $next = [long]0
+    foreach ($sp in $spans) {
+        if ($sp[0] -gt $next) { $out += ('{0}-{1}' -f (& $toIp $next), (& $toIp ($sp[0] - 1))) }
+        if ($sp[1] + 1 -gt $next) { $next = $sp[1] + 1 }
+    }
+    if ($next -le 4294967295) { $out += ('{0}-{1}' -f (& $toIp $next), '255.255.255.255') }
+    return $out
+}
+
+function Set-LaiPrivateAcl {
+    <#
+    .SYNOPSIS
+        Replaces a file's or folder's permissions with: the given user, SYSTEM and Administrators
+        (inheritance from the parent removed, so "Authenticated Users" from C:\ no longer applies).
+        -UserAccess ReadOnly gives the user read/execute only. Windows only; returns icacls' exit
+        code and output.
+    #>
+    param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][string]$UserSid, [ValidateSet('Full', 'ReadOnly')][string]$UserAccess = 'Full')
+    $inherit = ''
+    if ((Get-Item -LiteralPath $Path -Force) -is [System.IO.DirectoryInfo]) { $inherit = '(OI)(CI)' }
+    $userGrant = $inherit + 'F'
+    if ($UserAccess -eq 'ReadOnly') { $userGrant = $inherit + 'RX' }
+    $prev = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
+    try {
+        $out = & icacls.exe $Path '/inheritance:r' '/grant:r' "*${UserSid}:$userGrant" "*S-1-5-18:${inherit}F" "*S-1-5-32-544:${inherit}F" 2>&1 | ForEach-Object { "$_" }
+        $code = $LASTEXITCODE
+    } finally { $ErrorActionPreference = $prev }
+    return [pscustomobject]@{ ExitCode = $code; Text = ($out -join "`n") }
+}
+
 function Get-LaiWebUIHold {
     <#
     .SYNOPSIS

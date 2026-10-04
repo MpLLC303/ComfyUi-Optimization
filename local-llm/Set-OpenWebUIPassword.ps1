@@ -18,6 +18,8 @@
 #>
 param(
     [string]$AIRoot = 'C:\AI',
+    # For automation only: a password typed here stays in the PowerShell history and is visible in
+    # the process list. Interactively, use -Prompt (and -PromptCurrent) instead.
     [string]$NewPassword = '',
     [switch]$Prompt,
     # The password Open WebUI currently accepts, when it differs from the stored one (e.g. after a

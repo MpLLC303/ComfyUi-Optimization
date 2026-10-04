@@ -263,10 +263,11 @@ function Add-SessionPath {
 
 function Protect-Path {
     # Owner, SYSTEM and Administrators only (folders under C:\ otherwise inherit "Authenticated Users").
-    param([Parameter(Mandatory)][string]$Path)
-    $grant = 'F'
-    if ((Get-Item -LiteralPath $Path -Force) -is [System.IO.DirectoryInfo]) { $grant = '(OI)(CI)F' }
-    $r = Invoke-Native -File 'icacls.exe' -Arguments @($Path, '/inheritance:r', '/grant:r', "*${CurrentUserSid}:$grant", "*S-1-5-18:$grant", "*S-1-5-32-544:$grant") -Capture -AllowFail
+    # -UserAccess ReadOnly: the user may read and run but not change it (Administrators still can);
+    # used for the scripts that scheduled tasks run elevated, so nothing running as the user can
+    # edit them and get administrator rights without a UAC prompt.
+    param([Parameter(Mandatory)][string]$Path, [ValidateSet('Full', 'ReadOnly')][string]$UserAccess = 'Full')
+    $r = Set-LaiPrivateAcl -Path $Path -UserSid $CurrentUserSid -UserAccess $UserAccess
     if ($r.ExitCode -ne 0) { Write-LaiLog WARN "Could not restrict permissions on ${Path}: $($r.Text)" }
 }
 
@@ -285,7 +286,10 @@ function Install-App {
         [Parameter(Mandatory)][string]$Url,
         [Parameter(Mandatory)][string]$FileName,
         [Parameter(Mandatory)][string[]]$InstallerArgs,
-        [Parameter(Mandatory)][scriptblock]$IsInstalled
+        [Parameter(Mandatory)][scriptblock]$IsInstalled,
+        # The vendor name the signing certificate must carry: a valid signature from anyone else
+        # (a hijacked download, a look-alike) is refused.
+        [Parameter(Mandatory)][string]$Publisher
     )
     $winget = Get-Command winget -ErrorAction SilentlyContinue
     if ($winget) {
@@ -301,6 +305,7 @@ function Install-App {
     Invoke-LaiRetry -What "download $FileName" -Action { Invoke-WebRequest -Uri $Url -OutFile $dest -UseBasicParsing } | Out-Null
     $sig = Get-AuthenticodeSignature -FilePath $dest
     if ($sig.Status -ne 'Valid') { throw "$FileName has an invalid Authenticode signature ($($sig.Status)); refusing to run it." }
+    if ([string]$sig.SignerCertificate.Subject -notmatch [regex]::Escape($Publisher)) { throw "$FileName is signed by '$($sig.SignerCertificate.Subject)', not $Publisher; refusing to run it." }
     Write-LaiLog INFO "Running $FileName (signed by $($sig.SignerCertificate.Subject.Split(',')[0]))"
     $proc = Start-Process -FilePath $dest -ArgumentList $InstallerArgs -Wait -PassThru
     if ($proc.ExitCode -ne 0 -and $proc.ExitCode -ne 3010) { throw "$FileName exited with code $($proc.ExitCode)" }
@@ -556,6 +561,14 @@ Invoke-Stage 'Preflight' {
         $w = Join-Path $P.Workspace $d
         if (-not (Test-Path -LiteralPath $w)) { New-Item -ItemType Directory -Force -Path $w | Out-Null }
     }
+    # The whole AI folder belongs to this user (folders under C:\ otherwise let every account change
+    # them): backups hold every chat, logs the install transcript. The scripts that the backup and
+    # resume tasks run as administrator are read-only even for the user. Skipped when the AI root is
+    # a drive root (not ours to lock down).
+    if ([System.IO.Path]::GetPathRoot($P.Root).TrimEnd('\', '/') -ne $P.Root.TrimEnd('\', '/')) {
+        Protect-Path -Path $P.Root
+        if (Test-Path -LiteralPath $P.Scripts) { Protect-Path -Path $P.Scripts -UserAccess ReadOnly }
+    }
     Protect-Path -Path $P.Secrets
 }
 $Catalog = Get-LaiCatalog -Path $CatalogPath -IncludeKeys @($State.flags['selectedModels'])
@@ -565,7 +578,7 @@ $Catalog = Get-LaiCatalog -Path $CatalogPath -IncludeKeys @($State.flags['select
 Invoke-Stage 'Ollama' {
     $ollamaExe = Join-Path $OllamaDir 'ollama.exe'
     if (-not (Test-Path -LiteralPath $ollamaExe)) {
-        Install-App -WingetId 'Ollama.Ollama' -Url 'https://ollama.com/download/OllamaSetup.exe' -FileName 'OllamaSetup.exe' `
+        Install-App -WingetId 'Ollama.Ollama' -Publisher 'Ollama' -Url 'https://ollama.com/download/OllamaSetup.exe' -FileName 'OllamaSetup.exe' `
             -InstallerArgs @('/VERYSILENT', '/NORESTART', '/SUPPRESSMSGBOXES') -IsInstalled { Test-Path -LiteralPath $ollamaExe }
     }
     Add-SessionPath $OllamaDir
@@ -752,7 +765,7 @@ Invoke-Stage 'WSL' {
 #region 6. Docker Desktop (guide Part 7) ----------------------------------------------------
 Invoke-Stage 'Docker' {
     if (-not (Test-Path -LiteralPath $DockerExe)) {
-        Install-App -WingetId 'Docker.DockerDesktop' -Url 'https://desktop.docker.com/win/main/amd64/Docker%20Desktop%20Installer.exe' `
+        Install-App -WingetId 'Docker.DockerDesktop' -Publisher 'Docker' -Url 'https://desktop.docker.com/win/main/amd64/Docker%20Desktop%20Installer.exe' `
             -FileName 'DockerDesktopInstaller.exe' -InstallerArgs @('install', '--quiet', '--accept-license', '--backend=wsl-2', '--always-run-service') `
             -IsInstalled { Test-Path -LiteralPath $DockerExe }
         $State.flags['dockerInstalledAt'] = (Get-Date).ToString('s')
@@ -870,7 +883,9 @@ Invoke-Stage 'Stack' {
     # Secrets: reuse the guide's key file if present so existing sessions stay valid.
     $guideSecret = Join-Path $P.Root 'openwebui-secret.txt'
     if (-not (Test-Path -LiteralPath $secretFile)) {
-        if (Test-Path -LiteralPath $guideSecret) { Copy-Item -LiteralPath $guideSecret -Destination $secretFile }
+        # Moved, not copied: the old file sits outside Secrets where other accounts could read it,
+        # and that key signs Open WebUI logins.
+        if (Test-Path -LiteralPath $guideSecret) { Move-Item -LiteralPath $guideSecret -Destination $secretFile }
         else { Set-Content -LiteralPath $secretFile -Value (New-LaiSecret) -NoNewline }
     }
     Protect-Path -Path $secretFile
@@ -924,16 +939,34 @@ Invoke-Stage 'Stack' {
         $State.flags['ollamaLanFallback'] = $true
         Save-State
         Set-UserEnv -Name 'OLLAMA_HOST' -Value '0.0.0.0:11434' | Out-Null
-        $nics = @(Get-NetAdapter -Physical -ErrorAction SilentlyContinue | ForEach-Object { $_.InterfaceAlias })
-        if ($nics.Count -gt 0 -and -not (Get-NetFirewallRule -DisplayName 'LocalAI - Block Ollama from LAN' -ErrorAction SilentlyContinue)) {
-            New-NetFirewallRule -DisplayName 'LocalAI - Block Ollama from LAN' -Direction Inbound -Protocol TCP -LocalPort 11434 `
-                -Action Block -InterfaceAlias $nics -Profile Any | Out-Null
+        # Block by address, not by adapter: everything except loopback and the Docker/WSL subnets,
+        # whichever adapter it arrives on (Wi-Fi, Ethernet, Tailscale, VPN, adapters added later).
+        $ruleName = 'LocalAI - Block Ollama from LAN'
+        $allowed = @('127.0.0.0/8', '172.16.0.0/12')
+        $allowed += @(Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+            Where-Object { $_.InterfaceAlias -like 'vEthernet (WSL*' -or $_.InterfaceAlias -like '*Docker*' } |
+            ForEach-Object { '{0}/{1}' -f $_.IPAddress, $_.PrefixLength })
+        $blocked = @(Get-LaiBlockRange -Allowed $allowed) + '::2-ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff'
+        Get-NetFirewallRule -DisplayName $ruleName -ErrorAction SilentlyContinue | Remove-NetFirewallRule -ErrorAction SilentlyContinue
+        New-NetFirewallRule -DisplayName $ruleName -Direction Inbound -Protocol TCP -LocalPort 11434 -Action Block -RemoteAddress $blocked -Profile Any | Out-Null
+        Write-LaiLog OK "Firewall: Ollama port 11434 blocked from every address except this PC and Docker/WSL ($($allowed -join ', '))"
+        $restartOllama = {
+            Get-Process -Name 'ollama app', 'ollama', 'llama-server' -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+            Start-Sleep -Seconds 3
+            Start-AsUser (Join-Path $OllamaDir 'ollama app.exe')
+            Wait-LaiHttp -Uri "$OllamaUrl/api/version" -TimeoutSec 90 | Out-Null
         }
-        Get-Process -Name 'ollama app', 'ollama', 'llama-server' -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
-        Start-Sleep -Seconds 3
-        Start-AsUser (Join-Path $OllamaDir 'ollama app.exe')
-        Wait-LaiHttp -Uri "$OllamaUrl/api/version" -TimeoutSec 90 | Out-Null
+        & $restartOllama
         $r = Invoke-Native -File 'docker' -Arguments @('exec', 'open-webui', 'python', '-c', $probe) -Capture -AllowFail
+        if ($r.Text -notmatch '"version"') {
+            # Docker reaches the host from a subnet we did not detect: fall back to blocking the
+            # physical adapters only (the LAN), and say what is not covered.
+            $nics = @(Get-NetAdapter -Physical -ErrorAction SilentlyContinue | ForEach-Object { $_.InterfaceAlias })
+            Get-NetFirewallRule -DisplayName $ruleName -ErrorAction SilentlyContinue | Remove-NetFirewallRule -ErrorAction SilentlyContinue
+            if ($nics.Count -gt 0) { New-NetFirewallRule -DisplayName $ruleName -Direction Inbound -Protocol TCP -LocalPort 11434 -Action Block -InterfaceAlias $nics -Profile Any | Out-Null }
+            Write-LaiLog WARN "Docker could not reach Ollama through the address-based block; using a block on the network adapters ($($nics -join ', ')) instead. VPN/Tailscale adapters are NOT covered: don't share this PC's Ollama port on a tailnet."
+            $r = Invoke-Native -File 'docker' -Arguments @('exec', 'open-webui', 'python', '-c', $probe) -Capture -AllowFail
+        }
         if ($r.Text -notmatch '"version"') { throw "Open WebUI still cannot reach Ollama at host.docker.internal:11434. Output: $($r.Text)" }
     }
     Write-LaiLog OK 'Open WebUI container reaches Ollama at host.docker.internal:11434'

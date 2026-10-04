@@ -6,7 +6,7 @@
 #   [Net.ServicePointManager]::SecurityProtocol = 'Tls12'
 #   irm https://raw.githubusercontent.com/MpLLC303/ComfyUi-Optimization/refs/heads/main/local-llm/Get-LocalAI.ps1 | iex
 #
-# LOCALAI_REF selects the branch to install from. Everything runs inside a script block so the
+# LOCALAI_REF selects the branch, tag or commit to install from. Everything runs inside a script block so the
 # settings below do not leak into your PowerShell session.
 & {
     $ErrorActionPreference = 'Stop'
@@ -18,9 +18,12 @@
     # LOCALAI_ROOT: the install's AI folder (set by the Start-menu 'Update toolkit' shortcut).
     $root = $env:LOCALAI_ROOT
     if (-not $root) { $root = 'C:\AI' }
-    $dest = Join-Path $root 'Installer'
+    # Unpacked in the user's temp folder; the copy that scheduled tasks run lives in AI\Scripts,
+    # which only Administrators can change (the installer copies itself there).
+    $dest = Join-Path $env:TEMP 'LocalAI-Installer'
     $zip = Join-Path $env:TEMP 'localai-installer.zip'
-    $url = "https://codeload.github.com/MpLLC303/ComfyUi-Optimization/zip/refs/heads/$ref"
+    # zip/<ref> accepts a branch, a tag or a commit, so a reviewed version can be pinned.
+    $url = "https://codeload.github.com/MpLLC303/ComfyUi-Optimization/zip/$ref"
 
     Write-Host "Downloading installer ($ref)..." -ForegroundColor Cyan
     Invoke-WebRequest -Uri $url -OutFile $zip -UseBasicParsing

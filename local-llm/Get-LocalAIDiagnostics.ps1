@@ -47,15 +47,22 @@ $webPort = 3000; if ($config.ContainsKey('WebUIPort')) { $webPort = [int]$config
 $secrets = New-Object System.Collections.ArrayList
 function Add-Secret([string]$Value) { if ($Value -and $Value.Length -ge 6 -and -not $secrets.Contains($Value)) { [void]$secrets.Add($Value) } }
 $names = New-Object System.Collections.ArrayList
+# Run from another account, the secret files cannot be read and their exact values can't be
+# redacted (the patterns below still apply): say so instead of shipping a bundle silently.
+$script:unreadableSecrets = @()
 $credFile = Join-Path (Join-Path $AIRoot 'Secrets') 'openwebui-admin.json'
 if (Test-Path -LiteralPath $credFile) {
-    try { $c = Get-Content -Encoding UTF8 -LiteralPath $credFile -Raw | ConvertFrom-Json; Add-Secret ([string]$c.password); if ($c.email) { [void]$names.Add([string]$c.email) } } catch { Write-Verbose 'cred file unreadable' }
+    try { $c = Get-Content -Encoding UTF8 -LiteralPath $credFile -Raw | ConvertFrom-Json; Add-Secret ([string]$c.password); if ($c.email) { [void]$names.Add([string]$c.email) } } catch { $script:unreadableSecrets += $credFile }
 }
 $keyFile = Join-Path (Join-Path $AIRoot 'Secrets') 'openwebui-secret.txt'
-if (Test-Path -LiteralPath $keyFile) { Add-Secret ((Get-Content -Encoding UTF8 -LiteralPath $keyFile -Raw).Trim()) }
+if (Test-Path -LiteralPath $keyFile) {
+    try { Add-Secret ((Get-Content -Encoding UTF8 -LiteralPath $keyFile -Raw -ErrorAction Stop).Trim()) } catch { $script:unreadableSecrets += $keyFile }
+}
 $envFile = Join-Path (Join-Path $AIRoot 'Stack') '.env'
 if (Test-Path -LiteralPath $envFile) {
-    foreach ($line in (Get-Content -Encoding UTF8 -LiteralPath $envFile)) {
+    $envLines = @()
+    try { $envLines = @(Get-Content -Encoding UTF8 -LiteralPath $envFile -ErrorAction Stop) } catch { $script:unreadableSecrets += $envFile }
+    foreach ($line in $envLines) {
         if ($line -match '^([A-Za-z_][A-Za-z0-9_]*)=(.+)$') {
             # Copy the groups first: the second -match below replaces $Matches.
             $k = $Matches[1]; $v = $Matches[2].Trim()
@@ -69,6 +76,8 @@ if (Test-Path -LiteralPath $searxSettings) {
     if ($m) { Add-Secret $m.Matches[0].Groups[1].Value }
 }
 if ($env:USERNAME) { [void]$names.Add($env:USERNAME) }
+# The computer name shows up in transcripts (Machine:, HOST\user) and container logs.
+if ($env:COMPUTERNAME) { [void]$names.Add($env:COMPUTERNAME) }
 
 function Protect-Text([string]$Text) {
     if (-not $Text) { return $Text }
@@ -78,6 +87,8 @@ function Protect-Text([string]$Text) {
     $Text = [regex]::Replace($Text, 'eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}', '[JWT]')
     $Text = [regex]::Replace($Text, '\b[0-9a-fA-F]{48,}\b', '[HEX]')
     if (-not $KeepNames) {
+        # Any e-mail address (other accounts, addresses in logs), not only the admin's.
+        $Text = [regex]::Replace($Text, '[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}', '<email>')
         foreach ($n in $names) {
             if ($n -and $n.Length -ge 3) { $Text = [regex]::Replace($Text, [regex]::Escape($n), '<user>', 'IgnoreCase') }
         }
@@ -184,4 +195,7 @@ Write-Host ''
 Write-Host $summaryText
 Write-Host ''
 try { Set-Clipboard -Value $summaryText; $clip = ' (summary copied to the clipboard)' } catch { $clip = '' }
-Write-LaiLog OK "Diagnostics: $zip$clip. Secrets, tokens$(if (-not $KeepNames) { ', your user name and the admin e-mail' }) are redacted; still, skim it before sharing."
+Write-LaiLog OK "Diagnostics: $zip$clip. Secrets, tokens$(if (-not $KeepNames) { ', your user and computer names and e-mail addresses' }) are redacted; still, skim it before sharing."
+if ($script:unreadableSecrets.Count) {
+    Write-LaiLog WARN "Could not read $($script:unreadableSecrets -join ', ') (run this as the account that installed Local AI): the admin password may not be redacted. Check the bundle before sharing it."
+}

@@ -235,9 +235,27 @@ deliberately not inside the backup archives.
 - **Nothing listens beyond 127.0.0.1**, and `Test-LocalAI.ps1` checks this. For phone access run
   `C:\AI\Scripts\Enable-TailscaleAccess.ps1`: HTTPS at `https://<this-pc>.<tailnet>.ts.net`, tailnet only, survives
   reboots, nothing opened on the LAN (`-Disable` removes it). Never port-forward or bind to `0.0.0.0`.
-- **Secrets** live in `C:\AI\Secrets` and `C:\AI\Stack\.env`, readable only by you, SYSTEM and
-  Administrators. The bootstrap admin password is removed from the container environment after
-  the first login.
+- **Your data stays yours.**
+  - `C:\AI` is readable only by you, SYSTEM and Administrators. Without this, other Windows accounts
+    could read the backups, which hold every chat. Secrets in `C:\AI\Secrets` and
+    `C:\AI\Stack\.env` are locked the same way.
+  - The bootstrap admin password is removed from the container environment after the first login.
+- **No silent admin rights.** The nightly backup and the resume-after-reboot tasks run as
+  administrator. The scripts they run, in `C:\AI\Scripts`, can only be changed by an administrator,
+  so nothing running as you can edit them and gain admin rights without a UAC prompt.
+  - Members of the `docker-users` group (you) are effectively administrators anyway, because Docker
+    can mount any drive. Don't add other accounts to it.
+- **If the installer had to open Ollama beyond 127.0.0.1** (only when containers couldn't reach it),
+  the firewall blocks port 11434 from every address except this PC and the Docker/WSL subnets.
+  That covers Wi-Fi, Ethernet, Tailscale and VPN alike.
+- **Updates trust this repository.** "Update toolkit" downloads the `main` branch over HTTPS and
+  runs it as administrator. Whoever can push to `main` controls what it installs, so keep two-factor
+  authentication on the GitHub account. To install a reviewed version instead, set
+  `$env:LOCALAI_REF` to a tag or commit before running the command.
+  - Ollama and Docker Desktop installers come from winget (hash-checked). The direct-download
+    fallback refuses files that aren't signed by Ollama or Docker.
+- **Passwords on the command line** end up in PowerShell history. Use `Set-OpenWebUIPassword.ps1 -Prompt`
+  rather than `-NewPassword`.
 - **Abliterated models** are community modifications: refusal behaviour is removed, but nobody has done release QA on them.
   Spot-check them before relying on them for anything important (guide Part 12).
 
