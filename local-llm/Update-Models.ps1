@@ -168,7 +168,11 @@ if ($Rollback.Count -gt 0) {
                 Write-LaiLog INFO ("  previous version kept as {0} (~{1} GB until the next update; Update-Models.ps1 -Rollback {2} brings it back, -DropPrevious frees it)" -f $pn, (Get-ModelGB $pn), $m.Key)
             }
         } finally { try { Remove-Model $candidate } catch { Write-Verbose "could not remove $candidate" } }
-        if ($old -ne $new -or $Retune -or -not (Test-LaiOllamaModel -BaseUrl $ollamaUrl -Name $m.Alias)) {
+        # Also when the tuned alias was built from other content than the tag holds now: a run cut off
+        # after the download but before the re-tune would otherwise report "unchanged" for good.
+        $tunedDigest = ''
+        if ($state['tuning'].ContainsKey($m.Key) -and $state['tuning'][$m.Key]['Digest']) { $tunedDigest = [string]$state['tuning'][$m.Key]['Digest'] }
+        if ($old -ne $new -or $Retune -or ($tunedDigest -and $tunedDigest -ne $new) -or -not (Test-LaiOllamaModel -BaseUrl $ollamaUrl -Name $m.Alias)) {
             Write-LaiLog INFO ("  {0}: {1} -> {2}" -f $m.Display, $(if ($old) { $old.Substring(0, 12) } else { 'missing' }), $new.Substring(0, 12))
             $changed += $m
         } else {

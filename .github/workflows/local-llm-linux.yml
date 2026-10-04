@@ -93,6 +93,9 @@ jobs:
           & ./local-llm/tests/Invoke-StaticChecks.ps1 -PssaPath 'not-used'
           exit $LASTEXITCODE
 
+      - name: Render guard behaviour (fake ComfyUI + fake Ollama)
+        run: python3 local-llm/tests/test_render_guard.py
+
       - name: Integration test (API layer against the real servers)
         shell: pwsh
         run: |

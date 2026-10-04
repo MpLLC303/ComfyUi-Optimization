@@ -106,6 +106,17 @@ try {
 
     Assert-That ((Test-LaiRegistryReachable -Url "$OllamaUrl/v2/") -and -not (Test-LaiRegistryReachable -Url 'http://127.0.0.1:1/v2/' -TimeoutSec 3)) 'registry probe: an HTTP 404 counts as online, a refused connection as offline'
 
+    Write-Host "`n=== 3c. a run cut off after the download is finished by the next run ===" -ForegroundColor Cyan
+    # The tag already holds new content (the pull finished), but the re-tune never ran: the tuned
+    # alias and the recorded digest are still the old ones.
+    Invoke-LaiApi -Method POST -Uri "$OllamaUrl/api/copy" -Body @{ source = $variant; destination = $tag } | Out-Null
+    $tunedBefore = [string](Read-LaiState -Path (Join-Path $aiRoot 'install-state.json'))['tuning']['main']['Digest']
+    $r = Invoke-Update @() $variant
+    $tunedAfter = [string](Read-LaiState -Path (Join-Path $aiRoot 'install-state.json'))['tuning']['main']['Digest']
+    Assert-That ($tunedBefore -and $tunedBefore -ne (Get-Digest $tag)) 'setup: tuning still records the old content'
+    Assert-That ($r.Code -eq 0 -and $r.Text -match 'Re-tuned' -and $tunedAfter -eq (Get-Digest $tag)) "the stale alias is re-tuned although the download itself found nothing new ($tunedAfter)"
+    Invoke-LaiApi -Method POST -Uri "$OllamaUrl/api/copy" -Body @{ source = $BaseModel; destination = $tag } | Out-Null
+
     Write-Host "`n=== 4. -DropPrevious ===" -ForegroundColor Cyan
     Invoke-Update @() $variant | Out-Null
     Assert-That (Test-LaiOllamaModel -BaseUrl $OllamaUrl -Name $prev) '-prev kept again after another re-publish'

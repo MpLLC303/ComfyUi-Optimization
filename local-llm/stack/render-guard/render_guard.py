@@ -101,14 +101,29 @@ def _is_timeout(e):
     return isinstance(reason, (socket.timeout, TimeoutError))
 
 
+def _reachable(base):
+    """True when a TCP connection to the URL's host:port opens within the probe timeout. A
+    connection that is refused, or never answered (host down, a firewall dropping packets),
+    means no ComfyUI there."""
+    u = urllib.parse.urlsplit(base)
+    try:
+        socket.create_connection((u.hostname, u.port or 80), timeout=CONFIG['probe_timeout']).close()
+        return True
+    except OSError:
+        return False
+
+
 def _probe_one(base):
     """One ComfyUI URL -> None (nothing listening) or a dict describing it."""
+    if not _reachable(base):
+        return None
     try:
         q = _http_json(base + '/queue', CONFIG['probe_timeout'])
     except Exception as e:
         if _is_timeout(e):
-            # Port open but no answer in time: ComfyUI is running and too busy to reply
-            # (e.g. loading a checkpoint). Safer to treat that as a render in progress.
+            # Connected, but no answer in time: ComfyUI is running and too busy to reply (e.g.
+            # loading a checkpoint). Safer to treat that as a render in progress. (A host that
+            # never accepts the connection was ruled out above: that is not "busy".)
             return {'url': base, 'busy': True, 'running': -1, 'pending': -1, 'held_mib': None, 'slow': True}
         return None
     running = len(q.get('queue_running') or [])

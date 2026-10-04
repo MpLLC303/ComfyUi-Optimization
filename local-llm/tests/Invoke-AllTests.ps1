@@ -13,7 +13,7 @@
     pwsh tests/Invoke-AllTests.ps1 -Only Static, Mock
 #>
 param(
-    # Static, Unit, Mock, ModelUpdate, UpdateWebUI, Uninstall, Integration, Acceptance
+    # Static, Unit, RenderGuard, Mock, ModelUpdate, UpdateWebUI, Uninstall, Integration, Acceptance
     [string[]]$Only = @(),
     [string]$LogDir = (Join-Path ([System.IO.Path]::GetTempPath()) 'lai-alltests'),
     [string]$SplitterForSandbox = 'character'
@@ -24,6 +24,7 @@ $t = $PSScriptRoot
 $suites = @(
     @{ Name = 'Static'; File = (Join-Path $t 'Invoke-StaticChecks.ps1'); Args = @() }
     @{ Name = 'Unit'; File = (Join-Path $t 'Invoke-WindowsUnitTests.ps1'); Args = @() }
+    @{ Name = 'RenderGuard'; Exe = 'python3'; File = (Join-Path $t 'test_render_guard.py'); Args = @() }
     @{ Name = 'Mock'; File = (Join-Path $t 'Invoke-InstallerMockRun.ps1'); Args = @() }
     @{ Name = 'ModelUpdate'; File = (Join-Path $t 'Invoke-ModelUpdateTest.ps1'); Args = @() }
     @{ Name = 'UpdateWebUI'; File = (Join-Path $t 'Invoke-UpdateWebUITest.ps1'); Args = @() }
@@ -65,7 +66,8 @@ try {
         Write-Host ("{0,-12} running..." -f $s.Name) -ForegroundColor Cyan
         $sw = [System.Diagnostics.Stopwatch]::StartNew()
         $prev = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
-        & pwsh -NoProfile -File $s.File @($s.Args) *> $log
+        if ($s.ContainsKey('Exe')) { & $s.Exe $s.File @($s.Args) *> $log }
+        else { & pwsh -NoProfile -File $s.File @($s.Args) *> $log }
         $code = $LASTEXITCODE
         $ErrorActionPreference = $prev
         $sw.Stop()
