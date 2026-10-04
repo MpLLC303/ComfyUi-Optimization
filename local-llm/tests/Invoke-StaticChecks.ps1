@@ -32,6 +32,7 @@ $files = Get-ChildItem -Path $Root -Recurse -File -Include *.ps1, *.psm1, *.psd1
 #            scriptblock's own (empty) set there, not the script's; copy it to a script variable.
 #   ELEVATED Install-LocalAI.ps1 (runs elevated, silently from the resume task) running code
 #            from AI\Scripts, a folder inside the user-controlled C:\AI.
+#   NOSILENT a scheduled task with -RunLevel Highest (elevated without a UAC prompt).
 #   ENCODING Get-Content of an env/config/state/secret file without -Encoding UTF8 (5.1 reads
 #            BOM-less UTF-8 as ANSI; .env must be BOM-less for docker compose).
 function Find-Pitfall([System.Management.Automation.Language.Ast]$Ast, [string[]]$Lines, [string]$FileName = '') {
@@ -58,6 +59,10 @@ function Find-Pitfall([System.Management.Automation.Language.Ast]$Ast, [string[]
         if ($FileName -eq 'Install-LocalAI.ps1' -and ($c.InvocationOperator -eq 'Ampersand' -or $c.InvocationOperator -eq 'Dot' -or $name -eq 'Import-Module') -and
             $c.Extent.Text -match '\$P\.Scripts' -and -not (& $marker $c 'elevated')) {
             & $add 'ELEVATED' $c 'the elevated installer runs code from AI\Scripts (user-controlled folder); run it from $SourceRoot'
+        }
+        # No scheduled task may run elevated: the scripts work on C:\AI, which the user controls.
+        if ($name -eq 'New-ScheduledTaskPrincipal' -and $c.Extent.Text -match '(?i)-RunLevel\s+Highest' -and -not (& $marker $c 'elevated')) {
+            & $add 'NOSILENT' $c 'scheduled task with -RunLevel Highest: it would run toolkit code elevated without a UAC prompt'
         }
         # Get-Content of a config/state/env/secret file without -Encoding: Windows PowerShell 5.1 reads
         # BOM-less UTF-8 (how .env must be written for docker compose) as ANSI and garbles non-ASCII.
@@ -137,6 +142,8 @@ $canaries = @(
     @{ Rule = 'ELEVATED'; Fire = $true; File = 'Install-LocalAI.ps1'; Code = 'Import-Module (Join-Path $P.Scripts ''lib\LocalAI.psm1'')' }
     @{ Rule = 'ELEVATED'; Fire = $false; File = 'Install-LocalAI.ps1'; Code = '& (Join-Path $SourceRoot ''Test-LocalAI.ps1'') -AIRoot $AIRoot' }
     @{ Rule = 'ELEVATED'; Fire = $false; File = 'Install-LocalAI.ps1'; Code = '$x = Join-Path $P.Scripts ''Watch-LocalAI.ps1''' }
+    @{ Rule = 'NOSILENT'; Fire = $true; Code = '$p = New-ScheduledTaskPrincipal -UserId $u -LogonType Interactive -RunLevel Highest' }
+    @{ Rule = 'NOSILENT'; Fire = $false; Code = '$p = New-ScheduledTaskPrincipal -UserId $u -LogonType Interactive -RunLevel Limited' }
     @{ Rule = 'ENCODING'; Fire = $true; Code = 'foreach ($l in (Get-Content -LiteralPath $envPath)) { $l }' }
     @{ Rule = 'ENCODING'; Fire = $true; Code = '$c = Get-Content -LiteralPath $credFile -Raw | ConvertFrom-Json' }
     @{ Rule = 'ENCODING'; Fire = $false; Code = '$c = Get-Content -LiteralPath $credFile -Raw -Encoding UTF8 | ConvertFrom-Json' }

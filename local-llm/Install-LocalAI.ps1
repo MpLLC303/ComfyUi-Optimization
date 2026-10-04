@@ -11,7 +11,8 @@
 
     Safe to re-run at any time: every step checks the current state first, nothing is downloaded twice,
     and tuned settings are reused. If WSL or Docker needs a reboot, the script registers a logon task,
-    reboots (60 s warning, cancel with "shutdown /a") and continues by itself after you sign in.
+    reboots (60 s warning, cancel with "shutdown /a") and continues after you sign in (it asks for
+    administrator rights again: click Yes).
 
     The only prompts you should see: one UAC prompt (admin rights) at the start.
 
@@ -92,7 +93,10 @@ function ConvertTo-PsLiteral {
     param($Value)
     if ($Value -is [array]) { return (($Value | ForEach-Object { ConvertTo-PsLiteral $_ }) -join ',') }
     if ($Value -is [int] -or $Value -is [long]) { return [string]$Value }
-    return "'" + ([string]$Value).Replace("'", "''") + "'"
+    # PowerShell also ends a single-quoted string at the typographic quotes U+2018-U+201B: double them too.
+    $t = [string]$Value
+    foreach ($q in @("'", [string][char]0x2018, [string][char]0x2019, [string][char]0x201A, [string][char]0x201B)) { $t = $t.Replace($q, $q + $q) }
+    return "'" + $t + "'"
 }
 
 function Get-RelaunchCommand {
@@ -358,7 +362,11 @@ function Register-ResumeTask {
     $cmd = Get-RelaunchCommand -ScriptPath $scriptPath -AddResume
     $action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument "-NoProfile -ExecutionPolicy Bypass -NoExit -Command $cmd"
     $trigger = New-ScheduledTaskTrigger -AtLogOn -User $CurrentUser
-    $principal = New-ScheduledTaskPrincipal -UserId $CurrentUser -LogonType Interactive -RunLevel Highest
+    # Not elevated: at sign-in it starts the installer, which asks for administrator rights with a
+    # normal UAC prompt (as on the first run). A task that ran the installer elevated without asking
+    # would let anything running as the user steer it through files in C:\AI (state, junctions,
+    # tools found on the user's PATH): nothing in this toolkit gets admin rights without a prompt.
+    $principal = New-ScheduledTaskPrincipal -UserId $CurrentUser -LogonType Interactive -RunLevel Limited
     $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit (New-TimeSpan -Hours 8)
     Register-ScheduledTask -TaskName $ResumeTask -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Force | Out-Null
 }
@@ -371,11 +379,11 @@ function Request-Reboot {
     Save-State
     Write-LaiLog WARN "Reboot required: $Reason"
     if ($NoReboot) {
-        Write-LaiLog WARN 'Reboot when convenient and sign in again; the installer resumes automatically.'
+        Write-LaiLog WARN 'Reboot when convenient and sign in again; the installer resumes then (click Yes when Windows asks for administrator rights).'
         Stop-Install 3010
     }
-    Write-LaiLog WARN 'Rebooting in 60 seconds. Save your work, or run "shutdown /a" to cancel. The installer resumes after you sign in.'
-    Invoke-Native -File 'shutdown.exe' -Arguments @('/r', '/t', '60', '/c', "Local AI installer: $Reason. It continues after you sign in.") | Out-Null
+    Write-LaiLog WARN 'Rebooting in 60 seconds. Save your work, or run "shutdown /a" to cancel. After you sign in the installer resumes: click Yes when Windows asks for administrator rights.'
+    Invoke-Native -File 'shutdown.exe' -Arguments @('/r', '/t', '60', '/c', "Local AI installer: $Reason. It continues after you sign in (click Yes at the prompt).") | Out-Null
     Stop-Install 3010
 }
 

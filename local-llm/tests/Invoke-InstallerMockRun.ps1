@@ -148,11 +148,14 @@ function global:docker {
 # ---- phase 1: fresh install until WSL needs a reboot ----------------------------------------
 Write-Host "`n=== PHASE 1: fresh run (expects reboot request) ===" -ForegroundColor Cyan
 # 'trial-ok,trial-missing' as ONE string, the way Install-LocalAI.cmd (powershell -File) delivers it.
-& $inst -AIRoot $aiRoot -SkipTests -TrialModels 'trial-ok,trial-missing' -KeepAlive 7m -BackupRetentionDays 9 -SkipCoder:$false -KnowledgeCollections 'PC & Electronics,General References'
+# The U+2019 apostrophe must survive the quoting of the resume task's command line (PowerShell ends
+# a single-quoted string at it too).
+& $inst -AIRoot $aiRoot -SkipTests -TrialModels 'trial-ok,trial-missing' -KeepAlive 7m -BackupRetentionDays 9 -SkipCoder:$false -KnowledgeCollections "PC & Electronics,Dad$([char]0x2019)s References"
 $code1 = $LASTEXITCODE
 $state = Get-Content -Encoding UTF8 -Raw (Join-Path $aiRoot 'install-state.json') | ConvertFrom-Json
 Assert-That ($code1 -eq 3010) "phase 1 exits 3010 for reboot (got $code1)"
 Assert-That ($global:Tasks.ContainsKey('LocalAI-Install-Resume')) 'resume task registered'
+Assert-That ([string]$global:TaskPrincipals['LocalAI-Install-Resume'] -match 'Limited' -and [string]$global:TaskPrincipals['LocalAI-Install-Resume'] -notmatch 'Highest') 'resume task is not elevated (the installer asks with a UAC prompt)'
 Assert-That ($global:Tasks['LocalAI-Install-Resume'] -match '-SkipCoder:\$false') 'an explicit false switch survives the reboot/resume relaunch'
 Assert-That ($global:Tasks['LocalAI-Install-Resume'] -match "-Resume" -and $global:Tasks['LocalAI-Install-Resume'] -match [regex]::Escape((Join-Path $env:ProgramFiles 'LocalAI'))) 'resume task runs the administrators-only copy in Program Files\LocalAI with -Resume'
 Assert-That (@($global:Calls | Where-Object { $_ -like 'shutdown /r /t 60*' }).Count -eq 1) 'reboot scheduled with 60 s warning'
@@ -243,7 +246,7 @@ Assert-That ($cfgAfter.ComfyUIPath -eq 'D:\ComfyUI\run_nvidia_gpu.bat') 're-run 
 Assert-That ($cfgAfter.OpenWebUIVersion -eq 'v0.99.0' -and $cfgAfter.RenderGuard -eq 'off') 'config reflects the kept version and mode'
 Assert-That ([string]$cfgAfter.WebUIOllamaUrl -ne '') 'config records the Ollama URL Open WebUI was given'
 $kc = @((Get-Content -Encoding UTF8 -Raw (Join-Path $aiRoot 'install-state.json') | ConvertFrom-Json).flags.params.KnowledgeCollections)
-Assert-That ($kc.Count -eq 2 -and $kc -contains 'General References') "a comma list given as one string is remembered split ($($kc -join ' | '))"
+Assert-That ($kc.Count -eq 2 -and $kc -contains "Dad$([char]0x2019)s References") "a comma list given as one string is remembered split, a typographic apostrophe intact through the resume command ($($kc -join ' | '))"
 Assert-That ($cfgAfter.KeepAlive -eq '7m' -and [int]$cfgAfter.BackupRetentionDays -eq 9) 're-run without switches keeps -KeepAlive / -BackupRetentionDays from the first run'
 
 Assert-That (@((Get-Content -Encoding UTF8 -Raw (Join-Path $aiRoot 'install-state.json') | ConvertFrom-Json).flags.selectedModels) -contains 'trial-ok') 're-run without -TrialModels keeps the chosen trial'

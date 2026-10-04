@@ -32,7 +32,8 @@ fails. The first window then says it continues in the Administrator window, and 
 
 Expect about 30-90 minutes. Most of that is about 67 GB of model downloads plus the Docker
 image. If WSL or Docker needs a reboot, the script warns you 60 seconds ahead (`shutdown /a`
-cancels it), reboots, and **continues by itself after you sign in**. At the end it opens
+cancels it), reboots, and **continues after you sign in**: click **Yes** when Windows asks for
+administrator rights. At the end it opens
 http://localhost:3000 and prints the admin login (also saved in
 `C:\AI\Secrets\openwebui-admin.json`). The installer also allows typing script names such as
 `C:\AI\Scripts\Test-LocalAI.ps1` in PowerShell, by setting the execution policy to RemoteSigned.
@@ -240,12 +241,12 @@ deliberately not inside the backup archives.
     could read the backups, which hold every chat. Secrets in `C:\AI\Secrets` and
     `C:\AI\Stack\.env` are locked the same way.
   - The bootstrap admin password is removed from the container environment after the first login.
-- **No silent admin rights.**
-  - Nothing that starts by itself as administrator runs code from `C:\AI`. You control that
-    folder, so you could swap anything in it, even a read-only subfolder.
-  - The nightly backup and the health watch run as you, without admin rights.
-  - The one task that needs admin rights is the installer's resume after a reboot. It runs a copy
-    in `C:\Program Files\LocalAI`, which only an administrator can change.
+- **No silent admin rights.** No scheduled task runs as administrator.
+  - The nightly backup and the health watch run as you.
+  - The installer's resume after a reboot starts as you and asks for administrator rights with the
+    normal Windows prompt. The installer works on files in `C:\AI`, which you control (you could
+    even swap folders in it), so it must never get admin rights without asking.
+  - That resume runs a copy in `C:\Program Files\LocalAI`, which only an administrator can change.
   - Members of the `docker-users` group (you) are effectively administrators anyway, because Docker
     can mount any drive. Don't add other accounts to it.
 - **If the installer had to open Ollama beyond 127.0.0.1** (only when containers couldn't reach it):
