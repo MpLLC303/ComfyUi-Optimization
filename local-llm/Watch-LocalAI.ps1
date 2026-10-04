@@ -161,7 +161,11 @@ if ($engine -eq $false) {
     foreach ($c in @(@{ Name = 'open-webui'; Url = "http://127.0.0.1:$webPort/health"; Key = 'Open WebUI' },
                      @{ Name = 'searxng'; Url = "http://127.0.0.1:$searxPort/healthz"; Key = 'SearXNG' })) {
         $ok = Test-Url $c.Url
-        if (-not $ok -and $c.Name -eq 'open-webui' -and (Test-LaiVolumeLockBusy)) {
+        $hold = $null; if ($c.Name -eq 'open-webui') { $hold = Get-LaiWebUIHold -AIRoot $AIRoot }
+        if (-not $ok -and $hold) {
+            # Left stopped on purpose by a failed restore: starting it could run on a damaged volume.
+            $details[$c.Key] = "kept stopped after a failed restore - $($hold['Recover'])"
+        } elseif (-not $ok -and $c.Name -eq 'open-webui' -and (Test-LaiVolumeLockBusy)) {
             # A backup, restore or update stopped it on purpose; starting it now could corrupt the data.
             $ok = $true
             $maintenance = $true

@@ -55,6 +55,7 @@ $swapScript = 'set -e; rm -rf /data/.restore-staging; mkdir /data/.restore-stagi
 
 function Invoke-Swap {
     param([string]$ArchivePath)
+    if ($env:LOCALAI_TEST_FAIL_SWAP) { throw 'Test hook: swap failed' }
     Invoke-Docker -Arguments @('run', '--rm', '-v', "${Volume}:/data", '-v', "${ArchivePath}:/restore.tar.gz:ro", $img, 'sh', '-c', $swapScript) | Out-Null
 }
 
@@ -70,6 +71,16 @@ $lock = $null
 $stoppedContainers = @()
 $volumeTouched = $false
 $safety = $null
+$holdPath = Join-Path $AIRoot 'open-webui-hold.json'
+function Set-Hold([string]$Why) {
+    # Keep Open WebUI down until a restore succeeds: the watch, Start-LocalAI and the installer
+    # check this file. The original restart policies are kept here so the recovery can put them back.
+    $list = @($stoppedContainers | ForEach-Object { @{ Id = $_.Id; Policy = $_.Policy } })
+    $ids = @($list | ForEach-Object { $_['Id'] })
+    $old = Get-LaiWebUIHold -AIRoot $AIRoot
+    if ($old -and $old['Containers']) { foreach ($c in @($old['Containers'])) { if ($ids -notcontains $c['Id']) { $list += $c } } }
+    Save-LaiState -State @{ Reason = $Why; Recover = $script:recoverCmd; Containers = $list; Since = (Get-Date).ToString('s') } -Path $holdPath
+}
 
 # Pick and confirm the archive before taking the lock, so an unanswered prompt never blocks the
 # nightly backup.
@@ -144,6 +155,18 @@ try {
     $volumeTouched = $true
     Invoke-Swap $staged
     Write-LaiLog OK "Volume '$Volume' now holds $($source.Name)"
+    # Recovering from an earlier failed restore: its containers are already stopped (so not listed
+    # above) and their policy is 'no'. Only now that the data is good, bring them back with the
+    # policy they had (adding them before the swap would start them on the damaged volume on failure).
+    $hold = Get-LaiWebUIHold -AIRoot $AIRoot
+    if ($hold -and $hold['Containers']) {
+        foreach ($h in @($hold['Containers'])) {
+            if (@($stoppedContainers | ForEach-Object { $_.Id }) -notcontains $h['Id'] -and
+                (Invoke-Docker -Arguments @('inspect', '--type', 'container', $h['Id']) -AllowFail).ExitCode -eq 0) {
+                $stoppedContainers += [pscustomobject]@{ Id = [string]$h['Id']; Policy = [string]$h['Policy'] }
+            }
+        }
+    }
 } catch {
     $failure = $_.Exception.Message
     Write-LaiLog FAIL $failure
@@ -153,11 +176,15 @@ try {
             try { Invoke-Swap $safety.FullName; Write-LaiLog OK 'Rollback complete: the volume is as it was before the restore.' }
             catch {
                 Write-LaiLog FAIL "Rollback failed too: $($_.Exception.Message)"
-                Write-LaiLog FAIL "Open WebUI is left STOPPED. Recover with: .\Restore-OpenWebUI.ps1 -Archive '$($safety.FullName)' -SkipSafetyBackup"
+                $script:recoverCmd = ".\Restore-OpenWebUI.ps1 -Archive '$($safety.FullName)' -SkipSafetyBackup"
+                Write-LaiLog FAIL "Open WebUI is left STOPPED (the health watch will not start it). Recover with: $script:recoverCmd"
+                Set-Hold 'restore and its rollback failed'
                 $stoppedContainers = @()
             }
         } else {
-            Write-LaiLog FAIL 'No safety backup exists; Open WebUI is left STOPPED so it cannot start on a damaged volume.'
+            $script:recoverCmd = '.\Restore-OpenWebUI.ps1 -Archive <a good backup> -SkipSafetyBackup'
+            Write-LaiLog FAIL "No safety backup exists; Open WebUI is left STOPPED so it cannot start on a damaged volume (the health watch will not start it). Recover with: $script:recoverCmd"
+            Set-Hold 'restore failed without a safety backup'
             $stoppedContainers = @()
         }
     }
@@ -173,6 +200,7 @@ try {
     Exit-LaiVolumeLock $lock
 }
 if ($script:restoreFailed) { exit 1 }
+if (Test-Path -LiteralPath $holdPath) { Remove-Item -LiteralPath $holdPath -Force; Write-LaiLog OK 'Earlier failed restore cleared: Open WebUI may run again' }
 
 # 4. Wait for Open WebUI.
 if ($stoppedContainers.Count -gt 0) {

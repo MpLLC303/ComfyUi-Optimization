@@ -72,6 +72,8 @@ try {
 
     # 3. Containers.
     if (-not (Test-Path -LiteralPath $compose)) { throw "Missing $compose. Re-run Install-LocalAI.ps1." }
+    $hold = Get-LaiWebUIHold -AIRoot $AIRoot
+    if ($hold) { throw "Open WebUI is kept stopped after a failed restore ($($hold['Reason'])). Recover first: $($hold['Recover'])" }
     $r = Invoke-Docker @('compose', '--project-directory', $stackDir, '-f', $compose, 'up', '-d')
     if ($r.ExitCode -ne 0) { throw "docker compose up failed: $($r.Text)" }
     Wait-LaiWebUI -BaseUrl "http://127.0.0.1:$webPort" -TimeoutSec $TimeoutSec

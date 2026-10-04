@@ -79,6 +79,7 @@ $archive = Join-Path $backupDir $name
 $workName = "incomplete-$name"
 $work = Join-Path $backupDir $workName
 $stopped = $false
+$verifiedOk = $false
 $exitCode = 0
 
 $deadline = (Get-Date).AddSeconds($EngineWaitSec)
@@ -156,31 +157,48 @@ try {
             Invoke-Docker -Arguments @('volume', 'rm', '-f', $scratch) -AllowFail | Out-Null
         }
     }
-    Move-Item -LiteralPath $work -Destination $archive -Force
+    # Verified: from here on the archive is good, and nothing below may delete it.
+    $verifiedOk = $true
+    for ($i = 1; $i -le 5; $i++) {
+        try { Move-Item -LiteralPath $work -Destination $archive -Force -ErrorAction Stop; break }
+        catch {
+            # Antivirus or a sync client can hold a just-written file for a moment.
+            if ($i -eq 5) { throw "Backup verified but could not be renamed (kept as $workName): $($_.Exception.Message)" }
+            Start-Sleep -Seconds (2 * $i)
+        }
+    }
     Write-BackupLog OK ("Backup {0} ({1:N1} MB){2}{3}" -f $archive, ($size / 1MB), $(if ($stopped) { '; container was paused for consistency' } else { '' }), $verified)
 
     # Retention: daily (untagged) archives older than N days go, but the newest three daily ones always
     # stay. Tagged archives (pre-compose, pre-restore, before-<version>) never count toward those three.
-    if (-not $NoPrune) {
-        $all = @(Get-ChildItem -LiteralPath $backupDir -Filter 'open-webui-*.tar.gz')
+    # The archive Update-OpenWebUI.ps1 -Rollback would use stays no matter how old it is. Applied to
+    # the mirror too, which would otherwise fill the NAS. One file that cannot be deleted (open in an
+    # archiver, held by a sync client) is a warning, not a failed backup.
+    $keepName = ''
+    if ($config.ContainsKey('RollbackArchive') -and $config['RollbackArchive']) { $keepName = Split-Path -Leaf ([string]$config['RollbackArchive']) }
+    $prune = {
+        param([string]$Dir)
+        $all = @(Get-ChildItem -LiteralPath $Dir -Filter 'open-webui-*.tar.gz' -ErrorAction Stop)
         $daily = @($all | Where-Object { $_.Name -match '^open-webui-\d{8}-\d{6}\.tar\.gz$' } | Sort-Object LastWriteTime -Descending)  # lai-ok: objects
-        $tagged = @($all | Where-Object { $_.Name -notmatch '^open-webui-\d{8}-\d{6}\.tar\.gz$' })
-        # The archive Update-OpenWebUI.ps1 -Rollback would use stays no matter how old it is.
-        $keep = ''
-        if ($config.ContainsKey('RollbackArchive') -and $config['RollbackArchive']) { $keep = [string]$config['RollbackArchive'] }
-        if ($keep) { $tagged = @($tagged | Where-Object { $_.FullName -ne $keep -and $_.Name -ne (Split-Path -Leaf $keep) }) }
+        $tagged = @($all | Where-Object { $_.Name -notmatch '^open-webui-\d{8}-\d{6}\.tar\.gz$' -and $_.Name -ne $keepName })
         $cutoff = (Get-Date).AddDays(-$RetentionDays)
-        foreach ($old in (@($daily | Select-Object -Skip 3) + $tagged | Where-Object { $_.LastWriteTime -lt $cutoff -and $_.FullName -ne $archive })) {
-            Remove-Item -LiteralPath $old.FullName -Force
-            Write-BackupLog INFO "Pruned $($old.Name)"
+        foreach ($old in (@($daily | Select-Object -Skip 3) + $tagged | Where-Object { $_.LastWriteTime -lt $cutoff -and $_.Name -ne $name })) {
+            try { Remove-Item -LiteralPath $old.FullName -Force -ErrorAction Stop; Write-BackupLog INFO "Pruned $($old.FullName)" }
+            catch { Write-BackupLog WARN "Could not prune $($old.FullName): $($_.Exception.Message)" }
         }
     }
+    if (-not $NoPrune) { & $prune $backupDir }
 
     if ($Mirror -and -not $NoMirror) {
         try {
-            if (-not (Test-Path -LiteralPath $Mirror)) { New-Item -ItemType Directory -Force -Path $Mirror | Out-Null }
-            Copy-Item -LiteralPath $archive -Destination $Mirror -Force
+            if (-not (Test-Path -LiteralPath $Mirror)) { New-Item -ItemType Directory -Force -Path $Mirror -ErrorAction Stop | Out-Null }
+            # Copy under a temporary name, then rename: an interrupted copy never looks like a backup.
+            $mirrorTmp = Join-Path $Mirror $workName
+            Copy-Item -LiteralPath $archive -Destination $mirrorTmp -Force -ErrorAction Stop
+            Move-Item -LiteralPath $mirrorTmp -Destination (Join-Path $Mirror $name) -Force -ErrorAction Stop
             Write-BackupLog OK "Mirrored to $Mirror"
+            Get-ChildItem -LiteralPath $Mirror -Filter 'incomplete-open-webui-*' -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
+            if (-not $NoPrune) { & $prune $Mirror }
         } catch {
             # The local archive is complete and verified; an offline NAS must not fail the backup.
             Write-BackupLog WARN "Mirror copy to $Mirror failed: $($_.Exception.Message)"
@@ -189,7 +207,7 @@ try {
 } catch {
     Write-BackupLog FAIL $_.Exception.Message
     $exitCode = 1
-    if (Test-Path -LiteralPath $work) { Remove-Item -LiteralPath $work -Force -ErrorAction SilentlyContinue }
+    if (-not $verifiedOk -and (Test-Path -LiteralPath $work)) { Remove-Item -LiteralPath $work -Force -ErrorAction SilentlyContinue }
 } finally {
     Exit-LaiVolumeLock $lock
 }

@@ -55,12 +55,31 @@ if ($PromptCurrent) {
 }
 if ($CurrentPassword) { $current = $CurrentPassword }
 $token = Connect-LaiWebUI -BaseUrl $baseUrl -Email $cred.email -Password $current
-$ok = Invoke-LaiApi -Method POST -Uri "$baseUrl/api/v1/auths/update/password" -Token $token -Body @{ password = $current; new_password = $NewPassword }
-if ($ok -ne $true) { throw 'Open WebUI refused the password change.' }
-Connect-LaiWebUI -BaseUrl $baseUrl -Email $cred.email -Password $NewPassword | Out-Null
+
+# The new password is written down BEFORE Open WebUI is asked to change it: if the request times out
+# after the change went through, or saving the file fails, the admin password is never lost.
+# (Same Secrets folder, so it inherits the folder's restricted permissions.)
+$pending = Join-Path (Join-Path $AIRoot 'Secrets') 'openwebui-admin.pending.json'
+$updated = @{ email = $cred.email; password = $NewPassword; url = "http://localhost:$port"; rotated = (Get-Date).ToString('s') }
+ConvertTo-Json -InputObject $updated | Set-Content -LiteralPath $pending -Encoding UTF8
+try {
+    $ok = Invoke-LaiApi -Method POST -Uri "$baseUrl/api/v1/auths/update/password" -Token $token -Body @{ password = $current; new_password = $NewPassword }
+} catch {
+    Write-LaiLog FAIL "The password change request failed: $($_.Exception.Message)"
+    Write-LaiLog WARN "If the change went through anyway, the new password is in $pending (otherwise the old one in $credFile still works)."
+    exit 1
+}
+if ($ok -ne $true) { Remove-Item -LiteralPath $pending -Force -ErrorAction SilentlyContinue; throw 'Open WebUI refused the password change; the old password still works.' }
 
 # Keep the file's existing ACL (the installer restricted it); just replace the content.
-$updated = @{ email = $cred.email; password = $NewPassword; url = "http://localhost:$port"; rotated = (Get-Date).ToString('s') }
-ConvertTo-Json -InputObject $updated | Set-Content -LiteralPath $credFile -Encoding UTF8
+try { ConvertTo-Json -InputObject $updated | Set-Content -LiteralPath $credFile -Encoding UTF8 -ErrorAction Stop }
+catch {
+    Write-LaiLog FAIL "Password changed, but $credFile could not be updated ($($_.Exception.Message)). The new password is in $pending; copy it over."
+    Write-Host "New password: $NewPassword" -ForegroundColor Green
+    exit 1
+}
+Remove-Item -LiteralPath $pending -Force -ErrorAction SilentlyContinue
+try { Connect-LaiWebUI -BaseUrl $baseUrl -Email $cred.email -Password $NewPassword | Out-Null }
+catch { Write-LaiLog WARN "Password changed and stored, but the check sign-in failed ($($_.Exception.Message)); try signing in on http://localhost:$port." }
 Write-LaiLog OK "Password changed for $($cred.email); existing sessions were signed out. Stored in $credFile"
 if (-not $Quiet) { Write-Host "New password: $NewPassword" -ForegroundColor Green }

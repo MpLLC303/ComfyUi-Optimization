@@ -212,10 +212,13 @@ $cfgFile = Join-Path $aiRoot 'localai-config.json'
 $cfgObj = Get-Content -Raw $cfgFile | ConvertFrom-Json
 $cfgObj | Add-Member -NotePropertyName ComfyUIPath -NotePropertyValue 'D:\ComfyUI\run_nvidia_gpu.bat' -Force
 $cfgObj | ConvertTo-Json -Depth 5 | Set-Content $cfgFile
-# An older render_guard.py is deployed: the re-run must restart the guard (compose up would not).
+# An older render_guard.py was started last: the re-run must restart the guard (compose up would not).
 $restartCalls = { @($global:Calls | Where-Object { $_ -like 'docker compose*restart render-guard*' }).Count }
 Assert-That ((& $restartCalls) -eq 0) 'fresh install: no render-guard restart needed'
-Add-Content -LiteralPath (Join-Path $aiRoot 'Stack/render-guard/render_guard.py') -Value '# older version'
+$stG = Get-Content -Raw (Join-Path $aiRoot 'install-state.json') | ConvertFrom-Json
+Assert-That ([string]$stG.flags.guardHash -ne '') 'the started render-guard code is recorded'
+$stG.flags.guardHash = 'hash-of-an-older-version'
+$stG | ConvertTo-Json -Depth 20 | Set-Content (Join-Path $aiRoot 'install-state.json')
 $sw = [Diagnostics.Stopwatch]::StartNew()
 & (Join-Path $aiRoot 'Scripts/Install-LocalAI.ps1') -AIRoot $aiRoot -SkipTests
 $code3 = $LASTEXITCODE

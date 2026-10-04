@@ -634,7 +634,9 @@ Invoke-Stage 'Models' {
             # Installed and already proven on 100% GPU by an earlier run: no 8K checkpoint load again
             # (it costs a 9-20 GB load per model and waits on a busy GPU). -Retune checks again.
             $t = $null; if ($State.tuning.ContainsKey($m.Key)) { $t = $State.tuning[$m.Key] }
-            if (-not $Retune -and $t -and $t['Source'] -eq $m.Source -and ([int]$t['GpuPercent'] -ge 100 -or $AllowCpu)) {
+            # Same content (digest) too: Update-Models may have pulled a re-published tag.
+            if (-not $Retune -and $t -and $t['Source'] -eq $m.Source -and ([int]$t['GpuPercent'] -ge 100 -or $AllowCpu) -and
+                (-not $t['Digest'] -or $t['Digest'] -eq (Get-LaiOllamaDigest -BaseUrl $OllamaUrl -Name $m.Source))) {
                 Write-LaiLog OK "$($m.Source) already installed and checked"
                 continue
             }
@@ -791,6 +793,8 @@ Invoke-Stage 'Docker' {
 
 #region 7. Open WebUI + SearXNG (guide Part 8, 9, 18) ---------------------------------------
 Invoke-Stage 'Stack' {
+    $hold = Get-LaiWebUIHold -AIRoot $AIRoot
+    if ($hold) { throw "Open WebUI is kept stopped after a failed restore ($($hold['Reason'])); starting it could run on damaged data. Recover first: $($hold['Recover'])" }
     if (-not (Test-Path -LiteralPath $P.Stack)) { New-Item -ItemType Directory -Force -Path $P.Stack | Out-Null }
     $searxDir = Join-Path $P.Stack 'searxng'
     if (-not (Test-Path -LiteralPath $searxDir)) { New-Item -ItemType Directory -Force -Path $searxDir | Out-Null }
@@ -799,11 +803,15 @@ Invoke-Stage 'Stack' {
     if (-not (Test-Path -LiteralPath $guardDir)) { New-Item -ItemType Directory -Force -Path $guardDir | Out-Null }
     # compose up only recreates a container whose configuration changed; a new render_guard.py in
     # the mounted folder would otherwise keep running the old code until the next reboot.
+    # The hash of the code last *started* is kept in state, so a run that fails before the restart
+    # (image pull, compose up) still restarts the guard on the next run. Installs from before this
+    # was recorded fall back to the hash of the file that was there.
     $guardFile = Join-Path $guardDir 'render_guard.py'
-    $guardBefore = ''
-    if (Test-Path -LiteralPath $guardFile) { $guardBefore = (Get-FileHash -LiteralPath $guardFile -Algorithm SHA256).Hash }
+    $guardRunning = [string]$State.flags['guardHash']
+    if (-not $guardRunning -and (Test-Path -LiteralPath $guardFile)) { $guardRunning = (Get-FileHash -LiteralPath $guardFile -Algorithm SHA256).Hash }
     Copy-Item -LiteralPath (Join-Path $SourceRoot 'stack\render-guard\render_guard.py') -Destination $guardDir -Force
-    $guardChanged = $guardBefore -and $guardBefore -ne (Get-FileHash -LiteralPath $guardFile -Algorithm SHA256).Hash
+    $guardNow = (Get-FileHash -LiteralPath $guardFile -Algorithm SHA256).Hash
+    $guardChanged = $guardRunning -and $guardRunning -ne $guardNow
     $searxSettings = Join-Path $searxDir 'settings.yml'
     if (-not (Test-Path -LiteralPath $searxSettings)) {
         $tpl = Get-Content -LiteralPath (Join-Path $SourceRoot 'stack\searxng\settings.yml') -Raw
@@ -890,10 +898,12 @@ Invoke-Stage 'Stack' {
     $pullPolicy = Get-LaiPullPolicy -Tags @($OpenWebUIVersion, $SearxngVersion)
     Invoke-LaiRetry -What 'docker compose pull' -Attempts 3 -DelaySeconds 15 -Action { Invoke-Compose -Arguments @('pull', '--policy', $pullPolicy) | Out-Null } | Out-Null
     Invoke-Compose -Arguments @('up', '-d', '--remove-orphans') | Out-Null
+    $guardStarted = $true
     if ($guardChanged) {
         try { Invoke-Compose -Arguments @('restart', 'render-guard') | Out-Null; Write-LaiLog OK 'Render guard restarted with the updated code' }
-        catch { Write-LaiLog WARN "Render guard still runs the old code until it restarts: $($_.Exception.Message)" }
+        catch { $guardStarted = $false; Write-LaiLog WARN "Render guard still runs the old code until it restarts: $($_.Exception.Message)" }
     }
+    if ($guardStarted) { $State.flags['guardHash'] = $guardNow; Save-State }
     $webui = "http://127.0.0.1:$($script:WebUIPortEffective)"
     Write-LaiLog INFO "Waiting for Open WebUI on $webui (first start runs database migrations)"
     Wait-LaiWebUI -BaseUrl $webui -TimeoutSec 600

@@ -54,6 +54,11 @@ Remove-Item -LiteralPath "$statePath.bak"
 Assert-That ((Read-LaiState -Path $statePath).Count -eq 0) 'damaged file and no .bak: empty settings instead of a crash'
 Save-LaiState -State @{ gen = 4 } -Path $statePath
 Assert-That ((Read-LaiState -Path $statePath)['gen'] -eq 4) 'saving over a damaged file works'
+# A Windows user name with an accent ends up in saved paths (C:\Users\J<o-umlaut>rg\...).
+$accented = 'C:\Users\J' + [char]0x00F6 + 'rg\AI\OllamaModels'
+Save-LaiState -State @{ modelDir = $accented } -Path $statePath
+Assert-That ((Read-LaiState -Path $statePath)['modelDir'] -eq $accented) 'non-ASCII path survives the round trip'
+Assert-That (((Get-Content -LiteralPath $statePath -Raw) | ConvertFrom-Json).modelDir -eq $accented) 'and a plain Get-Content (no -Encoding) reads it right too'
 
 # ---- UTF-8 request bodies ----------------------------------------------------------------------
 Write-Host "`n=== Invoke-LaiApi UTF-8 body ===" -ForegroundColor Cyan
@@ -215,6 +220,8 @@ $r = Invoke-Child 'Uninstall-LocalAI.ps1' @('-AIRoot', $aiRoot, '-WhatIf')
 Assert-That ($r.Code -eq 0) "Uninstall -WhatIf on an empty root exits 0 (got $($r.Code))"
 $r = Invoke-Child 'Stop-LocalAI.ps1' @('-AIRoot', $aiRoot, '-PauseHours', '1')
 Assert-That ($r.Code -eq 0) "Stop-LocalAI with nothing running exits 0 (got $($r.Code))"
+$r = Invoke-Child 'Release-GPU.ps1' @('-OllamaUrl', 'http://127.0.0.1:1')
+Assert-That ($r.Code -eq 0 -and $r.Text -match 'not running') "Release-GPU with Ollama closed says so and exits 0 (got $($r.Code))"
 if ($r.Code -ne 0 -or $failures -gt 0) { Write-Host $r.Text }
 
 Write-Host "`n=== diagnostics bundle: redaction ===" -ForegroundColor Cyan

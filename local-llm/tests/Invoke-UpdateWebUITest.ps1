@@ -45,6 +45,7 @@ services:
   open-webui:
     image: alpine:${OPEN_WEBUI_VERSION}
     container_name: open-webui
+    restart: always
     command: ["sleep", "3600"]
     volumes: ["open-webui:/app/backend/data"]
 volumes:
@@ -52,7 +53,8 @@ volumes:
     name: open-webui
 '@ | Set-Content -LiteralPath (Join-Path $stack 'docker-compose.yml')
 Set-Content -LiteralPath (Join-Path $stack '.env') -Value @('OPEN_WEBUI_VERSION=3.19', 'SEARXNG_VERSION=x', 'RENDER_GUARD_MODE=cpu')
-ConvertTo-Json @{ WebUIPort = 3000; OllamaUrl = 'http://127.0.0.1:11434' } | Set-Content -LiteralPath (Join-Path $aiRoot 'localai-config.json')
+# WebUIOllamaUrl: restores re-apply it to the (real, shared) sandbox Open WebUI, so keep it pointing at Ollama.
+ConvertTo-Json @{ WebUIPort = 3000; OllamaUrl = 'http://127.0.0.1:11434'; WebUIOllamaUrl = 'http://127.0.0.1:11434' } | Set-Content -LiteralPath (Join-Path $aiRoot 'localai-config.json')
 ConvertTo-Json @{ email = 'admin@localhost'; password = 'Test-Password-123' } | Set-Content -LiteralPath (Join-Path (Join-Path $aiRoot 'Secrets') 'openwebui-admin.json')
 Invoke-DockerText @('rm', '-f', 'open-webui') | Out-Null
 Invoke-DockerText @('volume', 'rm', 'open-webui') | Out-Null
@@ -98,6 +100,22 @@ try {
     $ErrorActionPreference = $prevPref
     Assert-That (Test-Path -LiteralPath $rollbackArchive) '60-day-old rollback archive survives pruning'
 
+    Write-Host "`n=== 3a. mirror: copied whole, and pruned like the local folder ===" -ForegroundColor Cyan
+    $mirrorDir = Join-Path $Work 'nas'
+    New-Item -ItemType Directory -Force -Path $mirrorDir | Out-Null
+    foreach ($d in 1..4) {
+        $f = Join-Path $mirrorDir ('open-webui-2020010{0}-000000.tar.gz' -f $d)
+        Set-Content -LiteralPath $f -Value 'old'
+        (Get-Item -LiteralPath $f).LastWriteTime = (Get-Date).AddDays(-60 + $d)
+    }
+    Set-Content -LiteralPath (Join-Path $mirrorDir 'incomplete-open-webui-20200101-000000.tar.gz') -Value 'cut off'
+    $prevPref = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
+    & pwsh -NoProfile -File (Join-Path $src 'Backup-OpenWebUI.ps1') -AIRoot $aiRoot -RetentionDays 1 -SkipDeepVerify -Mirror $mirrorDir 2>&1 | Out-Null
+    $ErrorActionPreference = $prevPref
+    $m = @(Get-ChildItem -LiteralPath $mirrorDir -Filter 'open-webui-*.tar.gz' | Sort-Object LastWriteTime -Descending)  # lai-ok: objects
+    Assert-That ($m.Count -eq 3 -and $m[0].Name -notlike 'open-webui-2020*' -and $m[0].Length -gt 100) "mirror: new archive plus the 2 newest old ones, 2 oldest pruned ($($m.Count) left)"
+    Assert-That (@(Get-ChildItem -LiteralPath $mirrorDir -Filter 'incomplete-*').Count -eq 0) 'mirror: no partial copies left'
+
     Write-Host "`n=== 3b. a failed backup leaves no archive that looks fresh ===" -ForegroundColor Cyan
     $bdir = Join-Path $aiRoot 'Backups'
     $countBefore = @(Get-ChildItem -LiteralPath $bdir -Filter 'open-webui-*.tar.gz').Count
@@ -123,7 +141,56 @@ try {
     $r = Invoke-Update @('-Rollback', '-Force')
     Assert-That ($r.Code -ne 0 -and $r.Text -match 'Nothing to roll back') 'second rollback refuses clearly'
     Assert-That ((Get-Content -LiteralPath (Join-Path (Join-Path $aiRoot 'Logs') 'update.log') -Raw) -match 'Rolled back') 'update.log has the history'
+
+    Write-Host "`n=== 5. a failed restore keeps Open WebUI down until a good restore ===" -ForegroundColor Cyan
+    $good = Get-ChildItem -LiteralPath (Join-Path $aiRoot 'Backups') -Filter 'open-webui-*.tar.gz' | Where-Object { $_.Name -notlike '*CORRUPT*' } | Select-Object -First 1
+    $holdFile = Join-Path $aiRoot 'open-webui-hold.json'
+    $runScript = {
+        param([string]$Name, [string[]]$Arguments)
+        $prevPref = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
+        $o = & pwsh -NoProfile -File (Join-Path $src $Name) -AIRoot $aiRoot @Arguments 2>&1 | ForEach-Object { "$_" }
+        $c = $LASTEXITCODE; $ErrorActionPreference = $prevPref
+        return [pscustomobject]@{ Code = $c; Text = ($o -join "`n") }
+    }
+    $env:LOCALAI_TEST_FAIL_SWAP = '1'
+    $r = & $runScript 'Restore-OpenWebUI.ps1' @('-Archive', $good.FullName, '-Force', '-SkipSafetyBackup')
+    $env:LOCALAI_TEST_FAIL_SWAP = ''
+    Assert-That ($r.Code -ne 0 -and (Test-Path -LiteralPath $holdFile)) "failed restore without a safety backup records a hold (exit $($r.Code))"
+    Assert-That ((Invoke-DockerText @('inspect', '-f', '{{.State.Status}} {{.HostConfig.RestartPolicy.Name}}', 'open-webui')) -eq 'exited no') 'container left stopped, restart policy off'
+    # The watch must not start it (point it at a dead port so the shared sandbox Open WebUI does not answer for it).
+    $cfgPath = Join-Path $aiRoot 'localai-config.json'
+    $cfgText = Get-Content -LiteralPath $cfgPath -Raw
+    $cfgTmp = Read-LaiState -Path $cfgPath; $cfgTmp['WebUIPort'] = 3999; Save-LaiState -State $cfgTmp -Path $cfgPath
+    & $runScript 'Watch-LocalAI.ps1' @() | Out-Null
+    Set-Content -LiteralPath $cfgPath -Value $cfgText -NoNewline
+    Assert-That ((Invoke-DockerText @('inspect', '-f', '{{.State.Status}}', 'open-webui')) -eq 'exited') 'health watch leaves the held container stopped'
+    Assert-That ((Get-Content -LiteralPath (Join-Path (Join-Path $aiRoot 'Logs') 'watch.log') -Raw) -match 'kept stopped after a failed restore') 'watch reports why it is down'
+    $st = & $runScript 'Start-LocalAI.ps1' @()
+    Assert-That ($st.Code -ne 0 -and $st.Text -match 'kept stopped after a failed restore' -and (Invoke-DockerText @('inspect', '-f', '{{.State.Status}}', 'open-webui')) -eq 'exited') 'Start-LocalAI refuses and says how to recover'
+    $r = & $runScript 'Restore-OpenWebUI.ps1' @('-Archive', $good.FullName, '-Force', '-SkipSafetyBackup')
+    Assert-That ($r.Code -eq 0 -and -not (Test-Path -LiteralPath $holdFile)) "recovery restore clears the hold (exit $($r.Code))"
+    Assert-That ((Invoke-DockerText @('inspect', '-f', '{{.State.Status}} {{.HostConfig.RestartPolicy.Name}}', 'open-webui')) -eq 'running always') 'container running again with its original restart policy'
+
+    Write-Host "`n=== 6. admin password rotation (real Open WebUI) ===" -ForegroundColor Cyan
+    $credPath = Join-Path (Join-Path $aiRoot 'Secrets') 'openwebui-admin.json'
+    $r = & $runScript 'Set-OpenWebUIPassword.ps1' @('-NewPassword', 'Rotated-Password-456', '-Quiet')
+    $stored = (Get-Content -LiteralPath $credPath -Raw | ConvertFrom-Json).password
+    Assert-That ($r.Code -eq 0 -and $stored -eq 'Rotated-Password-456') "rotation stores the new password (exit $($r.Code))"
+    Assert-That (-not (Test-Path -LiteralPath (Join-Path (Join-Path $aiRoot 'Secrets') 'openwebui-admin.pending.json'))) 'no pending copy left after success'
+    Assert-That ([bool](Connect-LaiWebUI -BaseUrl 'http://127.0.0.1:3000' -Email 'admin@localhost' -Password 'Rotated-Password-456')) 'Open WebUI accepts the new password'
+    $r = & $runScript 'Set-OpenWebUIPassword.ps1' @('-NewPassword', 'Test-Password-123', '-Quiet')
+    Assert-That ($r.Code -eq 0) 'rotated back for the other suites'
 } finally {
+    # Never leave the shared sandbox Open WebUI with a changed admin password.
+    try {
+        $sb = 'http://127.0.0.1:3000'
+        try { Connect-LaiWebUI -BaseUrl $sb -Email 'admin@localhost' -Password 'Test-Password-123' | Out-Null }
+        catch {
+            $t = Connect-LaiWebUI -BaseUrl $sb -Email 'admin@localhost' -Password 'Rotated-Password-456'
+            Invoke-LaiApi -Method POST -Uri "$sb/api/v1/auths/update/password" -Token $t -Body @{ password = 'Rotated-Password-456'; new_password = 'Test-Password-123' } | Out-Null
+            Write-Host '  (sandbox admin password restored)'
+        }
+    } catch { Write-Host "  could not verify the sandbox admin password: $($_.Exception.Message)" -ForegroundColor Yellow }
     Invoke-DockerText @('compose', '--project-directory', $stack, '-f', (Join-Path $stack 'docker-compose.yml'), 'down') | Out-Null
     Invoke-DockerText @('volume', 'rm', 'open-webui') | Out-Null
 }

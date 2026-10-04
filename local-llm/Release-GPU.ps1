@@ -16,8 +16,11 @@ $ErrorActionPreference = 'Stop'
 Import-Module (Join-Path (Join-Path $PSScriptRoot 'lib') 'LocalAI.psm1') -Force
 
 $before = Get-LaiGpuInfo
-$loaded = @(Get-LaiOllamaLoaded -BaseUrl $OllamaUrl)
-if ($loaded.Count -eq 0) {
+$loaded = $null
+try { $loaded = @(Get-LaiOllamaLoaded -BaseUrl $OllamaUrl) } catch { Write-Verbose "Ollama not answering: $($_.Exception.Message)" }
+if ($null -eq $loaded) {
+    Write-LaiLog OK 'Ollama is not running, so no model holds VRAM.'
+} elseif ($loaded.Count -eq 0) {
     Write-LaiLog OK 'No Ollama models are loaded.'
 } else {
     Write-LaiLog INFO "Unloading: $(($loaded | ForEach-Object { $_.name }) -join ', ')"

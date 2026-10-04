@@ -10,6 +10,10 @@
 
 Set-StrictMode -Version 1
 
+# Windows PowerShell 5.1 on .NET 4.x may still default to SSL3/TLS 1.0, which registries and GitHub
+# refuse. Every script imports this module, so enabling TLS 1.2 here covers all of them.
+try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12 } catch { Write-Verbose 'TLS setting unavailable' }
+
 #region Logging and small utilities -------------------------------------------------------
 
 function Write-LaiLog {
@@ -47,7 +51,8 @@ function ConvertTo-LaiHashtable {
 function ConvertFrom-LaiStateFile([string]$Path) {
     # $null when missing, empty or unreadable JSON; otherwise a hashtable.
     if (-not (Test-Path -LiteralPath $Path)) { return $null }
-    $raw = Get-Content -LiteralPath $Path -Raw -ErrorAction Stop
+    # -Encoding UTF8: Windows PowerShell 5.1 reads BOM-less files in the ANSI code page otherwise.
+    $raw = Get-Content -LiteralPath $Path -Raw -Encoding UTF8 -ErrorAction Stop
     if ([string]::IsNullOrWhiteSpace($raw)) { return $null }
     try { $h = ConvertTo-LaiHashtable ($raw | ConvertFrom-Json -ErrorAction Stop) } catch { return $null }
     if ($h -isnot [hashtable]) { return $null }
@@ -62,7 +67,7 @@ function Read-LaiState {
     if (-not (Test-Path -LiteralPath $Path)) { return @{} }
     $h = ConvertFrom-LaiStateFile $Path
     if ($null -ne $h) { return $h }
-    $raw = Get-Content -LiteralPath $Path -Raw -ErrorAction SilentlyContinue
+    $raw = Get-Content -LiteralPath $Path -Raw -Encoding UTF8 -ErrorAction SilentlyContinue
     if ([string]::IsNullOrWhiteSpace($raw)) { $bak = ConvertFrom-LaiStateFile "$Path.bak"; if ($null -ne $bak) { return $bak }; return @{} }
     try { Copy-Item -LiteralPath $Path -Destination "$Path.bad" -Force -ErrorAction Stop } catch { Write-Verbose 'could not keep the damaged copy' }
     $bak = ConvertFrom-LaiStateFile "$Path.bak"
@@ -84,7 +89,9 @@ function Save-LaiState {
     $State['updated'] = (Get-Date).ToString('s')
     $json = ConvertTo-Json -InputObject $State -Depth 20
     $tmp = "$Path.tmp"
-    [System.IO.File]::WriteAllText($tmp, $json, (New-Object System.Text.UTF8Encoding($false)))
+    # With a BOM, like the Set-Content -Encoding UTF8 this replaced: any 5.1 reader (Get-Content
+    # without -Encoding, older copies of these scripts) then still decodes non-ASCII paths correctly.
+    [System.IO.File]::WriteAllText($tmp, $json, (New-Object System.Text.UTF8Encoding($true)))
     for ($i = 1; $i -le 5; $i++) {
         try {
             if (Test-Path -LiteralPath $Path) { [System.IO.File]::Replace($tmp, $Path, "$Path.bak") }
@@ -96,6 +103,21 @@ function Save-LaiState {
             Start-Sleep -Milliseconds (200 * $i)
         }
     }
+}
+
+function Get-LaiWebUIHold {
+    <#
+    .SYNOPSIS
+        A failed restore can leave Open WebUI stopped on purpose (its volume may be half-swapped). It
+        records that in <AIRoot>\open-webui-hold.json; the watch, Start-LocalAI and the installer must
+        not start the container while it exists. Returns the hold (reason, recover, containers) or $null.
+    #>
+    param([Parameter(Mandatory)][string]$AIRoot)
+    $path = Join-Path $AIRoot 'open-webui-hold.json'
+    if (-not (Test-Path -LiteralPath $path)) { return $null }
+    $h = Read-LaiState -Path $path
+    $h['Path'] = $path
+    return $h
 }
 
 function New-LaiSecret {
@@ -427,7 +449,12 @@ function Test-LaiRegistryReachable {
     catch {
         $resp = $null
         try { $resp = $_.Exception.Response } catch { $resp = $null }
-        return ($null -ne $resp)
+        if ($null -ne $resp) { return $true }
+        # A TLS/certificate failure (proxy inspection, old protocol) is not "offline": the pulls should
+        # still be tried and report their own error.
+        $msg = [string]$_.Exception.Message
+        if ($_.Exception.InnerException) { $msg += ' ' + $_.Exception.InnerException.Message }
+        return ($msg -match 'SSL|TLS|trust|certificate')
     }
 }
 
@@ -906,14 +933,22 @@ function Invoke-LaiModelSetup {
     )
     $results = @{}
     $loadedOnce = $false
+    $ollamaVer = ''
+    try { $ollamaVer = [string](Get-LaiOllamaVersion -BaseUrl $BaseUrl) } catch { Write-Verbose 'version unknown' }
     foreach ($m in $Models) {
         Write-LaiLog STEP "Tuning $($m.Display) ($($m.Source))"
         $info = Get-LaiOllamaModelInfo -BaseUrl $BaseUrl -Name $m.Source
+        $digest = Get-LaiOllamaDigest -BaseUrl $BaseUrl -Name $m.Source
         $prev = $null
         if ($Previous.ContainsKey($m.Key)) { $prev = $Previous[$m.Key] }
+        # Results from before Digest/OllamaVersion were recorded still count (no forced re-tune).
+        $sameModel = $prev -and (-not $prev['Digest'] -or $prev['Digest'] -eq $digest)
+        $sameOllama = $prev -and $prev['OllamaVersion'] -and $prev['OllamaVersion'] -eq $ollamaVer
         $reuse = (-not $Retune) -and $prev -and ($prev['Source'] -eq $m.Source) -and ($prev['Fingerprint'] -eq $Fingerprint) -and
-            ($prev['MaxContext'] -eq $m.MaxContext) -and (Test-LaiOllamaModel -BaseUrl $BaseUrl -Name $m.Alias)
-        if ($reuse -and $prev['TokensPerSec'] -and $null -ne $prev['GpuPercent']) {
+            ($prev['MaxContext'] -eq $m.MaxContext) -and $sameModel -and (Test-LaiOllamaModel -BaseUrl $BaseUrl -Name $m.Alias)
+        # Skipping the load also needs the same Ollama: a new version can place layers differently.
+        # (Results without a recorded version take the verify path once, which records it.)
+        if ($reuse -and $sameOllama -and $prev['TokensPerSec'] -and $null -ne $prev['GpuPercent']) {
             # Nothing that decides the fit changed: refresh the alias (system prompt, parameters) and
             # keep the measured numbers. The acceptance test at the end measures speed again.
             $ctx = [int]$prev['Context']
@@ -922,6 +957,8 @@ function Invoke-LaiModelSetup {
             $results[$m.Key] = $prev.Clone()
             $results[$m.Key]['Alias'] = $m.Alias
             $results[$m.Key]['Tools'] = ($info.Capabilities -contains 'tools')
+            $results[$m.Key]['Digest'] = $digest
+            $results[$m.Key]['Reused'] = $true
             continue
         }
         if (-not $loadedOnce) { $loadedOnce = $true; if ($BeforeFirstLoad) { & $BeforeFirstLoad } }
@@ -935,6 +972,15 @@ function Invoke-LaiModelSetup {
         }
         Set-LaiOllamaDerivedModel -BaseUrl $BaseUrl -Name $m.Alias -From $m.Source -NumCtx $ctx -Parameters $m.Parameters -System $SystemPrompt
         $load = Invoke-LaiOllamaLoad -BaseUrl $BaseUrl -Name $m.Alias -KeepAlive '2m'
+        if ($reuse -and $load.GpuPercent -lt 100 -and -not $AllowCpu) {
+            # The reused context no longer fits (new Ollama, other VRAM use): measure it again.
+            Write-LaiLog WARN "  reused context $ctx is now only $($load.GpuPercent)% on the GPU; re-tuning"
+            Stop-LaiOllamaModels -BaseUrl $BaseUrl
+            $fit = Find-LaiMaxContext -BaseUrl $BaseUrl -Name $m.Source -Candidates $Candidates -MaxContext $m.MaxContext -MinFreeMiB $MinFreeMiB -AllowCpu:$AllowCpu
+            $ctx = $fit.Context
+            Set-LaiOllamaDerivedModel -BaseUrl $BaseUrl -Name $m.Alias -From $m.Source -NumCtx $ctx -Parameters $m.Parameters -System $SystemPrompt
+            $load = Invoke-LaiOllamaLoad -BaseUrl $BaseUrl -Name $m.Alias -KeepAlive '2m'
+        }
         $speed = Measure-LaiOllamaSpeed -BaseUrl $BaseUrl -Name $m.Alias
         Stop-LaiOllamaModels -BaseUrl $BaseUrl
         $level = 'OK'
@@ -952,6 +998,9 @@ function Invoke-LaiModelSetup {
             TokensPerSec = $speed
             Tools        = ($info.Capabilities -contains 'tools')
             Fingerprint  = $Fingerprint
+            Digest       = $digest
+            OllamaVersion = $ollamaVer
+            Reused       = $false
         }
     }
     return $results

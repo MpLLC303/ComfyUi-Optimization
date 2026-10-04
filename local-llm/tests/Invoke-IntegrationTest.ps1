@@ -43,7 +43,21 @@ $again = Invoke-LaiModelSetup -BaseUrl $OllamaUrl -Models $catalog.Models -Candi
     -SystemPrompt $system -Fingerprint 'test' -Previous $results -AllowCpu
 foreach ($k in $results.Keys) {
     if ($again[$k]['Context'] -ne $results[$k]['Context']) { Write-LaiLog FAIL "re-run changed context for $k"; $failures++ }
+    if (-not $again[$k]['Reused']) { Write-LaiLog FAIL "re-run loaded $k again although nothing changed"; $failures++ }
 }
+# A re-published model (new digest) is measured again; a new Ollama version is at least re-verified.
+$mainKey = @($catalog.Models)[0].Key
+$tamper = {
+    param([string]$Field, [string]$Value)
+    $p = @{}; foreach ($k in $results.Keys) { $p[$k] = $results[$k].Clone() }
+    $p[$mainKey][$Field] = $Value
+    return (Invoke-LaiModelSetup -BaseUrl $OllamaUrl -Models @(@($catalog.Models)[0]) -Candidates $catalog.ContextCandidates `
+        -SystemPrompt $system -Fingerprint 'test' -Previous $p -AllowCpu)
+}
+$d = & $tamper 'Digest' 'sha256:republished'
+if ($d[$mainKey]['Reused']) { Write-LaiLog FAIL 'a changed model digest did not trigger a new measurement'; $failures++ } else { Write-LaiLog OK 'changed digest: measured again' }
+$v = & $tamper 'OllamaVersion' '0.0.1'
+if ($v[$mainKey]['Reused'] -or $v[$mainKey]['Context'] -ne $results[$mainKey]['Context']) { Write-LaiLog FAIL 'a new Ollama version was not re-verified at the tuned context'; $failures++ } else { Write-LaiLog OK 'new Ollama version: re-verified at the tuned context' }
 
 $token = Connect-LaiWebUI -BaseUrl $WebUIUrl -Email $Email -Password $Password
 Invoke-LaiWebUISetup -BaseUrl $WebUIUrl -Token $token -Models $catalog.Models -ModelResults $results -SystemPrompt $system `
