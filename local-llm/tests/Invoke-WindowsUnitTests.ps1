@@ -338,6 +338,67 @@ $r = Invoke-Child 'Release-GPU.ps1' @('-OllamaUrl', 'http://127.0.0.1:1')
 Assert-That ($r.Code -eq 0 -and $r.Text -match 'not running') "Release-GPU with Ollama closed says so and exits 0 (got $($r.Code))"
 if ($r.Code -ne 0 -or $failures -gt 0) { Write-Host $r.Text }
 
+Write-Host "`n=== Enable-TailscaleAccess against a fake tailscale CLI ===" -ForegroundColor Cyan
+$shimDir = Join-Path $Work 'tsshim'
+New-Item -ItemType Directory -Force -Path $shimDir | Out-Null
+$shimPs = Join-Path $shimDir 'tailscale-shim.ps1'
+@'
+$a = $args -join ' '
+Add-Content -LiteralPath $env:LAI_TS_LOG -Value $a
+$sc = $env:LAI_TS_SCENARIO
+if ($a -eq 'status --json') {
+    if ($sc -eq 'hang') { Start-Sleep -Seconds 60 }
+    if ($sc -eq 'needslogin') { '{"BackendState":"NeedsLogin","Self":{"DNSName":"pc.tail.ts.net."}}'; exit 0 }
+    if ($sc -eq 'nohttps') { '{"BackendState":"Running","Self":{"DNSName":"pc.tail.ts.net."}}'; exit 0 }
+    [Console]::Error.WriteLine('Warning: client version differs from the daemon')   # stderr must not break the JSON
+    '{"BackendState":"Running","Self":{"DNSName":"pc.tail.ts.net.","CapMap":{"https":null}}}'; exit 0
+}
+if ($a -like 'serve --bg *') { exit 0 }
+if ($a -eq 'serve status --json') {
+    if ($sc -eq 'noapply') { '{}'; exit 0 }
+    '{"Web":{"pc.tail.ts.net:443":{"Handlers":{"/":{"Proxy":"http://127.0.0.1:3999"}}}}}'; exit 0
+}
+if ($a -eq 'serve --https=443 off') { [Console]::Error.WriteLine('error: handler does not exist'); exit 1 }
+exit 2
+'@ | Set-Content -LiteralPath $shimPs
+if ($onWindows) {
+    Set-Content -LiteralPath (Join-Path $shimDir 'tailscale.cmd') -Value ('@"{0}" -NoProfile -ExecutionPolicy Bypass -File "{1}" %*' -f $childExe, $shimPs)
+} else {
+    Set-Content -LiteralPath (Join-Path $shimDir 'tailscale') -Value ("#!/bin/sh`nexec pwsh -NoProfile -File '{0}' `"`$@`"" -f $shimPs)
+    & chmod +x (Join-Path $shimDir 'tailscale')
+}
+$tsLog = Join-Path $shimDir 'calls.txt'
+$savedPath = $env:Path; $savedPATH = $env:PATH
+$env:Path = $shimDir + [System.IO.Path]::PathSeparator + $savedPath
+if (-not $onWindows) { $env:PATH = $env:Path }
+$env:LAI_TS_LOG = $tsLog
+$env:LOCALAI_TS_TIMEOUT = '8'
+try {
+    $runTs = { param($Scenario, [string[]]$More)
+        $env:LAI_TS_SCENARIO = $Scenario
+        if (Test-Path -LiteralPath $tsLog) { Remove-Item -LiteralPath $tsLog }
+        $sw = [Diagnostics.Stopwatch]::StartNew()
+        $res = Invoke-Child 'Enable-TailscaleAccess.ps1' (@('-AIRoot', $aiRoot, '-Port', '3999') + $More)
+        $calls = @(); if (Test-Path -LiteralPath $tsLog) { $calls = @(Get-Content -LiteralPath $tsLog) }
+        return [pscustomobject]@{ Code = $res.Code; Text = $res.Text; Calls = $calls; Seconds = $sw.Elapsed.TotalSeconds }
+    }
+    $r = & $runTs 'ok' @()
+    Assert-That ($r.Code -eq 0 -and $r.Text -match 'available to your tailnet at https://pc\.tail\.ts\.net/') "serve applied and verified -> success (exit $($r.Code))"
+    $r = & $runTs 'needslogin' @()
+    Assert-That ($r.Code -ne 0 -and $r.Text -match 'NeedsLogin' -and -not ($r.Calls -match '^serve')) 'not signed in: clear error, nothing served'
+    $r = & $runTs 'nohttps' @()
+    Assert-That ($r.Code -ne 0 -and $r.Text -match 'HTTPS certificates' -and -not ($r.Calls -match '^serve')) 'HTTPS certificates off: explained, serve never called (it would block)'
+    $r = & $runTs 'noapply' @()
+    Assert-That ($r.Code -ne 0 -and $r.Text -match 'did not record a mapping') 'serve exits 0 but records nothing: not reported as success'
+    $r = & $runTs 'ok' @('-Disable')
+    Assert-That ($r.Code -eq 0 -and $r.Text -match 'removed') '-Disable with nothing mapped is fine (idempotent)'
+    $r = & $runTs 'hang' @()
+    Assert-That ($r.Code -ne 0 -and $r.Text -match 'did not answer within 8 s' -and $r.Seconds -lt 40) ("a hung tailscale CLI times out instead of hanging ({0:N0} s)" -f $r.Seconds)
+} finally {
+    $env:Path = $savedPath; if (-not $onWindows) { $env:PATH = $savedPATH }
+    $env:LAI_TS_SCENARIO = ''; $env:LOCALAI_TS_TIMEOUT = ''
+}
+
 Write-Host "`n=== diagnostics bundle: redaction ===" -ForegroundColor Cyan
 $dRoot = Join-Path $Work 'diagroot'
 foreach ($d in 'Secrets', 'Stack', 'Logs') { New-Item -ItemType Directory -Force -Path (Join-Path $dRoot $d) | Out-Null }

@@ -60,8 +60,13 @@ try {
 # 3. Containers.
 $dockerUp = (Get-Command docker -ErrorAction SilentlyContinue) -and ((Invoke-Docker @('version', '--format', '{{.Server.Version}}')).ExitCode -eq 0)
 if ($dockerUp -and (Test-Path -LiteralPath $compose)) {
-    $r = Invoke-Docker @('compose', '--project-directory', $stackDir, '-f', $compose, 'stop')
-    if ($r.ExitCode -ne 0) { throw "docker compose stop failed: $($r.Text)" }
+    # Not in the middle of a backup/restore/update: its 'finally' would start Open WebUI again.
+    if (Test-LaiVolumeLockBusy) { Write-LaiLog INFO 'Waiting for a backup/restore/update to finish first' }
+    $lock = Enter-LaiVolumeLock -TimeoutSec 1800
+    try {
+        $r = Invoke-Docker @('compose', '--project-directory', $stackDir, '-f', $compose, 'stop')
+        if ($r.ExitCode -ne 0) { throw "docker compose stop failed: $($r.Text)" }
+    } finally { Exit-LaiVolumeLock $lock }
     Write-LaiLog OK 'Containers stopped (data kept)'
 } elseif (-not $dockerUp) {
     Write-LaiLog INFO 'Docker is not running; no containers to stop'

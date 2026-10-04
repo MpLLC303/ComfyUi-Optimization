@@ -122,6 +122,15 @@ try {
     Assert-That (Test-LaiOllamaModel -BaseUrl $OllamaUrl -Name $prev) '-prev kept again after another re-publish'
     $r = Invoke-Update @('-DropPrevious') ''
     Assert-That ($r.Code -eq 0 -and -not (Test-LaiOllamaModel -BaseUrl $OllamaUrl -Name $prev)) '-DropPrevious deletes it'
+
+    Write-Host "`n=== 5. one model update at a time ===" -ForegroundColor Cyan
+    $holdScript = Join-Path $Work 'hold-setup.ps1'
+    Set-Content -LiteralPath $holdScript -Value ("Import-Module '{0}' -Force; `$l = Enter-LaiSetupLock; Start-Sleep -Seconds 60" -f (Join-Path (Join-Path $src 'lib') 'LocalAI.psm1'))
+    $holder = Start-Process -FilePath 'pwsh' -ArgumentList @('-NoProfile', '-File', $holdScript) -PassThru
+    Start-Sleep -Seconds 4
+    $r = Invoke-Update @() ''
+    if (-not $holder.HasExited) { $holder.Kill() }
+    Assert-That ($r.Code -ne 0 -and $r.Text -match 'already running') "a second update refuses while another holds the lock (exit $($r.Code))"
 } finally {
     foreach ($n in @($tag, $variant, $prev, "$tag-prevnew", $alias)) { try { Remove-IfThere $n } catch { Write-Verbose "cleanup $n" } }
     $env:LOCALAI_TEST_CATALOG = ''

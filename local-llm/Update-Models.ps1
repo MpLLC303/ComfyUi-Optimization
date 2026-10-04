@@ -44,6 +44,8 @@ Import-Module (Join-Path (Join-Path $PSScriptRoot 'lib') 'LocalAI.psm1') -Force
 
 $config = Read-LaiState -Path (Join-Path $AIRoot 'localai-config.json')
 $statePath = Join-Path $AIRoot 'install-state.json'
+# Not while the installer or another model update runs: both tune the same models.
+$script:SetupLock = Enter-LaiSetupLock
 $state = Read-LaiState -Path $statePath
 if (-not $state.ContainsKey('tuning') -or $null -eq $state['tuning']) { $state['tuning'] = @{} }
 $ollamaUrl = 'http://127.0.0.1:11434'

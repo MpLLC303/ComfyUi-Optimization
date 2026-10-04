@@ -66,8 +66,38 @@ try {
     Invoke-Watch | Out-Null
     Assert-That ((Get-State 'open-webui') -eq 'created') 'Open WebUI is not started mid-backup/restore'
     Assert-That ((Get-WatchLog) -match 'left alone') 'watch.log says it was left alone on purpose'
+    if ($holder -and -not $holder.HasExited) { $holder.Kill() }
+
+    Write-Host "`n=== 4. gaming mode Stop/Start wait for a running backup instead of racing it ===" -ForegroundColor Cyan
+    # A throwaway compose project, so the sandbox's real containers are not touched.
+    $stack = Join-Path $aiRoot 'Stack'
+    @'
+name: lai-stopstart-test
+services:
+  probe:
+    image: alpine:3.20
+    container_name: lai-stopstart-probe
+    command: ["sleep", "3600"]
+'@ | Set-Content -LiteralPath (Join-Path $stack 'docker-compose.yml')
+    Invoke-DockerText @('compose', '--project-directory', $stack, '-f', (Join-Path $stack 'docker-compose.yml'), 'up', '-d') | Out-Null
+    $cfg = Read-LaiState -Path (Join-Path $aiRoot 'localai-config.json'); $cfg['WebUIPort'] = 3000; Save-LaiState -State $cfg -Path (Join-Path $aiRoot 'localai-config.json')
+    Set-Content -LiteralPath $holdScript -Value ("Import-Module '{0}' -Force; `$l = Enter-LaiVolumeLock; Start-Sleep -Seconds 8; Exit-LaiVolumeLock `$l" -f (Join-Path (Join-Path $src 'lib') 'LocalAI.psm1'))
+    foreach ($step in @(@{ Script = 'Stop-LocalAI.ps1'; Want = 'exited' }, @{ Script = 'Start-LocalAI.ps1'; Want = 'running' })) {
+        $holder = Start-Process -FilePath 'pwsh' -ArgumentList @('-NoProfile', '-File', $holdScript) -PassThru
+        $deadline = (Get-Date).AddSeconds(30)
+        while (-not (Test-LaiVolumeLockBusy) -and (Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 200 }
+        $t0 = Get-Date
+        $prev = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
+        $out = (& pwsh -NoProfile -File (Join-Path $src $step.Script) -AIRoot $aiRoot 2>&1 | ForEach-Object { "$_" }) -join "`n"
+        $code = $LASTEXITCODE; $ErrorActionPreference = $prev
+        $waited = ((Get-Date) - $t0).TotalSeconds
+        Assert-That ($code -eq 0 -and $out -match 'Waiting for a backup' -and $waited -ge 4 -and (Get-State 'lai-stopstart-probe') -eq $step.Want) ("{0} waited {1:N0} s for the lock, then the container is {2} (exit {3})" -f $step.Script, $waited, (Get-State 'lai-stopstart-probe'), $code)
+        if (-not $holder.HasExited) { $holder.WaitForExit(15000) | Out-Null }
+    }
 } finally {
     if ($holder -and -not $holder.HasExited) { $holder.Kill() }
+    $tc = Join-Path (Join-Path $aiRoot 'Stack') 'docker-compose.yml'
+    if (Test-Path -LiteralPath $tc) { Invoke-DockerText @('compose', '--project-directory', (Join-Path $aiRoot 'Stack'), '-f', $tc, 'down') | Out-Null }
     Invoke-DockerText @('rm', '-f', 'open-webui') | Out-Null
     if ((Get-State 'searxng') -ne 'running') { Invoke-DockerText @('start', 'searxng') | Out-Null }
 }

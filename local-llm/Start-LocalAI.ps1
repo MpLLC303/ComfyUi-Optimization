@@ -74,8 +74,13 @@ try {
     if (-not (Test-Path -LiteralPath $compose)) { throw "Missing $compose. Re-run Install-LocalAI.ps1." }
     $hold = Get-LaiWebUIHold -AIRoot $AIRoot
     if ($hold) { throw "Open WebUI is kept stopped after a failed restore ($($hold['Reason'])). Recover first: $($hold['Recover'])" }
-    $r = Invoke-Docker @('compose', '--project-directory', $stackDir, '-f', $compose, 'up', '-d')
-    if ($r.ExitCode -ne 0) { throw "docker compose up failed: $($r.Text)" }
+    # Not in the middle of a backup/restore/update (it stopped Open WebUI on purpose).
+    if (Test-LaiVolumeLockBusy) { Write-LaiLog INFO 'Waiting for a backup/restore/update to finish first' }
+    $lock = Enter-LaiVolumeLock -TimeoutSec 1800
+    try {
+        $r = Invoke-Docker @('compose', '--project-directory', $stackDir, '-f', $compose, 'up', '-d')
+        if ($r.ExitCode -ne 0) { throw "docker compose up failed: $($r.Text)" }
+    } finally { Exit-LaiVolumeLock $lock }
     Wait-LaiWebUI -BaseUrl "http://127.0.0.1:$webPort" -TimeoutSec $TimeoutSec
     Write-LaiLog OK "Open WebUI is up on http://localhost:$webPort"
 

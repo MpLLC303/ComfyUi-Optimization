@@ -183,6 +183,9 @@ foreach ($d in @($P.Root, $P.Logs, $P.Secrets, $P.Backups, $P.Downloads)) {
 $script:TranscriptOn = $false
 try { Start-Transcript -Path (Join-Path $P.Logs ('install-{0}.log' -f (Get-Date -Format 'yyyyMMdd-HHmmss'))) | Out-Null; $script:TranscriptOn = $true } catch { Write-Verbose 'Transcript unavailable' }
 
+# One installer run or model update at a time (released when this process ends, even if killed).
+try { $script:SetupLock = Enter-LaiSetupLock }
+catch { Write-Host $_.Exception.Message -ForegroundColor Red; exit 1 }
 $State = Read-LaiState -Path $P.State
 foreach ($k in @('stages', 'tuning', 'flags')) { if (-not $State.ContainsKey($k) -or $null -eq $State[$k]) { $State[$k] = @{} } }
 

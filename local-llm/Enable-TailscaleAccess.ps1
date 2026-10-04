@@ -28,19 +28,35 @@ param(
 $ErrorActionPreference = 'Stop'
 Import-Module (Join-Path (Join-Path $PSScriptRoot 'lib') 'LocalAI.psm1') -Force
 
-$cmd = Get-Command tailscale -ErrorAction SilentlyContinue
-if ($cmd) { $ts = $cmd } else {
+$cmd = Get-Command tailscale -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+if ($cmd) { $ts = $cmd.Source } else {
     $exe = Join-Path $env:ProgramFiles 'Tailscale\tailscale.exe'
     if (-not (Test-Path -LiteralPath $exe)) { throw 'Tailscale is not installed. Get it from https://tailscale.com/download/windows, sign in, then re-run.' }
     $ts = $exe
 }
 
 function Invoke-Tailscale {
+    # With a time limit: when the Tailscale service is stuck, the CLI waits forever, and so would this
+    # script. Arguments here never contain spaces, so joining them is safe.
     param([string[]]$Arguments)
-    $prev = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
-    try { $out = @(& $ts @Arguments 2>&1 | ForEach-Object { "$_" }); $code = $LASTEXITCODE }
-    finally { $ErrorActionPreference = $prev }
-    return [pscustomobject]@{ ExitCode = $code; Text = ($out -join "`n") }
+    $limit = 30; if ($env:LOCALAI_TS_TIMEOUT) { $limit = [int]$env:LOCALAI_TS_TIMEOUT }
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = [string]$ts
+    $psi.Arguments = ($Arguments -join ' ')
+    $psi.UseShellExecute = $false
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    $psi.CreateNoWindow = $true
+    $proc = [System.Diagnostics.Process]::Start($psi)
+    $outTask = $proc.StandardOutput.ReadToEndAsync()
+    $errTask = $proc.StandardError.ReadToEndAsync()
+    if (-not $proc.WaitForExit($limit * 1000)) {
+        try { $proc.Kill() } catch { Write-Verbose 'already gone' }
+        throw "tailscale $($Arguments -join ' ') did not answer within $limit s. Is the Tailscale service running? Restart the Tailscale app and try again."
+    }
+    $proc.WaitForExit()
+    # Out: stdout only (the JSON); Text: everything, for messages (warnings go to stderr).
+    return [pscustomobject]@{ ExitCode = $proc.ExitCode; Out = $outTask.Result; Text = ($outTask.Result + $errTask.Result).Trim() }
 }
 
 if ($Port -le 0) {
@@ -51,7 +67,7 @@ if ($Port -le 0) {
 
 $statusRun = Invoke-Tailscale @('status', '--json')
 if ($statusRun.ExitCode -ne 0) { throw "tailscale status failed: $($statusRun.Text)" }
-$status = $statusRun.Text | ConvertFrom-Json
+$status = $statusRun.Out | ConvertFrom-Json
 if ($status.BackendState -ne 'Running') {
     throw "Tailscale is '$($status.BackendState)'. Open the Tailscale app, sign in, then re-run."
 }
@@ -84,7 +100,7 @@ $r = Invoke-Tailscale @('serve', '--bg', [string]$Port)
 if ($r.ExitCode -ne 0) { throw "tailscale serve failed: $($r.Text)" }
 
 # Trust the stored config, not the exit code (serve can exit 0 without applying anything).
-$cfg = (Invoke-Tailscale @('serve', 'status', '--json')).Text | ConvertFrom-Json
+$cfg = (Invoke-Tailscale @('serve', 'status', '--json')).Out | ConvertFrom-Json
 $target = "http://127.0.0.1:$Port"
 $ok = $false
 if ($cfg -and $cfg.PSObject.Properties.Name -contains 'Web' -and $cfg.Web) {
