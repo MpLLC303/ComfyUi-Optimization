@@ -48,9 +48,23 @@ foreach ($k in $results.Keys) {
 $token = Connect-LaiWebUI -BaseUrl $WebUIUrl -Email $Email -Password $Password
 Invoke-LaiWebUISetup -BaseUrl $WebUIUrl -Token $token -Models $catalog.Models -ModelResults $results -SystemPrompt $system `
     -DefaultPreset $catalog.DefaultPreset -Collections @('PC & Electronics', 'General References') -SearxngQueryUrl $SearxngQueryUrl
+# A user edit to a preset (attached knowledge, an extra parameter) must survive a re-run.
+$p0 = ConvertTo-LaiHashtable (Get-LaiWebUIModel -BaseUrl $WebUIUrl -Token $token -Id $catalog.DefaultPreset)
+$p0['meta']['knowledge'] = @(@{ id = 'user-kb'; name = 'User collection'; type = 'collection' })
+$p0['params']['temperature'] = 0.33
+Invoke-LaiApi -Method POST -Uri "$WebUIUrl/api/v1/models/model/update" -Token $token -Body @{
+    id = $p0['id']; name = $p0['name']; base_model_id = $p0['base_model_id']; meta = $p0['meta']; params = $p0['params']; is_active = $true
+} | Out-Null
 # Idempotency: the whole configuration pass must succeed a second time unchanged.
 Invoke-LaiWebUISetup -BaseUrl $WebUIUrl -Token $token -Models $catalog.Models -ModelResults $results -SystemPrompt $system `
     -DefaultPreset $catalog.DefaultPreset -Collections @('PC & Electronics', 'General References') -SearxngQueryUrl $SearxngQueryUrl
+
+$p1 = Get-LaiWebUIModel -BaseUrl $WebUIUrl -Token $token -Id $catalog.DefaultPreset
+if (@($p1.meta.knowledge).Count -ne 1 -or $p1.meta.knowledge[0].id -ne 'user-kb' -or [double]$p1.params.temperature -ne 0.33) {
+    Write-LaiLog FAIL "re-run dropped the user's preset edits (knowledge=$(@($p1.meta.knowledge).Count), temperature=$($p1.params.temperature))"; $failures++
+} elseif (-not $p1.params.system -or $p1.params.function_calling -ne 'native') {
+    Write-LaiLog FAIL 're-run did not restore the managed preset keys'; $failures++
+} else { Write-LaiLog OK 're-run kept the user preset edits (attached knowledge, temperature) and refreshed the managed keys' }
 
 $rc = Get-LaiWebUIRetrievalConfig -BaseUrl $WebUIUrl -Token $token
 if ($rc.web.SEARXNG_LANGUAGE -ne 'all' -or $rc.web.WEB_LOADER_CONCURRENT_REQUESTS -ne 10 -or $rc.TEXT_SPLITTER -ne 'token' -or $rc.TOP_K -ne 5) {

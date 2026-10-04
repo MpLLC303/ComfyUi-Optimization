@@ -167,6 +167,7 @@ if ($ollamaUp) {
         foreach ($m in $catalog.Models) {
             $full = Resolve-LaiModelName $m.Source
             if ($names -contains $full) { $toRemove += $full }
+            if ($names -contains "$full-prev") { $toRemove += "$full-prev" }
         }
     }
     foreach ($n in $toRemove) {

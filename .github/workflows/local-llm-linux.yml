@@ -105,6 +105,12 @@ jobs:
           & ./local-llm/tests/Invoke-InstallerMockRun.ps1 -Work "$env:RUNNER_TEMP/mockroot"
           exit $LASTEXITCODE
 
+      - name: Model update test (keep previous version, rollback)
+        shell: pwsh
+        run: |
+          & ./local-llm/tests/Invoke-ModelUpdateTest.ps1
+          exit $LASTEXITCODE
+
       - name: Uninstall test
         shell: pwsh
         run: |

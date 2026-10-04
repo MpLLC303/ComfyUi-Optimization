@@ -11,18 +11,29 @@
     Optionally upgrades Ollama itself first (-UpdateOllama). Finishes with Test-LocalAI.ps1 -Quick.
     Open WebUI needs no change: its presets point at the alias names, which stay the same.
 
+    When a model really changed, the version you had is kept as <tag>-prev (Ollama would otherwise
+    delete its files right after the pull), so -Rollback can bring it back if the new upload is
+    worse. That costs the old model's size on disk until the next update or -DropPrevious.
+
 .EXAMPLE
     .\Update-Models.ps1                    # check all models
 .EXAMPLE
     .\Update-Models.ps1 -UpdateOllama      # upgrade Ollama via winget first
 .EXAMPLE
     .\Update-Models.ps1 -Retune            # re-measure every model even if nothing changed
+.EXAMPLE
+    .\Update-Models.ps1 -Rollback main     # go back to the previous version of Local Main ('all' = every kept one)
+.EXAMPLE
+    .\Update-Models.ps1 -DropPrevious      # delete the kept previous versions to free the disk space
 #>
 param(
     [string]$AIRoot = 'C:\AI',
     [switch]$UpdateOllama,
     [switch]$Retune,
-    [switch]$SkipTests
+    [switch]$SkipTests,
+    [string[]]$Rollback = @(),
+    [switch]$DropPrevious,
+    [switch]$NoKeepPrevious
 )
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
@@ -56,17 +67,65 @@ if ($UpdateOllama) {
 }
 
 $env:OLLAMA_HOST = '127.0.0.1:11434'   # the CLI is only a client of the local server
+
+function Get-PrevName([string]$Source) {
+    $full = Resolve-LaiModelName $Source
+    return "$full-prev"
+}
+function Copy-Model([string]$From, [string]$To) {
+    Invoke-LaiApi -Method POST -Uri "$ollamaUrl/api/copy" -Body @{ source = $From; destination = $To } | Out-Null
+}
+function Remove-Model([string]$Name) {
+    if (Test-LaiOllamaModel -BaseUrl $ollamaUrl -Name $Name) { Invoke-LaiApi -Method DELETE -Uri "$ollamaUrl/api/delete" -Body @{ model = $Name } | Out-Null }
+}
+function Get-ModelGB([string]$Name) {
+    $t = (Invoke-LaiApi -Uri "$ollamaUrl/api/tags").models | Where-Object { $_.name -eq (Resolve-LaiModelName $Name) } | Select-Object -First 1
+    if ($t) { return [Math]::Round($t.size / 1GB, 1) }
+    return 0
+}
+
 $changed = @()
-foreach ($m in $catalog.Models) {
-    $old = Get-LaiOllamaDigest -BaseUrl $ollamaUrl -Name $m.Source
-    Write-LaiLog STEP "Checking $($m.Source)"
-    Invoke-LaiOllamaPull -BaseUrl $ollamaUrl -Name $m.Source
-    $new = Get-LaiOllamaDigest -BaseUrl $ollamaUrl -Name $m.Source
-    if ($old -ne $new -or $Retune -or -not (Test-LaiOllamaModel -BaseUrl $ollamaUrl -Name $m.Alias)) {
-        Write-LaiLog INFO ("  {0}: {1} -> {2}" -f $m.Display, $(if ($old) { $old.Substring(0, 12) } else { 'missing' }), $new.Substring(0, 12))
+if ($DropPrevious) {
+    foreach ($m in $catalog.Models) {
+        $pn = Get-PrevName $m.Source
+        if (Test-LaiOllamaModel -BaseUrl $ollamaUrl -Name $pn) { Remove-Model $pn; Write-LaiLog OK "Deleted $pn" }
+    }
+    exit 0
+}
+if ($Rollback.Count -gt 0) {
+    foreach ($m in $catalog.Models) {
+        if ($Rollback -notcontains 'all' -and $Rollback -notcontains $m.Key) { continue }
+        $pn = Get-PrevName $m.Source
+        if (-not (Test-LaiOllamaModel -BaseUrl $ollamaUrl -Name $pn)) { Write-LaiLog WARN "$($m.Display): no previous version kept ($pn)"; continue }
+        Copy-Model $pn (Resolve-LaiModelName $m.Source)
+        Remove-Model $pn
+        Write-LaiLog OK "$($m.Display): back to the previous version ($((Get-LaiOllamaDigest -BaseUrl $ollamaUrl -Name $m.Source).Substring(0, 12)))"
         $changed += $m
-    } else {
-        Write-LaiLog OK "  $($m.Display): unchanged ($($new.Substring(0, 12)))"
+    }
+    if ($changed.Count -eq 0) { throw "Nothing to roll back for: $($Rollback -join ', ')" }
+} else {
+    foreach ($m in $catalog.Models) {
+        $old = Get-LaiOllamaDigest -BaseUrl $ollamaUrl -Name $m.Source
+        Write-LaiLog STEP "Checking $($m.Source)"
+        # Keep a reference to the current version first: a pull deletes files no tag points to.
+        $candidate = "$(Resolve-LaiModelName $m.Source)-prevnew"
+        if ($old -and -not $NoKeepPrevious) { Copy-Model (Resolve-LaiModelName $m.Source) $candidate }
+        if ($env:LOCALAI_TEST_PULL_FROM) { Copy-Model $env:LOCALAI_TEST_PULL_FROM (Resolve-LaiModelName $m.Source) }   # test hook: simulated re-publish
+        else { Invoke-LaiOllamaPull -BaseUrl $ollamaUrl -Name $m.Source }
+        $new = Get-LaiOllamaDigest -BaseUrl $ollamaUrl -Name $m.Source
+        if ($old -and $old -ne $new -and -not $NoKeepPrevious) {
+            $pn = Get-PrevName $m.Source
+            Remove-Model $pn
+            Copy-Model $candidate $pn
+            Write-LaiLog INFO ("  previous version kept as {0} (~{1} GB until the next update; Update-Models.ps1 -Rollback {2} brings it back, -DropPrevious frees it)" -f $pn, (Get-ModelGB $pn), $m.Key)
+        }
+        Remove-Model $candidate
+        if ($old -ne $new -or $Retune -or -not (Test-LaiOllamaModel -BaseUrl $ollamaUrl -Name $m.Alias)) {
+            Write-LaiLog INFO ("  {0}: {1} -> {2}" -f $m.Display, $(if ($old) { $old.Substring(0, 12) } else { 'missing' }), $new.Substring(0, 12))
+            $changed += $m
+        } else {
+            Write-LaiLog OK "  $($m.Display): unchanged ($($new.Substring(0, 12)))"
+        }
     }
 }
 

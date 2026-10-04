@@ -531,6 +531,27 @@ function Get-LaiWebUIModel {
     }
 }
 
+function Merge-LaiPresetForm {
+    # Re-runs update only what the installer manages (base model, name, system prompt, tool mode,
+    # capabilities, ...). Everything else the user changed on the preset - attached knowledge, tools,
+    # access, extra parameters - is kept.
+    param([Parameter(Mandatory)][hashtable]$Managed, $Existing)
+    if (-not $Existing) { return $Managed }
+    $old = ConvertTo-LaiHashtable $Existing
+    $params = @{}
+    if ($old.ContainsKey('params') -and $old['params'] -is [hashtable]) { $params = $old['params'] }
+    foreach ($k in $Managed['params'].Keys) { $params[$k] = $Managed['params'][$k] }
+    $meta = @{}
+    if ($old.ContainsKey('meta') -and $old['meta'] -is [hashtable]) { $meta = $old['meta'] }
+    foreach ($k in $Managed['meta'].Keys) { $meta[$k] = $Managed['meta'][$k] }
+    $access = $Managed['access_grants']
+    if ($old.ContainsKey('access_grants') -and $null -ne $old['access_grants']) { $access = @($old['access_grants']) }
+    return @{
+        id = $Managed['id']; name = $Managed['name']; base_model_id = $Managed['base_model_id']
+        meta = $meta; params = $params; access_grants = $access; is_active = $true
+    }
+}
+
 function Set-LaiWebUIModel {
     # Idempotent create-or-update of a workspace model (preset).
     param([string]$BaseUrl = 'http://127.0.0.1:3000', [Parameter(Mandatory)][string]$Token, [Parameter(Mandatory)][hashtable]$Model)
@@ -893,6 +914,7 @@ function New-LaiPresetForm {
             image_generation = $false; code_interpreter = $false
         }
         tags              = @(@{ name = 'local' })
+        hidden            = $false
     }
     # Native tool calling lets the model decide when to search. In legacy (prompt-based) mode a
     # default-on web search would run a search before every single message, so leave it off there.
@@ -940,7 +962,9 @@ function Invoke-LaiWebUISetup {
     foreach ($m in $Models) {
         $native = [bool]$ModelResults[$m.Key]['Tools']
         if (-not $native) { Write-LaiLog WARN "$($m.Source) has no native tool-calling template; $($m.Display) uses legacy (prompt-based) function calling" }
-        $action = Set-LaiWebUIModel -BaseUrl $BaseUrl -Token $Token -Model (New-LaiPresetForm -Entry $m -NativeTools $native -SystemPrompt $SystemPrompt)
+        $form = Merge-LaiPresetForm -Managed (New-LaiPresetForm -Entry $m -NativeTools $native -SystemPrompt $SystemPrompt) `
+            -Existing (Get-LaiWebUIModel -BaseUrl $BaseUrl -Token $Token -Id $m.Preset)
+        $action = Set-LaiWebUIModel -BaseUrl $BaseUrl -Token $Token -Model $form
         Write-LaiLog OK "Preset '$($m.Display)' $action (base $($m.Alias), function calling $(if ($native) { 'native' } else { 'legacy' }))"
     }
 
