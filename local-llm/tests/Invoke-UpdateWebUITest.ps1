@@ -95,10 +95,16 @@ try {
     $old = (Get-Date).AddDays(-60).ToString('yyyy-MM-dd HH:mm:ss')
     Invoke-DockerText @('run', '--rm', '-v', "$(Split-Path -Parent $rollbackArchive):/b", 'alpine:3.20', 'touch', '-d', $old, "/b/$(Split-Path -Leaf $rollbackArchive)") | Out-Null
     Assert-That (((Get-Date) - (Get-Item -LiteralPath $rollbackArchive).LastWriteTime).TotalDays -gt 50) 'rollback archive aged to 60 days'
+    # An uninstall's final backup (the only copy of the old chats after a reinstall) and an ordinary
+    # tagged one, both 60 days old: only the ordinary one may go.
+    $bdir = Split-Path -Parent $rollbackArchive
+    Invoke-DockerText @('run', '--rm', '-v', "${bdir}:/b", 'alpine:3.20', 'sh', '-c', "echo x > /b/open-webui-20200101-000000-pre-uninstall.tar.gz; echo x > /b/open-webui-20200101-000000-pre-restore.tar.gz; touch -d '$old' /b/open-webui-20200101-000000-pre-uninstall.tar.gz /b/open-webui-20200101-000000-pre-restore.tar.gz") | Out-Null
     $prevPref = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
     & pwsh -NoProfile -File (Join-Path $src 'Backup-OpenWebUI.ps1') -AIRoot $aiRoot -RetentionDays 1 -SkipDeepVerify 2>&1 | Out-Null
     $ErrorActionPreference = $prevPref
     Assert-That (Test-Path -LiteralPath $rollbackArchive) '60-day-old rollback archive survives pruning'
+    Assert-That (Test-Path -LiteralPath (Join-Path $bdir 'open-webui-20200101-000000-pre-uninstall.tar.gz')) '60-day-old pre-uninstall archive survives pruning'
+    Assert-That (-not (Test-Path -LiteralPath (Join-Path $bdir 'open-webui-20200101-000000-pre-restore.tar.gz'))) '60-day-old ordinary tagged archive is pruned'
 
     Write-Host "`n=== 3a. mirror: copied whole, and pruned like the local folder ===" -ForegroundColor Cyan
     $mirrorDir = Join-Path $Work 'nas'
@@ -134,7 +140,7 @@ try {
     Set-Marker 'DATA-v2'
     $r = Invoke-Update @('-Rollback', '-Force')
     $cfg = Read-LaiState -Path (Join-Path $aiRoot 'localai-config.json')
-    Assert-That ($r.Code -eq 0 -or $r.Text -match 'Rolled back') "rollback ran (exit $($r.Code))"
+    Assert-That ($r.Code -eq 0 -and $r.Text -match 'Rolled back') "rollback ran (exit $($r.Code))"
     Assert-That ((Get-Image) -eq 'alpine:3.19') 'old image running again'
     Assert-That ((Get-Marker) -eq 'DATA-v1') 'pre-update data restored'
     Assert-That (-not $cfg.ContainsKey('RollbackArchive') -and $cfg['OpenWebUIVersion'] -eq '3.19') 'rollback point consumed, version recorded'

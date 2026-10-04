@@ -1,4 +1,5 @@
 #Requires -Version 5.1
+
 <#
 .SYNOPSIS
     Acceptance test for the local AI stack: the guide's "finished V1" checklist, actually executed.
@@ -25,6 +26,7 @@
     clean. The first CPU load reads the whole model into RAM (about 19 GB for Local Main).
 #>
 param(
+    # Install folder (the installer's -AIRoot).
     [string]$AIRoot = 'C:\AI',
     [switch]$Quick,
     # Defaults to config\models.psd1 next to this script.
@@ -229,13 +231,15 @@ if ($script:token) {
         if ($config.ContainsKey('WebUIOllamaUrl') -and $config['WebUIOllamaUrl']) { $expected = [string]$config['WebUIOllamaUrl'] }
         $oc = Invoke-LaiApi -Uri "$webUrl/ollama/config" -Token $token
         $urls = @($oc.OLLAMA_BASE_URLS | ForEach-Object { ([string]$_).TrimEnd('/') })
-        if ($urls -notcontains $expected) {
-            return (Warn "Open WebUI uses $($urls -join ', ') instead of $expected (e.g. after restoring an older backup) - re-run Install-LocalAI.ps1")
-        }
         # Actually through Open WebUI to Ollama, not just the setting: catches a render guard that is
-        # down or a stale firewall rule (LAN-fallback installs after WSL picked a new subnet).
+        # down or a stale firewall rule (LAN-fallback installs after WSL picked a new subnet). Probed
+        # even when the URL is not the expected one, so a broken connection is a FAIL, not a WARN.
+        $via = $expected; if ($urls -notcontains $expected) { $via = $urls -join ', ' }
         try { $v = Invoke-LaiApi -Uri "$webUrl/ollama/api/version" -Token $token -TimeoutSec 20 }
-        catch { return (Fail "Open WebUI cannot reach Ollama via $expected ($((Get-LaiHttpErrorText $_))) - $startAgain; if it persists, re-run Install-LocalAI.cmd (it also refreshes the firewall rule)") }
+        catch { return (Fail "Open WebUI cannot reach Ollama via $via ($((Get-LaiHttpErrorText $_))) - $startAgain; if it persists, re-run Install-LocalAI.cmd (it also refreshes the firewall rule)") }
+        if ($urls -notcontains $expected) {
+            return (Warn "Open WebUI uses $via instead of $expected (e.g. after restoring an older backup); it works, but re-run Install-LocalAI.ps1 to put it back")
+        }
         if ($expected -like '*render-guard*') { Pass "$expected (render guard), Ollama $($v.version)" } else { Pass "$expected (direct), Ollama $($v.version)" }
     }
     Add-Check 'Signup disabled, memories enabled' {

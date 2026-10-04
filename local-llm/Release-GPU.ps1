@@ -1,4 +1,5 @@
 #Requires -Version 5.1
+
 <#
 .SYNOPSIS
     Unloads every Ollama model from VRAM so ComfyUI / Forge get the whole RTX 3090.
@@ -9,7 +10,8 @@
     silently spills into shared system memory instead of failing, which makes renders crawl.
     Run this before a ComfyUI/Forge session. The next chat reloads the model automatically (~5-10 s).
 
-    Note: if Open WebUI sends a request during a render, Ollama loads a model again.
+    Note: with the render guard on (the default), chats during a ComfyUI render run on the CPU and do
+    not take VRAM back. With -RenderGuard off, a chat during a render loads a model on the GPU again.
 #>
 param([string]$OllamaUrl = 'http://127.0.0.1:11434')
 $ErrorActionPreference = 'Stop'

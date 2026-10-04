@@ -1,4 +1,5 @@
 #Requires -Version 5.1
+
 <#
 .SYNOPSIS
     Frees the GPU from Ollama, then starts ComfyUI (Comfy Desktop or the portable build).
@@ -18,10 +19,13 @@
     .\Start-ComfyUI.ps1 -Path 'D:\ComfyUI_windows_portable\run_nvidia_gpu.bat' -CreateShortcut
 #>
 param(
+    # Install folder (the installer's -AIRoot).
     [string]$AIRoot = 'C:\AI',
     [string]$Path = '',
     [switch]$CreateShortcut,
+    # Only free the GPU (and remember -Path); do not start ComfyUI.
     [switch]$NoLaunch,
+    # Ollama to ask to unload its models.
     [string]$OllamaUrl = 'http://127.0.0.1:11434'
 )
 $ErrorActionPreference = 'Stop'

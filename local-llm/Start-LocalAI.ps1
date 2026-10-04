@@ -1,4 +1,5 @@
 #Requires -Version 5.1
+
 <#
 .SYNOPSIS
     Brings the local AI stack back after Stop-LocalAI.ps1 (or after quitting Docker/Ollama by hand).
@@ -11,7 +12,9 @@
     .\Start-LocalAI.ps1
 #>
 param(
+    # Install folder (the installer's -AIRoot).
     [string]$AIRoot = 'C:\AI',
+    # How long to wait for Docker and Open WebUI to come up.
     [int]$TimeoutSec = 300
 )
 $ErrorActionPreference = 'Stop'

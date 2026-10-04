@@ -93,6 +93,12 @@ jobs:
           & ./local-llm/tests/Invoke-StaticChecks.ps1 -PssaPath 'not-used'
           exit $LASTEXITCODE
 
+      - name: Test runner self-test (missing program, ASSERT FAIL with exit 0, no banner, hang)
+        shell: pwsh
+        run: |
+          & ./local-llm/tests/Invoke-AllTests.ps1 -SelfTest
+          exit $LASTEXITCODE
+
       - name: Render guard behaviour (fake ComfyUI + fake Ollama)
         run: python3 local-llm/tests/test_render_guard.py
 
@@ -137,6 +143,12 @@ jobs:
         shell: pwsh
         run: |
           & ./local-llm/tests/Invoke-WindowsUnitTests.ps1
+          exit $LASTEXITCODE
+
+      - name: Nothing left behind (containers, volumes, helper processes, models, admin password)
+        shell: pwsh
+        run: |
+          & ./local-llm/tests/Reset-Sandbox.ps1 -Check
           exit $LASTEXITCODE
 
       - name: Logs on failure

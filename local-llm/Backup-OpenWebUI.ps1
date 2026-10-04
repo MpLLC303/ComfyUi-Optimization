@@ -1,4 +1,5 @@
 #Requires -Version 5.1
+
 <#
 .SYNOPSIS
     Consistent backup of the Open WebUI data volume (users, chats, memories, presets, settings,
@@ -18,25 +19,32 @@
     .\Backup-OpenWebUI.ps1 -Mirror E:\Backups  # also copy the newest archive to E:
 #>
 param(
+    # Install folder (the installer's -AIRoot).
     [string]$AIRoot = 'C:\AI',
     # 0 = take the value from localai-config.json (14 days if not set).
     [int]$RetentionDays = 0,
     # Optional second copy (another drive, NAS share). '' = take it from localai-config.json.
     [string]$Mirror = '',
+    # Suffix for the archive name (pre-uninstall, before-<version>, ...). Tagged archives are not daily ones.
     [string]$Tag = '',
     # Archive the running container instead of stopping it (used before replacing a manual install).
     [switch]$NoStop,
     # Used by Restore-OpenWebUI.ps1: never delete or mirror anything while a restore is in progress.
     [switch]$NoPrune,
+    # Do not copy this archive to the mirror folder.
     [switch]$NoMirror,
     # A missed 03:30 run starts right after sign-in, while Docker Desktop is still starting.
     [int]$EngineWaitSec = 300,
+    # Docker volume to archive (tests use throwaway ones).
     [string]$Volume = 'open-webui',
+    # Container that uses the volume; stopped while the archive is written unless -NoStop.
     [string]$Container = 'open-webui',
+    # Small local image that runs tar on the volume.
     [string]$HelperImage = 'alpine:3.20',
     # Deep check: open the archived webui.db with SQLite (integrity_check + user/chat counts) in a
     # throwaway volume. Uses an image that is already local (Open WebUI's own) so nothing is downloaded.
     [switch]$SkipDeepVerify,
+    # Image for the deep check; '' = the Open WebUI version in Stack\.env (skipped if that image is not local).
     [string]$VerifyImage = ''
 )
 $ErrorActionPreference = 'Stop'
@@ -191,6 +199,8 @@ try {
 
     # Retention: daily (untagged) archives older than N days go, but the newest three daily ones always
     # stay. Tagged archives (pre-compose, pre-restore, before-<version>) never count toward those three.
+    # The final backup of an uninstall (-pre-uninstall) is never pruned: after a reinstall it is the
+    # only copy of the old chats, and the new install's first backup would otherwise delete it.
     # The archive Update-OpenWebUI.ps1 -Rollback would use stays no matter how old it is. Applied to
     # the mirror too, which would otherwise fill the NAS. One file that cannot be deleted (open in an
     # archiver, held by a sync client) is a warning, not a failed backup.
@@ -202,7 +212,7 @@ try {
         param([string]$Dir)
         $all = @(Get-ChildItem -LiteralPath $Dir -Filter 'open-webui-*.tar.gz' -ErrorAction Stop)
         $daily = @($all | Where-Object { $_.Name -match '^open-webui-\d{8}-\d{6}\.tar\.gz$' } | Sort-Object LastWriteTime -Descending)  # lai-ok: objects
-        $tagged = @($all | Where-Object { $_.Name -notmatch '^open-webui-\d{8}-\d{6}\.tar\.gz$' -and $keepNames -notcontains $_.Name })
+        $tagged = @($all | Where-Object { $_.Name -notmatch '^open-webui-\d{8}-\d{6}\.tar\.gz$' -and $_.Name -notmatch '-pre-uninstall\.tar\.gz$' -and $keepNames -notcontains $_.Name })
         $cutoff = (Get-Date).AddDays(-$RetentionDays)
         foreach ($old in (@($daily | Select-Object -Skip 3) + $tagged | Where-Object { $_.LastWriteTime -lt $cutoff -and $_.Name -ne $name })) {
             try { Remove-Item -LiteralPath $old.FullName -Force -ErrorAction Stop; Write-BackupLog INFO "Pruned $($old.FullName)" }

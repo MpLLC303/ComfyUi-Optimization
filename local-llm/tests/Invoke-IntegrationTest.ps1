@@ -60,6 +60,11 @@ $v = & $tamper 'OllamaVersion' '0.0.1'
 if ($v[$mainKey]['Reused'] -or $v[$mainKey]['Context'] -ne $results[$mainKey]['Context']) { Write-LaiLog FAIL 'a new Ollama version was not re-verified at the tuned context'; $failures++ } else { Write-LaiLog OK 'new Ollama version: re-verified at the tuned context' }
 
 $token = Connect-LaiWebUI -BaseUrl $WebUIUrl -Email $Email -Password $Password
+# Point the shared Open WebUI straight at Ollama: an earlier suite (the mock run's render guard on
+# :11435) may have left it elsewhere, and the chat checks below would fail for that reason.
+$oc = ConvertTo-LaiHashtable (Invoke-LaiApi -Uri "$WebUIUrl/ollama/config" -Token $token)
+$ocCfgs = @{}; if ($oc.ContainsKey('OLLAMA_API_CONFIGS') -and $oc['OLLAMA_API_CONFIGS']) { $ocCfgs = $oc['OLLAMA_API_CONFIGS'] }
+Invoke-LaiApi -Method POST -Uri "$WebUIUrl/ollama/config/update" -Token $token -Body @{ ENABLE_OLLAMA_API = $true; OLLAMA_BASE_URLS = [object[]]@($OllamaUrl); OLLAMA_API_CONFIGS = $ocCfgs } | Out-Null
 Invoke-LaiWebUISetup -BaseUrl $WebUIUrl -Token $token -Models $catalog.Models -ModelResults $results -SystemPrompt $system `
     -DefaultPreset $catalog.DefaultPreset -Collections @('PC & Electronics', 'General References') -SearxngQueryUrl $SearxngQueryUrl
 # A user edit to a preset (attached knowledge, an extra parameter) must survive a re-run.

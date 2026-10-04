@@ -1,4 +1,5 @@
 #Requires -Version 5.1
+
 <#
 .SYNOPSIS
     Re-pulls the installed models and re-tunes only the ones whose content actually changed.
@@ -29,13 +30,16 @@
     .\Update-Models.ps1 -Unpin main        # after a -Rollback: let updates touch Local Main again
 #>
 param(
+    # Install folder (the installer's -AIRoot).
     [string]$AIRoot = 'C:\AI',
     [switch]$UpdateOllama,
     [switch]$Retune,
+    # Skip the quick health check at the end.
     [switch]$SkipTests,
     [string[]]$Rollback = @(),
     [string[]]$Unpin = @(),
     [switch]$DropPrevious,
+    # Do not keep the old version of an updated model as <tag>-prev (saves disk space, no -Rollback).
     [switch]$NoKeepPrevious
 )
 $ErrorActionPreference = 'Stop'

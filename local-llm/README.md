@@ -25,7 +25,9 @@ irm https://raw.githubusercontent.com/MpLLC303/ComfyUi-Optimization/refs/heads/m
 
 It downloads the newest toolkit to your temp folder, unblocks it and starts the installer. You get
 **one UAC prompt**, and then everything runs unattended in a new Administrator window (one more
-prompt after each reboot it needs).
+prompt after each reboot it needs). The one exception: if Open WebUI already has an admin account
+the installer doesn't know, it asks once for that account's e-mail and password. Only one installer
+run (or model update) can run at a time; a second one says so and stops.
 
 Alternative: download https://github.com/MpLLC303/ComfyUi-Optimization/archive/refs/heads/main.zip,
 **Extract All**, and double-click `local-llm\Install-LocalAI.cmd`. Running it from inside the ZIP
@@ -34,12 +36,14 @@ fails. The first window then says it continues in the Administrator window, and 
 Expect about 30-90 minutes. Most of that is about 67 GB of model downloads plus the Docker
 image. If WSL or Docker needs a reboot, the script warns you 60 seconds ahead (`shutdown /a`
 cancels it), reboots, and **continues after you sign in**: click **Yes** when Windows asks for
-administrator rights. At the end it opens
+administrator rights. If the resumed run fails twice in a row, it stops resuming by itself: fix the
+cause and run `C:\AI\Scripts\Install-LocalAI.cmd` again. At the end it opens
 http://localhost:3000 and prints the admin login (also saved in
 `C:\AI\Secrets\openwebui-admin.json`). The installer also allows typing script names such as
 `C:\AI\Scripts\Test-LocalAI.ps1` in PowerShell, by setting the execution policy to RemoteSigned.
 The everyday ones (Open WebUI, Gaming mode, Start again, Health check, ComfyUI, Diagnostics, Update
-toolkit) have Start-menu shortcuts under **Local AI**; run the rest from `C:\AI\Scripts`.
+toolkit) have Start-menu shortcuts under **Local AI**; run the rest from `C:\AI\Scripts`. Every
+script explains itself: `Get-Help C:\AI\Scripts\<name>.ps1 -Detailed`.
 
 ### Update the toolkit (existing installs)
 
@@ -63,7 +67,9 @@ render-guard mode and trial models.
   parameters, hiding a preset) are kept. The RAG settings (chunking, top-k, web search) are reset to
   the installer's values.
 - **Switches are remembered:** `-SkipVision`, `-KeepAlive` and the like apply to later runs too.
-  Change one by passing it again; `-ForgetSettings` goes back to the defaults.
+  Change one by passing it again; `-ForgetSettings` goes back to the defaults. It does not reset
+  `-RenderGuard`, `-ModelDir`, the ports or the trial models: pass those again to change them
+  (e.g. `Install-LocalAI.cmd -RenderGuard cpu` turns the render guard back on).
 
 Options are in the config block at the top of `Install-LocalAI.ps1`. The common ones:
 
@@ -130,7 +136,7 @@ used by the desktop and open apps):
 6. **SearXNG is set up from day one.** It needs no API key and keeps searches private, so there's no provider to choose
    and nothing to sign up for. It's bound to localhost only.
 7. **Backups are consistent and versioned.** The guide's command tars a live SQLite database and
-   overwrites one file. The script pauses the container for a few seconds, keeps timestamped archives
+   overwrites one file. The script stops the container while the archive is written (seconds to a few minutes), keeps timestamped archives
    (14 days, never fewer than 3), and verifies each one contains `webui.db`.
 8. **Privacy and robustness flags.** `OLLAMA_NO_CLOUD=1` (no cloud models or cloud search), `OLLAMA_NUM_PARALLEL=1`
    (the KV cache is allocated per parallel slot), `OLLAMA_GPU_OVERHEAD=512 MiB` (keeps ≤1 GiB free; above that,
@@ -141,8 +147,8 @@ used by the desktop and open apps):
 ## Daily use
 
 - **Local Main** for everything, **Local Vision** when you attach images, **Local Code** for code.
-- **Start menu → Local AI:** opens Open WebUI, has *Gaming mode (free GPU)*, *Start again*, *Health check*, *ComfyUI (free GPU first)* and *Diagnostics*. Each script window stays open until you press Enter, so you can read the result.
-- **Before ComfyUI/Forge:** start ComfyUI with `C:\AI\Scripts\Start-ComfyUI.ps1` (add `-CreateShortcut` once for a desktop icon). It unloads Ollama, shows free VRAM and launches Comfy Desktop or the portable build. For Forge or anything else, run `C:\AI\Scripts\Release-GPU.ps1`. Ollama keeps the last model in
+- **Start menu → Local AI:** opens Open WebUI, has *Gaming mode (free GPU)*, *Start again*, *Health check*, *ComfyUI (free GPU first)*, *Diagnostics (redacted zip)* and *Update toolkit*. Each script window stays open until you press Enter, so you can read the result.
+- **Before ComfyUI/Forge:** start ComfyUI with `C:\AI\Scripts\Start-ComfyUI.ps1` (add `-CreateShortcut` once for a desktop icon). It unloads Ollama, shows free VRAM and launches Comfy Desktop or the portable build. If ComfyUI is installed somewhere unusual, run it once as `C:\AI\Scripts\Start-ComfyUI.ps1 -Path <...\run_nvidia_gpu.bat or Comfy Desktop.exe>`; the path is remembered. For Forge or anything else, run `C:\AI\Scripts\Release-GPU.ps1`. Ollama keeps the last model in
   VRAM for 15 minutes, and a resident 19 GB model plus Wan 2.2 doesn't fit in 24 GB. On Windows, the
   driver then spills into system RAM instead of failing, so renders slow to a crawl without any error.
 - **Chatting during a render (render guard):** Open WebUI reaches Ollama through a small proxy
@@ -179,7 +185,7 @@ Every item on the guide's V1 list is a real test. It checks:
 - that a memory is recalled in a new conversation (it uses a random number, then deletes it)
 - that a document is retrieved from a freshly indexed collection (random code, deleted afterwards)
 - that a SearXNG search returns results
-- that a backup from the last two days exists and the task is scheduled
+- that the backup task is scheduled (a newest backup older than about two days is a warning)
 - that ports 11434/3000/8888 listen on loopback only
 
 The exit code is the number of failures.
@@ -188,7 +194,7 @@ The exit code is the number of failures.
 
 | Task | Command |
 |---|---|
-| Update Open WebUI | `C:\AI\Scripts\Update-OpenWebUI.ps1 -Latest` (backs up, pulls, recreates the container, runs a quick test). Undo it with `Update-OpenWebUI.ps1 -Rollback`: previous image plus the data from just before the update (the newest `before-<version>` backup is never pruned). History in `C:\AI\Logs\update.log`. Re-running the installer keeps the updated version |
+| Update Open WebUI | `C:\AI\Scripts\Update-OpenWebUI.ps1 -Latest` (backs up, pulls, recreates the container, runs a quick test). Undo it with `Update-OpenWebUI.ps1 -Rollback` (type YES): previous image plus the data from just before the update, so chats made since the update are lost (a safety copy of them is kept in `C:\AI\Backups`). The newest `before-<version>` backup is never pruned. History in `C:\AI\Logs\update.log`. Re-running the installer keeps the updated version |
 | Change the admin password | `C:\AI\Scripts\Set-OpenWebUIPassword.ps1` (random) or `-Prompt` (type your own); updates the secrets file and signs out old sessions |
 | Back up now | `C:\AI\Scripts\Backup-OpenWebUI.ps1` (add `-Mirror E:\Backups` or set `-BackupMirror` at install for a second copy) |
 | Update models / Ollama | `C:\AI\Scripts\Update-Models.ps1` re-pulls every model and re-tunes only those whose upstream tag changed (`-UpdateOllama` upgrades Ollama first). A model that really changed keeps its previous version as `<tag>-prev`, which costs its size on disk until the next update. Bring it back with `-Rollback main` (or `fast`, `vision`, `code`, `all`), which also pins it so later updates leave it alone until `-Unpin main`. Free the space with `-DropPrevious` |
@@ -197,11 +203,11 @@ The exit code is the number of failures.
 | Health watch | Task `LocalAI-Watch` runs `C:\AI\Scripts\Watch-LocalAI.ps1` every 15 minutes while you're signed in: checks Ollama, the Docker engine, Open WebUI, SearXNG, the render guard, backup freshness and free disk space (models, backups, Docker data; warns under 10 GB), restarts a stopped container or Ollama (never Docker Desktop itself, in case you quit it on purpose), and shows a Windows notification only when a problem persists for two checks in a row (and once when it's fixed). History in `C:\AI\Logs\watch.log`; run it by hand with `-NoHeal -Verbose`; silence it with `-PauseMinutes 240` (gaming, stack stopped on purpose) and `-Unpause` |
 | Gaming / long render: free everything | `C:\AI\Scripts\Stop-LocalAI.ps1` unloads the models, stops the containers (data kept) and pauses the health watch for 12 h. Add `-QuitDocker` to also release the WSL VM's RAM (up to 16 GB), or `-QuitOllama`. `Start-LocalAI.ps1` brings it all back and resumes the watch |
 | Something's wrong / asking for help | `C:\AI\Scripts\Get-LocalAIDiagnostics.ps1 -RunTests` (or Start menu → Local AI → Diagnostics) writes `C:\AI\Logs\diagnostics-<time>.zip` and copies a short summary to the clipboard. It covers versions, GPU/VRAM, Ollama, containers, logs and test results. The admin password, secret keys, tokens, your Windows user name and the admin e-mail are redacted. Nothing is uploaded |
-| Uninstall | `C:\AI\Scripts\Uninstall-LocalAI.ps1` (elevated; `-WhatIf` first to preview). It takes a verified final backup, then removes the scheduled tasks, containers, Tailscale mapping, `localai-*` aliases and shortcut. Chats and models are kept unless you add `-RemoveData` / `-RemoveModels`, and `-ResetOllamaSettings` also drops the OLLAMA_* variables. Backups are never deleted. If the final backup fails, nothing is removed |
-| After restoring an older backup | The restore puts this install's Ollama connection back. If the backup had a different admin password, run `Set-OpenWebUIPassword.ps1 -PromptCurrent` (type the old one), then re-run the installer to re-apply presets. `Test-LocalAI.ps1` warns if the connection is wrong |
-| Restore a backup | `C:\AI\Scripts\Restore-OpenWebUI.ps1` (newest daily backup) or `-Archive <file>` (local, NAS or UNC path). It takes a verified safety backup first, swaps the data only after the archive checks out, and rolls back automatically if anything fails |
+| Uninstall | Start Docker Desktop first, then `C:\AI\Scripts\Uninstall-LocalAI.ps1` (elevated; `-WhatIf` first to preview; it asks you to type YES). It takes a verified final backup (`...-pre-uninstall.tar.gz`), then removes the scheduled tasks, containers, Tailscale mapping, `localai-*` aliases, the shortcuts, the Start-menu folder and `C:\Program Files\LocalAI`. Chats and models are kept unless you add `-RemoveData` / `-RemoveModels`, and `-ResetOllamaSettings` also drops the OLLAMA_* variables. If the final backup fails, nothing is removed; with Docker not running, `-RemoveData` refuses. The Backups folder is kept, and the final backup is never pruned, even after a reinstall: get your chats back with `Restore-OpenWebUI.ps1 -Archive <that file>` |
+| After restoring an older backup | The restore puts this install's Ollama connection back. If the backup had a different admin password, run `Set-OpenWebUIPassword.ps1 -PromptCurrent` (type the old one; it then sets a new random password and prints it, add `-Prompt` to choose your own), then re-run the installer to re-apply presets. `Test-LocalAI.ps1` warns if the connection is wrong |
+| Restore a backup | `C:\AI\Scripts\Restore-OpenWebUI.ps1` (newest daily backup) or `-Archive <file>` (local, NAS or UNC path). It takes a verified safety backup first, swaps the data only after the archive checks out, and rolls back automatically if anything fails. If even the rollback fails, Open WebUI is **kept stopped on purpose** so nothing writes to half-restored data: Start again, the installer, updates and nightly backups refuse until you run the recovery command the restore printed (also in the health-watch notification and `C:\AI\open-webui-hold.json`) |
 
-Every backup is also opened with SQLite in a throwaway volume (integrity check plus user/chat counts in
+Every nightly backup is also opened with SQLite in a throwaway volume (when the Open WebUI image is on the PC; the restore's own safety copy skips it) (integrity check plus user/chat counts in
 `C:\AI\Logs\backup.log`). An archive that fails is kept as `...-CORRUPT.tar.gz`, never replaces a good one, and makes
 `Test-LocalAI.ps1` fail so you notice.
 
@@ -227,6 +233,8 @@ deliberately not inside the backup archives.
 | Chat is suddenly slow (CPU speed) | ComfyUI has a job queued or finished less than 60 s ago, so the render guard runs chats on the CPU | Expected. `docker logs render-guard` shows why. Wait for the render, or re-run the installer with `-RenderGuard off` |
 | Open WebUI: "render-guard: Ollama ... is not reachable" | Ollama isn't running | Start Ollama from the Start menu. To take the guard out of the path, re-run the installer with `-RenderGuard off` (changing the URL by hand in Admin Settings is undone by the next installer run) |
 | Installer interrupted | Power loss, closed window | Run it again. It's idempotent, and tuning results are reused. |
+| "Another Local AI installer run or model update is already running" | An installer window (often the Administrator one) or `Update-Models.ps1` is still open | Let it finish or close that window, then try again |
+| "Open WebUI is kept stopped after a failed restore" | A restore and its automatic rollback both failed | Run the recovery command shown in the message (also in `C:\AI\open-webui-hold.json`), then Start again |
 
 ## Security model (unchanged from the guide's Part 19-26 intent)
 
@@ -234,7 +242,8 @@ deliberately not inside the backup archives.
   and no file write access: those capabilities are turned off in every preset. Shell access (Open
   Terminal in a Docker sandbox, scoped to `C:\AI\Workspace`) is V2 and should keep the guide's
   permission levels A-F.
-- **Nothing listens beyond 127.0.0.1**, and `Test-LocalAI.ps1` checks this. For phone access run
+- **Nothing listens beyond 127.0.0.1**, and `Test-LocalAI.ps1` checks this. For phone access install
+  Tailscale, sign in, turn on MagicDNS and HTTPS Certificates at login.tailscale.com/admin/dns, then run
   `C:\AI\Scripts\Enable-TailscaleAccess.ps1`: HTTPS at `https://<this-pc>.<tailnet>.ts.net`, tailnet only, survives
   reboots, nothing opened on the LAN (`-Disable` removes it). Never port-forward or bind to `0.0.0.0`.
 - **Your data stays yours.**
@@ -259,7 +268,8 @@ deliberately not inside the backup archives.
 - **Updates trust this repository.** "Update toolkit" downloads the `main` branch over HTTPS and
   runs it as administrator. Whoever can push to `main` controls what it installs, so keep two-factor
   authentication on the GitHub account. To install a reviewed version instead, set
-  `$env:LOCALAI_REF` to a tag or commit before running the command.
+  `$env:LOCALAI_REF` to a tag or commit before running the command, and replace `refs/heads/main`
+  in its URL with the same tag or commit (otherwise the downloader itself still comes from `main`).
   - Ollama and Docker Desktop installers come from winget (hash-checked). The direct-download
     fallback refuses files that aren't signed by Ollama or Docker.
 - **Passwords on the command line** end up in PowerShell history. Use `Set-OpenWebUIPassword.ps1 -Prompt`

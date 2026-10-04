@@ -1009,7 +1009,9 @@ function Test-LaiWebUIWebSearch {
     param([string]$BaseUrl = 'http://127.0.0.1:3000', [Parameter(Mandatory)][string]$Token, [string]$Query = 'Ollama release notes')
     try {
         $r = Invoke-LaiApi -Method POST -Uri "$BaseUrl/api/v1/retrieval/process/web/search" -Token $Token -Body @{ queries = @($Query) } -TimeoutSec 180
-        $urls = @($r.filenames)
+        $urls = @($r.filenames | Where-Object { $_ })
+        # An empty list is the same situation as "No results found": not proof that search works.
+        if ($urls.Count -eq 0) { return [pscustomobject]@{ Status = 'no-results'; Count = 0; Detail = 'the search returned no pages' } }
         return [pscustomobject]@{ Status = 'ok'; Count = $urls.Count; Detail = (($urls | Select-Object -First 3) -join ', ') }
     } catch {
         $msg = Get-LaiHttpErrorText $_

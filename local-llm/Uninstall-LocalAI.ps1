@@ -1,4 +1,5 @@
 #Requires -Version 5.1
+
 <#
 .SYNOPSIS
     Removes the local AI stack that Install-LocalAI.ps1 set up, with a final backup first.
@@ -30,12 +31,15 @@
 #>
 [CmdletBinding(SupportsShouldProcess = $true)]
 param(
+    # Install folder (the installer's -AIRoot).
     [string]$AIRoot = 'C:\AI',
     [switch]$RemoveData,
     [switch]$RemoveModels,
     [switch]$ResetOllamaSettings,
+    # Skip the final backup (with -RemoveData the chats are then gone for good).
     [switch]$NoBackup,
     [switch]$Force,
+    # Ollama to remove the aliases (and with -RemoveModels the models) from; '' = OllamaUrl from localai-config.json, else 127.0.0.1:11434.
     [string]$OllamaUrl = ''
 )
 $ErrorActionPreference = 'Stop'
@@ -80,6 +84,16 @@ function Invoke-Step {
 $dockerUp = $false
 if (Get-Command docker -ErrorAction SilentlyContinue) { $dockerUp = ((Invoke-Docker @('version', '--format', '{{.Server.Version}}')).ExitCode -eq 0) }
 $volumeExists = $dockerUp -and ((Invoke-Docker @('volume', 'inspect', 'open-webui')).ExitCode -eq 0)
+# Without the engine there is no final backup and the data volume stays, but -RemoveData would
+# still delete Secrets: the stored admin password for data that is still there. Refuse instead.
+$dockerInstalled = [bool](Get-Command docker -ErrorAction SilentlyContinue)
+if (-not $dockerInstalled -and $env:ProgramFiles) { $dockerInstalled = Test-Path -LiteralPath (Join-Path $env:ProgramFiles 'Docker\Docker\resources\bin\docker.exe') }
+if ($RemoveData -and -not $dockerUp -and $dockerInstalled -and $WhatIfPreference) {
+    Write-LaiLog WARN 'Docker is not running: without -WhatIf, -RemoveData would refuse until Docker Desktop is started.'
+} elseif ($RemoveData -and -not $dockerUp -and $dockerInstalled) {
+    Write-LaiLog FAIL 'Docker is not running, so the final backup cannot be taken and the Open WebUI data cannot be removed. Start Docker Desktop, wait until it says "Engine running", then run this again. Nothing was removed.'
+    exit 1
+}
 
 # ---- plan + confirmation ------------------------------------------------------------------------
 $plan = @('scheduled tasks (backup, health watch, install resume)', 'containers open-webui, searxng, render-guard',

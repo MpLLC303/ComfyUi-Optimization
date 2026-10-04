@@ -1,4 +1,5 @@
 #Requires -Version 5.1
+
 <#
 .SYNOPSIS
     Puts the local AI stack to sleep (for gaming or a long render): frees VRAM and RAM, silences the
@@ -6,9 +7,9 @@
 
 .DESCRIPTION
     1. Unloads every Ollama model (frees up to ~21 GB of VRAM).
-    2. Stops the containers (Open WebUI, SearXNG, render guard) without removing them; data stays.
-    3. Pauses the 15-minute health watch for -PauseHours (default 12), so it neither restarts the
+    2. Pauses the 15-minute health watch for -PauseHours (default 12), so it neither restarts the
        containers nor notifies you. Start-LocalAI.ps1 ends the pause early.
+    3. Stops the containers (Open WebUI, SearXNG, render guard) without removing them; data stays.
     Optional, for the most free RAM:
       -QuitOllama   quit the Ollama tray app and server.
       -QuitDocker   quit Docker Desktop and its WSL VM (gives back up to the 16 GB the VM may hold).
@@ -21,6 +22,7 @@
     .\Stop-LocalAI.ps1 -QuitDocker -QuitOllama -PauseHours 4
 #>
 param(
+    # Install folder (the installer's -AIRoot).
     [string]$AIRoot = 'C:\AI',
     [int]$PauseHours = 12,
     [switch]$QuitOllama,

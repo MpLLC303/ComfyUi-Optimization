@@ -104,12 +104,30 @@ class H(BaseHTTPRequestHandler):
         self._j({})
 ThreadingHTTPServer(('127.0.0.1', $fakePort), H).serve_forever()
 "@ | Set-Content $fakeOllama
+# A fake left by a killed run would hold the port, the new one would die on bind, and the "no
+# deletes recorded" checks would then pass against a dead server.
+& /bin/sh -c "pkill -f 'fake_ollama[.]py' ; true"
 $fake = Start-Process -FilePath python3 -ArgumentList $fakeOllama -PassThru
-Start-Sleep -Seconds 1
+$fakeUp = $false
+for ($i = 0; $i -lt 50 -and -not $fakeUp -and -not $fake.HasExited; $i++) {
+    try { Invoke-RestMethod "http://127.0.0.1:$fakePort/api/tags" -TimeoutSec 2 | Out-Null; $fakeUp = $true } catch { Start-Sleep -Milliseconds 200 }
+}
+if (-not $fakeUp) { Write-Host "fake Ollama on :$fakePort did not start" -ForegroundColor Red; exit 1 }
 $env:ProgramData = Join-Path $Work 'ProgramData'
 $menuDir = Join-Path $env:ProgramData 'Microsoft\Windows\Start Menu\Programs\Local AI'
 $renamed = $false
-if (Test-Container 'searxng') { Invoke-DockerQuiet -DockerArgs @('rename', 'searxng', 'searxng-uninstall-test-keep') | Out-Null; $renamed = $true }
+# The uninstaller removes any container named searxng: park the sandbox's real one under another
+# name. A run killed before the rename back leaves it parked; undo that first.
+if (-not (Test-Container 'searxng') -and (Test-Container 'searxng-uninstall-test-keep')) {
+    Invoke-DockerQuiet -DockerArgs @('rename', 'searxng-uninstall-test-keep', 'searxng') | Out-Null
+}
+if (Test-Container 'searxng') {
+    if ((Invoke-DockerQuiet -DockerArgs @('rename', 'searxng', 'searxng-uninstall-test-keep')) -ne 0) {
+        Write-Host 'Could not move the sandbox searxng aside; stopping before the uninstaller can delete it.' -ForegroundColor Red
+        Stop-Process -Id $fake.Id -Force; exit 1
+    }
+    $renamed = $true
+}
 
 try {
     Write-Host "`n=== 1. -WhatIf ===" -ForegroundColor Cyan
@@ -157,10 +175,23 @@ try {
     Assert-That ($code -ne 0) "exits non-zero (got $code)"
     Assert-That ((Test-Container 'open-webui') -and (Test-Volume 'open-webui')) 'nothing removed'
     Assert-That (-not (Test-Path $deletes) -and -not (Test-Path $tasksLog)) 'no aliases or tasks removed'
+
+    Write-Host "`n=== 5. -RemoveData while the Docker engine is down refuses ===" -ForegroundColor Cyan
+    New-Stack
+    Set-Content -LiteralPath (Join-Path $aiRoot 'Secrets/openwebui-admin.json') -Value '{"email":"a","password":"b"}'
+    $savedDockerHost = $env:DOCKER_HOST
+    $env:DOCKER_HOST = 'unix:///nonexistent/lai-docker.sock'
+    try { $code = Invoke-Uninstall @('-Force', '-RemoveData') } finally { $env:DOCKER_HOST = $savedDockerHost }
+    Assert-That ($code -ne 0) "exits non-zero (got $code)"
+    Assert-That (Test-Path -LiteralPath (Join-Path $aiRoot 'Secrets/openwebui-admin.json')) 'the stored admin password is kept (its data volume is still there)'
+    Assert-That ((Test-Container 'open-webui') -and (Test-Volume 'open-webui') -and -not (Test-Path $tasksLog)) 'nothing removed'
 } finally {
     foreach ($c in 'open-webui', 'render-guard') { Invoke-DockerQuiet -DockerArgs @('rm', '-f', $c) | Out-Null }
     Invoke-DockerQuiet -DockerArgs @('volume', 'rm', 'open-webui') | Out-Null
-    if ($renamed) { Invoke-DockerQuiet -DockerArgs @('rename', 'searxng-uninstall-test-keep', 'searxng') | Out-Null }
+    Invoke-DockerQuiet -DockerArgs @('network', 'rm', 'lai-uninstall-test_default') | Out-Null
+    if ($renamed) {
+        if ((Invoke-DockerQuiet -DockerArgs @('rename', 'searxng-uninstall-test-keep', 'searxng')) -ne 0) { Write-Host '  ASSERT FAIL sandbox searxng could not be renamed back' -ForegroundColor Red; $failures++ }
+    }
     if ($fake -and -not $fake.HasExited) { Stop-Process -Id $fake.Id -Force }
 }
 

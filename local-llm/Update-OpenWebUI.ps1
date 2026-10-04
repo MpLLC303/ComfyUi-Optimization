@@ -1,4 +1,5 @@
 #Requires -Version 5.1
+
 <#
 .SYNOPSIS
     Backs up, then updates Open WebUI (and optionally SearXNG) to a newer pinned image.
@@ -17,14 +18,18 @@
                                                 # just before it (the 'before-<version>' backup)
 #>
 param(
+    # Install folder (the installer's -AIRoot).
     [string]$AIRoot = 'C:\AI',
     [string]$Version = '',
     [switch]$Latest,
+    # Also move SearXNG to this image tag.
     [string]$SearxngVersion = '',
+    # Skip the backup before the update (then -Rollback has no matching data).
     [switch]$SkipBackup,
     # Undo the last update: switch back to the previous image and restore the backup taken right
     # before the update (Open WebUI migrates its database on upgrade, so the old image needs old data).
     [switch]$Rollback,
+    # Skip the "type YES" confirmation of -Rollback.
     [switch]$Force
 )
 $ErrorActionPreference = 'Stop'

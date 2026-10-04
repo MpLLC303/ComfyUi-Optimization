@@ -1,4 +1,5 @@
 #Requires -Version 5.1
+
 <#
 .SYNOPSIS
     Makes Open WebUI reachable from your phone/laptop over Tailscale (HTTPS, tailnet only), without
@@ -21,7 +22,9 @@
     .\Enable-TailscaleAccess.ps1 -Disable   # remove the mapping again
 #>
 param(
+    # Install folder (the installer's -AIRoot).
     [string]$AIRoot = 'C:\AI',
+    # Open WebUI's loopback port; 0 = take it from localai-config.json (3000 if not set).
     [int]$Port = 0,
     [switch]$Disable
 )

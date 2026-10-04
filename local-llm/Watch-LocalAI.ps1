@@ -1,4 +1,5 @@
 #Requires -Version 5.1
+
 <#
 .SYNOPSIS
     Lightweight health watch for the local AI stack, meant to run every 15 minutes as a scheduled task.
@@ -24,8 +25,10 @@
 #>
 [CmdletBinding()]
 param(
+    # Install folder (the installer's -AIRoot).
     [string]$AIRoot = 'C:\AI',
     [switch]$NoHeal,
+    # Log only; no Windows notification.
     [switch]$NoNotify,
     # Warn when the drive with the models, backups or Docker's data has less than this free.
     [int]$MinFreeGB = 10,

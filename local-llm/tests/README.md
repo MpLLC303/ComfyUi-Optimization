@@ -12,6 +12,8 @@ architecture family and chat template as the real ones), so the tests fit on a C
 | `Invoke-UpdateWebUITest.ps1` | `Update-OpenWebUI.ps1` on a throwaway stack (alpine images standing in for Open WebUI versions): an update records a rollback point, a failed pull changes nothing, the rollback archive survives pruning, `-Rollback` brings back the old image and the pre-update data, and a second rollback refuses. |
 | `Invoke-UninstallTest.ps1` | `Uninstall-LocalAI.ps1` against real Docker with a fake Ollama (it records deletes, so the real models stay put) and mocked scheduled tasks: `-WhatIf` changes nothing; the default removal takes a verified backup and removes containers, aliases and tasks while keeping data; `-RemoveData -RemoveModels`; and a failing backup that aborts before anything is removed. A sandbox `searxng` container is moved aside and restored. |
 | `Invoke-WatchTest.ps1` | `Watch-LocalAI.ps1` against real containers: a stopped SearXNG is restarted, nothing is healed while paused, and Open WebUI is left alone while another process holds the volume lock. |
+| `Invoke-AllTests.ps1 -SelfTest` | The runner itself: a suite whose program is missing, one that prints ASSERT FAIL but exits 0, one without its PASSED banner, one with a non-zero exit, and one that hangs (killed with its child process after the time limit) are all reported as failed. |
+| `Reset-Sandbox.ps1` | Puts the shared sandbox back (throwaway containers and volumes, helper processes, a parked SearXNG, test models, the admin password, Open WebUI's Ollama connection). `-Check` only reports: the runner runs it after every suite, and a suite that leaves anything behind fails. |
 | `test_render_guard.py` | `render_guard.py` with a fake ComfyUI and a fake streaming Ollama. It checks CPU routing while busy and for the hold period, `/free` with back-off, 20 concurrent streams, connected-but-silent counted as busy, unreachable counted as not busy, and SIGTERM. |
 | `../Test-LocalAI.ps1 -CatalogPath tests/models.test.psd1 -NoContainers` | The acceptance checklist itself. |
 
@@ -37,7 +39,7 @@ pwsh tests/Invoke-AllTests.ps1                 # every suite, one after another,
 pwsh tests/Invoke-AllTests.ps1 -Only Static,Mock   # a subset
 ```
 
-Run the suites through `Invoke-AllTests.ps1` (or one at a time). They share one Ollama, one Open WebUI and one
+Run the suites through `Invoke-AllTests.ps1` (or one at a time, after `pwsh tests/Reset-Sandbox.ps1`). A suite passes only with exit 0, its own PASSED banner, no ASSERT FAIL line, within `-TimeoutSec` (default 1800), and with nothing left behind. They share one Ollama, one Open WebUI and one
 Docker engine, so running two at once makes them unload each other's models and fight over the
 `open-webui` volume. The failures look like product bugs. The runner holds a lock file, so a second run refuses to start.
 

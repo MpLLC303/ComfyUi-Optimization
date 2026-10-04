@@ -1,4 +1,5 @@
 #Requires -Version 5.1
+
 <#
 .SYNOPSIS
     Rotates the Open WebUI admin password and updates <AIRoot>\Secrets\openwebui-admin.json.
@@ -17,6 +18,7 @@
                                                       # password that backup had; the stored one is replaced
 #>
 param(
+    # Install folder (the installer's -AIRoot).
     [string]$AIRoot = 'C:\AI',
     # For automation only: a password typed here stays in the PowerShell history and is visible in
     # the process list. Interactively, use -Prompt (and -PromptCurrent) instead.
@@ -26,6 +28,7 @@ param(
     # restore). -PromptCurrent asks for it without echoing or leaving it in the shell history.
     [string]$CurrentPassword = '',
     [switch]$PromptCurrent,
+    # Do not print the new password (it is still stored in <AIRoot>\Secrets).
     [switch]$Quiet
 )
 $ErrorActionPreference = 'Stop'

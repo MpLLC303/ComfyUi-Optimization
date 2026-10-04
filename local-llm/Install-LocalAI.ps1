@@ -1,4 +1,5 @@
 #Requires -Version 5.1
+
 <#
 .SYNOPSIS
     One-shot, resumable installer for a private local AI stack on Windows + RTX 3090:
@@ -42,9 +43,11 @@ param(
     [string[]]$TrialModels = @(),
     # Loopback ports (never exposed to the LAN). A busy port is replaced by the next free one.
     [int]$WebUIPort = 3000,
+    # SearXNG's loopback port (Open WebUI's web search).
     [int]$SearxngPort = 8888,
     # Pinned image versions (the guide's :main tag is a moving target; Update-OpenWebUI.ps1 bumps these).
     [string]$OpenWebUIVersion = 'v0.11.4',
+    # Pinned SearXNG image tag.
     [string]$SearxngVersion = '2026.10.2-19ffbcd30',
     # Open WebUI admin login. A random password is generated and stored in <AIRoot>\Secrets.
     [string]$AdminEmail = 'admin@localhost',
@@ -57,23 +60,31 @@ param(
     [int]$MinFreeVramMiB = 768,
     # Before loading/tuning models, wait until other programs use at most this much VRAM (desktop is ~1.5-2.5 GB).
     [int]$MaxBusyVramMiB = 3500,
+    # How long to wait for that before loading anyway.
     [int]$GpuWaitMinutes = 10,
     # How long an idle model stays in VRAM. Run Release-GPU.ps1 before ComfyUI/Forge sessions.
     [string]$KeepAlive = '15m',
     # While ComfyUI has a job running or queued, answer chats on the CPU instead of taking VRAM from
     # the render (stack/render-guard). 'off' = plain pass-through to Ollama.
     [ValidateSet('cpu', 'off')][string]$RenderGuard = 'cpu',
+    # Empty Open WebUI knowledge collections to create (existing ones are kept).
     [string[]]$KnowledgeCollections = @('PC & Electronics', '3D Printing', 'Property', 'School', 'Home Projects', 'General References'),
     # Nightly backup of the Open WebUI volume (chats, memories, settings, knowledge).
     [string]$BackupTime = '03:30',
+    # Daily archives older than this are deleted (the newest three always stay).
     [int]$BackupRetentionDays = 14,
+    # Optional second copy of each backup (another drive or a NAS share).
     [string]$BackupMirror = '',
     # Behaviour switches.
+    # When WSL/Docker needs a reboot: do not reboot by itself; stop (exit 3010) and resume after the next sign-in.
     [switch]$NoReboot,
+    # Measure every model's context again, even when nothing changed.
     [switch]$Retune,
+    # Skip the acceptance checklist (Test-LocalAI.ps1) at the end.
     [switch]$SkipTests,
     # Forget the settings remembered from earlier runs (e.g. a -SkipVision) and use the defaults above.
     [switch]$ForgetSettings,
+    # Set by the after-reboot task: continue where the previous run stopped.
     [switch]$Resume
     # ========================================================
 )

@@ -1,4 +1,5 @@
 #Requires -Version 5.1
+
 <#
 .SYNOPSIS
     Restores an Open WebUI backup archive (made by Backup-OpenWebUI.ps1) into the open-webui volume.
@@ -22,11 +23,16 @@
     .\Restore-OpenWebUI.ps1 -Archive \\nas\backups\open-webui-20261002-175511.tar.gz
 #>
 param(
+    # Install folder (the installer's -AIRoot).
     [string]$AIRoot = 'C:\AI',
     [string]$Archive = '',
+    # Do not archive the current data first (no automatic rollback if the restore fails).
     [switch]$SkipSafetyBackup,
+    # Docker volume to restore into.
     [string]$Volume = 'open-webui',
+    # Container that uses the volume; stopped during the restore.
     [string]$Container = 'open-webui',
+    # Small local image that runs tar on the volume.
     [string]$HelperImage = 'alpine:3.20',
     # Skip the "type YES" confirmation (scripts, automation).
     [switch]$Force

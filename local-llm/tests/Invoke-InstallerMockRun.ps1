@@ -45,11 +45,14 @@ $env:LOCALAI_TEST_ALLOW_CPU = '1'
 # local python3 because docker compose is mocked). Its request counter proves traffic went through it.
 $env:LOCALAI_TEST_WEBUI_OLLAMA_URL = 'http://127.0.0.1:11435'
 $guardStatus = 'http://127.0.0.1:11435/render-guard/status'
-try { Invoke-RestMethod $guardStatus -TimeoutSec 2 | Out-Null } catch {
-    & /bin/sh -c "UPSTREAM=http://127.0.0.1:11434 COMFYUI_URLS=http://127.0.0.1:18188 LISTEN_PORT=11435 setsid nohup python3 '$src/stack/render-guard/render_guard.py' > /tmp/render-guard-mock.log 2>&1 &"
-    Start-Sleep -Seconds 2
+# Always this checkout's guard: one left running by an earlier run may be older code.
+& /bin/sh -c "pkill -f 'render-guard/render_guard[.]py' ; true"
+$guardProc = Start-Process -FilePath 'python3' -ArgumentList @('-u', "$src/stack/render-guard/render_guard.py") -PassThru -RedirectStandardOutput (Join-Path $Work 'render-guard.log') -RedirectStandardError (Join-Path $Work 'render-guard.err') -Environment @{ UPSTREAM = 'http://127.0.0.1:11434'; COMFYUI_URLS = 'http://127.0.0.1:18188'; LISTEN_PORT = '11435' }
+$guardBefore = $null
+for ($i = 0; $i -lt 60 -and $null -eq $guardBefore -and -not $guardProc.HasExited; $i++) {
+    try { $guardBefore = [int](Invoke-RestMethod $guardStatus -TimeoutSec 2).stats.requests } catch { Start-Sleep -Milliseconds 500 }
 }
-$guardBefore = [int](Invoke-RestMethod $guardStatus -TimeoutSec 5).stats.requests
+if ($null -eq $guardBefore) { Write-Host "render guard did not start: $(Get-Content -Raw (Join-Path $Work 'render-guard.err'))" -ForegroundColor Red; exit 1 }
 
 # The sandbox Open WebUI already has an admin; give the installer its credentials.
 ConvertTo-Json @{ email = $Email; password = $Password } | Set-Content (Join-Path $aiRoot 'Secrets/openwebui-admin.json')
@@ -63,7 +66,11 @@ Set-Content (Join-Path $env:LOCALAPPDATA 'Ollama/server.log') "$cfgLine"
 & /usr/bin/docker volume rm open-webui owui-old 2>$null | Out-Null
 & /usr/bin/docker volume create owui-old | Out-Null
 & /usr/bin/docker run --rm -v owui-old:/data alpine:3.20 sh -c 'head -c 65536 /dev/urandom > /data/webui.db; echo legacy-marker > /data/marker.txt' | Out-Null
-& /usr/bin/docker run -d --restart always --name open-webui -v owui-old:/app/backend/data alpine:3.20 sleep 3600 | Out-Null
+& /usr/bin/docker run -d --restart always --label lai-test=1 --name open-webui -v owui-old:/app/backend/data alpine:3.20 sleep 3600 | Out-Null
+
+# Everything below runs in try/finally: the container above has restart=always and comes back after
+# a reboot, and the shared Open WebUI must not keep pointing at this run's render guard.
+try {
 
 # ---- patched installer copy ----------------------------------------------------------------
 $inst = Join-Path $copy 'Install-LocalAI.ps1'
@@ -299,7 +306,20 @@ $env:LOCALAI_TEST_FAIL_STAGE = ''
 & (Join-Path $aiRoot 'Scripts/Install-LocalAI.ps1') -AIRoot $aiRoot -SkipTests
 Assert-That ($LASTEXITCODE -eq 0 -and -not (Get-Content -Encoding UTF8 -Raw (Join-Path $aiRoot 'install-state.json') | ConvertFrom-Json).flags.PSObject.Properties['resumeFailures']) 'a good run clears the failure count'
 
-& /usr/bin/docker rm -f open-webui 2>$null | Out-Null
-& /usr/bin/docker ps -aq --filter 'name=^/open-webui-legacy-' | ForEach-Object { & /usr/bin/docker rm -f $_ | Out-Null }
+} finally {
+    $env:LOCALAI_TEST_FAIL_STAGE = ''
+    & /usr/bin/docker rm -f open-webui 2>$null | Out-Null
+    & /usr/bin/docker ps -aq --filter 'name=^/open-webui-legacy-' | ForEach-Object { & /usr/bin/docker rm -f $_ | Out-Null }
+    & /usr/bin/docker volume rm open-webui owui-old 2>$null | Out-Null
+    # The installer pointed the shared Open WebUI at the guard on :11435; point it back at Ollama.
+    try {
+        Import-Module (Join-Path $src 'lib/LocalAI.psm1') -Force
+        $tok = Connect-LaiWebUI -BaseUrl 'http://127.0.0.1:3000' -Email $Email -Password $Password
+        $oc = ConvertTo-LaiHashtable (Invoke-LaiApi -Uri 'http://127.0.0.1:3000/ollama/config' -Token $tok)
+        $cfgs = @{}; if ($oc.ContainsKey('OLLAMA_API_CONFIGS') -and $oc['OLLAMA_API_CONFIGS']) { $cfgs = $oc['OLLAMA_API_CONFIGS'] }
+        Invoke-LaiApi -Method POST -Uri 'http://127.0.0.1:3000/ollama/config/update' -Token $tok -Body @{ ENABLE_OLLAMA_API = $true; OLLAMA_BASE_URLS = [object[]]@('http://127.0.0.1:11434'); OLLAMA_API_CONFIGS = $cfgs } | Out-Null
+    } catch { Write-Host "  could not point Open WebUI back at Ollama: $($_.Exception.Message)" -ForegroundColor Yellow }
+    if ($guardProc -and -not $guardProc.HasExited) { $guardProc.Kill() }
+}
 if ($failures -eq 0) { Write-Host "`nMOCK RUN PASSED" -ForegroundColor Green } else { Write-Host "`nMOCK RUN FAILED ($failures)" -ForegroundColor Red }
 exit $failures

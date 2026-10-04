@@ -68,6 +68,7 @@ ConvertTo-Json @{ OllamaUrl = $OllamaUrl; SelectedModels = @('main') } | Set-Con
 $env:LOCALAI_TEST_CATALOG = $catalogFile
 $env:LOCALAI_TEST_ALLOW_CPU = '1'
 
+$holder = $null
 try {
     Write-Host "`n=== 1. nothing changed upstream ===" -ForegroundColor Cyan
     $r = Invoke-Update @() $tag
@@ -125,13 +126,17 @@ try {
 
     Write-Host "`n=== 5. one model update at a time ===" -ForegroundColor Cyan
     $holdScript = Join-Path $Work 'hold-setup.ps1'
-    Set-Content -LiteralPath $holdScript -Value ("Import-Module '{0}' -Force; `$l = Enter-LaiSetupLock; Start-Sleep -Seconds 60" -f (Join-Path (Join-Path $src 'lib') 'LocalAI.psm1'))
+    $ready = Join-Path $Work 'holder.ready'
+    Set-Content -LiteralPath $holdScript -Value ("Import-Module '{0}' -Force; `$l = Enter-LaiSetupLock; Set-Content -LiteralPath '{1}' -Value x; Start-Sleep -Seconds 60" -f (Join-Path (Join-Path $src 'lib') 'LocalAI.psm1'), $ready)
     $holder = Start-Process -FilePath 'pwsh' -ArgumentList @('-NoProfile', '-File', $holdScript) -PassThru
-    Start-Sleep -Seconds 4
+    # Wait until it really holds the lock (a cold pwsh start can take several seconds on CI).
+    for ($i = 0; $i -lt 150 -and -not (Test-Path -LiteralPath $ready) -and -not $holder.HasExited; $i++) { Start-Sleep -Milliseconds 200 }
+    Assert-That (Test-Path -LiteralPath $ready) 'setup: the other process holds the setup lock'
     $r = Invoke-Update @() ''
     if (-not $holder.HasExited) { $holder.Kill() }
     Assert-That ($r.Code -ne 0 -and $r.Text -match 'already running') "a second update refuses while another holds the lock (exit $($r.Code))"
 } finally {
+    if ($holder -and -not $holder.HasExited) { $holder.Kill() }
     foreach ($n in @($tag, $variant, $prev, "$tag-prevnew", $alias)) { try { Remove-IfThere $n } catch { Write-Verbose "cleanup $n" } }
     $env:LOCALAI_TEST_CATALOG = ''
 }

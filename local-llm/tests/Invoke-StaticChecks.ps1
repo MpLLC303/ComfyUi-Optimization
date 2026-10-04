@@ -19,6 +19,7 @@ param(
 )
 $ErrorActionPreference = 'Stop'
 $problems = 0
+$Root = (Resolve-Path -LiteralPath $Root).Path.TrimEnd([char]'/', [char]'\')
 $files = Get-ChildItem -Path $Root -Recurse -File -Include *.ps1, *.psm1, *.psd1
 
 # Runtime pitfalls the parser and PSSA accept. Each rule was a real bug in this toolkit; each has
@@ -35,7 +36,10 @@ $files = Get-ChildItem -Path $Root -Recurse -File -Include *.ps1, *.psm1, *.psd1
 #   NOSILENT a scheduled task with -RunLevel Highest (elevated without a UAC prompt).
 #   ENCODING Get-Content of an env/config/state/secret file without -Encoding UTF8 (5.1 reads
 #            BOM-less UTF-8 as ANSI; .env must be BOM-less for docker compose).
-function Find-Pitfall([System.Management.Automation.Language.Ast]$Ast, [string[]]$Lines, [string]$FileName = '') {
+#   HELP     a user-facing script (toolkit root) with a parameter its help never mentions: no
+#            .PARAMETER entry, no comment right above it, no -Name in the help text.
+#   DOCPARAM README.md tells the user to run a script with a -Switch that script does not have.
+function Find-Pitfall([System.Management.Automation.Language.Ast]$Ast, [string[]]$Lines, [string]$FileName = '', [switch]$UserFacing) {
     $found = New-Object System.Collections.Generic.List[object]
     $add = { param($Rule, $Node, $Msg) $found.Add([pscustomobject]@{ Rule = $Rule; Line = $Node.Extent.StartLineNumber; Message = $Msg }) }
     $marker = { param($Node, $Tag) $Lines[$Node.Extent.StartLineNumber - 1] -match ('#\s*lai-ok:\s*' + $Tag) }
@@ -110,6 +114,28 @@ function Find-Pitfall([System.Management.Automation.Language.Ast]$Ast, [string[]
         }
     }
 
+    # Every parameter of a user-facing script is explained somewhere Get-Help shows it.
+    $help = $null
+    if ($UserFacing -and $Ast -is [System.Management.Automation.Language.ScriptBlockAst] -and $Ast.ParamBlock) { $help = $Ast.GetHelpContent() }
+    # A help block PowerShell does not recognise is invisible to Get-Help: '#Requires' directly
+    # above '<#' (no blank line) joins them into one comment that does not start with a keyword.
+    if ($UserFacing -and -not $help -and @($Lines | Select-Object -First 6 | Where-Object { $_ -match '^\s*<#' }).Count) {
+        & $add 'HELP' $Ast 'the comment-based help is not recognised (Get-Help shows nothing); put a blank line between #Requires and <#'
+    }
+    if ($help) {
+        $helpText = (@($help.Synopsis, $help.Description) + @($help.Examples) + @($help.Notes)) -join "`n"
+        foreach ($prm in $Ast.ParamBlock.Parameters) {
+            $pn = $prm.Name.VariablePath.UserPath
+            if ($help.Parameters.ContainsKey($pn.ToUpperInvariant())) { continue }
+            if ($helpText -match ('(?i)-' + [regex]::Escape($pn) + '\b')) { continue }
+            $above = $prm.Extent.StartLineNumber - 2
+            while ($above -ge 0 -and $Lines[$above] -match '^\s*$') { $above-- }
+            if ($above -ge 0 -and $Lines[$above] -match '^\s*#') { continue }
+            if (& $marker $prm 'help') { continue }
+            & $add 'HELP' $prm "parameter -$pn is not documented: add .PARAMETER $pn or a # comment line right above it"
+        }
+    }
+
     foreach ($v in $Ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.VariableExpressionAst] -and $n.VariablePath.UserPath -eq 'PSBoundParameters' }, $true)) {
         $sb = $v.Parent
         while ($sb -and -not ($sb -is [System.Management.Automation.Language.ScriptBlockAst])) { $sb = $sb.Parent }
@@ -120,6 +146,29 @@ function Find-Pitfall([System.Management.Automation.Language.Ast]$Ast, [string[]
         if ($owner -is [System.Management.Automation.Language.InvokeMemberExpressionAst] -and @('ForEach', 'Where') -contains [string]$owner.Member.Value) { continue }
         if (& $marker $v 'bound') { continue }
         & $add 'BOUND' $v '$PSBoundParameters inside a scriptblock is that block''s own (empty) set; copy the script''s to $script:BoundParams first'
+    }
+    return , $found
+}
+
+function Find-DocParam([string]$Text, [hashtable]$ParamsByScript) {
+    # "Script.ps1 -A -B x" in the docs: every -A must be a parameter of that script. The command runs
+    # to the end of the code span or line, or a comment / pipe / ';'. Install-LocalAI.cmd passes its
+    # arguments to Install-LocalAI.ps1. -WhatIf/-Confirm/-Verbose are common parameters.
+    $found = New-Object System.Collections.Generic.List[object]
+    $lineNo = 0
+    foreach ($line in ($Text -split "`n")) {
+        $lineNo++
+        foreach ($m in [regex]::Matches($line, '([A-Za-z][\w-]*)\.(ps1|cmd)((?:[ \t]+[^`|#;\s]+)*)')) {
+            $script = $m.Groups[1].Value + '.ps1'
+            if (-not $ParamsByScript.ContainsKey($script)) { continue }
+            foreach ($a in [regex]::Matches($m.Groups[3].Value, '(?<=^|\s)-([A-Za-z]\w*)')) {
+                $pn = $a.Groups[1].Value
+                if (@('WhatIf', 'Confirm', 'Verbose') -contains $pn) { continue }
+                if (@($ParamsByScript[$script] | Where-Object { $_ -eq $pn }).Count -eq 0) {
+                    $found.Add([pscustomobject]@{ Rule = 'DOCPARAM'; Line = $lineNo; Message = "$script has no parameter -$pn (docs: $($m.Value.Trim()))" })
+                }
+            }
+        }
     }
     return , $found
 }
@@ -157,19 +206,39 @@ $canaries = @(
     @{ Rule = 'BOUND'; Fire = $true; Code = '$b = { $PSBoundParameters.Count }; & $b' }
     @{ Rule = 'BOUND'; Fire = $false; Code = 'function F { param($X) $PSBoundParameters.ContainsKey(''X'') }' }
     @{ Rule = 'BOUND'; Fire = $false; Code = 'function F { param($X) $PSBoundParameters.Keys | ForEach-Object { $PSBoundParameters[$_] } }' }
+    @{ Rule = 'HELP'; Fire = $true; UserFacing = $true; Code = "<#`n.SYNOPSIS`n  x`n#>`nparam(`n  [switch]`$Force`n)" }
+    @{ Rule = 'HELP'; Fire = $false; UserFacing = $true; Code = "<#`n.SYNOPSIS`n  x`n.PARAMETER Force`n  y`n#>`nparam(`n  [switch]`$Force`n)" }
+    @{ Rule = 'HELP'; Fire = $false; UserFacing = $true; Code = "<#`n.SYNOPSIS`n  x`n#>`nparam(`n  # skip the prompt`n  [switch]`$Force`n)" }
+    @{ Rule = 'HELP'; Fire = $false; UserFacing = $true; Code = "<#`n.SYNOPSIS`n  x`n.DESCRIPTION`n  -Force skips the prompt.`n#>`nparam(`n  [switch]`$Force`n)" }
+    @{ Rule = 'HELP'; Fire = $false; Code = "<#`n.SYNOPSIS`n  x`n#>`nparam(`n  [switch]`$Force`n)" }
+    @{ Rule = 'HELP'; Fire = $true; UserFacing = $true; Code = "#Requires -Version 5.1`n<#`n.SYNOPSIS`n  x`n#>`nparam(`n  # y`n  [switch]`$Force`n)" }
+    @{ Rule = 'HELP'; Fire = $false; UserFacing = $true; Code = "#Requires -Version 5.1`n`n<#`n.SYNOPSIS`n  x`n#>`nparam(`n  # y`n  [switch]`$Force`n)" }
 )
 $canaryFail = 0
+$docCanaries = @(
+    @{ Fire = $true; Text = 'Run `Update-OpenWebUI.ps1 -Latests` to update.' }
+    @{ Fire = $true; Text = '    .\Install-LocalAI.cmd -RenderGuard off -NoSuchSwitch' }
+    @{ Fire = $false; Text = 'Run `Update-OpenWebUI.ps1 -Latest` or `Install-LocalAI.cmd -RenderGuard off` (or -Foo outside the span).' }
+    @{ Fire = $false; Text = '.\Uninstall-LocalAI.ps1 -WhatIf   # -NotAParam in a comment' }
+)
+foreach ($k in $docCanaries) {
+    $hit = (Find-DocParam -Text $k.Text -ParamsByScript @{ 'Update-OpenWebUI.ps1' = @('Latest'); 'Install-LocalAI.ps1' = @('RenderGuard'); 'Uninstall-LocalAI.ps1' = @('Force') }).Count -gt 0
+    if ($hit -ne $k.Fire) {
+        $canaryFail++; $problems++
+        Write-Host ("CANARY   rule DOCPARAM {0} on: {1}" -f $(if ($k.Fire) { 'did not fire' } else { 'fired wrongly' }), $k.Text) -ForegroundColor Red
+    }
+}
 foreach ($k in $canaries) {
     $t = $null; $e = $null
     $cast = [System.Management.Automation.Language.Parser]::ParseInput($k.Code, [ref]$t, [ref]$e)
     $fn = ''; if ($k.ContainsKey('File')) { $fn = $k.File }
-    $hit = @((Find-Pitfall -Ast $cast -Lines @($k.Code -split "`n") -FileName $fn) | Where-Object { $_.Rule -eq $k.Rule }).Count -gt 0
+    $hit = @((Find-Pitfall -Ast $cast -Lines @($k.Code -split "`n") -FileName $fn -UserFacing:([bool]$k.UserFacing)) | Where-Object { $_.Rule -eq $k.Rule }).Count -gt 0
     if ($hit -ne $k.Fire) {
         $canaryFail++; $problems++
         Write-Host ("CANARY   rule {0} {1} on: {2}" -f $k.Rule, $(if ($k.Fire) { 'did not fire' } else { 'fired wrongly' }), $k.Code) -ForegroundColor Red
     }
 }
-Write-Host ("Pitfall-rule canaries: {0}/{1} OK" -f ($canaries.Count - $canaryFail), $canaries.Count) -ForegroundColor $(if ($canaryFail) { 'Red' } else { 'Green' })
+Write-Host ("Pitfall-rule canaries: {0}/{1} OK" -f ($canaries.Count + $docCanaries.Count - $canaryFail), ($canaries.Count + $docCanaries.Count)) -ForegroundColor $(if ($canaryFail) { 'Red' } else { 'Green' })
 
 foreach ($f in $files) {
     $tokens = $null; $errs = $null
@@ -185,9 +254,25 @@ foreach ($f in $files) {
         }
     }
 
-    foreach ($p in (Find-Pitfall -Ast $ast -Lines @(Get-Content -LiteralPath $f.FullName) -FileName $f.Name)) {
+    $userFacing = $f.DirectoryName -eq $root
+    foreach ($p in (Find-Pitfall -Ast $ast -Lines @(Get-Content -LiteralPath $f.FullName) -FileName $f.Name -UserFacing:$userFacing)) {
         $problems++
         Write-Host ("{0,-8} {1}:{2} {3}" -f $p.Rule, $f.Name, $p.Line, $p.Message) -ForegroundColor Red
+    }
+}
+
+# The README's commands against the scripts' real parameters.
+$paramsByScript = @{}
+foreach ($f in ($files | Where-Object { $_.DirectoryName -eq $Root -and $_.Extension -eq '.ps1' })) {
+    $tokens = $null; $errs = $null
+    $ast = [System.Management.Automation.Language.Parser]::ParseFile($f.FullName, [ref]$tokens, [ref]$errs)
+    $paramsByScript[$f.Name] = @(if ($ast.ParamBlock) { $ast.ParamBlock.Parameters | ForEach-Object { $_.Name.VariablePath.UserPath } })
+}
+# README.md only: IMPROVEMENTS.md is a backlog and may name switches that do not exist yet.
+foreach ($doc in @(Get-ChildItem -LiteralPath $Root -Filter 'README.md' -File)) {
+    foreach ($p in (Find-DocParam -Text (Get-Content -LiteralPath $doc.FullName -Raw -Encoding UTF8) -ParamsByScript $paramsByScript)) {
+        $problems++
+        Write-Host ("{0,-8} {1}:{2} {3}" -f $p.Rule, $doc.Name, $p.Line, $p.Message) -ForegroundColor Red
     }
 }
 

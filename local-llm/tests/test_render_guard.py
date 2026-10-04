@@ -128,10 +128,10 @@ def silent_listener():
 def run_guard(comfy_urls, upstream_port, extra=None):
     port = free_port()
     env = dict(os.environ, UPSTREAM='http://127.0.0.1:%d' % upstream_port, COMFYUI_URLS=comfy_urls,
-               LISTEN_PORT=str(port), PROBE_TIMEOUT='0.5', CACHE_SEC='0', HOLD_SEC='2',
+               LISTEN_PORT=str(port), PROBE_TIMEOUT='0.5', CACHE_SEC='0', HOLD_SEC='4',
                FREE_BACKOFF_SEC='30', WATCH_SEC='0.5', FREE_COMFYUI_MIN_MIB='1024')
     env.update(extra or {})
-    p = subprocess.Popen([sys.executable, '-u', GUARD], env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    p = subprocess.Popen([sys.executable, '-u', GUARD], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     for _ in range(50):
         try:
             socket.create_connection(('127.0.0.1', port), timeout=0.2).close()
@@ -182,7 +182,7 @@ def main():
         COMFY['running'] = 0
         chat(gport)
         check(last_num_gpu() == 0, 'within HOLD_SEC after the job: still on the CPU')
-        time.sleep(2.5)
+        time.sleep(4.5)
         chat(gport)
         check(last_num_gpu() is None, 'after HOLD_SEC: back on the GPU')
 

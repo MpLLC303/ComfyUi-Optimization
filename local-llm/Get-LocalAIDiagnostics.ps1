@@ -1,4 +1,5 @@
 #Requires -Version 5.1
+
 <#
 .SYNOPSIS
     Collects everything needed to troubleshoot the local AI stack into one redacted zip, plus a short
@@ -23,9 +24,11 @@
     .\Get-LocalAIDiagnostics.ps1 -RunTests  # also runs Test-LocalAI -Quick and includes its output
 #>
 param(
+    # Install folder (the installer's -AIRoot).
     [string]$AIRoot = 'C:\AI',
     [switch]$RunTests,
     [switch]$KeepNames,
+    # Where the zip is written; '' = <AIRoot>\Logs.
     [string]$OutDir = ''
 )
 $ErrorActionPreference = 'Stop'
