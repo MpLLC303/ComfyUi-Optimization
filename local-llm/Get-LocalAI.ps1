@@ -18,8 +18,8 @@
     # LOCALAI_ROOT: the install's AI folder (set by the Start-menu 'Update toolkit' shortcut).
     $root = $env:LOCALAI_ROOT
     if (-not $root) { $root = 'C:\AI' }
-    # Unpacked in the user's temp folder; the copy that scheduled tasks run lives in AI\Scripts,
-    # which only Administrators can change (the installer copies itself there).
+    # Unpacked in the user's temp folder; the installer copies itself into AI\Scripts (and, before a
+    # reboot, into Program Files\LocalAI for the resume).
     $dest = Join-Path $env:TEMP 'LocalAI-Installer'
     $zip = Join-Path $env:TEMP 'localai-installer.zip'
     # zip/<ref> accepts a branch, a tag or a commit, so a reviewed version can be pinned.
@@ -42,6 +42,6 @@
     Write-Host ''
     if ($code -eq 10) { Write-Host 'The installer continues in the Administrator window that opened.' -ForegroundColor Cyan }
     elseif ($code -eq 1223) { Write-Host 'Administrator rights were declined; run the command again and click Yes.' -ForegroundColor Red }
-    elseif ($code -eq 3010) { Write-Host 'A restart is needed; the installer resumes by itself after you sign in again.' -ForegroundColor Cyan }
+    elseif ($code -eq 3010) { Write-Host 'A restart is needed; the installer resumes after you sign in again (click Yes when Windows asks).' -ForegroundColor Cyan }
     elseif ($code -ne 0) { Write-Host "The installer stopped with an error (code $code); see the messages above." -ForegroundColor Red }
 }

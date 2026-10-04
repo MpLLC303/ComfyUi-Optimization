@@ -70,7 +70,7 @@ $inst = Join-Path $copy 'Install-LocalAI.ps1'
 $text = Get-Content -Raw $inst
 $patches = @(
     @('$p = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())', '$p = $null'),
-    @('return $p.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)', 'return $true'),
+    @('return $p.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)', 'return (-not $env:LOCALAI_MOCK_NOT_ADMIN)'),
     @('[Security.Principal.WindowsIdentity]::GetCurrent().Name', "'MOCKPC\testuser'"),
     @('[Security.Principal.WindowsIdentity]::GetCurrent().User.Value', "'S-1-5-21-1-2-3-1001'"),
     @('[Environment]::OSVersion.Version.Build', '22631'),
@@ -85,6 +85,7 @@ Set-Content -Path $inst -Value $text
 # ---- mocks ----------------------------------------------------------------------------------
 $global:Calls = New-Object System.Collections.ArrayList
 $global:Tasks = @{}
+$global:ConsoleUser = 'MOCKPC\testuser'
 $global:TaskPrincipals = @{}
 $global:WslInstalled = $false
 function global:Record([string]$s) { [void]$global:Calls.Add($s) }
@@ -94,7 +95,7 @@ function global:Get-CimInstance {
     $free = (Get-PSDrive -Name '/').Free
     switch ($ClassName) {
         'Win32_LogicalDisk' { [pscustomobject]@{ DeviceID = 'C:'; FreeSpace = $free } }
-        'Win32_ComputerSystem' { [pscustomobject]@{ TotalPhysicalMemory = 64GB; HypervisorPresent = $true } }
+        'Win32_ComputerSystem' { [pscustomobject]@{ TotalPhysicalMemory = 64GB; HypervisorPresent = $true; UserName = $global:ConsoleUser } }
         'Win32_Processor' { [pscustomobject]@{ Name = 'AMD Ryzen 9 9950X3D 16-Core Processor'; VirtualizationFirmwareEnabled = $true } }
     }
 }
@@ -137,7 +138,7 @@ function global:New-ScheduledTaskPrincipal { [pscustomobject]@{ Args = "$args" }
 function global:New-ScheduledTaskSettingsSet { [pscustomobject]@{ Args = "$args" } }
 function global:Register-ScheduledTask { param($TaskName, $Action, $Trigger, $Principal, $Settings, [switch]$Force) $global:Tasks[$TaskName] = $Action.Argument; $global:TaskPrincipals[$TaskName] = [string]$Principal.Args; Record "Register-ScheduledTask $TaskName" }
 function global:Unregister-ScheduledTask { param($TaskName, $Confirm) $global:Tasks.Remove($TaskName); Record "Unregister-ScheduledTask $TaskName" }
-function global:Start-Process { param($FilePath, $ArgumentList, [switch]$Wait, [switch]$PassThru, $Verb) Record "Start-Process $FilePath $ArgumentList"; if ($PassThru) { [pscustomobject]@{ ExitCode = 0 } } }
+function global:Start-Process { param($FilePath, $ArgumentList, [switch]$Wait, [switch]$PassThru, $Verb, $ErrorAction) Record "Start-Process $FilePath $ArgumentList"; if ($Verb -eq 'RunAs') { Record "RUNAS $($ArgumentList -join ' ')" }; if ($PassThru) { [pscustomobject]@{ ExitCode = 0 } } }
 function global:docker {
     $a = @($args)
     if ($a[0] -eq 'compose') { Record "docker $($a -join ' ')"; $global:LASTEXITCODE = 0; return }
@@ -163,10 +164,20 @@ Assert-That ($null -ne $state.stages.Tuning -and $null -eq $state.stages.WSL) 's
 Assert-That (Test-Path (Join-Path $aiRoot 'Scripts/lib/LocalAI.psm1')) 'scripts copied to AI\Scripts'
 
 # ---- phase 2: resume after "reboot" ----------------------------------------------------------
-Write-Host "`n=== PHASE 2: resume after reboot ===" -ForegroundColor Cyan
-$global:WslInstalled = $true
+# ---- phase 1b: the (non-elevated) resume task at sign-in asks for admin rights --------------
+Write-Host "`n=== PHASE 1b: resume task at sign-in, not elevated ===" -ForegroundColor Cyan
 $resumeCmd = $global:Tasks['LocalAI-Install-Resume']
 $cmd = $resumeCmd.Substring($resumeCmd.IndexOf('-Command ') + 9)
+$env:LOCALAI_MOCK_NOT_ADMIN = '1'
+Invoke-Expression $cmd
+$code1b = $LASTEXITCODE
+$env:LOCALAI_MOCK_NOT_ADMIN = ''
+$runas = @($global:Calls | Where-Object { $_ -like 'RUNAS *' }) | Select-Object -Last 1
+Assert-That ($code1b -eq 10 -and $runas) "not elevated: relaunches through a UAC prompt (exit $code1b)"
+Assert-That ($runas -match '-Resume' -and $runas -match [regex]::Escape((Join-Path $env:ProgramFiles 'LocalAI'))) 'the elevated relaunch keeps -Resume (2-strike limit) and runs the Program Files copy'
+
+Write-Host "`n=== PHASE 2: resume after reboot ===" -ForegroundColor Cyan
+$global:WslInstalled = $true
 Invoke-Expression $cmd
 $code2 = $LASTEXITCODE
 $state = Get-Content -Encoding UTF8 -Raw (Join-Path $aiRoot 'install-state.json') | ConvertFrom-Json
@@ -257,8 +268,13 @@ Write-Host "`n=== PHASE 4: re-run with -TrialModels none ===" -ForegroundColor C
 $st = Get-Content -Encoding UTF8 -Raw (Join-Path $aiRoot 'install-state.json') | ConvertFrom-Json
 $st.flags.PSObject.Properties.Remove('params')
 $st | ConvertTo-Json -Depth 20 | Set-Content (Join-Path $aiRoot 'install-state.json')
+# This run: a standard account signed in, an administrator's password typed at the UAC prompt.
+$global:ConsoleUser = 'MOCKPC\kid'
 & (Join-Path $aiRoot 'Scripts/Install-LocalAI.ps1') -AIRoot $aiRoot -SkipTests -TrialModels none
 Assert-That ($LASTEXITCODE -eq 0) "phase 4 completes (exit $LASTEXITCODE)"
+$global:ConsoleUser = 'MOCKPC\testuser'
+$lastLog = Get-ChildItem (Join-Path $aiRoot 'Logs') -Filter 'install-*.log' | Sort-Object LastWriteTime | Select-Object -Last 1  # lai-ok: objects
+Assert-That ($lastLog -and (Get-Content -Raw $lastLog.FullName) -match 'signed in as MOCKPC\\kid, but the installer runs as MOCKPC\\testuser') 'warns when UAC was approved with another account'
 Assert-That ((& $restartCalls) -eq 1) 'unchanged render_guard.py: no restart'
 Assert-That (@((Get-Content -Encoding UTF8 -Raw (Join-Path $aiRoot 'install-state.json') | ConvertFrom-Json).flags.selectedModels) -notcontains 'trial-ok') '-TrialModels none deselects the trial'
 $tp = Get-TestPreset 'trial-standin'

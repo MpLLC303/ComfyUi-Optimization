@@ -23,8 +23,9 @@ $env:LOCALAI_REF = 'main'
 irm https://raw.githubusercontent.com/MpLLC303/ComfyUi-Optimization/refs/heads/main/local-llm/Get-LocalAI.ps1 | iex
 ```
 
-It downloads the newest toolkit to `C:\AI\Installer`, unblocks it and starts the installer. You get
-**one UAC prompt**, and then everything runs unattended in a new Administrator window.
+It downloads the newest toolkit to your temp folder, unblocks it and starts the installer. You get
+**one UAC prompt**, and then everything runs unattended in a new Administrator window (one more
+prompt after each reboot it needs).
 
 Alternative: download https://github.com/MpLLC303/ComfyUi-Optimization/archive/refs/heads/main.zip,
 **Extract All**, and double-click `local-llm\Install-LocalAI.cmd`. Running it from inside the ZIP

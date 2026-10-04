@@ -292,7 +292,7 @@ function Wait-LaiHttp {
 }
 
 function New-LaiVolumeMutex {
-    # The nightly backup runs elevated; a mutex it creates gets an admin-only DACL by default, and a
+    # The installer and Uninstall run elevated; a mutex they create gets an admin-only DACL by default, and a
     # non-elevated restore or the health watch could then not even open it. On Windows PowerShell
     # create it so every signed-in user may wait on it. Falls back to the default (other platforms,
     # or a mutex an older version already created) - then UnauthorizedAccessException means "busy".

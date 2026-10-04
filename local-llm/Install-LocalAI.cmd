@@ -12,5 +12,5 @@ set rc=%errorlevel%
 echo.
 if "%rc%"=="10" echo The installer continues in the Administrator window that just opened. You can close this one.
 if "%rc%"=="1223" echo Administrator rights were declined. Run this file again and click Yes.
-if "%rc%"=="3010" echo A restart is needed; the installer resumes by itself after you sign in again.
+if "%rc%"=="3010" echo A restart is needed; the installer resumes after you sign in again (click Yes when Windows asks).
 pause

@@ -45,7 +45,7 @@ $onWindows = ($env:OS -eq 'Windows_NT')
 if ($onWindows -and -not $WhatIfPreference) {
     $id = [Security.Principal.WindowsIdentity]::GetCurrent()
     if (-not (New-Object Security.Principal.WindowsPrincipal($id)).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
-        throw 'Run this from an elevated PowerShell (the scheduled tasks were registered with highest privileges).'
+        throw 'Run this from an elevated PowerShell (it removes scheduled tasks, the Program Files copy and firewall rules).'
     }
 }
 

@@ -14,7 +14,8 @@
     reboots (60 s warning, cancel with "shutdown /a") and continues after you sign in (it asks for
     administrator rights again: click Yes).
 
-    The only prompts you should see: one UAC prompt (admin rights) at the start.
+    The only prompts you should see: a UAC prompt (admin rights) at the start, and another after
+    each reboot it needs.
 
 .EXAMPLE
     # From the folder containing this file (normal PowerShell; it elevates itself):
@@ -101,7 +102,7 @@ function ConvertTo-PsLiteral {
 
 function Get-RelaunchCommand {
     param([string]$ScriptPath = $PSCommandPath, [switch]$AddResume)
-    $cmd = "& '" + $ScriptPath.Replace("'", "''") + "'"
+    $cmd = '& ' + (ConvertTo-PsLiteral $ScriptPath)
     foreach ($kv in $script:BoundParams.GetEnumerator()) {
         if ($kv.Key -eq 'Resume') { continue }
         if ($kv.Value -is [System.Management.Automation.SwitchParameter]) {
@@ -125,14 +126,21 @@ foreach ($kv in $PSBoundParameters.GetEnumerator()) { $script:BoundParams[$kv.Ke
 
 if (-not (Test-IsAdmin)) {
     Write-Host 'Requesting administrator rights (needed for WSL, Docker Desktop, scheduled tasks and the port audit)...' -ForegroundColor Cyan
-    try { Start-Process -FilePath 'powershell.exe' -Verb RunAs -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-NoExit', '-Command', (Get-RelaunchCommand)) -ErrorAction Stop }
+    # -AddResume keeps -Resume when the (non-elevated) resume task started this at sign-in, so the
+    # elevated run counts failed resumes and stops retrying after two.
+    try { Start-Process -FilePath 'powershell.exe' -Verb RunAs -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-NoExit', '-Command', (Get-RelaunchCommand -AddResume:$Resume)) -ErrorAction Stop }
     catch {
         # 'No' at the UAC prompt (or closing it) lands here.
-        Write-Host 'Administrator rights were not granted, so nothing was installed. Run it again and click Yes at the prompt.' -ForegroundColor Red
+        if ($Resume) {
+            Write-Host 'The Local AI install is not finished. It asks again at your next sign-in (sign out and back in to continue now), then click Yes.' -ForegroundColor Yellow
+        } else {
+            Write-Host 'Administrator rights were not granted, so nothing was installed. Run it again and click Yes at the prompt.' -ForegroundColor Red
+        }
         exit 1223   # ERROR_CANCELLED
     }
     # Exit code 10 tells the wrappers (Install-LocalAI.cmd, Get-LocalAI.ps1) that the install goes on
     # in the new Administrator window.
+    Write-Host 'The installer continues in the Administrator window that just opened; you can close this one.' -ForegroundColor Cyan
     exit 10
 }
 
@@ -159,9 +167,10 @@ $DockerExe = Join-Path $env:ProgramFiles 'Docker\Docker\Docker Desktop.exe'
 $DockerBin = Join-Path $env:ProgramFiles 'Docker\Docker\resources\bin'
 $ResumeTask = 'LocalAI-Install-Resume'
 $ToolkitItems = @('Install-LocalAI.ps1', 'Install-LocalAI.cmd', 'Test-LocalAI.ps1', 'Backup-OpenWebUI.ps1', 'Update-OpenWebUI.ps1', 'Release-GPU.ps1', 'Set-OpenWebUIPassword.ps1', 'Restore-OpenWebUI.ps1', 'Update-Models.ps1', 'Start-ComfyUI.ps1', 'Enable-TailscaleAccess.ps1', 'Watch-LocalAI.ps1', 'Uninstall-LocalAI.ps1', 'Stop-LocalAI.ps1', 'Start-LocalAI.ps1', 'Get-LocalAIDiagnostics.ps1', 'Get-LocalAI.ps1', 'VERSION', 'README.md', 'lib', 'config', 'stack')
-# The resume task runs the installer elevated without a prompt, so it runs a copy that only
-# Administrators can change. Not C:\AI\Scripts: the user has full control of C:\AI, and full
-# control of a folder lets you rename any folder inside it and put a different one in its place.
+# After a reboot the resume task (not elevated) starts this copy, which asks for admin rights with a
+# UAC prompt. The prompt names powershell.exe, not the script, so the script it runs must be one
+# only Administrators can change: not C:\AI\Scripts (the user has full control of C:\AI and can
+# swap any folder inside it).
 $ElevatedDir = Join-Path $env:ProgramFiles 'LocalAI'
 $BackupTask = 'LocalAI-Backup-OpenWebUI'
 $WatchTask = 'LocalAI-Watch'
@@ -297,8 +306,7 @@ function Set-OllamaBlockRule {
 function Protect-Path {
     # Owner, SYSTEM and Administrators only (folders under C:\ otherwise inherit "Authenticated Users").
     # -UserAccess ReadOnly: the user may read and run but not change it (Administrators still can);
-    # used for the scripts that scheduled tasks run elevated, so nothing running as the user can
-    # edit them and get administrator rights without a UAC prompt.
+    # used for the copy the resume relaunches elevated (see $ElevatedDir).
     param([Parameter(Mandatory)][string]$Path, [ValidateSet('Full', 'ReadOnly')][string]$UserAccess = 'Full')
     $r = Set-LaiPrivateAcl -Path $Path -UserSid $CurrentUserSid -UserAccess $UserAccess
     if ($r.ExitCode -ne 0) { Write-LaiLog WARN "Could not restrict permissions on ${Path}: $($r.Text)" }
@@ -516,6 +524,12 @@ Invoke-Stage 'Preflight' {
     }
 
     $cs = Get-CimInstance Win32_ComputerSystem
+    # A standard account that typed an administrator's password at the UAC prompt runs this as that
+    # administrator: tasks, AppData and folder permissions then belong to the other account, and the
+    # resume after a reboot waits for the administrator to sign in.
+    if ($cs.UserName -and $cs.UserName -ne $CurrentUser) {
+        Write-LaiLog WARN "You are signed in as $($cs.UserName), but the installer runs as $CurrentUser (credentials typed at the UAC prompt). Local AI is set up for $CurrentUser. To use it from $($cs.UserName), make that account an administrator and run the installer there."
+    }
     $cpu = Get-CimInstance Win32_Processor | Select-Object -First 1
     Write-LaiLog INFO ("CPU: {0}; RAM: {1} GB" -f $cpu.Name.Trim(), [Math]::Round($cs.TotalPhysicalMemory / 1GB))
     if (-not $cs.HypervisorPresent -and -not $cpu.VirtualizationFirmwareEnabled) {
@@ -1169,8 +1183,8 @@ Invoke-Stage 'Backup' {
 $testExit = 0
 if (-not $SkipTests) {
     Invoke-Stage 'Verify' {
-        # From the installer's own copy, never AI\Scripts: this runs elevated (with no prompt when the
-        # resume task started it), and the user can swap folders inside C:\AI.
+        # From the installer's own copy, never AI\Scripts: this runs elevated (approved for the
+        # installer, not for whatever sits in AI\Scripts), and the user can swap folders inside C:\AI.
         & (Join-Path $SourceRoot 'Test-LocalAI.ps1') -AIRoot $AIRoot
         $script:testExit = $LASTEXITCODE
     }
