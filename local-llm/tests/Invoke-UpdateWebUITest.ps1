@@ -79,8 +79,20 @@ try {
     Assert-That ($cfg['RollbackArchive'] -eq $rollbackArchive) 'rollback point kept'
     Assert-That ((Get-Image) -eq 'alpine:3.20') 'running container untouched'
 
+    Write-Host "`n=== 2b. SearXNG-only update keeps the Open WebUI rollback point ===" -ForegroundColor Cyan
+    $r = Invoke-Update @('-Version', '3.20', '-SearxngVersion', 'x2', '-SkipBackup')
+    $cfg = Read-LaiState -Path (Join-Path $aiRoot 'localai-config.json')
+    Assert-That ($cfg['RollbackArchive'] -eq $rollbackArchive -and $cfg['PreviousOpenWebUIVersion'] -eq '3.19') 'rollback point untouched'
+    Assert-That ((Get-Content -LiteralPath (Join-Path $stack '.env')) -contains 'SEARXNG_VERSION=x2') 'SearXNG version changed'
+    $r = Invoke-Update @()
+    Assert-That ($r.Code -eq 0 -and $r.Text -match 'Nothing to do') 'no arguments: explains instead of re-pulling'
+
     Write-Host "`n=== 3. retention keeps the rollback archive ===" -ForegroundColor Cyan
-    (Get-Item -LiteralPath $rollbackArchive).LastWriteTime = (Get-Date).AddDays(-60)
+    # Age it through a container: on Linux the archive is owned by root (Docker wrote it), so a
+    # non-root test user cannot change its timestamp directly.
+    $old = (Get-Date).AddDays(-60).ToString('yyyy-MM-dd HH:mm:ss')
+    Invoke-DockerText @('run', '--rm', '-v', "$(Split-Path -Parent $rollbackArchive):/b", 'alpine:3.20', 'touch', '-d', $old, "/b/$(Split-Path -Leaf $rollbackArchive)") | Out-Null
+    Assert-That (((Get-Date) - (Get-Item -LiteralPath $rollbackArchive).LastWriteTime).TotalDays -gt 50) 'rollback archive aged to 60 days'
     $prevPref = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
     & pwsh -NoProfile -File (Join-Path $src 'Backup-OpenWebUI.ps1') -AIRoot $aiRoot -RetentionDays 1 -SkipDeepVerify 2>&1 | Out-Null
     $ErrorActionPreference = $prevPref

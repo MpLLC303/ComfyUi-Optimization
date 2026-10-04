@@ -97,6 +97,13 @@ try {
     $r = Invoke-Update @('-Unpin', 'main') ''
     Assert-That ($r.Code -eq 0) 'unpin'
 
+    Write-Host "`n=== 3b. a failed download keeps the current version, no leftovers ===" -ForegroundColor Cyan
+    $before = Get-Digest $tag
+    $r = Invoke-Update @() 'testorg/does-not-exist:1b'
+    Assert-That ($r.Code -ne 0 -and $r.Text -match 'download failed') "failed download is reported and the run exits non-zero (exit $($r.Code))"
+    Assert-That ((Get-Digest $tag) -eq $before) 'model unchanged'
+    Assert-That (-not (Test-LaiOllamaModel -BaseUrl $OllamaUrl -Name "$tag-prevnew")) 'temporary reference cleaned up after the failure'
+
     Write-Host "`n=== 4. -DropPrevious ===" -ForegroundColor Cyan
     Invoke-Update @() $variant | Out-Null
     Assert-That (Test-LaiOllamaModel -BaseUrl $OllamaUrl -Name $prev) '-prev kept again after another re-publish'

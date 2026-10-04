@@ -101,7 +101,11 @@ if ($Latest) {
 
 $lines = @(Get-Content -LiteralPath $envPath)
 $current = ($lines | Where-Object { $_ -like 'OPEN_WEBUI_VERSION=*' } | Select-Object -First 1) -replace '^OPEN_WEBUI_VERSION=', ''
-if ($Version -and $Version -eq $current -and -not $SearxngVersion) { Write-UpdateLog OK "Already on $current"; exit 0 }
+if (-not $Version -and -not $SearxngVersion) { Write-UpdateLog INFO 'Nothing to do: pass -Latest, -Version <tag> or -SearxngVersion <tag> (or -Rollback).'; exit 0 }
+if ($Version -and $Version -eq $current) {
+    if (-not $SearxngVersion) { Write-UpdateLog OK "Already on $current"; exit 0 }
+    $Version = ''   # SearXNG-only: leave Open WebUI and its rollback point alone
+}
 $pre = $null
 $configBefore = Read-LaiState -Path $configPath
 
@@ -123,27 +127,38 @@ try {
         Save-LaiState -State $config -Path $configPath
     }
 
+    # The revert lives in 'finally' so it also runs when the multi-GB download is cancelled with
+    # Ctrl+C (PowerShell skips 'catch' then). Without it, the next Start again would quietly pull
+    # and run the new version outside this script.
+    $pulled = $false
     try {
         Set-EnvVersion -OpenWebUI $Version -Searxng $SearxngVersion
         Invoke-Docker -Arguments ($base + @('pull'))
+        $pulled = $true
     } catch {
-        # Typo in the version, no network, registry down: put the old versions back so the next start
-        # (or reboot) does not try to run an image that does not exist.
-        [System.IO.File]::WriteAllLines($envPath, [string[]]$lines, (New-Object System.Text.UTF8Encoding($false)))
-        Save-LaiState -State $configBefore -Path $configPath
         throw "Could not pull the new image(s), nothing was changed: $($_.Exception.Message)"
+    } finally {
+        if (-not $pulled) {
+            [System.IO.File]::WriteAllLines($envPath, [string[]]$lines, (New-Object System.Text.UTF8Encoding($false)))
+            Save-LaiState -State $configBefore -Path $configPath
+        }
     }
-    Invoke-Docker -Arguments ($base + @('up', '-d', '--remove-orphans'))
+    try { Invoke-Docker -Arguments ($base + @('up', '-d', '--remove-orphans')) }
+    catch { if ($pre -and $Version) { throw "$($_.Exception.Message). Undo the update with: Update-OpenWebUI.ps1 -Rollback" } else { throw } }
 } finally { Exit-LaiVolumeLock $lock }
 
 if ($Version) {
     $config['OpenWebUIVersion'] = $Version
     Save-LaiState -State $config -Path $configPath
 }
-Wait-LaiWebUI -BaseUrl "http://127.0.0.1:$port" -TimeoutSec 600
+try { Wait-LaiWebUI -BaseUrl "http://127.0.0.1:$port" -TimeoutSec 600 }
+catch {
+    if ($pre -and $Version) { throw "Open WebUI $Version did not come up ($($_.Exception.Message)). Check 'docker logs --tail 80 open-webui', or undo with: Update-OpenWebUI.ps1 -Rollback" }
+    throw
+}
 $running = (Invoke-LaiApi -Uri "http://127.0.0.1:$port/api/version").version
 Write-UpdateLog OK "Open WebUI $running is up on http://localhost:$port (was $current)"
-if ($pre) { Write-UpdateLog INFO "If this version misbehaves: Update-OpenWebUI.ps1 -Rollback (back to $current with the data from $($pre.Name))" }
+if ($pre -and $Version) { Write-UpdateLog INFO "If this version misbehaves: Update-OpenWebUI.ps1 -Rollback (back to $current with the data from $($pre.Name))" }
 
 & (Join-Path $PSScriptRoot 'Test-LocalAI.ps1') -AIRoot $AIRoot -Quick
 exit $LASTEXITCODE

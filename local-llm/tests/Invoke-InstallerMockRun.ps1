@@ -147,7 +147,7 @@ function global:docker {
 # ---- phase 1: fresh install until WSL needs a reboot ----------------------------------------
 Write-Host "`n=== PHASE 1: fresh run (expects reboot request) ===" -ForegroundColor Cyan
 # 'trial-ok,trial-missing' as ONE string, the way Install-LocalAI.cmd (powershell -File) delivers it.
-& $inst -AIRoot $aiRoot -SkipTests -TrialModels 'trial-ok,trial-missing' -KeepAlive 7m -BackupRetentionDays 9 -SkipCoder:$false
+& $inst -AIRoot $aiRoot -SkipTests -TrialModels 'trial-ok,trial-missing' -KeepAlive 7m -BackupRetentionDays 9 -SkipCoder:$false -KnowledgeCollections 'PC & Electronics,General References'
 $code1 = $LASTEXITCODE
 $state = Get-Content -Raw (Join-Path $aiRoot 'install-state.json') | ConvertFrom-Json
 Assert-That ($code1 -eq 3010) "phase 1 exits 3010 for reboot (got $code1)"
@@ -224,6 +224,8 @@ $cfgAfter = Get-Content -Raw $cfgFile | ConvertFrom-Json
 Assert-That ($cfgAfter.ComfyUIPath -eq 'D:\ComfyUI\run_nvidia_gpu.bat') 're-run keeps ComfyUIPath in the config'
 Assert-That ($cfgAfter.OpenWebUIVersion -eq 'v0.99.0' -and $cfgAfter.RenderGuard -eq 'off') 'config reflects the kept version and mode'
 Assert-That ([string]$cfgAfter.WebUIOllamaUrl -ne '') 'config records the Ollama URL Open WebUI was given'
+$kc = @((Get-Content -Raw (Join-Path $aiRoot 'install-state.json') | ConvertFrom-Json).flags.params.KnowledgeCollections)
+Assert-That ($kc.Count -eq 2 -and $kc -contains 'General References') "a comma list given as one string is remembered split ($($kc -join ' | '))"
 Assert-That ($cfgAfter.KeepAlive -eq '7m' -and [int]$cfgAfter.BackupRetentionDays -eq 9) 're-run without switches keeps -KeepAlive / -BackupRetentionDays from the first run'
 
 Assert-That (@((Get-Content -Raw (Join-Path $aiRoot 'install-state.json') | ConvertFrom-Json).flags.selectedModels) -contains 'trial-ok') 're-run without -TrialModels keeps the chosen trial'

@@ -182,7 +182,8 @@ if (-not $State.flags.ContainsKey('params') -or $null -eq $State.flags['params']
 $savedParams = $State.flags['params']
 foreach ($name in $RememberedParams) {
     if ($PSBoundParameters.ContainsKey($name)) {
-        $v = $PSBoundParameters[$name]
+        # The variable, not $PSBoundParameters: list parameters were split above, the bound value was not.
+        $v = Get-Variable -Name $name -ValueOnly
         if ($v -is [System.Management.Automation.SwitchParameter]) { $v = [bool]$v.IsPresent }
         $savedParams[$name] = $v
     } elseif ($savedParams.ContainsKey($name)) {

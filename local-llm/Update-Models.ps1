@@ -107,6 +107,7 @@ function Get-ModelGB([string]$Name) {
 }
 
 $changed = @()
+$failedPulls = @()
 if ($Unpin.Count -gt 0) {
     if ($Unpin -contains 'all') { $script:pinned = @() } else { $script:pinned = @($pinned | Where-Object { $Unpin -notcontains $_ }) }
     Save-Pins
@@ -142,8 +143,15 @@ if ($Rollback.Count -gt 0) {
         $candidate = "$(Resolve-LaiModelName $m.Source)-prevnew"
         try {
             if ($old -and -not $NoKeepPrevious) { Copy-Model (Resolve-LaiModelName $m.Source) $candidate }
-            if ($env:LOCALAI_TEST_PULL_FROM) { Copy-Model $env:LOCALAI_TEST_PULL_FROM (Resolve-LaiModelName $m.Source) }   # test hook: simulated re-publish
-            else { Invoke-LaiOllamaPull -BaseUrl $ollamaUrl -Name $m.Source }
+            try {
+                if ($env:LOCALAI_TEST_PULL_FROM) { Copy-Model $env:LOCALAI_TEST_PULL_FROM (Resolve-LaiModelName $m.Source) }   # test hook: simulated re-publish
+                else { Invoke-LaiOllamaPull -BaseUrl $ollamaUrl -Name $m.Source }
+            } catch {
+                # Keep going: the models already updated in this run still get re-tuned below.
+                Write-LaiLog WARN "  $($m.Display): download failed, kept the current version ($((Get-LaiHttpErrorText $_)))"
+                $failedPulls += $m.Display
+                continue
+            }
             $new = Get-LaiOllamaDigest -BaseUrl $ollamaUrl -Name $m.Source
             if ($old -and $old -ne $new -and -not $NoKeepPrevious) {
                 $pn = Get-PrevName $m.Source
@@ -177,8 +185,9 @@ if ($changed.Count -gt 0) {
     Write-LaiLog OK 'All models are current; nothing to re-tune.'
 }
 
+if ($failedPulls.Count -gt 0) { Write-LaiLog WARN "Not updated (download failed): $($failedPulls -join ', '). Run Update-Models.ps1 again later." }
 if (-not $SkipTests) {
     & (Join-Path $PSScriptRoot 'Test-LocalAI.ps1') -AIRoot $AIRoot -Quick
-    exit $LASTEXITCODE
+    exit [Math]::Max($LASTEXITCODE, $failedPulls.Count)
 }
-exit 0
+exit $failedPulls.Count

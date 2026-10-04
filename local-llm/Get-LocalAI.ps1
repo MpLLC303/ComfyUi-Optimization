@@ -35,4 +35,6 @@
     Get-ChildItem -LiteralPath $top.FullName -Recurse -File | Unblock-File
 
     & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $installer -AIRoot $root
+    Write-Host ''
+    Write-Host 'The installer continues in the Administrator window that opened (after the UAC prompt).' -ForegroundColor Cyan
 }
