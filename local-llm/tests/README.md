@@ -9,6 +9,7 @@ architecture family and chat template as the real ones), so the tests fit on a C
 | `Invoke-IntegrationTest.ps1` | The API layer (`lib/LocalAI.psm1`) against Ollama v0.35.1 and Open WebUI v0.11.4: it covers the context tuner, the tuned aliases, presets, hiding raw models, admin/RAG/web-search config (run twice to check it's idempotent), knowledge collections, and the chat/memory/RAG/web-search smoke tests. |
 | `Invoke-InstallerMockRun.ps1` | The full `Install-LocalAI.ps1` orchestration, with Windows-only commands mocked: a fresh run that hits a reboot, a resume via the logon task, migrating a manual-install container, `.env`/secret handling, backup task, report, and an idempotent re-run. |
 | `Invoke-ModelUpdateTest.ps1` | `Update-Models.ps1` against a real Ollama, on private copies of the stand-in model: an unchanged pull keeps no extra copy, a re-published tag keeps `<tag>-prev` and re-tunes, then `-Rollback` and `-DropPrevious`. |
+| `Invoke-UpdateWebUITest.ps1` | `Update-OpenWebUI.ps1` on a throwaway stack (alpine images standing in for Open WebUI versions): an update records a rollback point, a failed pull changes nothing, the rollback archive survives pruning, `-Rollback` brings back the old image and the pre-update data, and a second rollback refuses. |
 | `Invoke-UninstallTest.ps1` | `Uninstall-LocalAI.ps1` against real Docker with a fake Ollama (it records deletes, so the real models stay put) and mocked scheduled tasks: `-WhatIf` changes nothing; the default removal takes a verified backup and removes containers, aliases and tasks while keeping data; `-RemoveData -RemoveModels`; and a failing backup that aborts before anything is removed. A sandbox `searxng` container is moved aside and restored. |
 | `../Test-LocalAI.ps1 -CatalogPath tests/models.test.psd1 -NoContainers` | The acceptance checklist itself. |
 
@@ -34,6 +35,7 @@ pwsh tests/Invoke-IntegrationTest.ps1 -SandboxTextSplitter character
 pwsh tests/Invoke-InstallerMockRun.ps1
 pwsh tests/Invoke-UninstallTest.ps1
 pwsh tests/Invoke-ModelUpdateTest.ps1
+pwsh tests/Invoke-UpdateWebUITest.ps1
 ```
 
 The sandbox blocks Hugging Face, the tiktoken CDN and the public search engines. So:

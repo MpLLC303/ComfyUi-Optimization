@@ -95,6 +95,8 @@ Assert-That ($free -eq 'FREE') "and as free after release (got '$free')"
 Write-Host "`n=== Start-menu shortcuts ===" -ForegroundColor Cyan
 $specs = @(Get-LaiShortcutSpecs -AIRoot "C:\It's AI" -WebUIPort 3001)
 Assert-That ($specs.Count -eq 7) "seven shortcut specs (got $($specs.Count))"
+$upd = $specs | Where-Object { $_.Name -like '*Update toolkit*' }
+Assert-That ($upd -and $upd.Arguments -match 'LOCALAI_ROOT' -and $upd.Arguments -notmatch '-AIRoot') 'Update toolkit passes the AI root via LOCALAI_ROOT'
 foreach ($sc in ($specs | Where-Object { $_.Kind -eq 'lnk' })) {
     $cmd = $sc.Arguments.Substring($sc.Arguments.IndexOf('"') + 1).TrimEnd('"')
     $errs = $null
@@ -113,6 +115,40 @@ if ($onWindows) {
     Assert-That ((Test-Path -LiteralPath $lnkPath) -and $back.Arguments -eq $spec.Arguments) '.lnk written and its arguments read back unchanged'
     Assert-That ($spec.Arguments.Length -lt 1024) "arguments fit the 1024-char .lnk limit ($($spec.Arguments.Length))"
 } else { Skip '.lnk creation needs WScript.Shell' }
+
+# ---- execution policy -------------------------------------------------------------------------
+Write-Host "`n=== execution policy ===" -ForegroundColor Cyan
+$cases = @(
+    @{ Args = @{}; Want = 'set' }
+    @{ Args = @{ LocalMachine = 'Restricted' }; Want = 'set' }
+    @{ Args = @{ LocalMachine = 'RemoteSigned' }; Want = 'none' }
+    @{ Args = @{ LocalMachine = 'Restricted'; CurrentUser = 'RemoteSigned' }; Want = 'none' }
+    @{ Args = @{ CurrentUser = 'Restricted' }; Want = 'user' }
+    @{ Args = @{ MachinePolicy = 'AllSigned' }; Want = 'gpo' }
+    @{ Args = @{ UserPolicy = 'RemoteSigned'; LocalMachine = 'Restricted' }; Want = 'none' }
+)
+foreach ($c in $cases) {
+    $a = $c.Args
+    $got = Get-LaiExecutionPolicyAction @a
+    Assert-That ($got -eq $c.Want) "policy action for $(($a.GetEnumerator() | ForEach-Object { "$($_.Key)=$($_.Value)" }) -join ',') -> $got (want $($c.Want))"
+}
+$isAdmin = $false
+if ($onWindows) { $isAdmin = (New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator) }
+if ($onWindows -and $isAdmin -and $PSVersionTable.PSEdition -eq 'Desktop') {
+    # The real thing, exactly as the installer runs it: from a -ExecutionPolicy Bypass process.
+    $savedLm = Get-ExecutionPolicy -Scope LocalMachine; $savedCu = Get-ExecutionPolicy -Scope CurrentUser
+    try {
+        Set-ExecutionPolicy Undefined -Scope CurrentUser -Force -ErrorAction SilentlyContinue
+        try { Set-ExecutionPolicy Restricted -Scope LocalMachine -Force -ErrorAction Stop } catch { Write-Verbose 'override warning' }
+        $msg = Set-LaiScriptPolicy
+        Assert-That ((Get-ExecutionPolicy -Scope LocalMachine) -eq 'RemoteSigned') "Set-LaiScriptPolicy from a Bypass process sets LocalMachine RemoteSigned ($msg)"
+        $msg2 = Set-LaiScriptPolicy
+        Assert-That ($msg2 -like '*already allows*') 'second run is a no-op'
+    } finally {
+        try { Set-ExecutionPolicy $savedLm -Scope LocalMachine -Force -ErrorAction Stop } catch { Write-Verbose 'restore' }
+        try { Set-ExecutionPolicy $savedCu -Scope CurrentUser -Force -ErrorAction Stop } catch { Write-Verbose 'restore' }
+    }
+} else { Skip 'real execution-policy change needs elevated Windows PowerShell (runs in Windows CI)' }
 
 # ---- scripts that must run on a machine with nothing installed -------------------------------------
 Write-Host "`n=== Watch / Uninstall / Stop smoke runs ===" -ForegroundColor Cyan

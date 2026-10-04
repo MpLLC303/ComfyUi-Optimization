@@ -25,6 +25,8 @@
     .\Update-Models.ps1 -Rollback main     # go back to the previous version of Local Main ('all' = every kept one)
 .EXAMPLE
     .\Update-Models.ps1 -DropPrevious      # delete the kept previous versions to free the disk space
+.EXAMPLE
+    .\Update-Models.ps1 -Unpin main        # after a -Rollback: let updates touch Local Main again
 #>
 param(
     [string]$AIRoot = 'C:\AI',
@@ -32,6 +34,7 @@ param(
     [switch]$Retune,
     [switch]$SkipTests,
     [string[]]$Rollback = @(),
+    [string[]]$Unpin = @(),
     [switch]$DropPrevious,
     [switch]$NoKeepPrevious
 )
@@ -67,6 +70,25 @@ if ($UpdateOllama) {
 }
 
 $env:OLLAMA_HOST = '127.0.0.1:11434'   # the CLI is only a client of the local server
+# 'powershell -File' passes "main,fast" as one string.
+$Rollback = @($Rollback | ForEach-Object { "$_" -split ',' } | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+$Unpin = @($Unpin | ForEach-Object { "$_" -split ',' } | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+if (-not $state.ContainsKey('flags') -or $null -eq $state['flags']) { $state['flags'] = @{} }
+$pinned = @()
+if ($state['flags'].ContainsKey('pinnedModels') -and $state['flags']['pinnedModels']) { $pinned = @($state['flags']['pinnedModels']) }
+function Save-Pins { $state['flags']['pinnedModels'] = @($script:pinned); Save-LaiState -State $state -Path $statePath }
+
+function Hide-InWebUI([string]$Id) {
+    # Keeps the -prev copy out of Open WebUI's model list (admins see every Ollama model). Best effort.
+    try {
+        $credFile = Join-Path (Join-Path $AIRoot 'Secrets') 'openwebui-admin.json'
+        if (-not (Test-Path -LiteralPath $credFile)) { return }
+        $port = 3000; if ($config.ContainsKey('WebUIPort')) { $port = [int]$config['WebUIPort'] }
+        $cred = Get-Content -LiteralPath $credFile -Raw | ConvertFrom-Json
+        $tok = Connect-LaiWebUI -BaseUrl "http://127.0.0.1:$port" -Email $cred.email -Password $cred.password
+        Hide-LaiWebUIModel -BaseUrl "http://127.0.0.1:$port" -Token $tok -Id $Id | Out-Null
+    } catch { Write-Verbose "could not hide $Id in Open WebUI: $($_.Exception.Message)" }
+}
 
 function Get-PrevName([string]$Source) {
     $full = Resolve-LaiModelName $Source
@@ -85,6 +107,12 @@ function Get-ModelGB([string]$Name) {
 }
 
 $changed = @()
+if ($Unpin.Count -gt 0) {
+    if ($Unpin -contains 'all') { $script:pinned = @() } else { $script:pinned = @($pinned | Where-Object { $Unpin -notcontains $_ }) }
+    Save-Pins
+    Write-LaiLog OK "Updates may change these again: $($Unpin -join ', ')"
+    exit 0
+}
 if ($DropPrevious) {
     foreach ($m in $catalog.Models) {
         $pn = Get-PrevName $m.Source
@@ -99,27 +127,32 @@ if ($Rollback.Count -gt 0) {
         if (-not (Test-LaiOllamaModel -BaseUrl $ollamaUrl -Name $pn)) { Write-LaiLog WARN "$($m.Display): no previous version kept ($pn)"; continue }
         Copy-Model $pn (Resolve-LaiModelName $m.Source)
         Remove-Model $pn
-        Write-LaiLog OK "$($m.Display): back to the previous version ($((Get-LaiOllamaDigest -BaseUrl $ollamaUrl -Name $m.Source).Substring(0, 12)))"
+        Write-LaiLog OK "$($m.Display): back to the previous version ($((Get-LaiOllamaDigest -BaseUrl $ollamaUrl -Name $m.Source).Substring(0, 12))); pinned so the next update leaves it alone (Update-Models.ps1 -Unpin $($m.Key) to undo)"
+        if ($pinned -notcontains $m.Key) { $script:pinned = @($pinned) + $m.Key }
         $changed += $m
     }
     if ($changed.Count -eq 0) { throw "Nothing to roll back for: $($Rollback -join ', ')" }
+    Save-Pins
 } else {
     foreach ($m in $catalog.Models) {
+        if ($pinned -contains $m.Key) { Write-LaiLog WARN "$($m.Display): pinned after a rollback, not updated (Update-Models.ps1 -Unpin $($m.Key) to allow it)"; continue }
         $old = Get-LaiOllamaDigest -BaseUrl $ollamaUrl -Name $m.Source
         Write-LaiLog STEP "Checking $($m.Source)"
         # Keep a reference to the current version first: a pull deletes files no tag points to.
         $candidate = "$(Resolve-LaiModelName $m.Source)-prevnew"
-        if ($old -and -not $NoKeepPrevious) { Copy-Model (Resolve-LaiModelName $m.Source) $candidate }
-        if ($env:LOCALAI_TEST_PULL_FROM) { Copy-Model $env:LOCALAI_TEST_PULL_FROM (Resolve-LaiModelName $m.Source) }   # test hook: simulated re-publish
-        else { Invoke-LaiOllamaPull -BaseUrl $ollamaUrl -Name $m.Source }
-        $new = Get-LaiOllamaDigest -BaseUrl $ollamaUrl -Name $m.Source
-        if ($old -and $old -ne $new -and -not $NoKeepPrevious) {
-            $pn = Get-PrevName $m.Source
-            Remove-Model $pn
-            Copy-Model $candidate $pn
-            Write-LaiLog INFO ("  previous version kept as {0} (~{1} GB until the next update; Update-Models.ps1 -Rollback {2} brings it back, -DropPrevious frees it)" -f $pn, (Get-ModelGB $pn), $m.Key)
-        }
-        Remove-Model $candidate
+        try {
+            if ($old -and -not $NoKeepPrevious) { Copy-Model (Resolve-LaiModelName $m.Source) $candidate }
+            if ($env:LOCALAI_TEST_PULL_FROM) { Copy-Model $env:LOCALAI_TEST_PULL_FROM (Resolve-LaiModelName $m.Source) }   # test hook: simulated re-publish
+            else { Invoke-LaiOllamaPull -BaseUrl $ollamaUrl -Name $m.Source }
+            $new = Get-LaiOllamaDigest -BaseUrl $ollamaUrl -Name $m.Source
+            if ($old -and $old -ne $new -and -not $NoKeepPrevious) {
+                $pn = Get-PrevName $m.Source
+                Remove-Model $pn
+                Copy-Model $candidate $pn
+                Hide-InWebUI $pn
+                Write-LaiLog INFO ("  previous version kept as {0} (~{1} GB until the next update; Update-Models.ps1 -Rollback {2} brings it back, -DropPrevious frees it)" -f $pn, (Get-ModelGB $pn), $m.Key)
+            }
+        } finally { try { Remove-Model $candidate } catch { Write-Verbose "could not remove $candidate" } }
         if ($old -ne $new -or $Retune -or -not (Test-LaiOllamaModel -BaseUrl $ollamaUrl -Name $m.Alias)) {
             Write-LaiLog INFO ("  {0}: {1} -> {2}" -f $m.Display, $(if ($old) { $old.Substring(0, 12) } else { 'missing' }), $new.Substring(0, 12))
             $changed += $m

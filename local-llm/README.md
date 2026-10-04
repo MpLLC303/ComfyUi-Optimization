@@ -53,15 +53,18 @@ render-guard mode and trial models. It is **not** instant:
   installer waits up to 10 minutes for other GPU apps to let go.
 - **NVIDIA driver updates:** after one, the models are re-tuned automatically, which takes longer.
 - **Open WebUI:** it restarts briefly for the backup step.
-- **Your settings:** the installer's presets (**Local Main/Fast/Vision/Code**) and RAG settings are
-  reset to its values. Make your own changes on a **copy** of a preset (Workspace > Models > Clone)
-  and they survive.
+- **Your settings:** on the four presets the installer refreshes only what it manages (base model,
+  system prompt, tool mode, capabilities). Your additions (attached knowledge, tools, access, extra
+  parameters, hiding a preset) are kept. The RAG settings (chunking, top-k, web search) are reset to
+  the installer's values.
+- **Switches are remembered:** `-SkipVision`, `-KeepAlive` and the like apply to later runs too.
+  Change one by passing it again; `-ForgetSettings` goes back to the defaults.
 
 Options are in the config block at the top of `Install-LocalAI.ps1`. The common ones:
 
 | Switch | Effect |
 |---|---|
-| `-SkipVision`, `-SkipCoder` | Skip the optional ~20 GB models. They're also skipped automatically if disk space is short. |
+| `-SkipVision`, `-SkipCoder` | Skip the optional ~20 GB models. They're also skipped automatically if disk space is short. Remembered for later runs; `-ForgetSettings` brings them back. |
 | `-ModelDir D:\AI\OllamaModels` | Put the models on another drive. This is chosen automatically when C: is short on space. |
 | `-Retune` | Re-measure the context sizes after a driver or hardware change. |
 | `-NoReboot` | Print "reboot now" instead of rebooting. It still resumes at the next sign-in. |
@@ -183,7 +186,7 @@ The exit code is the number of failures.
 | Update Open WebUI | `C:\AI\Scripts\Update-OpenWebUI.ps1 -Latest` (backs up, pulls, recreates the container, runs a quick test). Undo it with `Update-OpenWebUI.ps1 -Rollback`: previous image plus the data from just before the update (the newest `before-<version>` backup is never pruned). History in `C:\AI\Logs\update.log`. Re-running the installer keeps the updated version |
 | Change the admin password | `C:\AI\Scripts\Set-OpenWebUIPassword.ps1` (random) or `-Prompt` (type your own); updates the secrets file and signs out old sessions |
 | Back up now | `C:\AI\Scripts\Backup-OpenWebUI.ps1` (add `-Mirror E:\Backups` or set `-BackupMirror` at install for a second copy) |
-| Update models / Ollama | `C:\AI\Scripts\Update-Models.ps1` re-pulls every model and re-tunes only those whose upstream tag changed (`-UpdateOllama` upgrades Ollama first). A model that really changed keeps its previous version as `<tag>-prev`, which costs its size on disk until the next update. Bring it back with `-Rollback main` (or `fast`, `vision`, `code`, `all`), or free the space with `-DropPrevious` |
+| Update models / Ollama | `C:\AI\Scripts\Update-Models.ps1` re-pulls every model and re-tunes only those whose upstream tag changed (`-UpdateOllama` upgrades Ollama first). A model that really changed keeps its previous version as `<tag>-prev`, which costs its size on disk until the next update. Bring it back with `-Rollback main` (or `fast`, `vision`, `code`, `all`), which also pins it so later updates leave it alone until `-Unpin main`. Free the space with `-DropPrevious` |
 | Re-tune after a driver/GPU change | Happens by itself on the next re-run when the driver version changed; force it with `C:\AI\Scripts\Install-LocalAI.ps1 -Retune` |
 | Add or swap a model | Try newer ones with `-TrialModels` first. To change the catalog for good, edit `config\models.psd1` in a downloaded copy (the copy in `C:\AI\Scripts` is replaced by the next Update toolkit) and run `Install-LocalAI.cmd` from there |
 | Health watch | Task `LocalAI-Watch` runs `C:\AI\Scripts\Watch-LocalAI.ps1` every 15 minutes while you're signed in: checks Ollama, the Docker engine, Open WebUI, SearXNG, the render guard, backup freshness and free disk space (models, backups, Docker data; warns under 10 GB), restarts a stopped container or Ollama (never Docker Desktop itself, in case you quit it on purpose), and shows a Windows notification only when a problem persists for two checks in a row (and once when it's fixed). History in `C:\AI\Logs\watch.log`; run it by hand with `-NoHeal -Verbose`; silence it with `-PauseMinutes 240` (gaming, stack stopped on purpose) and `-Unpause` |
@@ -213,7 +216,7 @@ deliberately not inside the backup archives.
 | "Docker engine did not start" | Licence prompt, virtualization off, or WSL broken | Open Docker Desktop once. Enable **SVM Mode** in the BIOS. Run `wsl --update`. Re-run. |
 | Web search: "no results" | SearXNG's upstream engines are rate-limiting (captchas) | Retry later. Tune engines in `C:\AI\Stack\searxng\settings.yml`, then `docker restart searxng`. |
 | RAG gives a wrong or empty answer | File not processed, collection not attached, or the chunk wasn't retrieved | Check Workspace → Knowledge (processing status). Attach the collection with `#`. Ask with the manual's own wording. |
-| Odd answers in Open WebUI but fine in `ollama run localai-main` | A preset or chat parameter was changed in the UI | Re-run the installer (it resets the presets) |
+| Odd answers in Open WebUI but fine in `ollama run localai-main` | A preset or chat parameter was changed in the UI | Re-run the installer to restore its system prompt and tool mode. Your own extra parameters are kept, so remove those in Workspace > Models if they are the cause |
 | Ollama tray settings | The new Ollama app's **Expose to network**, **Context length** and **Model location** settings override the environment variables | Leave them at their defaults. The tuned aliases keep their own context either way. |
 | Port 3000 or 8888 already in use | Another local service | The installer picks the next free port and records it in `install-report.md` |
 | Chat is suddenly slow (CPU speed) | ComfyUI has a job queued or finished less than 60 s ago, so the render guard runs chats on the CPU | Expected. `docker logs render-guard` shows why. Wait for the render, or re-run the installer with `-RenderGuard off` |

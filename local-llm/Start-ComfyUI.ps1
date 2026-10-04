@@ -32,7 +32,7 @@ function Test-LaunchTarget {
     # launching it would start this launcher again, endlessly) and anything that runs PowerShell.
     param([string]$Candidate)
     if (-not $Candidate) { return $false }
-    if ($Candidate -like '*\Local AI\*' -or (Split-Path -Leaf $Candidate) -like '*free GPU first*') { return $false }
+    if ($Candidate -like '*\Start Menu\Programs\Local AI\*' -or (Split-Path -Leaf $Candidate) -like '*free GPU first*') { return $false }
     if ($Candidate -like '*.lnk') {
         try {
             $target = (New-Object -ComObject WScript.Shell).CreateShortcut($Candidate).TargetPath

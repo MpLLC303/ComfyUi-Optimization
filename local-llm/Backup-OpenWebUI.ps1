@@ -158,10 +158,10 @@ try {
         $all = @(Get-ChildItem -LiteralPath $backupDir -Filter 'open-webui-*.tar.gz')
         $daily = @($all | Where-Object { $_.Name -match '^open-webui-\d{8}-\d{6}\.tar\.gz$' } | Sort-Object LastWriteTime -Descending)  # lai-ok: objects
         $tagged = @($all | Where-Object { $_.Name -notmatch '^open-webui-\d{8}-\d{6}\.tar\.gz$' })
-        # The newest before-<version> archive is the rollback point for the current Open WebUI version;
-        # it stays no matter how old it is.
-        $rollback = $all | Where-Object { $_.Name -like '*-before-*' -and $_.Name -notlike '*-CORRUPT*' } | Sort-Object LastWriteTime -Descending | Select-Object -First 1  # lai-ok: objects
-        if ($rollback) { $tagged = @($tagged | Where-Object { $_.FullName -ne $rollback.FullName }) }
+        # The archive Update-OpenWebUI.ps1 -Rollback would use stays no matter how old it is.
+        $keep = ''
+        if ($config.ContainsKey('RollbackArchive') -and $config['RollbackArchive']) { $keep = [string]$config['RollbackArchive'] }
+        if ($keep) { $tagged = @($tagged | Where-Object { $_.FullName -ne $keep -and $_.Name -ne (Split-Path -Leaf $keep) }) }
         $cutoff = (Get-Date).AddDays(-$RetentionDays)
         foreach ($old in (@($daily | Select-Object -Skip 3) + $tagged | Where-Object { $_.LastWriteTime -lt $cutoff -and $_.FullName -ne $archive })) {
             Remove-Item -LiteralPath $old.FullName -Force

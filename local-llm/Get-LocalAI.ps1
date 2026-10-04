@@ -15,7 +15,10 @@
 
     $ref = $env:LOCALAI_REF
     if (-not $ref) { $ref = 'main' }
-    $dest = 'C:\AI\Installer'
+    # LOCALAI_ROOT: the install's AI folder (set by the Start-menu 'Update toolkit' shortcut).
+    $root = $env:LOCALAI_ROOT
+    if (-not $root) { $root = 'C:\AI' }
+    $dest = Join-Path $root 'Installer'
     $zip = Join-Path $env:TEMP 'localai-installer.zip'
     $url = "https://codeload.github.com/MpLLC303/ComfyUi-Optimization/zip/refs/heads/$ref"
 
@@ -31,5 +34,5 @@
     if (-not (Test-Path -LiteralPath $installer)) { throw "Installer not found in the downloaded archive ($installer)." }
     Get-ChildItem -LiteralPath $top.FullName -Recurse -File | Unblock-File
 
-    & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $installer
+    & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $installer -AIRoot $root
 }

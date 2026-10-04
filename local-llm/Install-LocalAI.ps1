@@ -70,6 +70,8 @@ param(
     [switch]$NoReboot,
     [switch]$Retune,
     [switch]$SkipTests,
+    # Forget the settings remembered from earlier runs (e.g. a -SkipVision) and use the defaults above.
+    [switch]$ForgetSettings,
     [switch]$Resume
     # ========================================================
 )
@@ -99,7 +101,8 @@ function Get-RelaunchCommand {
     foreach ($kv in $script:BoundParams.GetEnumerator()) {
         if ($kv.Key -eq 'Resume') { continue }
         if ($kv.Value -is [System.Management.Automation.SwitchParameter]) {
-            if ($kv.Value.IsPresent) { $cmd += " -$($kv.Key)" }
+            # An explicit -Name:$false matters too: it overrides a remembered switch.
+            if ($kv.Value.IsPresent) { $cmd += " -$($kv.Key)" } else { $cmd += " -$($kv.Key):`$false" }
         } else {
             $cmd += " -$($kv.Key) " + (ConvertTo-PsLiteral $kv.Value)
         }
@@ -160,9 +163,22 @@ foreach ($k in @('stages', 'tuning', 'flags')) { if (-not $State.ContainsKey($k)
 
 # Settings passed on an earlier run are remembered, so "Update toolkit" (which passes none) does not
 # quietly undo them (e.g. download the Vision model skipped with -SkipVision). A value passed now wins.
+# 'powershell -File' (Install-LocalAI.cmd) passes "a,b" as ONE string; split list parameters here.
+$TrialModels = @($TrialModels | ForEach-Object { "$_" -split ',' } | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+$KnowledgeCollections = [string[]]@($KnowledgeCollections | ForEach-Object { "$_" -split ',' } | ForEach-Object { $_.Trim() } | Where-Object { $_ })
 $RememberedParams = @('SkipVision', 'SkipCoder', 'AdminEmail', 'KvCacheType', 'GpuOverheadMiB', 'MinFreeVramMiB',
     'MaxBusyVramMiB', 'GpuWaitMinutes', 'KeepAlive', 'KnowledgeCollections', 'BackupTime', 'BackupRetentionDays', 'BackupMirror')
-if (-not $State.flags.ContainsKey('params') -or $null -eq $State.flags['params']) { $State.flags['params'] = @{} }
+if ($ForgetSettings) { $State.flags['params'] = @{}; Write-LaiLog INFO 'Forgetting settings remembered from earlier runs (-ForgetSettings)' }
+if (-not $State.flags.ContainsKey('params') -or $null -eq $State.flags['params']) {
+    $State.flags['params'] = @{}
+    # Installs made before settings were remembered: infer the skips from what was installed, so the
+    # first update does not download a 20 GB model the user had left out.
+    if (-not $ForgetSettings -and $State.flags.ContainsKey('selectedModels') -and @($State.flags['selectedModels']).Count -gt 0) {
+        $had = @($State.flags['selectedModels'])
+        if ($had -notcontains 'vision') { $State.flags['params']['SkipVision'] = $true }
+        if ($had -notcontains 'code') { $State.flags['params']['SkipCoder'] = $true }
+    }
+}
 $savedParams = $State.flags['params']
 foreach ($name in $RememberedParams) {
     if ($PSBoundParameters.ContainsKey($name)) {
@@ -514,13 +530,10 @@ Invoke-Stage 'Preflight' {
     catch { Write-Verbose "Unblock-File skipped: $($_.Exception.Message)" }
     # Windows' default policy (Restricted) refuses every typed .ps1. RemoteSigned still blocks
     # unsigned scripts that come from the internet, and is the Windows Server default.
-    try {
-        $policy = Get-ExecutionPolicy
-        if (@('Restricted', 'AllSigned', 'Undefined') -contains [string]$policy) {
-            Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope LocalMachine -Force -ErrorAction Stop
-            Write-LaiLog OK "PowerShell execution policy: $policy -> RemoteSigned, so the scripts in $($P.Scripts) can be run by name"
-        }
-    } catch { Write-LaiLog WARN "Could not change the PowerShell execution policy ($($_.Exception.Message)); use the Start-menu shortcuts or 'powershell -ExecutionPolicy Bypass -File <script>'." }
+    if ($env:OS -eq 'Windows_NT') {
+        try { Write-LaiLog OK ('PowerShell: ' + (Set-LaiScriptPolicy)) }
+        catch { Write-LaiLog WARN "Could not change the PowerShell execution policy ($($_.Exception.Message)); use the Start-menu shortcuts or 'powershell -ExecutionPolicy Bypass -File <script>'." }
+    }
     foreach ($d in @('Projects', 'Scratch', 'Downloads', 'Generated')) {
         $w = Join-Path $P.Workspace $d
         if (-not (Test-Path -LiteralPath $w)) { New-Item -ItemType Directory -Force -Path $w | Out-Null }
@@ -966,7 +979,8 @@ Invoke-Stage 'Backup' {
     ConvertTo-Json -InputObject $config -Depth 5 | Set-Content -LiteralPath $P.Config -Encoding UTF8
 
     $backupScript = Join-Path $P.Scripts 'Backup-OpenWebUI.ps1'
-    $action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument ('-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "{0}" -AIRoot "{1}"' -f $backupScript, $AIRoot)
+    # -EngineWaitSec: a missed 03:30 run starts at sign-in, while Docker Desktop may need several minutes.
+    $action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument ('-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "{0}" -AIRoot "{1}" -EngineWaitSec 1200' -f $backupScript, $AIRoot)
     $trigger = New-ScheduledTaskTrigger -Daily -At $BackupTime
     $principal = New-ScheduledTaskPrincipal -UserId $CurrentUser -LogonType Interactive -RunLevel Highest
     $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit (New-TimeSpan -Hours 1) `

@@ -146,11 +146,13 @@ function global:docker {
 
 # ---- phase 1: fresh install until WSL needs a reboot ----------------------------------------
 Write-Host "`n=== PHASE 1: fresh run (expects reboot request) ===" -ForegroundColor Cyan
-& $inst -AIRoot $aiRoot -SkipTests -TrialModels trial-ok, trial-missing -KeepAlive 7m -BackupRetentionDays 9
+# 'trial-ok,trial-missing' as ONE string, the way Install-LocalAI.cmd (powershell -File) delivers it.
+& $inst -AIRoot $aiRoot -SkipTests -TrialModels 'trial-ok,trial-missing' -KeepAlive 7m -BackupRetentionDays 9 -SkipCoder:$false
 $code1 = $LASTEXITCODE
 $state = Get-Content -Raw (Join-Path $aiRoot 'install-state.json') | ConvertFrom-Json
 Assert-That ($code1 -eq 3010) "phase 1 exits 3010 for reboot (got $code1)"
 Assert-That ($global:Tasks.ContainsKey('LocalAI-Install-Resume')) 'resume task registered'
+Assert-That ($global:Tasks['LocalAI-Install-Resume'] -match '-SkipCoder:\$false') 'an explicit false switch survives the reboot/resume relaunch'
 Assert-That ($global:Tasks['LocalAI-Install-Resume'] -match "-Resume" -and $global:Tasks['LocalAI-Install-Resume'] -match [regex]::Escape((Join-Path $aiRoot 'Scripts'))) 'resume task runs the stable copy in AI\Scripts with -Resume'
 Assert-That (@($global:Calls | Where-Object { $_ -like 'shutdown /r /t 60*' }).Count -eq 1) 'reboot scheduled with 60 s warning'
 Assert-That ($null -ne $state.stages.Tuning -and $null -eq $state.stages.WSL) 'stages up to Tuning done, WSL pending'
@@ -228,11 +230,17 @@ Assert-That (@((Get-Content -Raw (Join-Path $aiRoot 'install-state.json') | Conv
 
 # ---- phase 4: drop the trial again ---------------------------------------------------------------
 Write-Host "`n=== PHASE 4: re-run with -TrialModels none ===" -ForegroundColor Cyan
+# Pretend this install predates remembered settings: the skips must be inferred from what is installed.
+$st = Get-Content -Raw (Join-Path $aiRoot 'install-state.json') | ConvertFrom-Json
+$st.flags.PSObject.Properties.Remove('params')
+$st | ConvertTo-Json -Depth 20 | Set-Content (Join-Path $aiRoot 'install-state.json')
 & (Join-Path $aiRoot 'Scripts/Install-LocalAI.ps1') -AIRoot $aiRoot -SkipTests -TrialModels none
 Assert-That ($LASTEXITCODE -eq 0) "phase 4 completes (exit $LASTEXITCODE)"
 Assert-That (@((Get-Content -Raw (Join-Path $aiRoot 'install-state.json') | ConvertFrom-Json).flags.selectedModels) -notcontains 'trial-ok') '-TrialModels none deselects the trial'
 $tp = Get-TestPreset 'trial-standin'
 Assert-That ($tp -and $tp.meta.hidden -eq $true) 'deselected trial preset is hidden (kept for old chats)'
+$p4 = (Get-Content -Raw (Join-Path $aiRoot 'install-state.json') | ConvertFrom-Json).flags.params
+Assert-That ($p4.SkipVision -eq $true -and $p4.SkipCoder -eq $true) 'older install: skips inferred from the installed models (no surprise 20 GB downloads)'
 
 & /usr/bin/docker rm -f open-webui 2>$null | Out-Null
 & /usr/bin/docker ps -aq --filter 'name=^/open-webui-legacy-' | ForEach-Object { & /usr/bin/docker rm -f $_ | Out-Null }

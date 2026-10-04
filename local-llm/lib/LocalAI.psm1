@@ -914,8 +914,10 @@ function New-LaiPresetForm {
             image_generation = $false; code_interpreter = $false
         }
         tags              = @(@{ name = 'local' })
-        hidden            = $false
     }
+    # A trial that is selected again must be shown again (the installer hid it when it was dropped);
+    # the measured presets keep whatever the user chose.
+    if ($Entry.Trial) { $meta['hidden'] = $false }
     # Native tool calling lets the model decide when to search. In legacy (prompt-based) mode a
     # default-on web search would run a search before every single message, so leave it off there.
     if ($NativeTools) { $meta['defaultFeatureIds'] = @('web_search') }
@@ -1005,6 +1007,48 @@ function Invoke-LaiWebUISetup {
 
 #endregion
 
+function Get-LaiExecutionPolicyAction {
+    # What to do so typed script paths work. Pure function (unit-tested). Note: the effective policy
+    # of the running process is useless here, because every entry point runs with -ExecutionPolicy
+    # Bypass; the persistent scopes decide what the user's own PowerShell windows will do.
+    #   'none'  - typed scripts already allowed
+    #   'set'   - set LocalMachine to RemoteSigned
+    #   'gpo'   - a Group Policy decides; cannot be changed here
+    #   'user'  - the CurrentUser scope blocks it; only that user can change it
+    param([string]$MachinePolicy = 'Undefined', [string]$UserPolicy = 'Undefined', [string]$CurrentUser = 'Undefined', [string]$LocalMachine = 'Undefined')
+    $blocking = @('Restricted', 'AllSigned', 'Undefined')
+    foreach ($gp in @($MachinePolicy, $UserPolicy)) {
+        if ($gp -and $gp -ne 'Undefined') { if (@('Restricted', 'AllSigned') -contains $gp) { return 'gpo' } else { return 'none' } }
+    }
+    if ($CurrentUser -and $CurrentUser -ne 'Undefined') {
+        if (@('Restricted', 'AllSigned') -contains $CurrentUser) { return 'user' }
+        return 'none'
+    }
+    if ($blocking -contains $LocalMachine) { return 'set' }
+    return 'none'
+}
+
+function Set-LaiScriptPolicy {
+    # Lets the user run C:\AI\Scripts\*.ps1 by name. Returns a one-line result for the log.
+    $s = @{}
+    foreach ($scope in 'MachinePolicy', 'UserPolicy', 'CurrentUser', 'LocalMachine') { $s[$scope] = [string](Get-ExecutionPolicy -Scope $scope) }
+    $action = Get-LaiExecutionPolicyAction -MachinePolicy $s['MachinePolicy'] -UserPolicy $s['UserPolicy'] -CurrentUser $s['CurrentUser'] -LocalMachine $s['LocalMachine']
+    switch ($action) {
+        'none' { return "execution policy already allows typed scripts (LocalMachine=$($s['LocalMachine']), CurrentUser=$($s['CurrentUser']))" }
+        'gpo' { return "execution policy is set by Group Policy ($($s['MachinePolicy'])/$($s['UserPolicy'])); use the Start-menu shortcuts" }
+        'user' { return "your CurrentUser execution policy is $($s['CurrentUser']); run 'Set-ExecutionPolicy RemoteSigned -Scope CurrentUser' once, or use the Start-menu shortcuts" }
+    }
+    try { Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope LocalMachine -Force -ErrorAction Stop }
+    catch {
+        # This process runs with -ExecutionPolicy Bypass, so PowerShell reports that the new setting is
+        # "overridden by a more specific scope". The machine setting was still written.
+        if ($_.FullyQualifiedErrorId -notlike '*ExecutionPolicyOverride*') { throw }
+    }
+    $now = [string](Get-ExecutionPolicy -Scope LocalMachine)
+    if ($now -ne 'RemoteSigned') { throw "LocalMachine execution policy is still $now" }
+    return "execution policy LocalMachine: $($s['LocalMachine']) -> RemoteSigned (typed scripts now run)"
+}
+
 function Get-LaiShortcutSpecs {
     # What goes into the "Local AI" Start-menu folder. Script shortcuts keep their window open
     # after the script ends (also after an error) so the result can be read.
@@ -1018,12 +1062,14 @@ function Get-LaiShortcutSpecs {
         @{ Name = 'Local AI - Health check'; Script = 'Test-LocalAI.ps1'; Extra = ' -Quick' }
         @{ Name = 'ComfyUI (free GPU first)'; Script = 'Start-ComfyUI.ps1'; Extra = '' }
         @{ Name = 'Local AI - Diagnostics (redacted zip)'; Script = 'Get-LocalAIDiagnostics.ps1'; Extra = ' -RunTests' }
-        @{ Name = 'Local AI - Update toolkit'; Script = 'Get-LocalAI.ps1'; Extra = '' }
+        @{ Name = 'Local AI - Update toolkit'; Script = 'Get-LocalAI.ps1'; Extra = ''; Env = 'LOCALAI_ROOT' }
     )
     $specs = @([pscustomobject]@{ Name = 'Local AI (Open WebUI)'; Kind = 'url'; Target = "http://localhost:$WebUIPort/"; Arguments = '' })
     foreach ($i in $items) {
         $path = $scripts + '\' + $i.Script
-        $cmd = "try { & $(& $q $path) -AIRoot $(& $q $AIRoot)$($i.Extra) } finally { Write-Host ''; Read-Host 'Done - press Enter to close' }"
+        if ($i.Env) { $call = "`$env:$($i.Env) = $(& $q $AIRoot.TrimEnd('\')); & $(& $q $path)" }   # bootstrap reads the root from the environment
+        else { $call = "& $(& $q $path) -AIRoot $(& $q $AIRoot)$($i.Extra)" }
+        $cmd = "try { $call } finally { Write-Host ''; Read-Host 'Done - press Enter to close' }"
         $specs += [pscustomobject]@{
             Name      = $i.Name
             Kind      = 'lnk'

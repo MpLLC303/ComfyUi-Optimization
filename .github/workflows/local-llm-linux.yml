@@ -111,6 +111,13 @@ jobs:
           & ./local-llm/tests/Invoke-ModelUpdateTest.ps1
           exit $LASTEXITCODE
 
+      - name: Open WebUI update / rollback test
+        shell: pwsh
+        run: |
+          docker pull -q alpine:3.19
+          & ./local-llm/tests/Invoke-UpdateWebUITest.ps1
+          exit $LASTEXITCODE
+
       - name: Uninstall test
         shell: pwsh
         run: |

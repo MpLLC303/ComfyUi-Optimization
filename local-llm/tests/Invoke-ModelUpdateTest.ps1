@@ -92,6 +92,10 @@ try {
     Assert-That (-not (Test-LaiOllamaModel -BaseUrl $OllamaUrl -Name $prev)) '-prev consumed by the rollback'
     $r = Invoke-Update @('-Rollback', 'main') ''
     Assert-That ($r.Code -ne 0 -and $r.Text -match 'Nothing to roll back') 'second rollback refuses clearly'
+    $r = Invoke-Update @() $variant
+    Assert-That ((Get-Digest $tag) -eq $original -and $r.Text -match 'pinned after a rollback') 'rolled-back model is pinned: the next update leaves it alone'
+    $r = Invoke-Update @('-Unpin', 'main') ''
+    Assert-That ($r.Code -eq 0) 'unpin'
 
     Write-Host "`n=== 4. -DropPrevious ===" -ForegroundColor Cyan
     Invoke-Update @() $variant | Out-Null

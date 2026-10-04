@@ -103,27 +103,41 @@ $lines = @(Get-Content -LiteralPath $envPath)
 $current = ($lines | Where-Object { $_ -like 'OPEN_WEBUI_VERSION=*' } | Select-Object -First 1) -replace '^OPEN_WEBUI_VERSION=', ''
 if ($Version -and $Version -eq $current -and -not $SearxngVersion) { Write-UpdateLog OK "Already on $current"; exit 0 }
 $pre = $null
+$configBefore = Read-LaiState -Path $configPath
 
 # Hold the volume lock for backup + swap, so the health watch does not restart the old container
 # halfway through and a scheduled backup does not run against a half-replaced stack.
 $lock = Enter-LaiVolumeLock -TimeoutSec 900
 try {
     if (-not $SkipBackup) {
-        $tag = "before-$($Version -replace '[^\w\.-]', '')"
+        if ($Version) { $tag = "before-$($Version -replace '[^\w\.-]', '')" } else { $tag = "before-searxng-$($SearxngVersion -replace '[^\w\.-]', '')" }
         & (Join-Path $PSScriptRoot 'Backup-OpenWebUI.ps1') -AIRoot $AIRoot -Tag $tag
         if ($LASTEXITCODE -ne 0) { throw 'Backup failed; not updating. Use -SkipBackup to override.' }
         $pre = Get-ChildItem -LiteralPath (Join-Path $AIRoot 'Backups') -Filter "open-webui-*-$tag.tar.gz" -ErrorAction SilentlyContinue |
             Sort-Object LastWriteTime -Descending | Select-Object -First 1  # lai-ok: objects
     }
+    if ($Version) {
+        # Record the rollback point now, not after success: if anything below fails, -Rollback must work.
+        if ($pre) { $config['PreviousOpenWebUIVersion'] = $current; $config['RollbackArchive'] = $pre.FullName }
+        else { [void]$config.Remove('PreviousOpenWebUIVersion'); [void]$config.Remove('RollbackArchive') }
+        Save-LaiState -State $config -Path $configPath
+    }
 
-    Set-EnvVersion -OpenWebUI $Version -Searxng $SearxngVersion
-    Invoke-Docker -Arguments ($base + @('pull'))
+    try {
+        Set-EnvVersion -OpenWebUI $Version -Searxng $SearxngVersion
+        Invoke-Docker -Arguments ($base + @('pull'))
+    } catch {
+        # Typo in the version, no network, registry down: put the old versions back so the next start
+        # (or reboot) does not try to run an image that does not exist.
+        [System.IO.File]::WriteAllLines($envPath, [string[]]$lines, (New-Object System.Text.UTF8Encoding($false)))
+        Save-LaiState -State $configBefore -Path $configPath
+        throw "Could not pull the new image(s), nothing was changed: $($_.Exception.Message)"
+    }
     Invoke-Docker -Arguments ($base + @('up', '-d', '--remove-orphans'))
 } finally { Exit-LaiVolumeLock $lock }
 
 if ($Version) {
     $config['OpenWebUIVersion'] = $Version
-    if ($pre) { $config['PreviousOpenWebUIVersion'] = $current; $config['RollbackArchive'] = $pre.FullName }
     Save-LaiState -State $config -Path $configPath
 }
 Wait-LaiWebUI -BaseUrl "http://127.0.0.1:$port" -TimeoutSec 600
