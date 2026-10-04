@@ -51,7 +51,14 @@ function Invoke-Tailscale {
     $outTask = $proc.StandardOutput.ReadToEndAsync()
     $errTask = $proc.StandardError.ReadToEndAsync()
     if (-not $proc.WaitForExit($limit * 1000)) {
-        try { $proc.Kill() } catch { Write-Verbose 'already gone' }
+        # The whole process tree: a wrapper (a .cmd, a shell script) would otherwise leave its child
+        # running and holding the output handles open.
+        if ($env:OS -eq 'Windows_NT') {
+            # Local 'Continue': under 'Stop', Windows PowerShell turns taskkill's stderr into an error.
+            $prevEap = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
+            try { & taskkill.exe /T /F /PID $proc.Id 2>&1 | Out-Null } finally { $ErrorActionPreference = $prevEap }
+        }
+        try { if (-not $proc.HasExited) { $proc.Kill() } } catch { Write-Verbose 'already gone' }
         throw "tailscale $($Arguments -join ' ') did not answer within $limit s. Is the Tailscale service running? Restart the Tailscale app and try again."
     }
     $proc.WaitForExit()
