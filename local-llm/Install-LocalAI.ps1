@@ -154,6 +154,11 @@ $OllamaDir = Join-Path $env:LOCALAPPDATA 'Programs\Ollama'
 $DockerExe = Join-Path $env:ProgramFiles 'Docker\Docker\Docker Desktop.exe'
 $DockerBin = Join-Path $env:ProgramFiles 'Docker\Docker\resources\bin'
 $ResumeTask = 'LocalAI-Install-Resume'
+$ToolkitItems = @('Install-LocalAI.ps1', 'Install-LocalAI.cmd', 'Test-LocalAI.ps1', 'Backup-OpenWebUI.ps1', 'Update-OpenWebUI.ps1', 'Release-GPU.ps1', 'Set-OpenWebUIPassword.ps1', 'Restore-OpenWebUI.ps1', 'Update-Models.ps1', 'Start-ComfyUI.ps1', 'Enable-TailscaleAccess.ps1', 'Watch-LocalAI.ps1', 'Uninstall-LocalAI.ps1', 'Stop-LocalAI.ps1', 'Start-LocalAI.ps1', 'Get-LocalAIDiagnostics.ps1', 'Get-LocalAI.ps1', 'VERSION', 'README.md', 'lib', 'config', 'stack')
+# The resume task runs the installer elevated without a prompt, so it runs a copy that only
+# Administrators can change. Not C:\AI\Scripts: the user has full control of C:\AI, and full
+# control of a folder lets you rename any folder inside it and put a different one in its place.
+$ElevatedDir = Join-Path $env:ProgramFiles 'LocalAI'
 $BackupTask = 'LocalAI-Backup-OpenWebUI'
 $WatchTask = 'LocalAI-Watch'
 $CurrentUser = [Security.Principal.WindowsIdentity]::GetCurrent().Name
@@ -261,6 +266,30 @@ function Add-SessionPath {
     if ($Dir -and (Test-Path -LiteralPath $Dir) -and (($env:Path -split ';') -notcontains $Dir)) { $env:Path = "$Dir;$env:Path" }
 }
 
+function Set-OllamaBlockRule {
+    # Only while Ollama has to listen beyond 127.0.0.1 (containers could not reach it otherwise).
+    # Default: block port 11434 by ADDRESS (everything except loopback, Docker Desktop's
+    # 192.168.65.0/24 and the WSL/Docker adapter subnets found now), whichever adapter traffic comes
+    # in on: Wi-Fi, Ethernet, Tailscale, VPN, adapters added later. -AdaptersOnly: the older rule on
+    # the physical adapters, used when Docker cannot get through the address rule.
+    param([switch]$AdaptersOnly)
+    $ruleName = 'LocalAI - Block Ollama from LAN'
+    Get-NetFirewallRule -DisplayName $ruleName -ErrorAction SilentlyContinue | Remove-NetFirewallRule -ErrorAction SilentlyContinue
+    if ($AdaptersOnly) {
+        $nics = @(Get-NetAdapter -Physical -ErrorAction SilentlyContinue | ForEach-Object { $_.InterfaceAlias })
+        if ($nics.Count -gt 0) { New-NetFirewallRule -DisplayName $ruleName -Direction Inbound -Protocol TCP -LocalPort 11434 -Action Block -InterfaceAlias $nics -Profile Any | Out-Null }
+        Write-LaiLog WARN "Docker could not reach Ollama through the address-based block; using a block on the network adapters ($($nics -join ', ')) instead. VPN/Tailscale adapters are NOT covered: don't share this PC's Ollama port on a tailnet."
+        return
+    }
+    $allowed = @('127.0.0.0/8', '192.168.65.0/24')
+    $allowed += @(Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+        Where-Object { $_.InterfaceAlias -like 'vEthernet (WSL*' -or $_.InterfaceAlias -like '*Docker*' } |
+        ForEach-Object { '{0}/{1}' -f $_.IPAddress, $_.PrefixLength })
+    $blocked = @(Get-LaiBlockRange -Allowed $allowed) + '::2-ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff'
+    New-NetFirewallRule -DisplayName $ruleName -Direction Inbound -Protocol TCP -LocalPort 11434 -Action Block -RemoteAddress $blocked -Profile Any | Out-Null
+    Write-LaiLog OK "Firewall: Ollama port 11434 blocked from every address except this PC and Docker/WSL ($($allowed -join ', '))"
+}
+
 function Protect-Path {
     # Owner, SYSTEM and Administrators only (folders under C:\ otherwise inherit "Authenticated Users").
     # -UserAccess ReadOnly: the user may read and run but not change it (Administrators still can);
@@ -305,7 +334,9 @@ function Install-App {
     Invoke-LaiRetry -What "download $FileName" -Action { Invoke-WebRequest -Uri $Url -OutFile $dest -UseBasicParsing } | Out-Null
     $sig = Get-AuthenticodeSignature -FilePath $dest
     if ($sig.Status -ne 'Valid') { throw "$FileName has an invalid Authenticode signature ($($sig.Status)); refusing to run it." }
-    if ([string]$sig.SignerCertificate.Subject -notmatch [regex]::Escape($Publisher)) { throw "$FileName is signed by '$($sig.SignerCertificate.Subject)', not $Publisher; refusing to run it." }
+    # The vendor must BE the certificate's CN= or O= (whole word): 'O=Docker, Inc.' passes,
+    # 'O=Dockerize LLC' does not.
+    if ([string]$sig.SignerCertificate.Subject -notmatch ('(^|,\s*)(CN|O)="?' + [regex]::Escape($Publisher) + '\b')) { throw "$FileName is signed by '$($sig.SignerCertificate.Subject)', not $Publisher; refusing to run it." }
     Write-LaiLog INFO "Running $FileName (signed by $($sig.SignerCertificate.Subject.Split(',')[0]))"
     $proc = Start-Process -FilePath $dest -ArgumentList $InstallerArgs -Wait -PassThru
     if ($proc.ExitCode -ne 0 -and $proc.ExitCode -ne 3010) { throw "$FileName exited with code $($proc.ExitCode)" }
@@ -314,8 +345,16 @@ function Install-App {
 }
 
 function Register-ResumeTask {
-    $scriptPath = Join-Path $P.Scripts 'Install-LocalAI.ps1'
-    if (-not (Test-Path -LiteralPath $scriptPath)) { $scriptPath = $PSCommandPath }
+    if ($SourceRoot.TrimEnd('\', '/') -ne $ElevatedDir.TrimEnd('\', '/')) {
+        if (Test-Path -LiteralPath $ElevatedDir) { Remove-Item -LiteralPath $ElevatedDir -Recurse -Force }
+        New-Item -ItemType Directory -Force -Path $ElevatedDir | Out-Null
+        foreach ($item in $ToolkitItems) {
+            $src = Join-Path $SourceRoot $item
+            if (Test-Path -LiteralPath $src) { Copy-Item -LiteralPath $src -Destination $ElevatedDir -Recurse -Force }
+        }
+        Protect-Path -Path $ElevatedDir -UserAccess ReadOnly
+    }
+    $scriptPath = Join-Path $ElevatedDir 'Install-LocalAI.ps1'
     $cmd = Get-RelaunchCommand -ScriptPath $scriptPath -AddResume
     $action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument "-NoProfile -ExecutionPolicy Bypass -NoExit -Command $cmd"
     $trigger = New-ScheduledTaskTrigger -AtLogOn -User $CurrentUser
@@ -541,7 +580,7 @@ Invoke-Stage 'Preflight' {
     # Keep a stable copy of the scripts for scheduled tasks and the resume task.
     if ($SourceRoot.TrimEnd('\') -ne $P.Scripts.TrimEnd('\')) {
         if (-not (Test-Path -LiteralPath $P.Scripts)) { New-Item -ItemType Directory -Force -Path $P.Scripts | Out-Null }
-        foreach ($item in @('Install-LocalAI.ps1', 'Install-LocalAI.cmd', 'Test-LocalAI.ps1', 'Backup-OpenWebUI.ps1', 'Update-OpenWebUI.ps1', 'Release-GPU.ps1', 'Set-OpenWebUIPassword.ps1', 'Restore-OpenWebUI.ps1', 'Update-Models.ps1', 'Start-ComfyUI.ps1', 'Enable-TailscaleAccess.ps1', 'Watch-LocalAI.ps1', 'Uninstall-LocalAI.ps1', 'Stop-LocalAI.ps1', 'Start-LocalAI.ps1', 'Get-LocalAIDiagnostics.ps1', 'Get-LocalAI.ps1', 'VERSION', 'README.md', 'lib', 'config', 'stack')) {
+        foreach ($item in $ToolkitItems) {
             $src = Join-Path $SourceRoot $item
             if (Test-Path -LiteralPath $src) { Copy-Item -LiteralPath $src -Destination $P.Scripts -Recurse -Force }
         }
@@ -934,37 +973,29 @@ Invoke-Stage 'Stack' {
     # Can the container reach Ollama on the Windows host? (guide Part 9 / troubleshooting)
     $probe = "import urllib.request;print(urllib.request.urlopen('http://host.docker.internal:11434/api/version',timeout=5).read().decode())"
     $r = Invoke-Native -File 'docker' -Arguments @('exec', 'open-webui', 'python', '-c', $probe) -Capture -AllowFail
+    $switched = $false
     if ($r.Text -notmatch '"version"') {
         Write-LaiLog WARN 'Open WebUI cannot reach Ollama on 127.0.0.1. Switching Ollama to listen on all interfaces with a firewall block for the LAN.'
         $State.flags['ollamaLanFallback'] = $true
         Save-State
         Set-UserEnv -Name 'OLLAMA_HOST' -Value '0.0.0.0:11434' | Out-Null
-        # Block by address, not by adapter: everything except loopback and the Docker/WSL subnets,
-        # whichever adapter it arrives on (Wi-Fi, Ethernet, Tailscale, VPN, adapters added later).
-        $ruleName = 'LocalAI - Block Ollama from LAN'
-        $allowed = @('127.0.0.0/8', '172.16.0.0/12')
-        $allowed += @(Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |
-            Where-Object { $_.InterfaceAlias -like 'vEthernet (WSL*' -or $_.InterfaceAlias -like '*Docker*' } |
-            ForEach-Object { '{0}/{1}' -f $_.IPAddress, $_.PrefixLength })
-        $blocked = @(Get-LaiBlockRange -Allowed $allowed) + '::2-ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff'
-        Get-NetFirewallRule -DisplayName $ruleName -ErrorAction SilentlyContinue | Remove-NetFirewallRule -ErrorAction SilentlyContinue
-        New-NetFirewallRule -DisplayName $ruleName -Direction Inbound -Protocol TCP -LocalPort 11434 -Action Block -RemoteAddress $blocked -Profile Any | Out-Null
-        Write-LaiLog OK "Firewall: Ollama port 11434 blocked from every address except this PC and Docker/WSL ($($allowed -join ', '))"
-        $restartOllama = {
+        $switched = $true
+    }
+    if ($State.flags['ollamaLanFallback']) {
+        # Rebuilt on every run, so the rule follows WSL's subnet (picked again at boot) and installs
+        # with the older adapter-only rule get this one.
+        Set-OllamaBlockRule
+        if ($switched) {
             Get-Process -Name 'ollama app', 'ollama', 'llama-server' -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
             Start-Sleep -Seconds 3
             Start-AsUser (Join-Path $OllamaDir 'ollama app.exe')
             Wait-LaiHttp -Uri "$OllamaUrl/api/version" -TimeoutSec 90 | Out-Null
         }
-        & $restartOllama
         $r = Invoke-Native -File 'docker' -Arguments @('exec', 'open-webui', 'python', '-c', $probe) -Capture -AllowFail
         if ($r.Text -notmatch '"version"') {
             # Docker reaches the host from a subnet we did not detect: fall back to blocking the
             # physical adapters only (the LAN), and say what is not covered.
-            $nics = @(Get-NetAdapter -Physical -ErrorAction SilentlyContinue | ForEach-Object { $_.InterfaceAlias })
-            Get-NetFirewallRule -DisplayName $ruleName -ErrorAction SilentlyContinue | Remove-NetFirewallRule -ErrorAction SilentlyContinue
-            if ($nics.Count -gt 0) { New-NetFirewallRule -DisplayName $ruleName -Direction Inbound -Protocol TCP -LocalPort 11434 -Action Block -InterfaceAlias $nics -Profile Any | Out-Null }
-            Write-LaiLog WARN "Docker could not reach Ollama through the address-based block; using a block on the network adapters ($($nics -join ', ')) instead. VPN/Tailscale adapters are NOT covered: don't share this PC's Ollama port on a tailnet."
+            Set-OllamaBlockRule -AdaptersOnly
             $r = Invoke-Native -File 'docker' -Arguments @('exec', 'open-webui', 'python', '-c', $probe) -Capture -AllowFail
         }
         if ($r.Text -notmatch '"version"') { throw "Open WebUI still cannot reach Ollama at host.docker.internal:11434. Output: $($r.Text)" }
@@ -1070,7 +1101,10 @@ Invoke-Stage 'Backup' {
     # -EngineWaitSec: a missed 03:30 run starts at sign-in, while Docker Desktop may need several minutes.
     $action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument ('-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "{0}" -AIRoot "{1}" -EngineWaitSec 1200' -f $backupScript, $AIRoot)
     $trigger = New-ScheduledTaskTrigger -Daily -At $BackupTime
-    $principal = New-ScheduledTaskPrincipal -UserId $CurrentUser -LogonType Interactive -RunLevel Highest
+    # Not elevated: docker-users membership, the volume mutex and C:\AI\Backups are all it needs, and
+    # an elevated task would run code from C:\AI, which the user controls (see $ElevatedDir).
+    # Non-elevated also sees mapped network drives, so a NAS mirror on a drive letter works.
+    $principal = New-ScheduledTaskPrincipal -UserId $CurrentUser -LogonType Interactive -RunLevel Limited
     $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit (New-TimeSpan -Hours 1) `
         -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 15)
     Register-ScheduledTask -TaskName $BackupTask -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Force | Out-Null

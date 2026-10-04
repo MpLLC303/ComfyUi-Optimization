@@ -232,7 +232,11 @@ if ($script:token) {
         if ($urls -notcontains $expected) {
             return (Warn "Open WebUI uses $($urls -join ', ') instead of $expected (e.g. after restoring an older backup) - re-run Install-LocalAI.ps1")
         }
-        if ($expected -like '*render-guard*') { Pass "$expected (render guard)" } else { Pass "$expected (direct)" }
+        # Actually through Open WebUI to Ollama, not just the setting: catches a render guard that is
+        # down or a stale firewall rule (LAN-fallback installs after WSL picked a new subnet).
+        try { $v = Invoke-LaiApi -Uri "$webUrl/ollama/api/version" -Token $token -TimeoutSec 20 }
+        catch { return (Fail "Open WebUI cannot reach Ollama via $expected ($((Get-LaiHttpErrorText $_))) - $startAgain; if it persists, re-run Install-LocalAI.cmd (it also refreshes the firewall rule)") }
+        if ($expected -like '*render-guard*') { Pass "$expected (render guard), Ollama $($v.version)" } else { Pass "$expected (direct), Ollama $($v.version)" }
     }
     Add-Check 'Signup disabled, memories enabled' {
         $a = Invoke-LaiApi -Uri "$webUrl/api/v1/auths/admin/config" -Token $token

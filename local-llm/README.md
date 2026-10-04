@@ -240,14 +240,20 @@ deliberately not inside the backup archives.
     could read the backups, which hold every chat. Secrets in `C:\AI\Secrets` and
     `C:\AI\Stack\.env` are locked the same way.
   - The bootstrap admin password is removed from the container environment after the first login.
-- **No silent admin rights.** The nightly backup and the resume-after-reboot tasks run as
-  administrator. The scripts they run, in `C:\AI\Scripts`, can only be changed by an administrator,
-  so nothing running as you can edit them and gain admin rights without a UAC prompt.
+- **No silent admin rights.**
+  - Nothing that starts by itself as administrator runs code from `C:\AI`. You control that
+    folder, so you could swap anything in it, even a read-only subfolder.
+  - The nightly backup and the health watch run as you, without admin rights.
+  - The one task that needs admin rights is the installer's resume after a reboot. It runs a copy
+    in `C:\Program Files\LocalAI`, which only an administrator can change.
   - Members of the `docker-users` group (you) are effectively administrators anyway, because Docker
     can mount any drive. Don't add other accounts to it.
-- **If the installer had to open Ollama beyond 127.0.0.1** (only when containers couldn't reach it),
-  the firewall blocks port 11434 from every address except this PC and the Docker/WSL subnets.
-  That covers Wi-Fi, Ethernet, Tailscale and VPN alike.
+- **If the installer had to open Ollama beyond 127.0.0.1** (only when containers couldn't reach it):
+  - The firewall blocks port 11434 from every address except this PC, Docker Desktop
+    (192.168.65.0/24) and the WSL/Docker adapter subnets found on this PC. That covers Wi-Fi,
+    Ethernet, Tailscale and VPN alike.
+  - WSL can pick a new subnet at boot. If chats then stop working, re-run the installer: it
+    rebuilds the rule on every run, and Health check flags it.
 - **Updates trust this repository.** "Update toolkit" downloads the `main` branch over HTTPS and
   runs it as administrator. Whoever can push to `main` controls what it installs, so keep two-factor
   authentication on the GitHub account. To install a reviewed version instead, set

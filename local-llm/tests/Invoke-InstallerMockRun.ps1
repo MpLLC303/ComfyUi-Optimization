@@ -85,6 +85,7 @@ Set-Content -Path $inst -Value $text
 # ---- mocks ----------------------------------------------------------------------------------
 $global:Calls = New-Object System.Collections.ArrayList
 $global:Tasks = @{}
+$global:TaskPrincipals = @{}
 $global:WslInstalled = $false
 function global:Record([string]$s) { [void]$global:Calls.Add($s) }
 function global:nvidia-smi { $global:LASTEXITCODE = 0; 'NVIDIA GeForce RTX 3090, 566.36, 24576, 1200, 23376' }
@@ -134,7 +135,7 @@ function global:New-ScheduledTaskAction { param($Execute, $Argument) [pscustomob
 function global:New-ScheduledTaskTrigger { [pscustomobject]@{ Args = "$args" } }
 function global:New-ScheduledTaskPrincipal { [pscustomobject]@{ Args = "$args" } }
 function global:New-ScheduledTaskSettingsSet { [pscustomobject]@{ Args = "$args" } }
-function global:Register-ScheduledTask { param($TaskName, $Action, $Trigger, $Principal, $Settings, [switch]$Force) $global:Tasks[$TaskName] = $Action.Argument; Record "Register-ScheduledTask $TaskName" }
+function global:Register-ScheduledTask { param($TaskName, $Action, $Trigger, $Principal, $Settings, [switch]$Force) $global:Tasks[$TaskName] = $Action.Argument; $global:TaskPrincipals[$TaskName] = [string]$Principal.Args; Record "Register-ScheduledTask $TaskName" }
 function global:Unregister-ScheduledTask { param($TaskName, $Confirm) $global:Tasks.Remove($TaskName); Record "Unregister-ScheduledTask $TaskName" }
 function global:Start-Process { param($FilePath, $ArgumentList, [switch]$Wait, [switch]$PassThru, $Verb) Record "Start-Process $FilePath $ArgumentList"; if ($PassThru) { [pscustomobject]@{ ExitCode = 0 } } }
 function global:docker {
@@ -153,7 +154,7 @@ $state = Get-Content -Encoding UTF8 -Raw (Join-Path $aiRoot 'install-state.json'
 Assert-That ($code1 -eq 3010) "phase 1 exits 3010 for reboot (got $code1)"
 Assert-That ($global:Tasks.ContainsKey('LocalAI-Install-Resume')) 'resume task registered'
 Assert-That ($global:Tasks['LocalAI-Install-Resume'] -match '-SkipCoder:\$false') 'an explicit false switch survives the reboot/resume relaunch'
-Assert-That ($global:Tasks['LocalAI-Install-Resume'] -match "-Resume" -and $global:Tasks['LocalAI-Install-Resume'] -match [regex]::Escape((Join-Path $aiRoot 'Scripts'))) 'resume task runs the stable copy in AI\Scripts with -Resume'
+Assert-That ($global:Tasks['LocalAI-Install-Resume'] -match "-Resume" -and $global:Tasks['LocalAI-Install-Resume'] -match [regex]::Escape((Join-Path $env:ProgramFiles 'LocalAI'))) 'resume task runs the administrators-only copy in Program Files\LocalAI with -Resume'
 Assert-That (@($global:Calls | Where-Object { $_ -like 'shutdown /r /t 60*' }).Count -eq 1) 'reboot scheduled with 60 s warning'
 Assert-That ($null -ne $state.stages.Tuning -and $null -eq $state.stages.WSL) 'stages up to Tuning done, WSL pending'
 Assert-That (Test-Path (Join-Path $aiRoot 'Scripts/lib/LocalAI.psm1')) 'scripts copied to AI\Scripts'
@@ -195,9 +196,14 @@ Assert-That ((& /usr/bin/docker run --rm -v open-webui:/d:ro alpine:3.20 cat /d/
 Assert-That ((& /usr/bin/docker inspect -f '{{.HostConfig.RestartPolicy.Name}}' (& /usr/bin/docker ps -aq --filter 'name=^/open-webui-legacy-')) -eq 'no') 'legacy container restart policy disabled'
 Assert-That ($null -eq (& /usr/bin/docker ps -a --filter 'name=^/open-webui$' --format '{{.ID}}') -and (& /usr/bin/docker ps -a --filter 'name=^/open-webui-legacy-' --format '{{.Status}}') -match 'Exited') 'legacy container stopped and renamed (kept)'
 Assert-That (@($global:Calls | Where-Object { $_ -like 'docker compose*up -d*' }).Count -ge 2) 'compose up ran (initial + after password removal)'
-$sidPat = '*:(OI)(CI)'
-Assert-That (@($global:Calls | Where-Object { $_ -like ('icacls ' + $aiRoot + ' /inheritance:r*' + $sidPat + 'F*') }).Count -ge 1) 'AI folder locked to the user, SYSTEM and Administrators'
-Assert-That (@($global:Calls | Where-Object { $_ -like ('icacls ' + (Join-Path $aiRoot 'Scripts') + ' /inheritance:r*' + $sidPat + 'RX*') }).Count -ge 1) 'Scripts read-only for the user (elevated tasks run them)'
+# Match the user's own grant (the SYSTEM/Administrators grants would match a loose pattern).
+$userSid = 'S-1-5-21-1-2-3-1001'
+Assert-That (@($global:Calls | Where-Object { $_ -like ('icacls ' + $aiRoot + ' /inheritance:r /grant:r *' + $userSid + ':(OI)(CI)F *S-1-5-18:(OI)(CI)F *S-1-5-32-544:(OI)(CI)F') }).Count -ge 1) 'AI folder locked to the user, SYSTEM and Administrators'
+Assert-That (@($global:Calls | Where-Object { $_ -like ('icacls ' + (Join-Path $aiRoot 'Scripts') + ' /inheritance:r /grant:r *' + $userSid + ':(OI)(CI)RX *') }).Count -ge 1) 'Scripts read-only for the user'
+$elevated = Join-Path $env:ProgramFiles 'LocalAI'
+Assert-That ((Test-Path (Join-Path $elevated 'Install-LocalAI.ps1')) -and (Test-Path (Join-Path $elevated 'lib/LocalAI.psm1'))) 'resume copy of the toolkit in Program Files\LocalAI'
+Assert-That (@($global:Calls | Where-Object { $_ -like ('icacls ' + $elevated + ' /inheritance:r /grant:r *' + $userSid + ':(OI)(CI)RX *') }).Count -ge 1) 'that copy is read-only for the user'
+Assert-That ([string]$global:TaskPrincipals['LocalAI-Backup-OpenWebUI'] -match 'Limited' -and [string]$global:TaskPrincipals['LocalAI-Backup-OpenWebUI'] -notmatch 'Highest') 'nightly backup task runs non-elevated'
 Assert-That (@($global:Calls | Where-Object { $_ -like 'docker compose*pull*' }).Count -ge 1 -and @($global:Calls | Where-Object { $_ -like 'docker compose*pull*' -and $_ -notlike '*--policy missing*' }).Count -eq 0) 'image pulls reuse local images (--policy missing)'
 Assert-That (Test-Path (Join-Path $env:USERPROFILE '.wslconfig')) '.wslconfig created'
 Assert-That ((Get-Content -Encoding UTF8 -Raw (Join-Path $aiRoot 'Stack/searxng/settings.yml')) -notmatch '__SEARXNG_SECRET__') 'SearXNG secret filled in'

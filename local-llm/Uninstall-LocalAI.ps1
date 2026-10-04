@@ -208,6 +208,11 @@ if ($desktop) {
     if (Test-Path -LiteralPath $lnk) { Invoke-Step 'desktop shortcut' { Remove-Item -LiteralPath $lnk -Force; Write-LaiLog OK 'Removed desktop shortcut' } }
 }
 
+# The administrators-only copy the resume task runs (see Install-LocalAI.ps1, $ElevatedDir).
+if ($env:ProgramFiles) {
+    $elevated = Join-Path $env:ProgramFiles 'LocalAI'
+    if (Test-Path -LiteralPath $elevated) { Invoke-Step $elevated { Remove-Item -LiteralPath $elevated -Recurse -Force; Write-LaiLog OK "Deleted $elevated" } }
+}
 if ($env:ProgramData) {
     $menu = Join-Path $env:ProgramData 'Microsoft\Windows\Start Menu\Programs\Local AI'
     if (Test-Path -LiteralPath $menu) { Invoke-Step 'Start-menu folder' { Remove-Item -LiteralPath $menu -Recurse -Force; Write-LaiLog OK "Removed Start-menu folder 'Local AI'" } }
