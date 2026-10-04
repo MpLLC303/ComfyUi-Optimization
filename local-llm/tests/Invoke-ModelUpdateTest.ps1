@@ -104,6 +104,8 @@ try {
     Assert-That ((Get-Digest $tag) -eq $before) 'model unchanged'
     Assert-That (-not (Test-LaiOllamaModel -BaseUrl $OllamaUrl -Name "$tag-prevnew")) 'temporary reference cleaned up after the failure'
 
+    Assert-That ((Test-LaiRegistryReachable -Url "$OllamaUrl/v2/") -and -not (Test-LaiRegistryReachable -Url 'http://127.0.0.1:1/v2/' -TimeoutSec 3)) 'registry probe: an HTTP 404 counts as online, a refused connection as offline'
+
     Write-Host "`n=== 4. -DropPrevious ===" -ForegroundColor Cyan
     Invoke-Update @() $variant | Out-Null
     Assert-That (Test-LaiOllamaModel -BaseUrl $OllamaUrl -Name $prev) '-prev kept again after another re-publish'

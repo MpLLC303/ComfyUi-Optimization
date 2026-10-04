@@ -44,22 +44,58 @@ function ConvertTo-LaiHashtable {
     return $InputObject
 }
 
-function Read-LaiState {
-    param([Parameter(Mandatory)][string]$Path)
-    if (-not (Test-Path -LiteralPath $Path)) { return @{} }
-    $raw = Get-Content -LiteralPath $Path -Raw
-    if ([string]::IsNullOrWhiteSpace($raw)) { return @{} }
-    $h = ConvertTo-LaiHashtable ($raw | ConvertFrom-Json)
-    if ($null -eq $h) { return @{} }
+function ConvertFrom-LaiStateFile([string]$Path) {
+    # $null when missing, empty or unreadable JSON; otherwise a hashtable.
+    if (-not (Test-Path -LiteralPath $Path)) { return $null }
+    $raw = Get-Content -LiteralPath $Path -Raw -ErrorAction Stop
+    if ([string]::IsNullOrWhiteSpace($raw)) { return $null }
+    try { $h = ConvertTo-LaiHashtable ($raw | ConvertFrom-Json -ErrorAction Stop) } catch { return $null }
+    if ($h -isnot [hashtable]) { return $null }
     return $h
 }
 
+function Read-LaiState {
+    # A state file cut short (power loss, full disk) must not stop every script that reads it: fall
+    # back to the previous good copy that Save-LaiState keeps (<file>.bak), else start empty. The
+    # damaged file is kept as <file>.bad for inspection.
+    param([Parameter(Mandatory)][string]$Path)
+    if (-not (Test-Path -LiteralPath $Path)) { return @{} }
+    $h = ConvertFrom-LaiStateFile $Path
+    if ($null -ne $h) { return $h }
+    $raw = Get-Content -LiteralPath $Path -Raw -ErrorAction SilentlyContinue
+    if ([string]::IsNullOrWhiteSpace($raw)) { $bak = ConvertFrom-LaiStateFile "$Path.bak"; if ($null -ne $bak) { return $bak }; return @{} }
+    try { Copy-Item -LiteralPath $Path -Destination "$Path.bad" -Force -ErrorAction Stop } catch { Write-Verbose 'could not keep the damaged copy' }
+    $bak = ConvertFrom-LaiStateFile "$Path.bak"
+    if ($null -ne $bak) {
+        Write-LaiLog WARN "$(Split-Path -Leaf $Path) was damaged (kept as .bad); using the previous saved copy."
+        return $bak
+    }
+    Write-LaiLog WARN "$(Split-Path -Leaf $Path) was damaged (kept as .bad) and there is no earlier copy; starting from empty settings."
+    return @{}
+}
+
 function Save-LaiState {
+    # Atomic: write a temp file next to it, then swap it in (the old version becomes <file>.bak), so a
+    # crash mid-write never leaves a half-written file. -ErrorAction Stop everywhere: inside a module
+    # the caller's $ErrorActionPreference does not apply, and a failed save must not pass silently.
     param([Parameter(Mandatory)][hashtable]$State, [Parameter(Mandatory)][string]$Path)
     $dir = Split-Path -Parent $Path
-    if ($dir -and -not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }
+    if ($dir -and -not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Force -Path $dir -ErrorAction Stop | Out-Null }
     $State['updated'] = (Get-Date).ToString('s')
-    ConvertTo-Json -InputObject $State -Depth 20 | Set-Content -LiteralPath $Path -Encoding UTF8
+    $json = ConvertTo-Json -InputObject $State -Depth 20
+    $tmp = "$Path.tmp"
+    [System.IO.File]::WriteAllText($tmp, $json, (New-Object System.Text.UTF8Encoding($false)))
+    for ($i = 1; $i -le 5; $i++) {
+        try {
+            if (Test-Path -LiteralPath $Path) { [System.IO.File]::Replace($tmp, $Path, "$Path.bak") }
+            else { [System.IO.File]::Move($tmp, $Path) }
+            return
+        } catch {
+            # A reader holding the file open (antivirus, another script) blocks the swap briefly.
+            if ($i -eq 5) { throw "Could not save $Path : $($_.Exception.Message)" }
+            Start-Sleep -Milliseconds (200 * $i)
+        }
+    }
 }
 
 function New-LaiSecret {
@@ -292,6 +328,25 @@ function Resolve-LaiModelName {
     return "${Name}:latest"
 }
 
+function Get-LaiModelManifestPath {
+    <#
+    .SYNOPSIS
+        Where Ollama keeps a model's manifest under its models folder:
+        <dir>\manifests\<host>\<namespace>\<name>\<tag> (host registry.ollama.ai, namespace library
+        when the name has none). Lets the installer see installed models while Ollama is not running.
+    #>
+    param([Parameter(Mandatory)][string]$ModelDir, [Parameter(Mandatory)][string]$Name)
+    $full = Resolve-LaiModelName $Name
+    $i = $full.LastIndexOf(':')
+    $repo = $full.Substring(0, $i); $tag = $full.Substring($i + 1)
+    $parts = @($repo.Split('/'))
+    if ($parts.Count -ge 2 -and $parts[0].Contains('.')) { $hostName = $parts[0]; $parts = @($parts | Select-Object -Skip 1) } else { $hostName = 'registry.ollama.ai' }
+    if ($parts.Count -eq 1) { $parts = @('library') + $parts }
+    $p = Join-Path (Join-Path $ModelDir 'manifests') $hostName
+    foreach ($seg in $parts) { $p = Join-Path $p $seg }
+    return (Join-Path $p $tag)
+}
+
 function Get-LaiOllamaVersion {
     param([string]$BaseUrl = 'http://127.0.0.1:11434')
     return (Invoke-LaiApi -Uri "$BaseUrl/api/version" -TimeoutSec 10).version
@@ -362,6 +417,18 @@ function Invoke-LaiOllamaPull {
         }
     } | Out-Null
     if (-not (Test-LaiOllamaModel -BaseUrl $BaseUrl -Name $Name)) { throw "Model $Name is still missing after pull." }
+}
+
+function Test-LaiRegistryReachable {
+    # Any HTTP answer (even 401/404) means the network path works; only a connection or name
+    # resolution failure counts as offline. Used to stop retrying every model when the PC is offline.
+    param([string]$Url = 'https://registry.ollama.ai/v2/', [int]$TimeoutSec = 8)
+    try { Invoke-WebRequest -Uri $Url -Method Head -TimeoutSec $TimeoutSec -UseBasicParsing -ErrorAction Stop | Out-Null; return $true }
+    catch {
+        $resp = $null
+        try { $resp = $_.Exception.Response } catch { $resp = $null }
+        return ($null -ne $resp)
+    }
 }
 
 function Get-LaiOllamaLoaded {
@@ -832,9 +899,13 @@ function Invoke-LaiModelSetup {
         [string]$Fingerprint = '',
         [int]$MinFreeMiB = 768,
         [switch]$Retune,
-        [switch]$AllowCpu
+        [switch]$AllowCpu,
+        # Runs once, right before the first model is loaded (e.g. wait until the GPU is idle). A re-run
+        # that reuses every tuning loads nothing, so it never waits on a busy GPU.
+        [scriptblock]$BeforeFirstLoad = $null
     )
     $results = @{}
+    $loadedOnce = $false
     foreach ($m in $Models) {
         Write-LaiLog STEP "Tuning $($m.Display) ($($m.Source))"
         $info = Get-LaiOllamaModelInfo -BaseUrl $BaseUrl -Name $m.Source
@@ -842,6 +913,18 @@ function Invoke-LaiModelSetup {
         if ($Previous.ContainsKey($m.Key)) { $prev = $Previous[$m.Key] }
         $reuse = (-not $Retune) -and $prev -and ($prev['Source'] -eq $m.Source) -and ($prev['Fingerprint'] -eq $Fingerprint) -and
             ($prev['MaxContext'] -eq $m.MaxContext) -and (Test-LaiOllamaModel -BaseUrl $BaseUrl -Name $m.Alias)
+        if ($reuse -and $prev['TokensPerSec'] -and $null -ne $prev['GpuPercent']) {
+            # Nothing that decides the fit changed: refresh the alias (system prompt, parameters) and
+            # keep the measured numbers. The acceptance test at the end measures speed again.
+            $ctx = [int]$prev['Context']
+            Set-LaiOllamaDerivedModel -BaseUrl $BaseUrl -Name $m.Alias -From $m.Source -NumCtx $ctx -Parameters $m.Parameters -System $SystemPrompt
+            Write-LaiLog OK ("  {0}: reusing tuned context {1} ({2}% GPU, {3} tok/s when measured; -Retune measures again)" -f $m.Alias, $ctx, $prev['GpuPercent'], $prev['TokensPerSec'])
+            $results[$m.Key] = $prev.Clone()
+            $results[$m.Key]['Alias'] = $m.Alias
+            $results[$m.Key]['Tools'] = ($info.Capabilities -contains 'tools')
+            continue
+        }
+        if (-not $loadedOnce) { $loadedOnce = $true; if ($BeforeFirstLoad) { & $BeforeFirstLoad } }
         if ($reuse) {
             $ctx = [int]$prev['Context']
             Write-LaiLog INFO "  reusing tuned context $ctx (use -Retune to measure again)"

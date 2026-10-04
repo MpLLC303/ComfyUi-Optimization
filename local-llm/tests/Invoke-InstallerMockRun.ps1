@@ -212,9 +212,14 @@ $cfgFile = Join-Path $aiRoot 'localai-config.json'
 $cfgObj = Get-Content -Raw $cfgFile | ConvertFrom-Json
 $cfgObj | Add-Member -NotePropertyName ComfyUIPath -NotePropertyValue 'D:\ComfyUI\run_nvidia_gpu.bat' -Force
 $cfgObj | ConvertTo-Json -Depth 5 | Set-Content $cfgFile
+# An older render_guard.py is deployed: the re-run must restart the guard (compose up would not).
+$restartCalls = { @($global:Calls | Where-Object { $_ -like 'docker compose*restart render-guard*' }).Count }
+Assert-That ((& $restartCalls) -eq 0) 'fresh install: no render-guard restart needed'
+Add-Content -LiteralPath (Join-Path $aiRoot 'Stack/render-guard/render_guard.py') -Value '# older version'
 $sw = [Diagnostics.Stopwatch]::StartNew()
 & (Join-Path $aiRoot 'Scripts/Install-LocalAI.ps1') -AIRoot $aiRoot -SkipTests
 $code3 = $LASTEXITCODE
+Assert-That ((& $restartCalls) -eq 1) 'changed render_guard.py: the guard is restarted to load it'
 Assert-That ($code3 -eq 0) "re-run completes (exit $code3) in $([int]$sw.Elapsed.TotalSeconds) s"
 Assert-That (@(Get-ChildItem (Join-Path $aiRoot 'Backups') -Filter '*pre-compose*').Count -eq 1) 'no second legacy migration on re-run'
 $envAfter = Get-Content $envFile
@@ -239,11 +244,25 @@ $st.flags.PSObject.Properties.Remove('params')
 $st | ConvertTo-Json -Depth 20 | Set-Content (Join-Path $aiRoot 'install-state.json')
 & (Join-Path $aiRoot 'Scripts/Install-LocalAI.ps1') -AIRoot $aiRoot -SkipTests -TrialModels none
 Assert-That ($LASTEXITCODE -eq 0) "phase 4 completes (exit $LASTEXITCODE)"
+Assert-That ((& $restartCalls) -eq 1) 'unchanged render_guard.py: no restart'
 Assert-That (@((Get-Content -Raw (Join-Path $aiRoot 'install-state.json') | ConvertFrom-Json).flags.selectedModels) -notcontains 'trial-ok') '-TrialModels none deselects the trial'
 $tp = Get-TestPreset 'trial-standin'
 Assert-That ($tp -and $tp.meta.hidden -eq $true) 'deselected trial preset is hidden (kept for old chats)'
 $p4 = (Get-Content -Raw (Join-Path $aiRoot 'install-state.json') | ConvertFrom-Json).flags.params
 Assert-That ($p4.SkipVision -eq $true -and $p4.SkipCoder -eq $true) 'older install: skips inferred from the installed models (no surprise 20 GB downloads)'
+
+# ---- phase 5: a resume that keeps failing stops starting itself -----------------------------------
+Write-Host "`n=== PHASE 5: failing resume gives up after two sign-ins ===" -ForegroundColor Cyan
+$global:Tasks['LocalAI-Install-Resume'] = $resumeCmd
+$env:LOCALAI_TEST_FAIL_STAGE = 'Ollama'
+& (Join-Path $aiRoot 'Scripts/Install-LocalAI.ps1') -AIRoot $aiRoot -SkipTests -Resume
+$c5a = $LASTEXITCODE
+Assert-That ($c5a -ne 0 -and $global:Tasks.ContainsKey('LocalAI-Install-Resume')) "first failed resume (exit $c5a) keeps the task for one more sign-in"
+& (Join-Path $aiRoot 'Scripts/Install-LocalAI.ps1') -AIRoot $aiRoot -SkipTests -Resume
+Assert-That (-not $global:Tasks.ContainsKey('LocalAI-Install-Resume')) 'second failed resume removes the task'
+$env:LOCALAI_TEST_FAIL_STAGE = ''
+& (Join-Path $aiRoot 'Scripts/Install-LocalAI.ps1') -AIRoot $aiRoot -SkipTests
+Assert-That ($LASTEXITCODE -eq 0 -and -not (Get-Content -Raw (Join-Path $aiRoot 'install-state.json') | ConvertFrom-Json).flags.PSObject.Properties['resumeFailures']) 'a good run clears the failure count'
 
 & /usr/bin/docker rm -f open-webui 2>$null | Out-Null
 & /usr/bin/docker ps -aq --filter 'name=^/open-webui-legacy-' | ForEach-Object { & /usr/bin/docker rm -f $_ | Out-Null }

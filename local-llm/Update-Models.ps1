@@ -135,8 +135,10 @@ if ($Rollback.Count -gt 0) {
     if ($changed.Count -eq 0) { throw "Nothing to roll back for: $($Rollback -join ', ')" }
     Save-Pins
 } else {
+    $offline = $false
     foreach ($m in $catalog.Models) {
         if ($pinned -contains $m.Key) { Write-LaiLog WARN "$($m.Display): pinned after a rollback, not updated (Update-Models.ps1 -Unpin $($m.Key) to allow it)"; continue }
+        if ($offline) { Write-LaiLog WARN "  $($m.Display): skipped, no connection to the model registry"; $failedPulls += $m.Display; continue }
         $old = Get-LaiOllamaDigest -BaseUrl $ollamaUrl -Name $m.Source
         Write-LaiLog STEP "Checking $($m.Source)"
         # Keep a reference to the current version first: a pull deletes files no tag points to.
@@ -150,6 +152,10 @@ if ($Rollback.Count -gt 0) {
                 # Keep going: the models already updated in this run still get re-tuned below.
                 Write-LaiLog WARN "  $($m.Display): download failed, kept the current version ($((Get-LaiHttpErrorText $_)))"
                 $failedPulls += $m.Display
+                # Offline: the remaining models would each spend ~30 s in retries for nothing.
+                $probeUrl = 'https://registry.ollama.ai/v2/'
+                if ($env:LOCALAI_TEST_REGISTRY_URL) { $probeUrl = $env:LOCALAI_TEST_REGISTRY_URL }
+                if (-not (Test-LaiRegistryReachable -Url $probeUrl)) { $offline = $true; Write-LaiLog WARN '  The model registry is unreachable (offline?); skipping the remaining downloads.' }
                 continue
             }
             $new = Get-LaiOllamaDigest -BaseUrl $ollamaUrl -Name $m.Source

@@ -43,6 +43,17 @@ $st = Read-LaiState -Path $statePath
 Assert-That ($st -is [hashtable]) 'Read-LaiState returns a hashtable'
 Assert-That (@($st['failed']).Count -eq 1 -and @($st['failed'])[0] -eq 'Docker') 'single-element array survives the round trip'
 Assert-That ($st['nested'] -is [hashtable] -and $st['nested']['a'] -eq 1) 'nested objects become hashtables'
+Save-LaiState -State @{ gen = 2 } -Path $statePath
+Assert-That ((Read-LaiState -Path $statePath)['gen'] -eq 2 -and (Read-LaiState -Path "$statePath.bak").ContainsKey('nested')) 'a save keeps the previous version as .bak'
+Assert-That (-not (Test-Path -LiteralPath "$statePath.tmp")) 'no temp file left behind'
+# A write cut short by a power loss or a full disk.
+Set-Content -LiteralPath $statePath -Value '{"gen": 3, "fail'
+$st = Read-LaiState -Path $statePath
+Assert-That ($st.ContainsKey('nested') -and (Test-Path -LiteralPath "$statePath.bad")) 'damaged file: previous copy used, damaged one kept as .bad'
+Remove-Item -LiteralPath "$statePath.bak"
+Assert-That ((Read-LaiState -Path $statePath).Count -eq 0) 'damaged file and no .bak: empty settings instead of a crash'
+Save-LaiState -State @{ gen = 4 } -Path $statePath
+Assert-That ((Read-LaiState -Path $statePath)['gen'] -eq 4) 'saving over a damaged file works'
 
 # ---- UTF-8 request bodies ----------------------------------------------------------------------
 Write-Host "`n=== Invoke-LaiApi UTF-8 body ===" -ForegroundColor Cyan
@@ -131,6 +142,20 @@ foreach ($c in $cases) {
     $a = $c.Args
     $got = Get-LaiExecutionPolicyAction @a
     Assert-That ($got -eq $c.Want) "policy action for $(($a.GetEnumerator() | ForEach-Object { "$($_.Key)=$($_.Value)" }) -join ',') -> $got (want $($c.Want))"
+}
+
+Write-Host "`n=== model manifest paths ===" -ForegroundColor Cyan
+$md = Join-Path $Work 'models'
+$sep = [System.IO.Path]::DirectorySeparatorChar
+foreach ($c in @(
+        @{ Name = 'huihui_ai/qwen3-abliterated:32b'; Want = 'manifests/registry.ollama.ai/huihui_ai/qwen3-abliterated/32b' }
+        @{ Name = 'qwen3:8b'; Want = 'manifests/registry.ollama.ai/library/qwen3/8b' }
+        @{ Name = 'nomic-embed-text'; Want = 'manifests/registry.ollama.ai/library/nomic-embed-text/latest' }
+        @{ Name = 'hf.co/bartowski/Qwen3-8B-GGUF:Q4_K_M'; Want = 'manifests/hf.co/bartowski/Qwen3-8B-GGUF/Q4_K_M' }
+    )) {
+    $got = Get-LaiModelManifestPath -ModelDir $md -Name $c.Name
+    $want = Join-Path $md ($c.Want -replace '/', $sep)
+    Assert-That ($got -eq $want) "manifest path for $($c.Name)"
 }
 
 Write-Host "`n=== image pull policy ===" -ForegroundColor Cyan

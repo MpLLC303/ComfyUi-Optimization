@@ -47,10 +47,12 @@ only re-applies it (it warns you). If your install is older than the Start-menu 
 one-liner.
 
 A re-run is safe, and it keeps your chats, models, image versions set by `Update-OpenWebUI.ps1`,
-render-guard mode and trial models. It is **not** instant:
-- **Time:** about 10-20 minutes.
-- **ComfyUI and games:** close them first. Every model is loaded and checked on the GPU, and the
-  installer waits up to 10 minutes for other GPU apps to let go.
+render-guard mode and trial models.
+- **Time:** a few minutes when nothing changed. Models that are installed and already passed the
+  GPU check are not loaded again, and the stored context tuning is reused. The health check at the
+  end still loads each model once to measure its speed (skip it with `-SkipTests`).
+- **ComfyUI and games:** they matter only when something has to be measured (a new model, a driver
+  update, `-Retune`). Then the installer waits up to 10 minutes for other GPU apps to let go.
 - **NVIDIA driver updates:** after one, the models are re-tuned automatically, which takes longer.
 - **Open WebUI:** it restarts briefly for the backup step.
 - **Your settings:** on the four presets the installer refreshes only what it manages (base model,

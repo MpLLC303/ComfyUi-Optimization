@@ -141,13 +141,14 @@ try {
 
     Write-Host "`n=== 3. -RemoveData -RemoveModels ===" -ForegroundColor Cyan
     New-Stack
+    'x' | Set-Content (Join-Path $aiRoot 'localai-config.json.bak')
     $code = Invoke-Uninstall @('-Force', '-RemoveData', '-RemoveModels')
     Assert-That ($code -eq 0) "full removal exits 0 (got $code)"
     Assert-That (-not (Test-Volume 'open-webui')) 'data volume deleted'
     $del = @(); if (Test-Path $deletes) { $del = @(Get-Content $deletes) }
     Assert-That ($del -contains $sourceModel) 'catalog source model deleted'
     Assert-That ($del -notcontains 'other/model:latest') 'unrelated model kept'
-    Assert-That (-not (Test-Path (Join-Path $aiRoot 'Stack')) -and -not (Test-Path (Join-Path $aiRoot 'Secrets')) -and -not (Test-Path (Join-Path $aiRoot 'localai-config.json'))) 'stack, secrets and config deleted'
+    Assert-That (-not (Test-Path (Join-Path $aiRoot 'Stack')) -and -not (Test-Path (Join-Path $aiRoot 'Secrets')) -and -not (Test-Path (Join-Path $aiRoot 'localai-config.json')) -and -not (Test-Path (Join-Path $aiRoot 'localai-config.json.bak'))) 'stack, secrets and config (with its .bak) deleted'
     Assert-That (@(Get-ChildItem (Join-Path $aiRoot 'Backups') -Filter '*-pre-uninstall.tar.gz').Count -eq 1) 'Backups folder kept with the final backup'
 
     Write-Host "`n=== 4. failing backup aborts ===" -ForegroundColor Cyan

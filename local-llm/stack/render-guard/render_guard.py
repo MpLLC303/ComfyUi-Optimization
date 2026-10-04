@@ -25,6 +25,7 @@ import http.client
 import json
 import os
 import select
+import signal
 import socket
 import sys
 import threading
@@ -431,7 +432,15 @@ def main():
     threading.Thread(target=_render_watcher, daemon=True).start()
     log('render-guard listening on :%d -> %s, mode=%s, ComfyUI at %s' % (
         CONFIG['listen_port'], CONFIG['upstream'], CONFIG['mode'], ', '.join(CONFIG['comfyui_urls'])))
-    srv.serve_forever()
+    # As PID 1 in its container, Python gets no default SIGTERM handling: without this, every
+    # 'docker stop' waits its full 10 s grace period and then kills the process.
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        log('render-guard stopping')
 
 
 if __name__ == '__main__':

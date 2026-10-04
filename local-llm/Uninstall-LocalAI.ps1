@@ -215,7 +215,9 @@ if ($env:ProgramData) {
 
 if ($RemoveData) {
     $here = (Resolve-Path -LiteralPath $PSScriptRoot).Path
-    foreach ($item in @('Stack', 'Secrets', 'Logs', 'Downloads', 'install-state.json', 'localai-config.json', 'watch-state.json', 'install-report.md')) {
+    $stateFiles = @()
+    foreach ($j in 'install-state.json', 'localai-config.json', 'watch-state.json') { $stateFiles += @($j, "$j.bak", "$j.bad", "$j.tmp") }
+    foreach ($item in (@('Stack', 'Secrets', 'Logs', 'Downloads', 'install-report.md') + $stateFiles)) {
         $path = Join-Path $AIRoot $item
         if (-not (Test-Path -LiteralPath $path)) { continue }
         Invoke-Step $path { Remove-Item -LiteralPath $path -Recurse -Force; Write-LaiLog OK "Deleted $path" }

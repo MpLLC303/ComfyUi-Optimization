@@ -98,6 +98,20 @@ try {
     $ErrorActionPreference = $prevPref
     Assert-That (Test-Path -LiteralPath $rollbackArchive) '60-day-old rollback archive survives pruning'
 
+    Write-Host "`n=== 3b. a failed backup leaves no archive that looks fresh ===" -ForegroundColor Cyan
+    $bdir = Join-Path $aiRoot 'Backups'
+    $countBefore = @(Get-ChildItem -LiteralPath $bdir -Filter 'open-webui-*.tar.gz').Count
+    Set-Content -LiteralPath (Join-Path $bdir 'incomplete-open-webui-20200101-000000.tar.gz') -Value 'left by a crash'
+    Invoke-DockerText @('volume', 'create', 'lai-empty-test') | Out-Null
+    $prevPref = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
+    & pwsh -NoProfile -File (Join-Path $src 'Backup-OpenWebUI.ps1') -AIRoot $aiRoot -Volume 'lai-empty-test' -Container 'lai-no-such-container' -SkipDeepVerify -NoPrune 2>&1 | Out-Null
+    $code = $LASTEXITCODE
+    $ErrorActionPreference = $prevPref
+    Invoke-DockerText @('volume', 'rm', 'lai-empty-test') | Out-Null
+    Assert-That ($code -ne 0) "backup of a volume without webui.db fails (exit $code)"
+    Assert-That (@(Get-ChildItem -LiteralPath $bdir -Filter 'open-webui-*.tar.gz').Count -eq $countBefore) 'no new archive counted as a backup'
+    Assert-That (@(Get-ChildItem -LiteralPath $bdir -Filter 'incomplete-*').Count -eq 0) 'the half-written file and an older leftover are removed'
+
     Write-Host "`n=== 4. -Rollback ===" -ForegroundColor Cyan
     Set-Marker 'DATA-v2'
     $r = Invoke-Update @('-Rollback', '-Force')

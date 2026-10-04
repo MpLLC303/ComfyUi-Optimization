@@ -201,6 +201,7 @@ function Invoke-Stage {
     param([Parameter(Mandatory)][string]$Name, [Parameter(Mandatory)][scriptblock]$Body)
     Write-Host ''
     Write-LaiLog STEP ('=' * 12 + " $Name " + '=' * 12)
+    if ($env:LOCALAI_TEST_FAIL_STAGE -and $env:LOCALAI_TEST_FAIL_STAGE -eq $Name) { throw "Test hook: stage $Name failed" }
     & $Body
     $State.stages[$Name] = (Get-Date).ToString('s')
     Save-State
@@ -315,6 +316,7 @@ function Request-Reboot {
     param([Parameter(Mandatory)][string]$Reason)
     Register-ResumeTask
     $State.flags['rebootRequestedAt'] = (Get-Date).ToString('s')
+    $State.flags['resumeFailures'] = 0
     Save-State
     Write-LaiLog WARN "Reboot required: $Reason"
     if ($NoReboot) {
@@ -497,7 +499,15 @@ Invoke-Stage 'Preflight' {
     $selected = @()
     $freeGB = Get-FreeGB $target
     $present = @()
-    try { $present = Get-LaiOllamaModelNames -BaseUrl $OllamaUrl } catch { Write-Verbose 'Ollama not installed yet' }
+    try { $present = Get-LaiOllamaModelNames -BaseUrl $OllamaUrl }
+    catch {
+        # Ollama not running (resume at sign-in, after gaming mode) or not installed yet: read the
+        # model folder instead, so installed models are not charged their full download size.
+        foreach ($cm in $catalogAll.Models) {
+            if (Test-Path -LiteralPath (Get-LaiModelManifestPath -ModelDir $target -Name $cm.Source)) { $present += (Resolve-LaiModelName $cm.Source) }
+        }
+        if ($present.Count) { Write-LaiLog INFO "Ollama is not answering yet; found $($present.Count) installed model(s) in $target" }
+    }
     $budget = $freeGB - 15
     foreach ($m in ($catalogAll.Models | Sort-Object { $_.Optional })) {
         $need = $m.DownloadGB
@@ -616,12 +626,18 @@ Invoke-Stage 'Ollama' {
 Invoke-Stage 'Models' {
     # The ollama CLI is a client of the local server; never let it target 0.0.0.0 (LAN fallback mode).
     $env:OLLAMA_HOST = '127.0.0.1:11434'
-    Stop-LaiOllamaModels -BaseUrl $OllamaUrl
-    Wait-LaiGpuIdle -MaxUsedMiB $MaxBusyVramMiB -TimeoutSec ($GpuWaitMinutes * 60) | Out-Null
     $droppedTrials = @()
+    $gpuReady = $false
     foreach ($m in ($Catalog.Models | Sort-Object { $_.Optional }, { $_.DownloadGB })) {
       try {
         if (Test-LaiOllamaModel -BaseUrl $OllamaUrl -Name $m.Source) {
+            # Installed and already proven on 100% GPU by an earlier run: no 8K checkpoint load again
+            # (it costs a 9-20 GB load per model and waits on a busy GPU). -Retune checks again.
+            $t = $null; if ($State.tuning.ContainsKey($m.Key)) { $t = $State.tuning[$m.Key] }
+            if (-not $Retune -and $t -and $t['Source'] -eq $m.Source -and ([int]$t['GpuPercent'] -ge 100 -or $AllowCpu)) {
+                Write-LaiLog OK "$($m.Source) already installed and checked"
+                continue
+            }
             Write-LaiLog OK "$($m.Source) already installed"
         } else {
             $free = Get-FreeGB $State.flags['modelDir']
@@ -632,6 +648,8 @@ Invoke-Stage 'Models' {
         }
         # Checkpoint (guide Steps 10-12, 14): it must load entirely on the RTX 3090 at a modest context.
         Stop-LaiOllamaModels -BaseUrl $OllamaUrl
+        # Once, and only when something is loaded (Ollama's own models are unloaded first, so they don't count as busy).
+        if (-not $gpuReady) { Wait-LaiGpuIdle -MaxUsedMiB $MaxBusyVramMiB -TimeoutSec ($GpuWaitMinutes * 60) | Out-Null; $gpuReady = $true }
         $load = Invoke-LaiOllamaLoad -BaseUrl $OllamaUrl -Name $m.Source -NumCtx 8192 -KeepAlive '1m'
         $gpu = Get-LaiGpuInfo
         Write-LaiLog INFO ("  loaded at 8K context: {0}% GPU, {1} GiB, VRAM used {2}/{3} MiB" -f $load.GpuPercent, $load.SizeGiB, $gpu.UsedMiB, $gpu.TotalMiB)
@@ -666,12 +684,16 @@ Invoke-Stage 'Models' {
 
 #region 4. Context tuning + tuned aliases (guide Parts 5, 10, 27 automated) ---------------
 Invoke-Stage 'Tuning' {
-    Stop-LaiOllamaModels -BaseUrl $OllamaUrl
-    $gpu = Wait-LaiGpuIdle -MaxUsedMiB $MaxBusyVramMiB -TimeoutSec ($GpuWaitMinutes * 60)
-    if (-not $gpu) { $gpu = Get-LaiGpuInfo }
+    $gpu = Get-LaiGpuInfo
     $fingerprint = "driver=$($gpu.DriverVersion);kv=$KvCacheType;overhead=$GpuOverheadMiB;free=$MinFreeVramMiB"
+    # Only when something is measured: unload, then wait for the GPU (a ComfyUI render may hold it).
+    $beforeLoad = {
+        Stop-LaiOllamaModels -BaseUrl $OllamaUrl
+        Wait-LaiGpuIdle -MaxUsedMiB $MaxBusyVramMiB -TimeoutSec ($GpuWaitMinutes * 60) | Out-Null
+    }
     $results = Invoke-LaiModelSetup -BaseUrl $OllamaUrl -Models $Catalog.Models -Candidates $Catalog.ContextCandidates `
-        -SystemPrompt $SystemPrompt -Previous $State.tuning -Fingerprint $fingerprint -MinFreeMiB $MinFreeVramMiB -Retune:$Retune -AllowCpu:$AllowCpu
+        -SystemPrompt $SystemPrompt -Previous $State.tuning -Fingerprint $fingerprint -MinFreeMiB $MinFreeVramMiB -Retune:$Retune -AllowCpu:$AllowCpu `
+        -BeforeFirstLoad $beforeLoad
     foreach ($k in $results.Keys) { $State.tuning[$k] = $results[$k] }
 }
 #endregion
@@ -775,7 +797,13 @@ Invoke-Stage 'Stack' {
     Copy-Item -LiteralPath (Join-Path $SourceRoot 'stack\docker-compose.yml') -Destination $P.Stack -Force
     $guardDir = Join-Path $P.Stack 'render-guard'
     if (-not (Test-Path -LiteralPath $guardDir)) { New-Item -ItemType Directory -Force -Path $guardDir | Out-Null }
+    # compose up only recreates a container whose configuration changed; a new render_guard.py in
+    # the mounted folder would otherwise keep running the old code until the next reboot.
+    $guardFile = Join-Path $guardDir 'render_guard.py'
+    $guardBefore = ''
+    if (Test-Path -LiteralPath $guardFile) { $guardBefore = (Get-FileHash -LiteralPath $guardFile -Algorithm SHA256).Hash }
     Copy-Item -LiteralPath (Join-Path $SourceRoot 'stack\render-guard\render_guard.py') -Destination $guardDir -Force
+    $guardChanged = $guardBefore -and $guardBefore -ne (Get-FileHash -LiteralPath $guardFile -Algorithm SHA256).Hash
     $searxSettings = Join-Path $searxDir 'settings.yml'
     if (-not (Test-Path -LiteralPath $searxSettings)) {
         $tpl = Get-Content -LiteralPath (Join-Path $SourceRoot 'stack\searxng\settings.yml') -Raw
@@ -862,6 +890,10 @@ Invoke-Stage 'Stack' {
     $pullPolicy = Get-LaiPullPolicy -Tags @($OpenWebUIVersion, $SearxngVersion)
     Invoke-LaiRetry -What 'docker compose pull' -Attempts 3 -DelaySeconds 15 -Action { Invoke-Compose -Arguments @('pull', '--policy', $pullPolicy) | Out-Null } | Out-Null
     Invoke-Compose -Arguments @('up', '-d', '--remove-orphans') | Out-Null
+    if ($guardChanged) {
+        try { Invoke-Compose -Arguments @('restart', 'render-guard') | Out-Null; Write-LaiLog OK 'Render guard restarted with the updated code' }
+        catch { Write-LaiLog WARN "Render guard still runs the old code until it restarts: $($_.Exception.Message)" }
+    }
     $webui = "http://127.0.0.1:$($script:WebUIPortEffective)"
     Write-LaiLog INFO "Waiting for Open WebUI on $webui (first start runs database migrations)"
     Wait-LaiWebUI -BaseUrl $webui -TimeoutSec 600
@@ -1052,6 +1084,7 @@ if (-not $SkipTests) {
 
 #region Report ---------------------------------------------------------------------------
 Unregister-ScheduledTask -TaskName $ResumeTask -Confirm:$false -ErrorAction SilentlyContinue
+if ($State.flags.ContainsKey('resumeFailures')) { [void]$State.flags.Remove('resumeFailures'); Save-State }
 $rows = foreach ($m in ($Catalog.Models | Sort-Object { $_.Order })) {
     $t = $State.tuning[$m.Key]
     '| {0} | `{1}` | {2:N0} | {3}% | {4} |' -f $m.Display, $m.Source, $t['Context'], $t['GpuPercent'], $t['TokensPerSec']
@@ -1094,7 +1127,19 @@ exit $testExit
 } catch {
     Write-LaiLog FAIL $_.Exception.Message
     if ($_.InvocationInfo) { Write-LaiLog FAIL ("at " + $_.InvocationInfo.PositionMessage.Split("`n")[0]) }
-    Write-LaiLog FAIL "Fix the issue above and run the installer again; finished steps are skipped. Log: $($P.Logs)"
+    Write-LaiLog FAIL "Fix the issue above and run the installer again; re-running is safe and reuses what is done (downloads, tuning). Log: $($P.Logs)"
+    if ($Resume -and $State -and $State.flags) {
+        # The resume task starts the installer at every sign-in. A failure that a reboot does not fix
+        # (virtualization off, a broken Docker) must not open an elevated window forever.
+        $n = 1; if ($State.flags.ContainsKey('resumeFailures')) { $n = [int]$State.flags['resumeFailures'] + 1 }
+        $State.flags['resumeFailures'] = $n
+        if ($n -ge 2) {
+            Unregister-ScheduledTask -TaskName $ResumeTask -Confirm:$false -ErrorAction SilentlyContinue
+            Write-LaiLog WARN "This failed after sign-in twice in a row, so the installer no longer starts by itself. After fixing it, run $(Join-Path $P.Scripts 'Install-LocalAI.ps1') -Resume as Administrator."
+        } else {
+            Write-LaiLog WARN 'The installer tries once more at the next sign-in.'
+        }
+    }
     Save-State
     Stop-Install 1
 }

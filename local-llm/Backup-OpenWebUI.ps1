@@ -74,6 +74,10 @@ $suffix = ''
 if ($Tag) { $suffix = "-$Tag" }
 $name = 'open-webui-{0}{1}.tar.gz' -f (Get-Date -Format 'yyyyMMdd-HHmmss'), $suffix
 $archive = Join-Path $backupDir $name
+# Written under a name no reader matches (open-webui-*.tar.gz) and renamed only once verified, so a
+# crash, reboot or full disk mid-archive never leaves a truncated file that counts as a fresh backup.
+$workName = "incomplete-$name"
+$work = Join-Path $backupDir $workName
 $stopped = $false
 $exitCode = 0
 
@@ -95,15 +99,17 @@ try {
         Invoke-Docker -Arguments @('stop', '-t', '30', $Container) | Out-Null
         $stopped = $true
     }
+    # Leftovers of an interrupted earlier run (we hold the volume lock, so none is in progress).
+    Get-ChildItem -LiteralPath $backupDir -Filter 'incomplete-open-webui-*' -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
     try {
         Invoke-Docker -Arguments @('run', '--rm', '-v', "${Volume}:/data:ro", '-v', "${backupDir}:/backup", $HelperImage,
-            'tar', 'czf', "/backup/$name", '-C', '/data', '.') | Out-Null
+            'tar', 'czf', "/backup/$workName", '-C', '/data', '.') | Out-Null
     } finally {
         if ($stopped) { Invoke-Docker -Arguments @('start', $Container) | Out-Null }
     }
 
-    $size = (Get-Item -LiteralPath $archive).Length
-    $listing = (Invoke-Docker -Arguments @('run', '--rm', '-v', "${backupDir}:/backup:ro", $HelperImage, 'tar', 'tzf', "/backup/$name")).Text
+    $size = (Get-Item -LiteralPath $work).Length
+    $listing = (Invoke-Docker -Arguments @('run', '--rm', '-v', "${backupDir}:/backup:ro", $HelperImage, 'tar', 'tzf', "/backup/$workName")).Text
     if ($size -lt 100 -or $listing -notmatch '(?m)^(\./)?webui\.db\s*$') { throw "Archive $name looks incomplete ($size bytes, webui.db missing)." }
     $verified = ''
     if (-not $SkipDeepVerify) {
@@ -128,7 +134,7 @@ try {
         $scratch = 'localai-verify-' + (Get-Date -Format 'yyyyMMddHHmmss')
         Invoke-Docker -Arguments @('volume', 'create', $scratch) | Out-Null
         try {
-            $extract = @('run', '--rm', '-v', "${scratch}:/d", '-v', "${backupDir}:/backup:ro", $HelperImage, 'tar', 'xzf', "/backup/$name", '-C', '/d') + $members
+            $extract = @('run', '--rm', '-v', "${scratch}:/d", '-v', "${backupDir}:/backup:ro", $HelperImage, 'tar', 'xzf', "/backup/$workName", '-C', '/d') + $members
             Invoke-Docker -Arguments $extract | Out-Null
             # Single quotes only inside the Python code: PS 5.1 mangles double quotes in native arguments.
             $py = "import sqlite3;c=sqlite3.connect('/d/webui.db');" +
@@ -141,7 +147,7 @@ try {
             if ($run.ExitCode -ne 0 -or $parts[0] -ne 'ok') {
                 # Keep it for inspection, but tagged so it never counts as one of the three protected daily backups.
                 $bad = $archive -replace '\.tar\.gz$', '-CORRUPT.tar.gz'
-                Move-Item -LiteralPath $archive -Destination $bad -Force
+                Move-Item -LiteralPath $work -Destination $bad -Force
                 $reason = ($out -split "`n" | Select-Object -Last 1)
                 throw "Archive ${name}: webui.db failed the SQLite check ($reason). Kept as $(Split-Path -Leaf $bad). Your live data may be damaged: do not delete older backups."
             }
@@ -150,6 +156,7 @@ try {
             Invoke-Docker -Arguments @('volume', 'rm', '-f', $scratch) -AllowFail | Out-Null
         }
     }
+    Move-Item -LiteralPath $work -Destination $archive -Force
     Write-BackupLog OK ("Backup {0} ({1:N1} MB){2}{3}" -f $archive, ($size / 1MB), $(if ($stopped) { '; container was paused for consistency' } else { '' }), $verified)
 
     # Retention: daily (untagged) archives older than N days go, but the newest three daily ones always
@@ -182,6 +189,7 @@ try {
 } catch {
     Write-BackupLog FAIL $_.Exception.Message
     $exitCode = 1
+    if (Test-Path -LiteralPath $work) { Remove-Item -LiteralPath $work -Force -ErrorAction SilentlyContinue }
 } finally {
     Exit-LaiVolumeLock $lock
 }
