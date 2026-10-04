@@ -80,6 +80,9 @@ if ($Rollback) {
     if (-not $Force -and (Read-Host 'Type YES to roll back') -cne 'YES') { Write-UpdateLog INFO 'Nothing changed.'; exit 1 }
     $lock = Enter-LaiVolumeLock -TimeoutSec 900
     try {
+        # Again under the lock: a restore that held it while this waited may have failed meanwhile.
+        $hold = Get-LaiWebUIHold -AIRoot $AIRoot
+        if ($hold) { throw "Open WebUI is kept stopped after a failed restore ($($hold['Reason'])). Recover first: $($hold['Recover'])" }
         # Old image first (it may not start on the migrated database; that is expected), then the
         # restore stops it, swaps in the pre-update data and starts it again.
         $envBefore = @(Get-Content -Encoding UTF8 -LiteralPath $envPath)
@@ -93,7 +96,16 @@ if ($Rollback) {
         }
         Invoke-Docker -Arguments ($base + @('up', '-d', 'open-webui'))
         & (Join-Path $PSScriptRoot 'Restore-OpenWebUI.ps1') -AIRoot $AIRoot -Archive $archive -Force
-        if ($LASTEXITCODE -ne 0) { throw "The restore step failed; see above. The stack is set to $prevVer." }
+        if ($LASTEXITCODE -ne 0) {
+            # The volume still holds the data the current version migrated (the restore rolled back, or
+            # holds Open WebUI down): go back to the current version, never the old image on that data.
+            [System.IO.File]::WriteAllLines($envPath, [string[]]$envBefore, (New-Object System.Text.UTF8Encoding($false)))
+            if (Get-LaiWebUIHold -AIRoot $AIRoot) {
+                throw "The restore step failed; see above. The version setting is back on $cur. After the recovery command above, use Start menu > Local AI > Start again."
+            }
+            Invoke-Docker -Arguments ($base + @('up', '-d', 'open-webui'))
+            throw "The restore step failed and was undone; Open WebUI $cur is running again on its current data."
+        }
     } finally { Exit-LaiVolumeLock $lock }
     $config['OpenWebUIVersion'] = $prevVer
     $config.Remove('PreviousOpenWebUIVersion'); $config.Remove('RollbackArchive')
@@ -123,6 +135,9 @@ $configBefore = Read-LaiState -Path $configPath
 # halfway through and a scheduled backup does not run against a half-replaced stack.
 $lock = Enter-LaiVolumeLock -TimeoutSec 900
 try {
+    # Again under the lock: a restore that held it while this waited may have failed meanwhile.
+    $hold = Get-LaiWebUIHold -AIRoot $AIRoot
+    if ($hold) { throw "Open WebUI is kept stopped after a failed restore ($($hold['Reason'])). Recover first: $($hold['Recover'])" }
     if (-not $SkipBackup) {
         if ($Version) { $tag = "before-$($Version -replace '[^\w\.-]', '')" } else { $tag = "before-searxng-$($SearxngVersion -replace '[^\w\.-]', '')" }
         & (Join-Path $PSScriptRoot 'Backup-OpenWebUI.ps1') -AIRoot $AIRoot -Tag $tag

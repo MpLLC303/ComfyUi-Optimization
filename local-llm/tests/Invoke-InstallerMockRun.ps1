@@ -247,6 +247,10 @@ $sw = [Diagnostics.Stopwatch]::StartNew()
 $code3 = $LASTEXITCODE
 Assert-That ((& $restartCalls) -eq 1) 'changed render_guard.py: the guard is restarted to load it'
 Assert-That ($code3 -eq 0) "re-run completes (exit $code3) in $([int]$sw.Elapsed.TotalSeconds) s"
+# This process lives on after the run (like the -NoExit Administrator window): the setup lock must
+# be free again, or a re-run / Update-Models would be refused until the window is closed.
+$probeLock = (& pwsh -NoProfile -Command ("Import-Module '{0}'; try {{ `$l = Enter-LaiSetupLock; 'FREE' }} catch {{ 'BUSY' }}" -f (Join-Path $copy 'lib/LocalAI.psm1'))) -join ''
+Assert-That ($probeLock -eq 'FREE') "setup lock released when the installer finishes ($probeLock)"
 Assert-That (@(Get-ChildItem (Join-Path $aiRoot 'Backups') -Filter '*pre-compose*').Count -eq 1) 'no second legacy migration on re-run'
 $envAfter = Get-Content -Encoding UTF8 $envFile
 Assert-That ($envAfter -contains 'OPEN_WEBUI_VERSION=v0.99.0') 're-run keeps the Open WebUI version set by Update-OpenWebUI'

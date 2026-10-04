@@ -76,6 +76,16 @@ $safety = $null
 $holdPath = Join-Path $AIRoot 'open-webui-hold.json'
 $script:holdArchive = ''
 $script:recoverCmd = ''
+function Clear-Hold([string]$Note) {
+    # Never throws: a hold that cannot be deleted right now (antivirus, a sync client) is a warning,
+    # not a reason to abandon a restore that worked. Retries briefly first.
+    for ($i = 1; $i -le 5; $i++) {
+        if (-not (Test-Path -LiteralPath $holdPath)) { return }
+        try { Remove-Item -LiteralPath $holdPath -Force -ErrorAction Stop; if ($Note) { Write-LaiLog OK $Note }; return }
+        catch { Start-Sleep -Milliseconds (300 * $i) }
+    }
+    Write-LaiLog WARN "Could not delete $holdPath; delete it by hand, or Start again, backups and updates keep refusing."
+}
 function Set-Hold([string]$Why, [object[]]$Held) {
     # Keep Open WebUI down until a restore succeeds: the watch, Start-LocalAI and the installer
     # check this file. The original restart policies are kept here so the recovery can put them back.
@@ -185,17 +195,20 @@ try {
             }
         }
     }
+    # The data is in place: clear the hold while still holding the lock, so nothing (Start again, a
+    # waiting update, the nightly backup) sees a stale "interrupted" hold after a restore that worked.
+    Clear-Hold 'Restore complete: Open WebUI may run again'
 } catch {
     $failure = $_.Exception.Message
     Write-LaiLog FAIL $failure
     if ($volumeTouched) {
         if ($safety) {
             Write-LaiLog WARN "Rolling back to the safety backup $($safety.Name)"
+            $rolledBack = $false
             try {
                 Invoke-Swap $safety.FullName
                 Write-LaiLog OK 'Rollback complete: the volume is as it was before the restore.'
-                # The data is good again: drop the in-progress hold this run wrote (not an older one).
-                if (-not $priorHold -and (Test-Path -LiteralPath $holdPath)) { Remove-Item -LiteralPath $holdPath -Force }
+                $rolledBack = $true
             }
             catch {
                 Write-LaiLog FAIL "Rollback failed too: $($_.Exception.Message)"
@@ -208,6 +221,9 @@ try {
                 $stoppedContainers = @()
                 try { Set-Hold 'restore and its rollback failed' $held } catch { Write-LaiLog FAIL "Could not record the hold ($($_.Exception.Message)): do NOT start Open WebUI until the restore succeeds." }
             }
+            # The data is good again: drop the in-progress hold this run wrote (not an older one).
+            # Outside the rollback's try, so a failed delete is not mistaken for a failed rollback.
+            if ($rolledBack -and -not $priorHold) { Clear-Hold '' }
         } else {
             $script:recoverCmd = "& '$(Join-Path $PSScriptRoot 'Restore-OpenWebUI.ps1')' -Archive '$(Join-Path $backupDir 'open-webui-YYYYMMDD-HHMMSS.tar.gz')' -SkipSafetyBackup  (use a backup from before the problem)"
             Write-LaiLog FAIL "No safety backup exists; Open WebUI is left STOPPED so it cannot start on a damaged volume (the health watch will not start it). Recover with: $script:recoverCmd"
@@ -230,7 +246,8 @@ try {
     Exit-LaiVolumeLock $lock
 }
 if ($script:restoreFailed) { exit 1 }
-if (Test-Path -LiteralPath $holdPath) { Remove-Item -LiteralPath $holdPath -Force; Write-LaiLog OK 'Earlier failed restore cleared: Open WebUI may run again' }
+# Normally cleared under the lock already (above); a last try that never throws.
+Clear-Hold 'Earlier failed restore cleared: Open WebUI may run again'
 
 # 4. Wait for Open WebUI.
 if ($stoppedContainers.Count -gt 0) {

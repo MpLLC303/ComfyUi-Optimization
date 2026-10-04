@@ -61,7 +61,10 @@ function Invoke-Tailscale {
         try { if (-not $proc.HasExited) { $proc.Kill() } } catch { Write-Verbose 'already gone' }
         throw "tailscale $($Arguments -join ' ') did not answer within $limit s. Is the Tailscale service running? Restart the Tailscale app and try again."
     }
-    $proc.WaitForExit()
+    # Reading has a limit too: a child that outlived tailscale could keep the pipes open.
+    if (-not [System.Threading.Tasks.Task]::WaitAll([System.Threading.Tasks.Task[]]@($outTask, $errTask), 10000)) {
+        throw "tailscale $($Arguments -join ' ') finished but its output never closed. Restart the Tailscale app and try again."
+    }
     # Out: stdout only (the JSON); Text: everything, for messages (warnings go to stderr).
     return [pscustomobject]@{ ExitCode = $proc.ExitCode; Out = $outTask.Result; Text = ($outTask.Result + $errTask.Result).Trim() }
 }

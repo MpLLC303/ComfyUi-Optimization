@@ -238,6 +238,9 @@ function Invoke-Stage {
 function Stop-Install {
     param([int]$Code = 0)
     if ($script:TranscriptOn) { try { Stop-Transcript | Out-Null } catch { Write-Verbose 'No transcript' } }
+    # The relaunched window stays open after the script ends (-NoExit), and a mutex stays owned as
+    # long as its thread lives: release it, or a re-run would be refused until that window closes.
+    if ($script:SetupLock) { Exit-LaiVolumeLock $script:SetupLock; $script:SetupLock = $null }
     exit $Code
 }
 
@@ -407,6 +410,20 @@ function Invoke-Compose {
     param([Parameter(Mandatory)][string[]]$Arguments, [switch]$Capture, [switch]$AllowFail)
     $base = @('compose', '--project-directory', $P.Stack, '-f', (Join-Path $P.Stack 'docker-compose.yml'))
     return Invoke-Native -File 'docker' -Arguments ($base + $Arguments) -Capture:$Capture -AllowFail:$AllowFail
+}
+
+function Invoke-ComposeUp {
+    # Starting containers goes through the volume lock: never between a backup's stop and its archive,
+    # or between a restore's stop and its swap. Under the lock, a restore that failed meanwhile
+    # (hold) stops it from starting Open WebUI on a damaged volume.
+    param([Parameter(Mandatory)][string[]]$Arguments)
+    if (Test-LaiVolumeLockBusy) { Write-LaiLog INFO 'Waiting for a backup/restore/update to finish first' }
+    $lock = Enter-LaiVolumeLock -TimeoutSec 1800
+    try {
+        $hold = Get-LaiWebUIHold -AIRoot $AIRoot
+        if ($hold) { throw "Open WebUI is kept stopped after a failed restore ($($hold['Reason'])); starting it could run on damaged data. Recover first: $($hold['Recover'])" }
+        Invoke-Compose -Arguments $Arguments | Out-Null
+    } finally { Exit-LaiVolumeLock $lock }
 }
 
 function Get-PortOwner {
@@ -983,7 +1000,7 @@ Invoke-Stage 'Stack' {
     # (Docker Hub rate-limits anonymous pulls). A floating tag (main, latest) is always re-pulled.
     $pullPolicy = Get-LaiPullPolicy -Tags @($OpenWebUIVersion, $SearxngVersion)
     Invoke-LaiRetry -What 'docker compose pull' -Attempts 3 -DelaySeconds 15 -Action { Invoke-Compose -Arguments @('pull', '--policy', $pullPolicy) | Out-Null } | Out-Null
-    Invoke-Compose -Arguments @('up', '-d', '--remove-orphans') | Out-Null
+    Invoke-ComposeUp -Arguments @('up', '-d', '--remove-orphans')
     $guardStarted = $true
     if ($guardChanged) {
         try { Invoke-Compose -Arguments @('restart', 'render-guard') | Out-Null; Write-LaiLog OK 'Render guard restarted with the updated code' }
@@ -1058,7 +1075,7 @@ Invoke-Stage 'Configure' {
         $envPath = Join-Path $P.Stack '.env'
         $lines = Get-Content -Encoding UTF8 -LiteralPath $envPath | ForEach-Object { if ($_ -like 'WEBUI_ADMIN_PASSWORD=*') { "WEBUI_ADMIN_PASSWORD=$($cred.password)" } else { $_ } }
         [System.IO.File]::WriteAllLines($envPath, [string[]]$lines, (New-Object System.Text.UTF8Encoding($false)))
-        Invoke-Compose -Arguments @('up', '-d', '--force-recreate', 'open-webui') | Out-Null
+        Invoke-ComposeUp -Arguments @('up', '-d', '--force-recreate', 'open-webui')
         Wait-LaiWebUI -BaseUrl $WebUIUrl -TimeoutSec 300
     }
     # An interrupted Set-OpenWebUIPassword run may have left the live password only in the pending file.
@@ -1082,7 +1099,7 @@ Invoke-Stage 'Configure' {
         $envPath = Join-Path $P.Stack '.env'
         $lines = Get-Content -Encoding UTF8 -LiteralPath $envPath | ForEach-Object { if ($_ -like 'WEBUI_ADMIN_PASSWORD=*') { 'WEBUI_ADMIN_PASSWORD=' } else { $_ } }
         [System.IO.File]::WriteAllLines($envPath, [string[]]$lines, (New-Object System.Text.UTF8Encoding($false)))
-        Invoke-Compose -Arguments @('up', '-d') | Out-Null
+        Invoke-ComposeUp -Arguments @('up', '-d')
         Wait-LaiWebUI -BaseUrl $WebUIUrl -TimeoutSec 300
         $c2 = Get-AdminCredential
         $token = Connect-LaiWebUI -BaseUrl $WebUIUrl -Email $c2.email -Password $c2.password
@@ -1234,7 +1251,7 @@ Write-Host "Login:       $($cred.email)" -ForegroundColor Green
 Write-Host "Password:    $($cred.password)   (also in $($P.Secrets)\openwebui-admin.json)" -ForegroundColor Green
 Write-Host 'Open a NEW terminal to use the ollama command (windows opened before the install do not see the PATH change).' -ForegroundColor Gray
 Start-AsUser "http://localhost:$($script:WebUIPortEffective)"
-exit $testExit
+Stop-Install $testExit
 #endregion
 
 } catch {

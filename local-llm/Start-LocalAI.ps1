@@ -78,6 +78,9 @@ try {
     if (Test-LaiVolumeLockBusy) { Write-LaiLog INFO 'Waiting for a backup/restore/update to finish first' }
     $lock = Enter-LaiVolumeLock -TimeoutSec 1800
     try {
+        # Again under the lock: a restore that held it while this waited may have failed meanwhile.
+        $hold = Get-LaiWebUIHold -AIRoot $AIRoot
+        if ($hold) { throw "Open WebUI is kept stopped after a failed restore ($($hold['Reason'])). Recover first: $($hold['Recover'])" }
         $r = Invoke-Docker @('compose', '--project-directory', $stackDir, '-f', $compose, 'up', '-d')
         if ($r.ExitCode -ne 0) { throw "docker compose up failed: $($r.Text)" }
     } finally { Exit-LaiVolumeLock $lock }

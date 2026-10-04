@@ -162,13 +162,14 @@ if ($engine -eq $false) {
                      @{ Name = 'searxng'; Url = "http://127.0.0.1:$searxPort/healthz"; Key = 'SearXNG' })) {
         $ok = Test-Url $c.Url
         $hold = $null; if ($c.Name -eq 'open-webui') { $hold = Get-LaiWebUIHold -AIRoot $AIRoot }
-        if (-not $ok -and $hold) {
-            # Left stopped on purpose by a failed restore: starting it could run on a damaged volume.
-            $details[$c.Key] = "kept stopped after a failed restore - $($hold['Recover'])"
-        } elseif (-not $ok -and $c.Name -eq 'open-webui' -and (Test-LaiVolumeLockBusy)) {
-            # A backup, restore or update stopped it on purpose; starting it now could corrupt the data.
+        if (-not $ok -and $c.Name -eq 'open-webui' -and (Test-LaiVolumeLockBusy)) {
+            # A backup, restore or update is running and stopped it on purpose (checked before the
+            # hold: a restore in progress has written its hold already, but has not failed).
             $ok = $true
             $maintenance = $true
+        } elseif (-not $ok -and $hold) {
+            # Left stopped on purpose by a failed or interrupted restore: starting it could run on a damaged volume.
+            $details[$c.Key] = "kept stopped after a failed restore - $($hold['Recover'])"
         } elseif (-not $ok -and (Test-CanHeal)) {
             $state = Get-ContainerState $c.Name
             if ($state -eq 'exited' -or $state -eq 'created') {

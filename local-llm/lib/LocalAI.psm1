@@ -296,7 +296,8 @@ function New-LaiVolumeMutex {
     # non-elevated restore or the health watch could then not even open it. On Windows PowerShell
     # create it so every signed-in user may wait on it. Falls back to the default (other platforms,
     # or a mutex an older version already created) - then UnauthorizedAccessException means "busy".
-    param([string]$Name = 'Global\LocalAI-OpenWebUI-Volume')
+    param([string]$Name = 'Global\LocalAI-OpenWebUI-Volume',
+        [string]$BusyMessage = 'Another backup/restore of the Open WebUI volume is running with administrator rights. Wait for it to finish (or run this elevated).')
     $name = $Name
     if ($PSVersionTable.PSEdition -eq 'Desktop') {
         try {
@@ -307,12 +308,12 @@ function New-LaiVolumeMutex {
             $created = $false
             return [System.Threading.Mutex]::new($false, $name, [ref]$created, $sec)
         } catch [System.UnauthorizedAccessException] {
-            throw 'Another backup/restore of the Open WebUI volume is running with administrator rights. Wait for it to finish (or run this elevated).'
+            throw $BusyMessage
         } catch { Write-Verbose "mutex ACL not applied: $($_.Exception.Message)" }
     }
     try { return (New-Object System.Threading.Mutex($false, $name)) }
     catch [System.UnauthorizedAccessException] {
-        throw 'Another backup/restore of the Open WebUI volume is running with administrator rights. Wait for it to finish (or run this elevated).'
+        throw $BusyMessage
     }
 }
 
@@ -348,10 +349,11 @@ function Enter-LaiSetupLock {
     # One installer run or model update at a time: both load, tune and rebuild the same models, and
     # two of them interleaved leave tuning results that match neither. Does not wait; throws when
     # busy. Released when the process exits (even if it is killed). Returns the mutex.
-    $m = New-LaiVolumeMutex -Name 'Global\LocalAI-Setup'
+    $busy = 'Another Local AI installer run or model update is already running. Wait for it to finish (or close an installer window that is still open), then try again.'
+    $m = New-LaiVolumeMutex -Name 'Global\LocalAI-Setup' -BusyMessage $busy
     $got = $false
     try { $got = $m.WaitOne(0) } catch [System.Threading.AbandonedMutexException] { $got = $true }
-    if (-not $got) { $m.Dispose(); throw 'Another Local AI installer run or model update is already running. Wait for it to finish, then try again.' }
+    if (-not $got) { $m.Dispose(); throw $busy }
     return $m
 }
 
