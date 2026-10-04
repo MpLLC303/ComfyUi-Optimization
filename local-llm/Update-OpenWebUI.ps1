@@ -45,7 +45,7 @@ function Write-UpdateLog {
 }
 function Set-EnvVersion {
     param([string]$OpenWebUI, [string]$Searxng)
-    $out = foreach ($l in @(Get-Content -LiteralPath $envPath)) {
+    $out = foreach ($l in @(Get-Content -Encoding UTF8 -LiteralPath $envPath)) {
         if ($OpenWebUI -and $l -like 'OPEN_WEBUI_VERSION=*') { "OPEN_WEBUI_VERSION=$OpenWebUI" }
         elseif ($Searxng -and $l -like 'SEARXNG_VERSION=*') { "SEARXNG_VERSION=$Searxng" }
         else { $l }
@@ -65,6 +65,9 @@ $config = Read-LaiState -Path $configPath
 $port = 3000; if ($config.ContainsKey('WebUIPort')) { $port = [int]$config['WebUIPort'] }
 $base = @('compose', '--project-directory', $stack, '-f', $compose)
 
+$hold = Get-LaiWebUIHold -AIRoot $AIRoot
+if ($hold) { throw "Open WebUI is kept stopped after a failed restore ($($hold['Reason'])); updating now would start it on damaged data. Recover first: $($hold['Recover'])" }
+
 if ($Rollback) {
     $prevVer = ''; $archive = ''
     if ($config.ContainsKey('PreviousOpenWebUIVersion')) { $prevVer = [string]$config['PreviousOpenWebUIVersion'] }
@@ -72,15 +75,22 @@ if ($Rollback) {
     if (-not $prevVer -or -not $archive -or -not (Test-Path -LiteralPath $archive)) {
         throw 'Nothing to roll back: no update with a backup is recorded (or its before-<version> backup is gone). Use Restore-OpenWebUI.ps1 -Archive <file> and Update-OpenWebUI.ps1 -Version <old> by hand.'
     }
-    $cur = ((Get-Content -LiteralPath $envPath | Where-Object { $_ -like 'OPEN_WEBUI_VERSION=*' } | Select-Object -First 1) -replace '^OPEN_WEBUI_VERSION=', '')
+    $cur = ((Get-Content -Encoding UTF8 -LiteralPath $envPath | Where-Object { $_ -like 'OPEN_WEBUI_VERSION=*' } | Select-Object -First 1) -replace '^OPEN_WEBUI_VERSION=', '')
     Write-UpdateLog WARN "Rollback: Open WebUI $cur -> $prevVer, and the data from $(Split-Path -Leaf $archive) (chats since that update are lost; a safety backup of the current data is taken first)."
     if (-not $Force -and (Read-Host 'Type YES to roll back') -cne 'YES') { Write-UpdateLog INFO 'Nothing changed.'; exit 1 }
     $lock = Enter-LaiVolumeLock -TimeoutSec 900
     try {
         # Old image first (it may not start on the migrated database; that is expected), then the
         # restore stops it, swaps in the pre-update data and starts it again.
+        $envBefore = @(Get-Content -Encoding UTF8 -LiteralPath $envPath)
         Set-EnvVersion -OpenWebUI $prevVer
-        Invoke-Docker -Arguments ($base + @('pull', '--policy', (Get-LaiPullPolicy -Tags @($prevVer)), 'open-webui'))
+        try { Invoke-Docker -Arguments ($base + @('pull', '--policy', (Get-LaiPullPolicy -Tags @($prevVer)), 'open-webui')) }
+        catch {
+            # Leave .env on the version that is running: otherwise the next Start again or installer
+            # run would start the old image on the already-migrated database.
+            [System.IO.File]::WriteAllLines($envPath, [string[]]$envBefore, (New-Object System.Text.UTF8Encoding($false)))
+            throw "Could not download Open WebUI $prevVer, nothing was changed: $($_.Exception.Message)"
+        }
         Invoke-Docker -Arguments ($base + @('up', '-d', 'open-webui'))
         & (Join-Path $PSScriptRoot 'Restore-OpenWebUI.ps1') -AIRoot $AIRoot -Archive $archive -Force
         if ($LASTEXITCODE -ne 0) { throw "The restore step failed; see above. The stack is set to $prevVer." }
@@ -99,7 +109,7 @@ if ($Latest) {
     Write-UpdateLog INFO "Latest Open WebUI release: $Version"
 }
 
-$lines = @(Get-Content -LiteralPath $envPath)
+$lines = @(Get-Content -Encoding UTF8 -LiteralPath $envPath)
 $current = ($lines | Where-Object { $_ -like 'OPEN_WEBUI_VERSION=*' } | Select-Object -First 1) -replace '^OPEN_WEBUI_VERSION=', ''
 if (-not $Version -and -not $SearxngVersion) { Write-UpdateLog INFO 'Nothing to do: pass -Latest, -Version <tag> or -SearxngVersion <tag> (or -Rollback).'; exit 0 }
 if ($Version -and $Version -eq $current) {
@@ -136,7 +146,7 @@ try {
         # Pinned versions already on disk are reused (no registry, no Docker Hub rate limit);
         # floating tags (main, latest) are re-pulled.
         $envNow = @{}
-        foreach ($l in (Get-Content -LiteralPath $envPath)) { if ($l -match '^([A-Z_]+)=(.*)$') { $envNow[$Matches[1]] = $Matches[2] } }
+        foreach ($l in (Get-Content -Encoding UTF8 -LiteralPath $envPath)) { if ($l -match '^([A-Z_]+)=(.*)$') { $envNow[$Matches[1]] = $Matches[2] } }
         Invoke-Docker -Arguments ($base + @('pull', '--policy', (Get-LaiPullPolicy -Tags @($envNow['OPEN_WEBUI_VERSION'], $envNow['SEARXNG_VERSION']))))
         $pulled = $true
     } catch {

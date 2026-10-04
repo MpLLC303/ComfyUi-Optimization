@@ -53,7 +53,7 @@ if ($config.ContainsKey('SelectedModels')) { $selected = @($config['SelectedMode
 $catalogPath = Join-Path (Join-Path $PSScriptRoot 'config') 'models.psd1'
 if ($env:LOCALAI_TEST_CATALOG) { $catalogPath = $env:LOCALAI_TEST_CATALOG }
 $catalog = Get-LaiCatalog -Path $catalogPath -IncludeKeys $selected
-$system = (Get-Content -LiteralPath (Join-Path (Join-Path $PSScriptRoot 'config') 'system-prompt.txt') -Raw).Trim()
+$system = (Get-Content -Encoding UTF8 -LiteralPath (Join-Path (Join-Path $PSScriptRoot 'config') 'system-prompt.txt') -Raw).Trim()
 $minFree = 768; if ($config.ContainsKey('MinFreeVramMiB')) { $minFree = [int]$config['MinFreeVramMiB'] }
 $maxBusy = 3500; if ($config.ContainsKey('MaxBusyVramMiB')) { $maxBusy = [int]$config['MaxBusyVramMiB'] }
 $allowCpu = ($env:LOCALAI_TEST_ALLOW_CPU -eq '1')
@@ -84,7 +84,7 @@ function Hide-InWebUI([string]$Id) {
         $credFile = Join-Path (Join-Path $AIRoot 'Secrets') 'openwebui-admin.json'
         if (-not (Test-Path -LiteralPath $credFile)) { return }
         $port = 3000; if ($config.ContainsKey('WebUIPort')) { $port = [int]$config['WebUIPort'] }
-        $cred = Get-Content -LiteralPath $credFile -Raw | ConvertFrom-Json
+        $cred = Get-Content -Encoding UTF8 -LiteralPath $credFile -Raw | ConvertFrom-Json
         $tok = Connect-LaiWebUI -BaseUrl "http://127.0.0.1:$port" -Email $cred.email -Password $cred.password
         Hide-LaiWebUIModel -BaseUrl "http://127.0.0.1:$port" -Token $tok -Id $Id | Out-Null
     } catch { Write-Verbose "could not hide $Id in Open WebUI: $($_.Exception.Message)" }

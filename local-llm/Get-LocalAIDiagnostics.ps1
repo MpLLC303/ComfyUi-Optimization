@@ -49,13 +49,13 @@ function Add-Secret([string]$Value) { if ($Value -and $Value.Length -ge 6 -and -
 $names = New-Object System.Collections.ArrayList
 $credFile = Join-Path (Join-Path $AIRoot 'Secrets') 'openwebui-admin.json'
 if (Test-Path -LiteralPath $credFile) {
-    try { $c = Get-Content -LiteralPath $credFile -Raw | ConvertFrom-Json; Add-Secret ([string]$c.password); if ($c.email) { [void]$names.Add([string]$c.email) } } catch { Write-Verbose 'cred file unreadable' }
+    try { $c = Get-Content -Encoding UTF8 -LiteralPath $credFile -Raw | ConvertFrom-Json; Add-Secret ([string]$c.password); if ($c.email) { [void]$names.Add([string]$c.email) } } catch { Write-Verbose 'cred file unreadable' }
 }
 $keyFile = Join-Path (Join-Path $AIRoot 'Secrets') 'openwebui-secret.txt'
 if (Test-Path -LiteralPath $keyFile) { Add-Secret ((Get-Content -LiteralPath $keyFile -Raw).Trim()) }
 $envFile = Join-Path (Join-Path $AIRoot 'Stack') '.env'
 if (Test-Path -LiteralPath $envFile) {
-    foreach ($line in (Get-Content -LiteralPath $envFile)) {
+    foreach ($line in (Get-Content -Encoding UTF8 -LiteralPath $envFile)) {
         if ($line -match '^([A-Za-z_][A-Za-z0-9_]*)=(.+)$') {
             # Copy the groups first: the second -match below replaces $Matches.
             $k = $Matches[1]; $v = $Matches[2].Trim()

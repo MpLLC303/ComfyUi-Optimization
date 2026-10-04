@@ -366,7 +366,7 @@ function Write-StackEnv {
     $envPath = Join-Path $P.Stack '.env'
     $all = @{}
     if (Test-Path -LiteralPath $envPath) {
-        foreach ($line in (Get-Content -LiteralPath $envPath)) {
+        foreach ($line in (Get-Content -Encoding UTF8 -LiteralPath $envPath)) {
             if ($line -match '^([A-Za-z_][A-Za-z0-9_]*)=(.*)$') { $all[$Matches[1]] = $Matches[2] }
         }
     }
@@ -392,7 +392,7 @@ function Save-AdminCredential {
 
 #endregion
 
-$SystemPrompt = (Get-Content -LiteralPath (Join-Path $SourceRoot 'config\system-prompt.txt') -Raw).Trim()
+$SystemPrompt = (Get-Content -Encoding UTF8 -LiteralPath (Join-Path $SourceRoot 'config\system-prompt.txt') -Raw).Trim()
 $CatalogPath = Join-Path $SourceRoot 'config\models.psd1'
 # Test hooks for tests/Invoke-InstallerMockRun.ps1 only (small stand-in model on a CPU-only box).
 if ($env:LOCALAI_TEST_CATALOG) { $CatalogPath = $env:LOCALAI_TEST_CATALOG }
@@ -408,7 +408,7 @@ if ($State.flags.ContainsKey('searxngPort')) { $script:SearxngPortEffective = [i
 $PrevStackEnv = @{}
 $prevEnvPath = Join-Path $P.Stack '.env'
 if (Test-Path -LiteralPath $prevEnvPath) {
-    foreach ($line in (Get-Content -LiteralPath $prevEnvPath)) {
+    foreach ($line in (Get-Content -Encoding UTF8 -LiteralPath $prevEnvPath)) {
         if ($line -match '^([A-Za-z_][A-Za-z0-9_]*)=(.*)$') { $PrevStackEnv[$Matches[1]] = $Matches[2] }
     }
 }
@@ -804,17 +804,17 @@ Invoke-Stage 'Stack' {
     # compose up only recreates a container whose configuration changed; a new render_guard.py in
     # the mounted folder would otherwise keep running the old code until the next reboot.
     # The hash of the code last *started* is kept in state, so a run that fails before the restart
-    # (image pull, compose up) still restarts the guard on the next run. Installs from before this
-    # was recorded fall back to the hash of the file that was there.
+    # (image pull, compose up) still restarts the guard on the next run. An install from before this
+    # was recorded (a guard file exists, no hash) cannot tell what runs: restart it once.
     $guardFile = Join-Path $guardDir 'render_guard.py'
     $guardRunning = [string]$State.flags['guardHash']
-    if (-not $guardRunning -and (Test-Path -LiteralPath $guardFile)) { $guardRunning = (Get-FileHash -LiteralPath $guardFile -Algorithm SHA256).Hash }
+    if (-not $guardRunning -and (Test-Path -LiteralPath $guardFile)) { $guardRunning = 'unknown' }
     Copy-Item -LiteralPath (Join-Path $SourceRoot 'stack\render-guard\render_guard.py') -Destination $guardDir -Force
     $guardNow = (Get-FileHash -LiteralPath $guardFile -Algorithm SHA256).Hash
     $guardChanged = $guardRunning -and $guardRunning -ne $guardNow
     $searxSettings = Join-Path $searxDir 'settings.yml'
     if (-not (Test-Path -LiteralPath $searxSettings)) {
-        $tpl = Get-Content -LiteralPath (Join-Path $SourceRoot 'stack\searxng\settings.yml') -Raw
+        $tpl = Get-Content -Encoding UTF8 -LiteralPath (Join-Path $SourceRoot 'stack\searxng\settings.yml') -Raw
         [System.IO.File]::WriteAllText($searxSettings, $tpl.Replace('__SEARXNG_SECRET__', (New-LaiSecret)), (New-Object System.Text.UTF8Encoding($false)))
     }
 
@@ -960,7 +960,7 @@ Invoke-Stage 'Configure' {
         Write-LaiLog INFO 'Open WebUI has no users yet; creating the admin account'
         $State.flags['adminVerified'] = $false
         $envPath = Join-Path $P.Stack '.env'
-        $lines = Get-Content -LiteralPath $envPath | ForEach-Object { if ($_ -like 'WEBUI_ADMIN_PASSWORD=*') { "WEBUI_ADMIN_PASSWORD=$($cred.password)" } else { $_ } }
+        $lines = Get-Content -Encoding UTF8 -LiteralPath $envPath | ForEach-Object { if ($_ -like 'WEBUI_ADMIN_PASSWORD=*') { "WEBUI_ADMIN_PASSWORD=$($cred.password)" } else { $_ } }
         [System.IO.File]::WriteAllLines($envPath, [string[]]$lines, (New-Object System.Text.UTF8Encoding($false)))
         Invoke-Compose -Arguments @('up', '-d', '--force-recreate', 'open-webui') | Out-Null
         Wait-LaiWebUI -BaseUrl $WebUIUrl -TimeoutSec 300
@@ -982,7 +982,7 @@ Invoke-Stage 'Configure' {
         $State.flags['adminVerified'] = $true
         Save-State
         $envPath = Join-Path $P.Stack '.env'
-        $lines = Get-Content -LiteralPath $envPath | ForEach-Object { if ($_ -like 'WEBUI_ADMIN_PASSWORD=*') { 'WEBUI_ADMIN_PASSWORD=' } else { $_ } }
+        $lines = Get-Content -Encoding UTF8 -LiteralPath $envPath | ForEach-Object { if ($_ -like 'WEBUI_ADMIN_PASSWORD=*') { 'WEBUI_ADMIN_PASSWORD=' } else { $_ } }
         [System.IO.File]::WriteAllLines($envPath, [string[]]$lines, (New-Object System.Text.UTF8Encoding($false)))
         Invoke-Compose -Arguments @('up', '-d') | Out-Null
         Wait-LaiWebUI -BaseUrl $WebUIUrl -TimeoutSec 300

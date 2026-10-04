@@ -72,14 +72,16 @@ $stoppedContainers = @()
 $volumeTouched = $false
 $safety = $null
 $holdPath = Join-Path $AIRoot 'open-webui-hold.json'
-function Set-Hold([string]$Why) {
+$script:holdArchive = ''
+$script:recoverCmd = ''
+function Set-Hold([string]$Why, [object[]]$Held) {
     # Keep Open WebUI down until a restore succeeds: the watch, Start-LocalAI and the installer
     # check this file. The original restart policies are kept here so the recovery can put them back.
-    $list = @($stoppedContainers | ForEach-Object { @{ Id = $_.Id; Policy = $_.Policy } })
+    $list = @($Held | ForEach-Object { @{ Id = $_.Id; Policy = $_.Policy } })
     $ids = @($list | ForEach-Object { $_['Id'] })
     $old = Get-LaiWebUIHold -AIRoot $AIRoot
     if ($old -and $old['Containers']) { foreach ($c in @($old['Containers'])) { if ($ids -notcontains $c['Id']) { $list += $c } } }
-    Save-LaiState -State @{ Reason = $Why; Recover = $script:recoverCmd; Containers = $list; Since = (Get-Date).ToString('s') } -Path $holdPath
+    Save-LaiState -State @{ Reason = $Why; Recover = $script:recoverCmd; Archive = [string]$script:holdArchive; Containers = $list; Since = (Get-Date).ToString('s') } -Path $holdPath
 }
 
 # Pick and confirm the archive before taking the lock, so an unanswered prompt never blocks the
@@ -176,16 +178,23 @@ try {
             try { Invoke-Swap $safety.FullName; Write-LaiLog OK 'Rollback complete: the volume is as it was before the restore.' }
             catch {
                 Write-LaiLog FAIL "Rollback failed too: $($_.Exception.Message)"
-                $script:recoverCmd = ".\Restore-OpenWebUI.ps1 -Archive '$($safety.FullName)' -SkipSafetyBackup"
+                $script:recoverCmd = "& '$(Join-Path $PSScriptRoot 'Restore-OpenWebUI.ps1')' -Archive '$($safety.FullName)' -SkipSafetyBackup"
+                $script:holdArchive = $safety.FullName
                 Write-LaiLog FAIL "Open WebUI is left STOPPED (the health watch will not start it). Recover with: $script:recoverCmd"
-                Set-Hold 'restore and its rollback failed'
+                # Hold the list first, clear it, then record: if writing the hold fails (full disk), the
+                # 'finally' below must still not start Open WebUI on the damaged volume.
+                $held = $stoppedContainers
                 $stoppedContainers = @()
+                try { Set-Hold 'restore and its rollback failed' $held } catch { Write-LaiLog FAIL "Could not record the hold ($($_.Exception.Message)): do NOT start Open WebUI until the restore succeeds." }
             }
         } else {
-            $script:recoverCmd = '.\Restore-OpenWebUI.ps1 -Archive <a good backup> -SkipSafetyBackup'
+            $script:recoverCmd = "& '$(Join-Path $PSScriptRoot 'Restore-OpenWebUI.ps1')' -Archive '$(Join-Path $backupDir 'open-webui-YYYYMMDD-HHMMSS.tar.gz')' -SkipSafetyBackup  (use a backup from before the problem)"
             Write-LaiLog FAIL "No safety backup exists; Open WebUI is left STOPPED so it cannot start on a damaged volume (the health watch will not start it). Recover with: $script:recoverCmd"
-            Set-Hold 'restore failed without a safety backup'
+            # Hold the list first, clear it, then record: if writing the hold fails (full disk), the
+            # 'finally' below must still not start Open WebUI on the damaged volume.
+            $held = $stoppedContainers
             $stoppedContainers = @()
+            try { Set-Hold 'restore failed without a safety backup' $held } catch { Write-LaiLog FAIL "Could not record the hold ($($_.Exception.Message)): do NOT start Open WebUI until the restore succeeds." }
         }
     }
     $script:restoreFailed = $true
@@ -219,7 +228,8 @@ if ($stoppedContainers.Count -gt 0) {
         if ($config.ContainsKey('WebUIOllamaUrl') -and $config['WebUIOllamaUrl']) { $expected = [string]$config['WebUIOllamaUrl'] }
         $credFile = Join-Path (Join-Path $AIRoot 'Secrets') 'openwebui-admin.json'
         try {
-            $cred = Get-Content -LiteralPath $credFile -Raw | ConvertFrom-Json
+            try { Resolve-LaiPendingPassword -AIRoot $AIRoot -BaseUrl "http://127.0.0.1:$port" | Out-Null } catch { Write-Verbose 'pending password check failed' }
+            $cred = Get-Content -Encoding UTF8 -LiteralPath $credFile -Raw | ConvertFrom-Json
             $token = Connect-LaiWebUI -BaseUrl "http://127.0.0.1:$port" -Email $cred.email -Password $cred.password
             if (Set-LaiWebUIOllamaUrl -BaseUrl "http://127.0.0.1:$port" -Token $token -OllamaUrl $expected) {
                 Write-LaiLog OK "Re-applied this install's Ollama connection ($expected) to the restored settings"

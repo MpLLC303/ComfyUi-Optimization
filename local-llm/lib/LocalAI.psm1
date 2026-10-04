@@ -597,6 +597,36 @@ function Wait-LaiWebUI {
     Wait-LaiHttp -Uri "$BaseUrl/health" -TimeoutSec $TimeoutSec -Condition { param($r) $r.status -eq $true } | Out-Null
 }
 
+function Resolve-LaiPendingPassword {
+    <#
+    .SYNOPSIS
+        Set-OpenWebUIPassword.ps1 writes the new password to openwebui-admin.pending.json before it
+        asks Open WebUI to change it. If that run was cut off, find out which password is live: if the
+        pending one signs in, it becomes the stored one; if not, the pending file is dropped.
+        Returns 'promoted', 'dropped' or 'none'.
+    #>
+    param([Parameter(Mandatory)][string]$AIRoot, [Parameter(Mandatory)][string]$BaseUrl)
+    $secrets = Join-Path $AIRoot 'Secrets'
+    $pending = Join-Path $secrets 'openwebui-admin.pending.json'
+    $credFile = Join-Path $secrets 'openwebui-admin.json'
+    if (-not (Test-Path -LiteralPath $pending)) { return 'none' }
+    $p = Get-Content -Encoding UTF8 -LiteralPath $pending -Raw | ConvertFrom-Json
+    try { Connect-LaiWebUI -BaseUrl $BaseUrl -Email $p.email -Password $p.password | Out-Null }
+    catch {
+        if (Get-LaiHttpStatus $_) {
+            # Open WebUI answered and refused it: the change never happened.
+            Remove-Item -LiteralPath $pending -Force
+            return 'dropped'
+        }
+        return 'none'   # Open WebUI not reachable: decide another time
+    }
+    # Replace the content only, so the credentials file keeps its restricted permissions.
+    Get-Content -Encoding UTF8 -LiteralPath $pending -Raw | Set-Content -LiteralPath $credFile -Encoding UTF8 -NoNewline -ErrorAction Stop
+    Remove-Item -LiteralPath $pending -Force
+    Write-LaiLog OK "An interrupted password change had gone through; $credFile now holds the new password."
+    return 'promoted'
+}
+
 function Connect-LaiWebUI {
     param(
         [string]$BaseUrl = 'http://127.0.0.1:3000',

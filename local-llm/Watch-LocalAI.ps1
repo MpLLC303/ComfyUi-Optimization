@@ -231,7 +231,11 @@ Write-Verbose $line
 if ($toNotify.Count -gt 0) {
     # One concrete next step, using the Start-menu shortcuts (typed commands may be blocked by policy).
     $hint = 'Start menu > Local AI > Health check for details.'
-    if ($failed -contains 'Docker' -or $failed -contains 'Open WebUI' -or $failed -contains 'SearXNG' -or $failed -contains 'Render guard' -or $failed -contains 'Ollama') {
+    $heldNow = Get-LaiWebUIHold -AIRoot $AIRoot
+    if ($heldNow -and $failed -contains 'Open WebUI') {
+        # Start again would refuse; the only fix is the recovery restore (the command is in the details).
+        $hint = 'Open WebUI was kept stopped after a failed restore. Run the recovery command above in PowerShell as Administrator.'
+    } elseif ($failed -contains 'Docker' -or $failed -contains 'Open WebUI' -or $failed -contains 'SearXNG' -or $failed -contains 'Render guard' -or $failed -contains 'Ollama') {
         $hint = 'Try Start menu > Local AI > Start again.'
     } elseif ($failed -contains 'Disk space') {
         $hint = 'Free some disk space (old backups in ' + (Join-Path $AIRoot 'Backups') + ', unused models).'

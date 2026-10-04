@@ -70,6 +70,15 @@ if ($RetentionDays -le 0) {
 }
 if (-not $Mirror -and $config.ContainsKey('BackupMirror') -and $config['BackupMirror']) { $Mirror = [string]$config['BackupMirror'] }
 
+# After a failed restore the volume may hold damaged data: a nightly archive of it would push the
+# good backups out of the protected newest three. Tagged runs (the recovery's own safety backup,
+# before an update) still run.
+$hold = Get-LaiWebUIHold -AIRoot $AIRoot
+if ($hold -and -not $Tag) {
+    Write-BackupLog WARN "Skipped: Open WebUI is held after a failed restore ($($hold['Reason'])). Recover first: $($hold['Recover'])"
+    exit 0
+}
+
 $suffix = ''
 if ($Tag) { $suffix = "-$Tag" }
 $name = 'open-webui-{0}{1}.tar.gz' -f (Get-Date -Format 'yyyyMMdd-HHmmss'), $suffix
@@ -118,7 +127,7 @@ try {
             $ver = 'v0.11.4'
             $envFile = Join-Path (Join-Path $AIRoot 'Stack') '.env'
             if (Test-Path -LiteralPath $envFile) {
-                $line = Get-Content -LiteralPath $envFile | Where-Object { $_ -like 'OPEN_WEBUI_VERSION=*' } | Select-Object -First 1
+                $line = Get-Content -Encoding UTF8 -LiteralPath $envFile | Where-Object { $_ -like 'OPEN_WEBUI_VERSION=*' } | Select-Object -First 1
                 if ($line) { $ver = $line.Substring(19) }
             }
             $VerifyImage = "ghcr.io/open-webui/open-webui:$ver"
@@ -163,7 +172,12 @@ try {
         try { Move-Item -LiteralPath $work -Destination $archive -Force -ErrorAction Stop; break }
         catch {
             # Antivirus or a sync client can hold a just-written file for a moment.
-            if ($i -eq 5) { throw "Backup verified but could not be renamed (kept as $workName): $($_.Exception.Message)" }
+            if ($i -eq 5) {
+                # Last resort: a copy under the final name (a reader may still allow that). The
+                # incomplete-* original is swept by the next run, so never leave the only copy there.
+                try { Copy-Item -LiteralPath $work -Destination $archive -Force -ErrorAction Stop; Remove-Item -LiteralPath $work -Force -ErrorAction SilentlyContinue; break }
+                catch { throw "Backup verified but could not be saved under its final name ($($_.Exception.Message)); the next run makes a new one." }
+            }
             Start-Sleep -Seconds (2 * $i)
         }
     }
@@ -174,13 +188,15 @@ try {
     # The archive Update-OpenWebUI.ps1 -Rollback would use stays no matter how old it is. Applied to
     # the mirror too, which would otherwise fill the NAS. One file that cannot be deleted (open in an
     # archiver, held by a sync client) is a warning, not a failed backup.
-    $keepName = ''
-    if ($config.ContainsKey('RollbackArchive') -and $config['RollbackArchive']) { $keepName = Split-Path -Leaf ([string]$config['RollbackArchive']) }
+    $keepNames = @()
+    if ($config.ContainsKey('RollbackArchive') -and $config['RollbackArchive']) { $keepNames += Split-Path -Leaf ([string]$config['RollbackArchive']) }
+    # The archive a pending recovery command names must survive too.
+    if ($hold -and $hold['Archive']) { $keepNames += Split-Path -Leaf ([string]$hold['Archive']) }
     $prune = {
         param([string]$Dir)
         $all = @(Get-ChildItem -LiteralPath $Dir -Filter 'open-webui-*.tar.gz' -ErrorAction Stop)
         $daily = @($all | Where-Object { $_.Name -match '^open-webui-\d{8}-\d{6}\.tar\.gz$' } | Sort-Object LastWriteTime -Descending)  # lai-ok: objects
-        $tagged = @($all | Where-Object { $_.Name -notmatch '^open-webui-\d{8}-\d{6}\.tar\.gz$' -and $_.Name -ne $keepName })
+        $tagged = @($all | Where-Object { $_.Name -notmatch '^open-webui-\d{8}-\d{6}\.tar\.gz$' -and $keepNames -notcontains $_.Name })
         $cutoff = (Get-Date).AddDays(-$RetentionDays)
         foreach ($old in (@($daily | Select-Object -Skip 3) + $tagged | Where-Object { $_.LastWriteTime -lt $cutoff -and $_.Name -ne $name })) {
             try { Remove-Item -LiteralPath $old.FullName -Force -ErrorAction Stop; Write-BackupLog INFO "Pruned $($old.FullName)" }

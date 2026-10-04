@@ -199,7 +199,8 @@ Add-Check 'Open WebUI admin login' {
     if (-not $script:webUp) { return (Skip 'Open WebUI not reachable') }
     $credFile = Join-Path (Join-Path $AIRoot 'Secrets') 'openwebui-admin.json'
     if (-not (Test-Path -LiteralPath $credFile)) { return (Fail "missing $credFile") }
-    $cred = Get-Content -LiteralPath $credFile -Raw | ConvertFrom-Json
+    try { Resolve-LaiPendingPassword -AIRoot $AIRoot -BaseUrl $webUrl | Out-Null } catch { Write-Verbose 'pending password check failed' }
+    $cred = Get-Content -Encoding UTF8 -LiteralPath $credFile -Raw | ConvertFrom-Json
     try { $script:token = Connect-LaiWebUI -BaseUrl $webUrl -Email $cred.email -Password $cred.password }
     catch { return (Fail "sign-in as $($cred.email) failed - after restoring an older backup run Set-OpenWebUIPassword.ps1 -PromptCurrent") }
     Pass $cred.email

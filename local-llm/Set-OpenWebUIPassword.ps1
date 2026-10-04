@@ -31,11 +31,13 @@ Import-Module (Join-Path (Join-Path $PSScriptRoot 'lib') 'LocalAI.psm1') -Force
 
 $credFile = Join-Path (Join-Path $AIRoot 'Secrets') 'openwebui-admin.json'
 if (-not (Test-Path -LiteralPath $credFile)) { throw "No stored credentials at $credFile. Run Install-LocalAI.ps1 first." }
-$cred = Get-Content -LiteralPath $credFile -Raw | ConvertFrom-Json
 $config = Read-LaiState -Path (Join-Path $AIRoot 'localai-config.json')
 $port = 3000
 if ($config.ContainsKey('WebUIPort')) { $port = [int]$config['WebUIPort'] }
 $baseUrl = "http://127.0.0.1:$port"
+# A previous run cut off mid-change: settle which password is live before changing it again.
+Resolve-LaiPendingPassword -AIRoot $AIRoot -BaseUrl $baseUrl | Out-Null
+$cred = Get-Content -Encoding UTF8 -LiteralPath $credFile -Raw | ConvertFrom-Json
 
 if ($Prompt) {
     $a = Read-Host 'New password' -AsSecureString

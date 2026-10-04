@@ -58,7 +58,7 @@ Assert-That ((Read-LaiState -Path $statePath)['gen'] -eq 4) 'saving over a damag
 $accented = 'C:\Users\J' + [char]0x00F6 + 'rg\AI\OllamaModels'
 Save-LaiState -State @{ modelDir = $accented } -Path $statePath
 Assert-That ((Read-LaiState -Path $statePath)['modelDir'] -eq $accented) 'non-ASCII path survives the round trip'
-Assert-That (((Get-Content -LiteralPath $statePath -Raw) | ConvertFrom-Json).modelDir -eq $accented) 'and a plain Get-Content (no -Encoding) reads it right too'
+Assert-That (((Get-Content -LiteralPath $statePath -Raw) | ConvertFrom-Json).modelDir -eq $accented) 'and a plain Get-Content (no -Encoding) reads it right too'  # lai-ok: encoding
 
 # ---- UTF-8 request bodies ----------------------------------------------------------------------
 Write-Host "`n=== Invoke-LaiApi UTF-8 body ===" -ForegroundColor Cyan
@@ -220,6 +220,13 @@ $r = Invoke-Child 'Uninstall-LocalAI.ps1' @('-AIRoot', $aiRoot, '-WhatIf')
 Assert-That ($r.Code -eq 0) "Uninstall -WhatIf on an empty root exits 0 (got $($r.Code))"
 $r = Invoke-Child 'Stop-LocalAI.ps1' @('-AIRoot', $aiRoot, '-PauseHours', '1')
 Assert-That ($r.Code -eq 0) "Stop-LocalAI with nothing running exits 0 (got $($r.Code))"
+$comfyDir = Join-Path $Work 'ComfyUI_portable'
+New-Item -ItemType Directory -Force -Path $comfyDir | Out-Null
+Set-Content -LiteralPath (Join-Path $comfyDir 'run_nvidia_gpu.bat') -Value '@echo off'
+Push-Location $comfyDir
+try { $r = Invoke-Child 'Start-ComfyUI.ps1' @('-AIRoot', $aiRoot, '-Path', (Join-Path '.' 'run_nvidia_gpu.bat'), '-NoLaunch', '-OllamaUrl', 'http://127.0.0.1:1') } finally { Pop-Location }
+$saved = [string](Read-LaiState -Path (Join-Path $aiRoot 'localai-config.json'))['ComfyUIPath']
+Assert-That ($r.Code -eq 0 -and [System.IO.Path]::IsPathRooted($saved) -and $saved -like '*ComfyUI_portable*run_nvidia_gpu.bat') "Start-ComfyUI remembers a relative -Path as a full path ($saved)"
 $r = Invoke-Child 'Release-GPU.ps1' @('-OllamaUrl', 'http://127.0.0.1:1')
 Assert-That ($r.Code -eq 0 -and $r.Text -match 'not running') "Release-GPU with Ollama closed says so and exits 0 (got $($r.Code))"
 if ($r.Code -ne 0 -or $failures -gt 0) { Write-Host $r.Text }

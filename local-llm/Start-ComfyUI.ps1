@@ -76,6 +76,8 @@ if (-not $Path) { $Path = Find-ComfyUI -Remembered $remembered }
 if (-not $Path -or -not (Test-Path -LiteralPath $Path)) {
     throw 'ComfyUI not found. Pass -Path <Comfy Desktop.exe | run_nvidia_gpu.bat | shortcut>; it is remembered for next time.'
 }
+# Remember a full path: the Start-menu shortcut runs from AI\Scripts, where a relative one breaks.
+$Path = (Resolve-Path -LiteralPath $Path).ProviderPath
 if (-not (Test-LaunchTarget $Path)) { throw "$Path is this toolkit's own launcher, not ComfyUI. Pass -Path <Comfy Desktop.exe | run_nvidia_gpu.bat>." }
 if ($Path -ne $remembered -and (Test-Path -LiteralPath $AIRoot)) {
     $config['ComfyUIPath'] = $Path

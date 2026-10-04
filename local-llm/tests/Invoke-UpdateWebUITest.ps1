@@ -73,11 +73,11 @@ try {
     $rollbackArchive = [string]$cfg['RollbackArchive']
 
     Write-Host "`n=== 2. failed pull changes nothing ===" -ForegroundColor Cyan
-    $envBefore = Get-Content -LiteralPath (Join-Path $stack '.env') -Raw
+    $envBefore = Get-Content -Encoding UTF8 -LiteralPath (Join-Path $stack '.env') -Raw
     $r = Invoke-Update @('-Version', '0.0.0-does-not-exist', '-SkipBackup')
     $cfg = Read-LaiState -Path (Join-Path $aiRoot 'localai-config.json')
     Assert-That ($r.Code -ne 0 -and $r.Text -match 'nothing was changed') "exits with 'nothing was changed' (exit $($r.Code))"
-    Assert-That ((Get-Content -LiteralPath (Join-Path $stack '.env') -Raw) -eq $envBefore) '.env still names the working version'
+    Assert-That ((Get-Content -Encoding UTF8 -LiteralPath (Join-Path $stack '.env') -Raw) -eq $envBefore) '.env still names the working version'
     Assert-That ($cfg['RollbackArchive'] -eq $rollbackArchive) 'rollback point kept'
     Assert-That ((Get-Image) -eq 'alpine:3.20') 'running container untouched'
 
@@ -85,7 +85,7 @@ try {
     $r = Invoke-Update @('-Version', '3.20', '-SearxngVersion', 'x2', '-SkipBackup')
     $cfg = Read-LaiState -Path (Join-Path $aiRoot 'localai-config.json')
     Assert-That ($cfg['RollbackArchive'] -eq $rollbackArchive -and $cfg['PreviousOpenWebUIVersion'] -eq '3.19') 'rollback point untouched'
-    Assert-That ((Get-Content -LiteralPath (Join-Path $stack '.env')) -contains 'SEARXNG_VERSION=x2') 'SearXNG version changed'
+    Assert-That ((Get-Content -Encoding UTF8 -LiteralPath (Join-Path $stack '.env')) -contains 'SEARXNG_VERSION=x2') 'SearXNG version changed'
     $r = Invoke-Update @()
     Assert-That ($r.Code -eq 0 -and $r.Text -match 'Nothing to do') 'no arguments: explains instead of re-pulling'
 
@@ -167,6 +167,13 @@ try {
     Assert-That ((Get-Content -LiteralPath (Join-Path (Join-Path $aiRoot 'Logs') 'watch.log') -Raw) -match 'kept stopped after a failed restore') 'watch reports why it is down'
     $st = & $runScript 'Start-LocalAI.ps1' @()
     Assert-That ($st.Code -ne 0 -and $st.Text -match 'kept stopped after a failed restore' -and (Invoke-DockerText @('inspect', '-f', '{{.State.Status}}', 'open-webui')) -eq 'exited') 'Start-LocalAI refuses and says how to recover'
+    $dailyBefore = @(Get-ChildItem -LiteralPath (Join-Path $aiRoot 'Backups') -Filter 'open-webui-*.tar.gz').Count
+    $b = & $runScript 'Backup-OpenWebUI.ps1' @('-SkipDeepVerify')
+    Assert-That ($b.Code -eq 0 -and $b.Text -match 'Skipped' -and @(Get-ChildItem -LiteralPath (Join-Path $aiRoot 'Backups') -Filter 'open-webui-*.tar.gz').Count -eq $dailyBefore) 'nightly backup skips possibly damaged data while held'
+    $u = & $runScript 'Update-OpenWebUI.ps1' @('-Version', '3.20', '-SkipBackup')
+    Assert-That ($u.Code -ne 0 -and $u.Text -match 'kept stopped after a failed restore' -and (Invoke-DockerText @('inspect', '-f', '{{.State.Status}}', 'open-webui')) -eq 'exited') 'Update-OpenWebUI refuses while held'
+    $hj = Read-LaiState -Path $holdFile
+    Assert-That ([string]$hj['Recover'] -match [regex]::Escape((Join-Path $src 'Restore-OpenWebUI.ps1'))) 'recovery command has the full script path'
     $r = & $runScript 'Restore-OpenWebUI.ps1' @('-Archive', $good.FullName, '-Force', '-SkipSafetyBackup')
     Assert-That ($r.Code -eq 0 -and -not (Test-Path -LiteralPath $holdFile)) "recovery restore clears the hold (exit $($r.Code))"
     Assert-That ((Invoke-DockerText @('inspect', '-f', '{{.State.Status}} {{.HostConfig.RestartPolicy.Name}}', 'open-webui')) -eq 'running always') 'container running again with its original restart policy'
@@ -174,20 +181,36 @@ try {
     Write-Host "`n=== 6. admin password rotation (real Open WebUI) ===" -ForegroundColor Cyan
     $credPath = Join-Path (Join-Path $aiRoot 'Secrets') 'openwebui-admin.json'
     $r = & $runScript 'Set-OpenWebUIPassword.ps1' @('-NewPassword', 'Rotated-Password-456', '-Quiet')
-    $stored = (Get-Content -LiteralPath $credPath -Raw | ConvertFrom-Json).password
+    $stored = (Get-Content -Encoding UTF8 -LiteralPath $credPath -Raw | ConvertFrom-Json).password
     Assert-That ($r.Code -eq 0 -and $stored -eq 'Rotated-Password-456') "rotation stores the new password (exit $($r.Code))"
     Assert-That (-not (Test-Path -LiteralPath (Join-Path (Join-Path $aiRoot 'Secrets') 'openwebui-admin.pending.json'))) 'no pending copy left after success'
     Assert-That ([bool](Connect-LaiWebUI -BaseUrl 'http://127.0.0.1:3000' -Email 'admin@localhost' -Password 'Rotated-Password-456')) 'Open WebUI accepts the new password'
     $r = & $runScript 'Set-OpenWebUIPassword.ps1' @('-NewPassword', 'Test-Password-123', '-Quiet')
     Assert-That ($r.Code -eq 0) 'rotated back for the other suites'
+    # An earlier run was cut off after Open WebUI applied the change: only the pending file knows it.
+    $pendingPath = Join-Path (Join-Path $aiRoot 'Secrets') 'openwebui-admin.pending.json'
+    $t = Connect-LaiWebUI -BaseUrl 'http://127.0.0.1:3000' -Email 'admin@localhost' -Password 'Test-Password-123'
+    Invoke-LaiApi -Method POST -Uri 'http://127.0.0.1:3000/api/v1/auths/update/password' -Token $t -Body @{ password = 'Test-Password-123'; new_password = 'Rotated-Password-789' } | Out-Null
+    ConvertTo-Json @{ email = 'admin@localhost'; password = 'Rotated-Password-789' } | Set-Content -LiteralPath $pendingPath -Encoding UTF8
+    $r = & $runScript 'Set-OpenWebUIPassword.ps1' @('-NewPassword', 'Test-Password-123', '-Quiet')
+    Assert-That ($r.Code -eq 0 -and $r.Text -match 'had gone through' -and -not (Test-Path -LiteralPath $pendingPath)) "interrupted change found via the pending file, then rotated (exit $($r.Code))"
+    # ...and one where the change never happened: the pending file is just dropped.
+    ConvertTo-Json @{ email = 'admin@localhost'; password = 'Never-Applied-000' } | Set-Content -LiteralPath $pendingPath -Encoding UTF8
+    $r = & $runScript 'Set-OpenWebUIPassword.ps1' @('-NewPassword', 'Test-Password-123', '-Quiet')
+    Assert-That ($r.Code -eq 0 -and -not (Test-Path -LiteralPath $pendingPath) -and (Get-Content -Encoding UTF8 -LiteralPath $credPath -Raw | ConvertFrom-Json).password -eq 'Test-Password-123') 'a pending password that never applied is dropped'
 } finally {
     # Never leave the shared sandbox Open WebUI with a changed admin password.
     try {
         $sb = 'http://127.0.0.1:3000'
         try { Connect-LaiWebUI -BaseUrl $sb -Email 'admin@localhost' -Password 'Test-Password-123' | Out-Null }
         catch {
-            $t = Connect-LaiWebUI -BaseUrl $sb -Email 'admin@localhost' -Password 'Rotated-Password-456'
-            Invoke-LaiApi -Method POST -Uri "$sb/api/v1/auths/update/password" -Token $t -Body @{ password = 'Rotated-Password-456'; new_password = 'Test-Password-123' } | Out-Null
+            foreach ($pw in 'Rotated-Password-456', 'Rotated-Password-789') {
+                try {
+                    $t = Connect-LaiWebUI -BaseUrl $sb -Email 'admin@localhost' -Password $pw
+                    Invoke-LaiApi -Method POST -Uri "$sb/api/v1/auths/update/password" -Token $t -Body @{ password = $pw; new_password = 'Test-Password-123' } | Out-Null
+                    break
+                } catch { Write-Verbose "not $pw" }
+            }
             Write-Host '  (sandbox admin password restored)'
         }
     } catch { Write-Host "  could not verify the sandbox admin password: $($_.Exception.Message)" -ForegroundColor Yellow }

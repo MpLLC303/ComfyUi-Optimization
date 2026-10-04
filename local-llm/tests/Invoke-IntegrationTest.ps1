@@ -31,7 +31,7 @@ $root = Split-Path -Parent $PSScriptRoot
 Import-Module (Join-Path $root 'lib/LocalAI.psm1') -Force
 
 $catalog = Get-LaiCatalog -Path (Join-Path $PSScriptRoot 'models.test.psd1')
-$system = Get-Content -Raw (Join-Path $root 'config/system-prompt.txt')
+$system = Get-Content -Encoding UTF8 -Raw (Join-Path $root 'config/system-prompt.txt')
 $failures = 0
 
 Write-LaiLog STEP "Ollama $(Get-LaiOllamaVersion -BaseUrl $OllamaUrl)"
