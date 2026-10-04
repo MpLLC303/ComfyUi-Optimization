@@ -399,6 +399,50 @@ try {
     $env:LAI_TS_SCENARIO = ''; $env:LOCALAI_TS_TIMEOUT = ''
 }
 
+Write-Host "`n=== resume command: real round trip through Windows PowerShell 5.1 ===" -ForegroundColor Cyan
+if ($onWindows) {
+    # The installer's own functions, taken from its source, not a copy.
+    $instAst = [System.Management.Automation.Language.Parser]::ParseFile((Join-Path $src 'Install-LocalAI.ps1'), [ref]$null, [ref]$null)
+    foreach ($fn in 'ConvertTo-PsLiteral', 'Get-RelaunchCommand') {
+        $def = $instAst.Find({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $fn }, $true)
+        . ([scriptblock]::Create($def.Extent.Text))
+    }
+    $q = [string][char]0x2019
+    $stubDir = Join-Path $Work ("stub O'Brien" + $q + 's')
+    New-Item -ItemType Directory -Force -Path $stubDir | Out-Null
+    $stub = Join-Path $stubDir 'Install-LocalAI.ps1'
+    $stubOut = Join-Path $Work 'stub-args.json'
+    Set-Content -LiteralPath $stub -Encoding UTF8 -Value ("param([string]`$AIRoot, [string[]]`$KnowledgeCollections, [switch]`$SkipCoder, [switch]`$Resume, [int]`$GpuOverheadMiB)`n" +
+        "ConvertTo-Json @{ AIRoot = `$AIRoot; KC = @(`$KnowledgeCollections); SkipCoderPresent = `$PSBoundParameters.ContainsKey('SkipCoder'); SkipCoder = [bool]`$SkipCoder; Resume = [bool]`$Resume; Gpu = `$GpuOverheadMiB } | Set-Content -LiteralPath '$stubOut' -Encoding UTF8")
+    $weirdRoot = "C:\AI O'Brien " + $q + 'x'
+    $script:BoundParams = @{ AIRoot = $weirdRoot; KnowledgeCollections = @(("Dad" + $q + 's Notes'), 'PC & Electronics'); SkipCoder = [switch]$false; GpuOverheadMiB = 512 }
+    $cmd = Get-RelaunchCommand -ScriptPath $stub -AddResume
+    if (Test-Path -LiteralPath $stubOut) { Remove-Item -LiteralPath $stubOut }
+    # Exactly how the resume task passes it: one argument string to powershell.exe.
+    Start-Process -FilePath 'powershell.exe' -ArgumentList "-NoProfile -ExecutionPolicy Bypass -Command $cmd" -Wait -WindowStyle Hidden
+    $got = $null; if (Test-Path -LiteralPath $stubOut) { $got = Get-Content -Encoding UTF8 -Raw -LiteralPath $stubOut | ConvertFrom-Json }
+    Assert-That ($got -and $got.AIRoot -eq $weirdRoot) "AI root with an apostrophe and U+2019 arrives intact ($($got.AIRoot))"
+    Assert-That ($got -and @($got.KC).Count -eq 2 -and @($got.KC)[0] -eq ("Dad" + $q + 's Notes') -and @($got.KC)[1] -eq 'PC & Electronics') 'list parameter with U+2019 and & arrives as two items'
+    Assert-That ($got -and $got.SkipCoderPresent -and -not $got.SkipCoder -and $got.Resume -and $got.Gpu -eq 512) 'explicit -SkipCoder:$false, -Resume and the number survive'
+} else { Skip 'resume round trip runs on Windows only' }
+
+Write-Host "`n=== Test-LocalAI: anything listening beyond localhost is reported ===" -ForegroundColor Cyan
+if ($onWindows) {
+    $expRoot = Join-Path $Work 'exposure'
+    New-Item -ItemType Directory -Force -Path $expRoot | Out-Null
+    ConvertTo-Json @{ WebUIPort = 39998; SearxngPort = 39997; OllamaUrl = 'http://127.0.0.1:1' } | Set-Content -LiteralPath (Join-Path $expRoot 'localai-config.json')
+    $line = { param($Addr)
+        $l = New-Object System.Net.Sockets.TcpListener([System.Net.IPAddress]::Parse($Addr), 39998)
+        $l.Start()
+        try { $res = Invoke-Child 'Test-LocalAI.ps1' @('-AIRoot', $expRoot, '-NoContainers', '-Quick') } finally { $l.Stop() }
+        return (@($res.Text -split "`n" | Where-Object { $_ -match 'Nothing exposed beyond localhost' }) -join ' ')
+    }
+    $open = & $line '0.0.0.0'
+    $closed = & $line '127.0.0.1'
+    Assert-That ($open -match 'FAIL' -and $open -match '39998@0\.0\.0\.0') "a port bound to all interfaces fails the check ($open)"
+    Assert-That ($closed -match 'PASS') "the same port on 127.0.0.1 passes ($closed)"
+} else { Skip 'exposure check runs on Windows only' }
+
 Write-Host "`n=== diagnostics bundle: redaction ===" -ForegroundColor Cyan
 $dRoot = Join-Path $Work 'diagroot'
 foreach ($d in 'Secrets', 'Stack', 'Logs') { New-Item -ItemType Directory -Force -Path (Join-Path $dRoot $d) | Out-Null }
