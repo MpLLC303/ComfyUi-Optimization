@@ -1161,7 +1161,9 @@ Invoke-Stage 'Backup' {
 $testExit = 0
 if (-not $SkipTests) {
     Invoke-Stage 'Verify' {
-        & (Join-Path $P.Scripts 'Test-LocalAI.ps1') -AIRoot $AIRoot
+        # From the installer's own copy, never AI\Scripts: this runs elevated (with no prompt when the
+        # resume task started it), and the user can swap folders inside C:\AI.
+        & (Join-Path $SourceRoot 'Test-LocalAI.ps1') -AIRoot $AIRoot
         $script:testExit = $LASTEXITCODE
     }
     $testExit = $script:testExit

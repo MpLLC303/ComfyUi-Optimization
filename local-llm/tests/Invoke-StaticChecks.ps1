@@ -30,9 +30,11 @@ $files = Get-ChildItem -Path $Root -Recurse -File -Include *.ps1, *.psm1, *.psd1
 #            reads $Matches: the second match has replaced the groups of the first.
 #   BOUND    $PSBoundParameters inside a scriptblock run with & or Invoke-Stage: it is the
 #            scriptblock's own (empty) set there, not the script's; copy it to a script variable.
+#   ELEVATED Install-LocalAI.ps1 (runs elevated, silently from the resume task) running code
+#            from AI\Scripts, a folder inside the user-controlled C:\AI.
 #   ENCODING Get-Content of an env/config/state/secret file without -Encoding UTF8 (5.1 reads
 #            BOM-less UTF-8 as ANSI; .env must be BOM-less for docker compose).
-function Find-Pitfall([System.Management.Automation.Language.Ast]$Ast, [string[]]$Lines) {
+function Find-Pitfall([System.Management.Automation.Language.Ast]$Ast, [string[]]$Lines, [string]$FileName = '') {
     $found = New-Object System.Collections.Generic.List[object]
     $add = { param($Rule, $Node, $Msg) $found.Add([pscustomobject]@{ Rule = $Rule; Line = $Node.Extent.StartLineNumber; Message = $Msg }) }
     $marker = { param($Node, $Tag) $Lines[$Node.Extent.StartLineNumber - 1] -match ('#\s*lai-ok:\s*' + $Tag) }
@@ -50,6 +52,12 @@ function Find-Pitfall([System.Management.Automation.Language.Ast]$Ast, [string[]
                     & $add 'PS51' $c "$name by property name fails on hashtables in Windows PowerShell 5.1; use a scriptblock or add '# lai-ok: objects'"
                 }
             }
+        }
+        # The installer runs elevated (silently, from the resume task): it must never run code from
+        # AI\Scripts, which lives in a folder the user controls. Use $SourceRoot (its own copy).
+        if ($FileName -eq 'Install-LocalAI.ps1' -and ($c.InvocationOperator -eq 'Ampersand' -or $c.InvocationOperator -eq 'Dot' -or $name -eq 'Import-Module') -and
+            $c.Extent.Text -match '\$P\.Scripts' -and -not (& $marker $c 'elevated')) {
+            & $add 'ELEVATED' $c 'the elevated installer runs code from AI\Scripts (user-controlled folder); run it from $SourceRoot'
         }
         # Get-Content of a config/state/env/secret file without -Encoding: Windows PowerShell 5.1 reads
         # BOM-less UTF-8 (how .env must be written for docker compose) as ANSI and garbles non-ASCII.
@@ -125,6 +133,10 @@ $canaries = @(
     @{ Rule = 'FORMAT'; Fire = $false; Code = '& docker inspect -f ''{{.State.Status}}'' open-webui' }
     @{ Rule = 'FORMAT'; Fire = $false; Code = 'Remove-Item $p -f' }
     @{ Rule = 'FORMAT'; Fire = $false; Code = '& docker compose --project-directory (Join-Path $r ''S'') -f (Join-Path $r ''c.yml'') up' }
+    @{ Rule = 'ELEVATED'; Fire = $true; File = 'Install-LocalAI.ps1'; Code = '& (Join-Path $P.Scripts ''Test-LocalAI.ps1'') -AIRoot $AIRoot' }
+    @{ Rule = 'ELEVATED'; Fire = $true; File = 'Install-LocalAI.ps1'; Code = 'Import-Module (Join-Path $P.Scripts ''lib\LocalAI.psm1'')' }
+    @{ Rule = 'ELEVATED'; Fire = $false; File = 'Install-LocalAI.ps1'; Code = '& (Join-Path $SourceRoot ''Test-LocalAI.ps1'') -AIRoot $AIRoot' }
+    @{ Rule = 'ELEVATED'; Fire = $false; File = 'Install-LocalAI.ps1'; Code = '$x = Join-Path $P.Scripts ''Watch-LocalAI.ps1''' }
     @{ Rule = 'ENCODING'; Fire = $true; Code = 'foreach ($l in (Get-Content -LiteralPath $envPath)) { $l }' }
     @{ Rule = 'ENCODING'; Fire = $true; Code = '$c = Get-Content -LiteralPath $credFile -Raw | ConvertFrom-Json' }
     @{ Rule = 'ENCODING'; Fire = $false; Code = '$c = Get-Content -LiteralPath $credFile -Raw -Encoding UTF8 | ConvertFrom-Json' }
@@ -143,7 +155,8 @@ $canaryFail = 0
 foreach ($k in $canaries) {
     $t = $null; $e = $null
     $cast = [System.Management.Automation.Language.Parser]::ParseInput($k.Code, [ref]$t, [ref]$e)
-    $hit = @((Find-Pitfall $cast @($k.Code -split "`n")) | Where-Object { $_.Rule -eq $k.Rule }).Count -gt 0
+    $fn = ''; if ($k.ContainsKey('File')) { $fn = $k.File }
+    $hit = @((Find-Pitfall -Ast $cast -Lines @($k.Code -split "`n") -FileName $fn) | Where-Object { $_.Rule -eq $k.Rule }).Count -gt 0
     if ($hit -ne $k.Fire) {
         $canaryFail++; $problems++
         Write-Host ("CANARY   rule {0} {1} on: {2}" -f $k.Rule, $(if ($k.Fire) { 'did not fire' } else { 'fired wrongly' }), $k.Code) -ForegroundColor Red
@@ -165,7 +178,7 @@ foreach ($f in $files) {
         }
     }
 
-    foreach ($p in (Find-Pitfall $ast @(Get-Content -LiteralPath $f.FullName))) {
+    foreach ($p in (Find-Pitfall -Ast $ast -Lines @(Get-Content -LiteralPath $f.FullName) -FileName $f.Name)) {
         $problems++
         Write-Host ("{0,-8} {1}:{2} {3}" -f $p.Rule, $f.Name, $p.Line, $p.Message) -ForegroundColor Red
     }
