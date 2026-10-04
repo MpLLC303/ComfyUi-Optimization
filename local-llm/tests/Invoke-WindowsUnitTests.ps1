@@ -94,7 +94,7 @@ Assert-That ($free -eq 'FREE') "and as free after release (got '$free')"
 # ---- shortcuts -----------------------------------------------------------------------------------
 Write-Host "`n=== Start-menu shortcuts ===" -ForegroundColor Cyan
 $specs = @(Get-LaiShortcutSpecs -AIRoot "C:\It's AI" -WebUIPort 3001)
-Assert-That ($specs.Count -eq 6) "six shortcut specs (got $($specs.Count))"
+Assert-That ($specs.Count -eq 7) "seven shortcut specs (got $($specs.Count))"
 foreach ($sc in ($specs | Where-Object { $_.Kind -eq 'lnk' })) {
     $cmd = $sc.Arguments.Substring($sc.Arguments.IndexOf('"') + 1).TrimEnd('"')
     $errs = $null

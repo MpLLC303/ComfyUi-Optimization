@@ -1,5 +1,5 @@
-# Bootstrap: downloads this repository as a ZIP and starts Install-LocalAI.ps1.
-# Only works while the repository is PUBLIC; a private repo returns 404 to anonymous requests.
+# Bootstrap: downloads the newest toolkit as a ZIP and starts Install-LocalAI.ps1 from it. Use it for
+# the first install and for every update (Start menu > Local AI > Update toolkit runs this file).
 # Paste into a normal (non-admin) PowerShell window:
 #
 #   $env:LOCALAI_REF = 'main'

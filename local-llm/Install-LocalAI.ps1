@@ -79,6 +79,9 @@ $ProgressPreference = 'SilentlyContinue'
 [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
 
 $SourceRoot = $PSScriptRoot
+$ToolkitVersion = 'unknown'
+$versionFile = Join-Path $SourceRoot 'VERSION'
+if (Test-Path -LiteralPath $versionFile) { $ToolkitVersion = (Get-Content -LiteralPath $versionFile -Raw).Trim() }
 Import-Module (Join-Path $SourceRoot 'lib\LocalAI.psm1') -Force
 
 #region Elevation ---------------------------------------------------------------------------
@@ -154,6 +157,26 @@ try { Start-Transcript -Path (Join-Path $P.Logs ('install-{0}.log' -f (Get-Date 
 
 $State = Read-LaiState -Path $P.State
 foreach ($k in @('stages', 'tuning', 'flags')) { if (-not $State.ContainsKey($k) -or $null -eq $State[$k]) { $State[$k] = @{} } }
+
+# Settings passed on an earlier run are remembered, so "Update toolkit" (which passes none) does not
+# quietly undo them (e.g. download the Vision model skipped with -SkipVision). A value passed now wins.
+$RememberedParams = @('SkipVision', 'SkipCoder', 'AdminEmail', 'KvCacheType', 'GpuOverheadMiB', 'MinFreeVramMiB',
+    'MaxBusyVramMiB', 'GpuWaitMinutes', 'KeepAlive', 'KnowledgeCollections', 'BackupTime', 'BackupRetentionDays', 'BackupMirror')
+if (-not $State.flags.ContainsKey('params') -or $null -eq $State.flags['params']) { $State.flags['params'] = @{} }
+$savedParams = $State.flags['params']
+foreach ($name in $RememberedParams) {
+    if ($PSBoundParameters.ContainsKey($name)) {
+        $v = $PSBoundParameters[$name]
+        if ($v -is [System.Management.Automation.SwitchParameter]) { $v = [bool]$v.IsPresent }
+        $savedParams[$name] = $v
+    } elseif ($savedParams.ContainsKey($name)) {
+        $v = $savedParams[$name]
+        if ($name -like 'Skip*') { $v = [System.Management.Automation.SwitchParameter][bool]$v }
+        if ($name -eq 'KnowledgeCollections') { $v = [string[]]@($v) }
+        Set-Variable -Name $name -Value $v -Scope Script
+        Write-Verbose "Using $name from the previous run"
+    }
+}
 
 function Save-State { Save-LaiState -State $State -Path $P.State }
 
@@ -383,7 +406,11 @@ if (-not $PSBoundParameters.ContainsKey('RenderGuard') -and @('cpu', 'off') -con
     $RenderGuard = $PrevStackEnv['RENDER_GUARD_MODE']
 }
 
-Write-LaiLog STEP "Local AI installer - log: $($P.Logs)"
+Write-LaiLog STEP "Local AI installer $ToolkitVersion - log: $($P.Logs)"
+if (-not $Resume -and $SourceRoot.TrimEnd('\') -eq $P.Scripts.TrimEnd('\')) {
+    Write-LaiLog WARN (('This is the installed copy in {0}; it re-applies the toolkit you already have. To get the newest ' +
+        'version use Start menu > Local AI > Update toolkit, or the one-line command in the README.') -f $P.Scripts)
+}
 if ($Resume) { Write-LaiLog INFO 'Resuming after reboot/sign-in.' }
 
 try {
@@ -475,12 +502,25 @@ Invoke-Stage 'Preflight' {
     # Keep a stable copy of the scripts for scheduled tasks and the resume task.
     if ($SourceRoot.TrimEnd('\') -ne $P.Scripts.TrimEnd('\')) {
         if (-not (Test-Path -LiteralPath $P.Scripts)) { New-Item -ItemType Directory -Force -Path $P.Scripts | Out-Null }
-        foreach ($item in @('Install-LocalAI.ps1', 'Install-LocalAI.cmd', 'Test-LocalAI.ps1', 'Backup-OpenWebUI.ps1', 'Update-OpenWebUI.ps1', 'Release-GPU.ps1', 'Set-OpenWebUIPassword.ps1', 'Restore-OpenWebUI.ps1', 'Update-Models.ps1', 'Start-ComfyUI.ps1', 'Enable-TailscaleAccess.ps1', 'Watch-LocalAI.ps1', 'Uninstall-LocalAI.ps1', 'Stop-LocalAI.ps1', 'Start-LocalAI.ps1', 'Get-LocalAIDiagnostics.ps1', 'README.md', 'lib', 'config', 'stack')) {
+        foreach ($item in @('Install-LocalAI.ps1', 'Install-LocalAI.cmd', 'Test-LocalAI.ps1', 'Backup-OpenWebUI.ps1', 'Update-OpenWebUI.ps1', 'Release-GPU.ps1', 'Set-OpenWebUIPassword.ps1', 'Restore-OpenWebUI.ps1', 'Update-Models.ps1', 'Start-ComfyUI.ps1', 'Enable-TailscaleAccess.ps1', 'Watch-LocalAI.ps1', 'Uninstall-LocalAI.ps1', 'Stop-LocalAI.ps1', 'Start-LocalAI.ps1', 'Get-LocalAIDiagnostics.ps1', 'Get-LocalAI.ps1', 'VERSION', 'README.md', 'lib', 'config', 'stack')) {
             $src = Join-Path $SourceRoot $item
             if (Test-Path -LiteralPath $src) { Copy-Item -LiteralPath $src -Destination $P.Scripts -Recurse -Force }
         }
         Write-LaiLog OK "Scripts copied to $($P.Scripts)"
     }
+    # Downloaded files carry the browser's "from the internet" mark; with it, typing a script path
+    # in PowerShell is refused even under RemoteSigned. Shortcuts and tasks use -Bypass anyway.
+    try { Get-ChildItem -LiteralPath $P.Scripts -Recurse -File -ErrorAction SilentlyContinue | Unblock-File -ErrorAction Stop }
+    catch { Write-Verbose "Unblock-File skipped: $($_.Exception.Message)" }
+    # Windows' default policy (Restricted) refuses every typed .ps1. RemoteSigned still blocks
+    # unsigned scripts that come from the internet, and is the Windows Server default.
+    try {
+        $policy = Get-ExecutionPolicy
+        if (@('Restricted', 'AllSigned', 'Undefined') -contains [string]$policy) {
+            Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope LocalMachine -Force -ErrorAction Stop
+            Write-LaiLog OK "PowerShell execution policy: $policy -> RemoteSigned, so the scripts in $($P.Scripts) can be run by name"
+        }
+    } catch { Write-LaiLog WARN "Could not change the PowerShell execution policy ($($_.Exception.Message)); use the Start-menu shortcuts or 'powershell -ExecutionPolicy Bypass -File <script>'." }
     foreach ($d in @('Projects', 'Scratch', 'Downloads', 'Generated')) {
         $w = Join-Path $P.Workspace $d
         if (-not (Test-Path -LiteralPath $w)) { New-Item -ItemType Directory -Force -Path $w | Out-Null }
@@ -920,7 +960,7 @@ Invoke-Stage 'Backup' {
         ModelDir = $State.flags['modelDir']; SelectedModels = @($State.flags['selectedModels'])
         BackupRetentionDays = $BackupRetentionDays; BackupMirror = $BackupMirror; KeepAlive = $KeepAlive
         MinFreeVramMiB = $MinFreeVramMiB; MaxBusyVramMiB = $MaxBusyVramMiB; RenderGuard = $RenderGuard
-        WebUIOllamaUrl = $script:WebUIOllamaUrl
+        WebUIOllamaUrl = $script:WebUIOllamaUrl; ToolkitVersion = $ToolkitVersion
     }
     foreach ($k in $managed.Keys) { $config[$k] = $managed[$k] }
     ConvertTo-Json -InputObject $config -Depth 5 | Set-Content -LiteralPath $P.Config -Encoding UTF8

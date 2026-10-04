@@ -225,7 +225,16 @@ Add-Content -LiteralPath $logFile -Value $line
 Write-Verbose $line
 
 if ($toNotify.Count -gt 0) {
-    Send-Notification 'Local AI: problem detected' ("Not working: {0}. Run {1} for details." -f $failedText, (Join-Path $AIRoot 'Scripts\Test-LocalAI.ps1'))
+    # One concrete next step, using the Start-menu shortcuts (typed commands may be blocked by policy).
+    $hint = 'Start menu > Local AI > Health check for details.'
+    if ($failed -contains 'Docker' -or $failed -contains 'Open WebUI' -or $failed -contains 'SearXNG' -or $failed -contains 'Render guard' -or $failed -contains 'Ollama') {
+        $hint = 'Try Start menu > Local AI > Start again.'
+    } elseif ($failed -contains 'Disk space') {
+        $hint = 'Free some disk space (old backups in ' + (Join-Path $AIRoot 'Backups') + ', unused models).'
+    } elseif ($failed -contains 'Backups') {
+        $hint = 'Run Start menu > Local AI > Diagnostics and check backup.log.'
+    }
+    Send-Notification 'Local AI: problem detected' ("Not working: {0}. {1}" -f $failedText, $hint)
 } elseif ($recovered.Count -gt 0 -or ($healed.Count -gt 0 -and $failed.Count -eq 0)) {
     $parts = @()
     if ($healed.Count -gt 0) { $parts += 'restarted ' + ($healed -join ', ') }

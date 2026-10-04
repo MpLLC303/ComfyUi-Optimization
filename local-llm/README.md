@@ -15,23 +15,47 @@ Browser ──> Open WebUI (Docker, 127.0.0.1:3000) ──> render-guard ──>
 
 ## Run it
 
-Pick one. In each case you get **one UAC prompt**, and then the installer runs unattended.
+Open a normal PowerShell window (Start > type *PowerShell*) and paste:
 
-1. **Double-click** `local-llm\Install-LocalAI.cmd` in a downloaded copy of this repository.
-2. **PowerShell**, from the `local-llm` folder:
-   `powershell -NoProfile -ExecutionPolicy Bypass -File .\Install-LocalAI.ps1`
-3. **No download needed (public repositories only).** This repository is private, so GitHub answers
-   anonymous `raw.githubusercontent.com` requests with **404** and the `irm ... | iex` bootstrap
-   (`Get-LocalAI.ps1`) will not work. Use option 1 or 2 with a copy you download while signed in:
-   https://github.com/MpLLC303/ComfyUi-Optimization/archive/refs/heads/main.zip
-   (or `git clone https://github.com/MpLLC303/ComfyUi-Optimization`, which prompts you to sign in).
+```powershell
+$env:LOCALAI_REF = 'main'
+[Net.ServicePointManager]::SecurityProtocol = 'Tls12'
+irm https://raw.githubusercontent.com/MpLLC303/ComfyUi-Optimization/refs/heads/main/local-llm/Get-LocalAI.ps1 | iex
+```
+
+It downloads the newest toolkit to `C:\AI\Installer`, unblocks it and starts the installer. You get
+**one UAC prompt**, and then everything runs unattended in a new Administrator window.
+
+Alternative: download https://github.com/MpLLC303/ComfyUi-Optimization/archive/refs/heads/main.zip,
+**Extract All**, and double-click `local-llm\Install-LocalAI.cmd`. Running it from inside the ZIP
+fails. The first window then says it continues in the Administrator window, and you can close it.
 
 Expect about 30-90 minutes. Most of that is about 67 GB of model downloads plus the Docker
 image. If WSL or Docker needs a reboot, the script warns you 60 seconds ahead (`shutdown /a`
-cancels it), reboots, and **continues by itself after you sign in**. You can re-run it at any
-time: finished steps are detected and skipped. At the end it opens
+cancels it), reboots, and **continues by itself after you sign in**. At the end it opens
 http://localhost:3000 and prints the admin login (also saved in
-`C:\AI\Secrets\openwebui-admin.json`).
+`C:\AI\Secrets\openwebui-admin.json`). The installer also allows typing script names such as
+`C:\AI\Scripts\Test-LocalAI.ps1` in PowerShell, by setting the execution policy to RemoteSigned.
+Every script also has a Start-menu shortcut under **Local AI**.
+
+### Update the toolkit (existing installs)
+
+New features (health watch, render guard, Start-menu folder, ...) arrive by **running the newest
+toolkit**, either with **Start menu > Local AI > Update toolkit** or the same one-liner as above.
+Don't run `C:\AI\Scripts\Install-LocalAI.ps1` for this: that is the copy you already have, and it
+only re-applies it (it warns you). If your install is older than the Start-menu folder, use the
+one-liner.
+
+A re-run is safe, and it keeps your chats, models, image versions set by `Update-OpenWebUI.ps1`,
+render-guard mode and trial models. It is **not** instant:
+- **Time:** about 10-20 minutes.
+- **ComfyUI and games:** close them first. Every model is loaded and checked on the GPU, and the
+  installer waits up to 10 minutes for other GPU apps to let go.
+- **NVIDIA driver updates:** after one, the models are re-tuned automatically, which takes longer.
+- **Open WebUI:** it restarts briefly for the backup step.
+- **Your settings:** the installer's presets (**Local Main/Fast/Vision/Code**) and RAG settings are
+  reset to its values. Make your own changes on a **copy** of a preset (Workspace > Models > Clone)
+  and they survive.
 
 Options are in the config block at the top of `Install-LocalAI.ps1`. The common ones:
 
@@ -160,8 +184,8 @@ The exit code is the number of failures.
 | Change the admin password | `C:\AI\Scripts\Set-OpenWebUIPassword.ps1` (random) or `-Prompt` (type your own); updates the secrets file and signs out old sessions |
 | Back up now | `C:\AI\Scripts\Backup-OpenWebUI.ps1` (add `-Mirror E:\Backups` or set `-BackupMirror` at install for a second copy) |
 | Update models / Ollama | `C:\AI\Scripts\Update-Models.ps1` re-pulls every model and re-tunes only those whose upstream tag changed; `-UpdateOllama` upgrades Ollama first |
-| Re-tune after a driver/GPU change | `C:\AI\Scripts\Install-LocalAI.ps1 -Retune` |
-| Add or swap a model | Edit `config\models.psd1`, then re-run the installer |
+| Re-tune after a driver/GPU change | Happens by itself on the next re-run when the driver version changed; force it with `C:\AI\Scripts\Install-LocalAI.ps1 -Retune` |
+| Add or swap a model | Try newer ones with `-TrialModels` first. To change the catalog for good, edit `config\models.psd1` in a downloaded copy (the copy in `C:\AI\Scripts` is replaced by the next Update toolkit) and run `Install-LocalAI.cmd` from there |
 | Health watch | Task `LocalAI-Watch` runs `C:\AI\Scripts\Watch-LocalAI.ps1` every 15 minutes while you're signed in: checks Ollama, the Docker engine, Open WebUI, SearXNG, the render guard, backup freshness and free disk space (models, backups, Docker data; warns under 10 GB), restarts a stopped container or Ollama (never Docker Desktop itself, in case you quit it on purpose), and shows a Windows notification only when a problem persists for two checks in a row (and once when it's fixed). History in `C:\AI\Logs\watch.log`; run it by hand with `-NoHeal -Verbose`; silence it with `-PauseMinutes 240` (gaming, stack stopped on purpose) and `-Unpause` |
 | Gaming / long render: free everything | `C:\AI\Scripts\Stop-LocalAI.ps1` unloads the models, stops the containers (data kept) and pauses the health watch for 12 h. Add `-QuitDocker` to also release the WSL VM's RAM (up to 16 GB), or `-QuitOllama`. `Start-LocalAI.ps1` brings it all back and resumes the watch |
 | Something's wrong / asking for help | `C:\AI\Scripts\Get-LocalAIDiagnostics.ps1 -RunTests` (or Start menu → Local AI → Diagnostics) writes `C:\AI\Logs\diagnostics-<time>.zip` and copies a short summary to the clipboard. It covers versions, GPU/VRAM, Ollama, containers, logs and test results. The admin password, secret keys, tokens, your Windows user name and the admin e-mail are redacted. Nothing is uploaded |
@@ -177,6 +201,8 @@ Keep a copy of `C:\AI\Secrets` (session key and admin login) in your password ma
 deliberately not inside the backup archives.
 
 ## Troubleshooting
+
+"Re-run the installer" below means `C:\AI\Scripts\Install-LocalAI.cmd`, with any switch after it, e.g. `C:\AI\Scripts\Install-LocalAI.cmd -RenderGuard off`. To also get the newest toolkit, use **Update toolkit** instead (it keeps your switches' effects).
 
 | Symptom | Likely cause | Fix |
 |---|---|---|

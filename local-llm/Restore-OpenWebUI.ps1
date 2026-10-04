@@ -27,7 +27,9 @@ param(
     [switch]$SkipSafetyBackup,
     [string]$Volume = 'open-webui',
     [string]$Container = 'open-webui',
-    [string]$HelperImage = 'alpine:3.20'
+    [string]$HelperImage = 'alpine:3.20',
+    # Skip the "type YES" confirmation (scripts, automation).
+    [switch]$Force
 )
 $ErrorActionPreference = 'Stop'
 Import-Module (Join-Path (Join-Path $PSScriptRoot 'lib') 'LocalAI.psm1') -Force
@@ -68,6 +70,22 @@ $lock = $null
 $stoppedContainers = @()
 $volumeTouched = $false
 $safety = $null
+
+# Pick and confirm the archive before taking the lock, so an unanswered prompt never blocks the
+# nightly backup.
+if (-not $Archive) {
+    $newest = Get-ChildItem -LiteralPath $backupDir -Filter 'open-webui-*.tar.gz' -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -match '^open-webui-\d{8}-\d{6}\.tar\.gz$' } | Sort-Object LastWriteTime -Descending | Select-Object -First 1  # lai-ok: objects
+    if (-not $newest) { throw "No daily backups found in $backupDir. Pass -Archive <file>." }
+    $Archive = $newest.FullName
+}
+if (-not (Test-Path -LiteralPath $Archive)) { throw "Archive not found: $Archive" }
+if (-not $Force) {
+    $info = Get-Item -LiteralPath $Archive
+    Write-LaiLog WARN ("This replaces ALL current Open WebUI data (chats, memories, knowledge, settings) with {0} from {1}." -f $info.Name, $info.LastWriteTime.ToString('yyyy-MM-dd HH:mm'))
+    Write-LaiLog INFO 'A verified safety backup of the current data is taken first, and the swap rolls back if anything fails.'
+    if ((Read-Host 'Type YES to restore') -cne 'YES') { Write-LaiLog INFO 'Nothing changed.'; exit 1 }
+}
 
 try {
     $lock = Enter-LaiVolumeLock

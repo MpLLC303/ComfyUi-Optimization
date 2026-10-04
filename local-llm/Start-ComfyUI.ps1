@@ -27,10 +27,25 @@ param(
 $ErrorActionPreference = 'Stop'
 Import-Module (Join-Path (Join-Path $PSScriptRoot 'lib') 'LocalAI.psm1') -Force
 
+function Test-LaunchTarget {
+    # $false for this toolkit's own shortcuts ("ComfyUI (free GPU first)" runs this script, so
+    # launching it would start this launcher again, endlessly) and anything that runs PowerShell.
+    param([string]$Candidate)
+    if (-not $Candidate) { return $false }
+    if ($Candidate -like '*\Local AI\*' -or (Split-Path -Leaf $Candidate) -like '*free GPU first*') { return $false }
+    if ($Candidate -like '*.lnk') {
+        try {
+            $target = (New-Object -ComObject WScript.Shell).CreateShortcut($Candidate).TargetPath
+            if ($target -match '(?i)\\(powershell|pwsh)\.exe$') { return $false }
+        } catch { Write-Verbose 'could not read shortcut target' }
+    }
+    return $true
+}
+
 function Find-ComfyUI {
     param([string]$Remembered)
     $candidates = @()
-    if ($Remembered) { $candidates += $Remembered }
+    if ($Remembered -and (Test-LaunchTarget $Remembered)) { $candidates += $Remembered }
     foreach ($base in @($env:LOCALAPPDATA, $env:ProgramFiles)) {
         if (-not $base) { continue }
         $candidates += Join-Path $base 'Programs\Comfy Desktop\Comfy Desktop.exe'
@@ -45,8 +60,10 @@ function Find-ComfyUI {
     if ($env:ProgramData) { $menus += Join-Path $env:ProgramData 'Microsoft\Windows\Start Menu\Programs' }
     foreach ($m in $menus) {
         if (-not (Test-Path -LiteralPath $m)) { continue }
-        $lnk = Get-ChildItem -LiteralPath $m -Recurse -Filter '*Comfy*.lnk' -ErrorAction SilentlyContinue | Select-Object -First 1
-        if ($lnk) { return $lnk.FullName }
+        foreach ($lnk in @(Get-ChildItem -LiteralPath $m -Recurse -Filter '*Comfy*.lnk' -ErrorAction SilentlyContinue)) {
+            if (-not (Test-LaunchTarget $lnk.FullName)) { continue }
+            return $lnk.FullName
+        }
     }
     return $null
 }
@@ -59,6 +76,7 @@ if (-not $Path) { $Path = Find-ComfyUI -Remembered $remembered }
 if (-not $Path -or -not (Test-Path -LiteralPath $Path)) {
     throw 'ComfyUI not found. Pass -Path <Comfy Desktop.exe | run_nvidia_gpu.bat | shortcut>; it is remembered for next time.'
 }
+if (-not (Test-LaunchTarget $Path)) { throw "$Path is this toolkit's own launcher, not ComfyUI. Pass -Path <Comfy Desktop.exe | run_nvidia_gpu.bat>." }
 if ($Path -ne $remembered -and (Test-Path -LiteralPath $AIRoot)) {
     $config['ComfyUIPath'] = $Path
     Save-LaiState -State $config -Path $configPath

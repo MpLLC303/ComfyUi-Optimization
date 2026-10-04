@@ -47,20 +47,37 @@ jobs:
           cache-dependency-path: .github/workflows/local-llm-linux.yml
 
       - name: Open WebUI 0.11.4
+        env:
+          # Same settings as stack/docker-compose.yml; ollama embeddings keep the run small.
+          WEBUI_SECRET_KEY: ci-only
+          WEBUI_URL: http://localhost:3000
+          WEBUI_ADMIN_EMAIL: admin@localhost
+          WEBUI_ADMIN_PASSWORD: Test-Password-123
+          WEBUI_ADMIN_NAME: Admin
+          OLLAMA_BASE_URL: http://localhost:11434
+          ENABLE_OPENAI_API: 'false'
+          ENABLE_MEMORIES: 'true'
+          RAG_TEXT_SPLITTER: token
+          ENABLE_MARKDOWN_HEADER_TEXT_SPLITTER: 'true'
+          CHUNK_SIZE: '2000'
+          CHUNK_OVERLAP: '200'
+          RAG_TOP_K: '5'
+          ENABLE_WEB_SEARCH: 'true'
+          WEB_SEARCH_ENGINE: searxng
+          SEARXNG_QUERY_URL: http://localhost:8888/search?q=<query>
+          WEB_SEARCH_RESULT_COUNT: '5'
+          ENABLE_COMMUNITY_SHARING: 'false'
+          ENABLE_VERSION_UPDATE_CHECK: 'false'
+          ANONYMIZED_TELEMETRY: 'false'
+          DO_NOT_TRACK: 'true'
+          SCARF_NO_ANALYTICS: 'true'
+          RAG_EMBEDDING_ENGINE: ollama
+          RAG_EMBEDDING_MODEL: nomic-embed-text:latest
         run: |
           python -m venv "$RUNNER_TEMP/owui-venv"
           "$RUNNER_TEMP/owui-venv/bin/pip" install -q open-webui==0.11.4
-          OWUI_DATA="$RUNNER_TEMP/owui-data"
-          mkdir -p "$OWUI_DATA"
-          # Same settings as stack/docker-compose.yml; ollama embeddings keep the run small.
-          DATA_DIR="$OWUI_DATA" WEBUI_SECRET_KEY=ci-only WEBUI_URL=http://localhost:3000 \
-          WEBUI_ADMIN_EMAIL=admin@localhost WEBUI_ADMIN_PASSWORD=Test-Password-123 WEBUI_ADMIN_NAME=Admin \
-          OLLAMA_BASE_URL=http://localhost:11434 ENABLE_OPENAI_API=false ENABLE_MEMORIES=true \
-          RAG_TEXT_SPLITTER=token ENABLE_MARKDOWN_HEADER_TEXT_SPLITTER=true CHUNK_SIZE=2000 CHUNK_OVERLAP=200 RAG_TOP_K=5 \
-          ENABLE_WEB_SEARCH=true WEB_SEARCH_ENGINE=searxng 'SEARXNG_QUERY_URL=http://localhost:8888/search?q=<query>' \
-          WEB_SEARCH_RESULT_COUNT=5 ENABLE_COMMUNITY_SHARING=false ENABLE_VERSION_UPDATE_CHECK=false \
-          ANONYMIZED_TELEMETRY=false DO_NOT_TRACK=true SCARF_NO_ANALYTICS=true \
-          RAG_EMBEDDING_ENGINE=ollama RAG_EMBEDDING_MODEL=nomic-embed-text:latest \
+          export DATA_DIR="$RUNNER_TEMP/owui-data"
+          mkdir -p "$DATA_DIR"
           nohup "$RUNNER_TEMP/owui-venv/bin/open-webui" serve --host 127.0.0.1 --port 3000 > "$RUNNER_TEMP/owui.log" 2>&1 &
           for i in $(seq 1 150); do curl -sf localhost:3000/health && break; sleep 4; done
           curl -sf localhost:3000/health || (tail -100 "$RUNNER_TEMP/owui.log"; exit 1)
