@@ -969,7 +969,8 @@ Invoke-Stage 'Backup' {
     $action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument ('-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "{0}" -AIRoot "{1}"' -f $backupScript, $AIRoot)
     $trigger = New-ScheduledTaskTrigger -Daily -At $BackupTime
     $principal = New-ScheduledTaskPrincipal -UserId $CurrentUser -LogonType Interactive -RunLevel Highest
-    $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit (New-TimeSpan -Hours 1)
+    $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit (New-TimeSpan -Hours 1) `
+        -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 15)
     Register-ScheduledTask -TaskName $BackupTask -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Force | Out-Null
     Write-LaiLog OK "Scheduled task '$BackupTask' runs daily at $BackupTime (missed runs catch up at next sign-in)"
 

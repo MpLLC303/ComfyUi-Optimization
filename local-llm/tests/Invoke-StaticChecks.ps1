@@ -75,7 +75,17 @@ if (Get-Module PSScriptAnalyzer) {
     }
     # The mock harness shadows cmdlets with global functions on purpose.
     foreach ($f in ($files | Where-Object { $_.Name -ne 'Invoke-InstallerMockRun.ps1' })) {
-        foreach ($r in (Invoke-ScriptAnalyzer -Path $f.FullName -Settings $settings)) {
+        # PSScriptAnalyzer itself occasionally throws a NullReferenceException (seen with the
+        # compatibility rules); retry once so a flaky analyzer does not fail the build, and report
+        # the file if it crashes twice.
+        $found = $null
+        for ($attempt = 1; $attempt -le 2 -and $null -eq $found; $attempt++) {
+            try { $found = @(Invoke-ScriptAnalyzer -Path $f.FullName -Settings $settings) }
+            catch {
+                if ($attempt -eq 2) { $problems++; Write-Host "PSSA     $($f.Name): analyzer crashed twice: $($_.Exception.Message)" -ForegroundColor Red; $found = @() }
+            }
+        }
+        foreach ($r in $found) {
             $problems++
             Write-Host ("PSSA     {0}:{1} [{2}] {3}" -f $f.Name, $r.Line, $r.RuleName, $r.Message) -ForegroundColor Red
         }

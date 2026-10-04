@@ -180,7 +180,7 @@ The exit code is the number of failures.
 
 | Task | Command |
 |---|---|
-| Update Open WebUI | `C:\AI\Scripts\Update-OpenWebUI.ps1 -Latest` (backs up, pulls, recreates the container, runs a quick test). It prints the exact roll-back command (older version plus the `before-<version>` backup). Re-running the installer later keeps the updated version |
+| Update Open WebUI | `C:\AI\Scripts\Update-OpenWebUI.ps1 -Latest` (backs up, pulls, recreates the container, runs a quick test). Undo it with `Update-OpenWebUI.ps1 -Rollback`: previous image plus the data from just before the update (the newest `before-<version>` backup is never pruned). History in `C:\AI\Logs\update.log`. Re-running the installer keeps the updated version |
 | Change the admin password | `C:\AI\Scripts\Set-OpenWebUIPassword.ps1` (random) or `-Prompt` (type your own); updates the secrets file and signs out old sessions |
 | Back up now | `C:\AI\Scripts\Backup-OpenWebUI.ps1` (add `-Mirror E:\Backups` or set `-BackupMirror` at install for a second copy) |
 | Update models / Ollama | `C:\AI\Scripts\Update-Models.ps1` re-pulls every model and re-tunes only those whose upstream tag changed; `-UpdateOllama` upgrades Ollama first |

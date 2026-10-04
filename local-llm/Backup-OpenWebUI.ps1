@@ -29,6 +29,8 @@ param(
     # Used by Restore-OpenWebUI.ps1: never delete or mirror anything while a restore is in progress.
     [switch]$NoPrune,
     [switch]$NoMirror,
+    # A missed 03:30 run starts right after sign-in, while Docker Desktop is still starting.
+    [int]$EngineWaitSec = 300,
     [string]$Volume = 'open-webui',
     [string]$Container = 'open-webui',
     [string]$HelperImage = 'alpine:3.20',
@@ -74,6 +76,15 @@ $name = 'open-webui-{0}{1}.tar.gz' -f (Get-Date -Format 'yyyyMMdd-HHmmss'), $suf
 $archive = Join-Path $backupDir $name
 $stopped = $false
 $exitCode = 0
+
+$deadline = (Get-Date).AddSeconds($EngineWaitSec)
+while ((Invoke-Docker -Arguments @('version', '--format', '{{.Server.Version}}') -AllowFail).ExitCode -ne 0) {
+    if ((Get-Date) -ge $deadline) {
+        Write-BackupLog FAIL "Docker engine is not running (waited $EngineWaitSec s). Start Docker Desktop (Start menu > Local AI > Start again); the next run will catch up."
+        exit 1
+    }
+    Start-Sleep -Seconds 10
+}
 
 $lock = $null
 try {
@@ -147,6 +158,10 @@ try {
         $all = @(Get-ChildItem -LiteralPath $backupDir -Filter 'open-webui-*.tar.gz')
         $daily = @($all | Where-Object { $_.Name -match '^open-webui-\d{8}-\d{6}\.tar\.gz$' } | Sort-Object LastWriteTime -Descending)  # lai-ok: objects
         $tagged = @($all | Where-Object { $_.Name -notmatch '^open-webui-\d{8}-\d{6}\.tar\.gz$' })
+        # The newest before-<version> archive is the rollback point for the current Open WebUI version;
+        # it stays no matter how old it is.
+        $rollback = $all | Where-Object { $_.Name -like '*-before-*' -and $_.Name -notlike '*-CORRUPT*' } | Sort-Object LastWriteTime -Descending | Select-Object -First 1  # lai-ok: objects
+        if ($rollback) { $tagged = @($tagged | Where-Object { $_.FullName -ne $rollback.FullName }) }
         $cutoff = (Get-Date).AddDays(-$RetentionDays)
         foreach ($old in (@($daily | Select-Object -Skip 3) + $tagged | Where-Object { $_.LastWriteTime -lt $cutoff -and $_.FullName -ne $archive })) {
             Remove-Item -LiteralPath $old.FullName -Force

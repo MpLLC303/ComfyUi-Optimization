@@ -79,10 +79,20 @@ Add-Check 'RTX 3090 visible' {
     Pass "$($gpu.Name), driver $($gpu.DriverVersion), $($gpu.TotalMiB) MiB"
 }
 
-Add-Check 'Ollama running' { Pass "v$(Get-LaiOllamaVersion -BaseUrl $ollamaUrl) on $ollamaUrl" }
+# Checks that depend on a failed one are skipped with the reason, so one cause shows up once.
+$script:ollamaUp = $false
+$script:engineUp = $true
+$script:webUp = $false
+$startAgain = 'Start menu > Local AI > Start again'
+Add-Check 'Ollama running' {
+    try { $v = Get-LaiOllamaVersion -BaseUrl $ollamaUrl } catch { return (Fail "not answering on $ollamaUrl - start Ollama from the Start menu, or $startAgain") }
+    $script:ollamaUp = $true
+    Pass "v$v on $ollamaUrl"
+}
 
 foreach ($m in $catalog.Models) {
     Add-Check "$($m.Display) installed" {
+        if (-not $script:ollamaUp) { return (Skip 'Ollama not running') }
         if (-not (Test-LaiOllamaModel -BaseUrl $ollamaUrl -Name $m.Source)) { return (Fail "$($m.Source) missing") }
         if (-not (Test-LaiOllamaModel -BaseUrl $ollamaUrl -Name $m.Alias)) { return (Fail "tuned alias $($m.Alias) missing (re-run the installer)") }
         Pass "$($m.Source) -> $($m.Alias)"
@@ -92,6 +102,7 @@ foreach ($m in $catalog.Models) {
 if (-not $Quick) {
     foreach ($m in $catalog.Models) {
         Add-Check "$($m.Display) fully on GPU" {
+            if (-not $script:ollamaUp) { return (Skip 'Ollama not running') }
             $load = Invoke-LaiOllamaLoad -BaseUrl $ollamaUrl -Name $m.Alias -KeepAlive '1m'
             $detail = "ctx $($load.Context), $($load.GpuPercent)% GPU, $($load.SizeGiB) GiB"
             if (-not $gpu) { return (Skip "$detail (CPU-only host)") }
@@ -113,6 +124,7 @@ if (-not $Quick) {
 
 if ($CpuCheck) {
     Add-Check 'CPU fallback (render guard)' {
+        if (-not $script:ollamaUp) { return (Skip 'Ollama not running') }
         $m = $catalog.Models | Where-Object { $_.Preset -eq $catalog.DefaultPreset } | Select-Object -First 1
         if (-not $m) { $m = @($catalog.Models)[0] }
         Stop-LaiOllamaModels -BaseUrl $ollamaUrl
@@ -156,18 +168,19 @@ if ($NoContainers) {
         $prev = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
         $v = (& docker version --format '{{.Server.Version}}' 2>$null); $code = $LASTEXITCODE
         $ErrorActionPreference = $prev
-        if ($code -ne 0) { return (Fail 'engine not running - start Docker Desktop') }
+        if ($code -ne 0) { $script:engineUp = $false; return (Fail "engine not running - $startAgain (starts Docker Desktop)") }
         Pass "engine $v"
     }
     $containers = @('open-webui', 'searxng')
     if (-not ($config.ContainsKey('WebUIOllamaUrl') -and $config['WebUIOllamaUrl'] -and $config['WebUIOllamaUrl'] -notlike '*render-guard*')) { $containers += 'render-guard' }
     foreach ($c in $containers) {
         Add-Check "Container $c" {
+            if (-not $script:engineUp) { return (Skip 'Docker engine down') }
             $prev = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
             $s = (& docker inspect -f '{{.State.Status}} {{if .State.Health}}{{.State.Health.Status}}{{end}} {{.HostConfig.RestartPolicy.Name}}' $c 2>$null); $code = $LASTEXITCODE
             $ErrorActionPreference = $prev
-            if ($code -ne 0) { return (Fail 'not found') }
-            if ($s -notmatch '^running') { return (Fail $s) }
+            if ($code -ne 0) { return (Fail 'not found - re-run the installer (C:\AI\Scripts\Install-LocalAI.cmd)') }
+            if ($s -notmatch '^running') { return (Fail "$s - $startAgain") }
             if ($s -match 'unhealthy') { return (Warn $s) }
             Pass $s
         }
@@ -175,16 +188,20 @@ if ($NoContainers) {
 }
 
 Add-Check 'Open WebUI reachable' {
-    Wait-LaiWebUI -BaseUrl $webUrl -TimeoutSec 30
+    if (-not $script:engineUp) { return (Skip 'Docker engine down') }
+    try { Wait-LaiWebUI -BaseUrl $webUrl -TimeoutSec 30 } catch { return (Fail "no answer on http://localhost:$webPort - $startAgain; if it persists: docker logs --tail 50 open-webui") }
+    $script:webUp = $true
     Pass "http://localhost:$webPort"
 }
 
 $token = $null
 Add-Check 'Open WebUI admin login' {
+    if (-not $script:webUp) { return (Skip 'Open WebUI not reachable') }
     $credFile = Join-Path (Join-Path $AIRoot 'Secrets') 'openwebui-admin.json'
     if (-not (Test-Path -LiteralPath $credFile)) { return (Fail "missing $credFile") }
     $cred = Get-Content -LiteralPath $credFile -Raw | ConvertFrom-Json
-    $script:token = Connect-LaiWebUI -BaseUrl $webUrl -Email $cred.email -Password $cred.password
+    try { $script:token = Connect-LaiWebUI -BaseUrl $webUrl -Email $cred.email -Password $cred.password }
+    catch { return (Fail "sign-in as $($cred.email) failed - after restoring an older backup run Set-OpenWebUIPassword.ps1 -PromptCurrent") }
     Pass $cred.email
 }
 
