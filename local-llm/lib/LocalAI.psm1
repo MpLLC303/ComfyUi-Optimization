@@ -14,6 +14,10 @@ Set-StrictMode -Version 1
 # refuse. Every script imports this module, so enabling TLS 1.2 here covers all of them.
 try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12 } catch { Write-Verbose 'TLS setting unavailable' }
 
+# The RAG self-test's temporary collection and uploaded file (exact names; see Get-LaiWebUISelfTestLeftover).
+$script:LaiSelfTestKb = 'LocalAI Self-Test (temporary)'
+$script:LaiSelfTestFile = 'localai-selftest-manual.md'
+
 #region Logging and small utilities -------------------------------------------------------
 
 function Write-LaiLog {
@@ -1122,6 +1126,25 @@ function Test-LaiWebUIMemory {
     }
 }
 
+function Get-LaiWebUISelfTestLeftover {
+    # What a RAG self-test that was cut off (window closed, PC shut down) leaves in Open WebUI: its
+    # temporary collection and the uploaded manual, which nothing else would ever remove. Exact names
+    # only, so nothing the user made matches. Returns one object per item with the URI that deletes it.
+    param([string]$BaseUrl = 'http://127.0.0.1:3000', [Parameter(Mandatory)][string]$Token)
+    $out = @()
+    foreach ($k in @(Get-LaiWebUIKnowledge -BaseUrl $BaseUrl -Token $Token | Where-Object { $_.name -ceq $script:LaiSelfTestKb })) {
+        $out += [pscustomobject]@{ Kind = 'collection'; Id = [string]$k.id; Uri = "$BaseUrl/api/v1/knowledge/$($k.id)/delete" }
+    }
+    $files = @()
+    # 404 is this endpoint's 'no file has that name'.
+    try { $files = @(Invoke-LaiApi -Uri "$BaseUrl/api/v1/files/search?filename=$([uri]::EscapeDataString($script:LaiSelfTestFile))&content=false" -Token $Token | ForEach-Object { $_ }) }
+    catch { if ((Get-LaiHttpStatus $_) -ne 404) { throw } }
+    foreach ($f in $files) {
+        if ([string]$f.filename -ceq $script:LaiSelfTestFile) { $out += [pscustomobject]@{ Kind = 'file'; Id = [string]$f.id; Uri = "$BaseUrl/api/v1/files/$($f.id)" } }
+    }
+    return $out
+}
+
 function Test-LaiWebUIRag {
     # Guide Step 33, automated: index a document containing a random code, retrieve it, clean up.
     param(
@@ -1131,14 +1154,21 @@ function Test-LaiWebUIRag {
         [string]$WorkDir = [System.IO.Path]::GetTempPath()
     )
     $code = 'QX-{0}-TANGERINE' -f (Get-Random -Minimum 1000 -Maximum 9999)
-    $doc = Join-Path $WorkDir 'localai-selftest-manual.md'
+    # A run that was cut off before its clean-up left these behind: remove them first.
+    try {
+        foreach ($left in @(Get-LaiWebUISelfTestLeftover -BaseUrl $BaseUrl -Token $Token)) {
+            Invoke-LaiApi -Method DELETE -Uri $left.Uri -Token $Token | Out-Null
+            Write-LaiLog INFO "Removed a self-test $($left.Kind) left by an interrupted earlier check"
+        }
+    } catch { Write-LaiLog WARN "Could not remove what an interrupted earlier self-test left in Open WebUI ($($_.Exception.Message)); delete '$script:LaiSelfTestKb' in Workspace > Knowledge" }
+    $doc = Join-Path $WorkDir $script:LaiSelfTestFile
     $text = "# Zorblax 9000 Widget Manual`n`n## Calibration`n`nThe calibration code for the Zorblax 9000 widget is $code. " +
         "Hold the reset button for 12 seconds before entering it.`n`n## Maintenance`n`nClean the intake filter monthly.`n"
     [System.IO.File]::WriteAllText($doc, $text, (New-Object System.Text.UTF8Encoding($false)))
     $kb = $null; $fileId = $null
     try {
         $kb = Invoke-LaiApi -Method POST -Uri "$BaseUrl/api/v1/knowledge/create" -Token $Token -Body @{
-            name = 'LocalAI Self-Test (temporary)'; description = 'Created and deleted by Install-LocalAI.ps1'
+            name = $script:LaiSelfTestKb; description = 'Created and deleted by Install-LocalAI.ps1'
         }
         $fileId = Send-LaiWebUIFile -BaseUrl $BaseUrl -Token $Token -Path $doc
         Wait-LaiWebUIFileProcessed -BaseUrl $BaseUrl -Token $Token -FileId $fileId

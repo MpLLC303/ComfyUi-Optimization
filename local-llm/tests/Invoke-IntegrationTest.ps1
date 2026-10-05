@@ -128,6 +128,20 @@ $mem = Test-LaiWebUIMemory -BaseUrl $WebUIUrl -Token $token -Model $main
 Write-LaiLog $(if ($mem.Passed) { 'OK' } else { 'FAIL' }) "memory: expected $($mem.Expected), got '$($mem.Answer)'"
 if (-not $mem.Passed) { $failures++ }
 
+# What a self-test cut off mid-run leaves (its collection and uploaded manual) must be removed by
+# the next run; a user's collection with a similar name must not be.
+$seedDir = Join-Path ([System.IO.Path]::GetTempPath()) ('lai-seed-' + [guid]::NewGuid().ToString('N'))
+New-Item -ItemType Directory -Path $seedDir | Out-Null
+$seedFile = Join-Path $seedDir 'localai-selftest-manual.md'
+Set-Content -LiteralPath $seedFile -Value '# leftover from an interrupted self-test'
+$seedKb = Invoke-LaiApi -Method POST -Uri "$WebUIUrl/api/v1/knowledge/create" -Token $token -Body @{ name = 'LocalAI Self-Test (temporary)'; description = 'seeded leftover' }
+$seedFileId = Send-LaiWebUIFile -BaseUrl $WebUIUrl -Token $token -Path $seedFile
+$decoy = Invoke-LaiApi -Method POST -Uri "$WebUIUrl/api/v1/knowledge/create" -Token $token -Body @{ name = 'LocalAI Self-Test (temporary) - my notes'; description = 'user collection' }
+Remove-Item -LiteralPath $seedDir -Recurse -Force
+$seen = @(Get-LaiWebUISelfTestLeftover -BaseUrl $WebUIUrl -Token $token)
+if (@($seen | Where-Object { $_.Id -eq $seedKb.id }).Count -ne 1 -or @($seen | Where-Object { $_.Id -eq $seedFileId }).Count -ne 1 -or @($seen | Where-Object { $_.Id -eq $decoy.id }).Count -ne 0) {
+    Write-LaiLog FAIL "leftover detection is wrong: found $(@($seen | ForEach-Object { "$($_.Kind) $($_.Id)" }) -join ', ')"; $failures++
+}
 $rag = Test-LaiWebUIRag -BaseUrl $WebUIUrl -Token $token -Model $main
 Write-LaiLog $(if ($rag.Passed) { 'OK' } else { 'FAIL' }) "rag: expected $($rag.Expected), got '$($rag.Answer)'"
 if (-not $rag.Passed) { $failures++ }
@@ -136,8 +150,19 @@ $web = Test-LaiWebUIWebSearch -BaseUrl $WebUIUrl -Token $token
 $lvl = 'OK'; if ($web.Status -eq 'no-results') { $lvl = 'WARN' } elseif ($web.Status -ne 'ok') { $lvl = 'FAIL'; $failures++ }
 Write-LaiLog $lvl "web search: $($web.Status) ($($web.Count) results) $($web.Detail)"
 
+$kbsAfter = @(Get-LaiWebUIKnowledge -BaseUrl $WebUIUrl -Token $token)
+if (@($kbsAfter | Where-Object { $_.id -eq $decoy.id }).Count -ne 1) { Write-LaiLog FAIL "the clean-up removed a user's collection with a similar name"; $failures++ }
+Invoke-LaiApi -Method DELETE -Uri "$WebUIUrl/api/v1/knowledge/$($decoy.id)/delete" -Token $token | Out-Null
 $leftover = @(Get-LaiWebUIKnowledge -BaseUrl $WebUIUrl -Token $token | Where-Object { $_.name -like 'LocalAI Self-Test*' })
-if ($leftover.Count -gt 0) { Write-LaiLog FAIL 'self-test collection was not cleaned up'; $failures++ }
+$leftFiles = @(Get-LaiWebUISelfTestLeftover -BaseUrl $WebUIUrl -Token $token | Where-Object { $_.Kind -eq 'file' })
+if ($leftover.Count -gt 0 -or $leftFiles.Count -gt 0) { Write-LaiLog FAIL "self-test collection or file was not cleaned up ($($leftover.Count) collection(s), $($leftFiles.Count) file(s))"; $failures++ }
+else { Write-LaiLog OK "the self-test removed an interrupted run's collection and file and its own, and kept the user's similar collection" }
+
+# The harness must see such a leftover too (a killed suite would otherwise fail the next one).
+$probeKb = Invoke-LaiApi -Method POST -Uri "$WebUIUrl/api/v1/knowledge/create" -Token $token -Body @{ name = 'LocalAI Self-Test (temporary)'; description = 'reset-sandbox probe' }
+$resetOut = (& pwsh -NoProfile -File (Join-Path $PSScriptRoot 'Reset-Sandbox.ps1') -Check -WebUIUrl $WebUIUrl -Email $Email -Password $Password 2>&1 | ForEach-Object { "$_" }) -join "`n"
+Invoke-LaiApi -Method DELETE -Uri "$WebUIUrl/api/v1/knowledge/$($probeKb.id)/delete" -Token $token | Out-Null
+if ($resetOut -notmatch ('LEFTOVER RAG self-test collection ' + [regex]::Escape([string]$probeKb.id))) { Write-LaiLog FAIL "Reset-Sandbox -Check did not report a self-test leftover: $resetOut"; $failures++ } else { Write-LaiLog OK 'Reset-Sandbox -Check reports a self-test leftover' }
 
 if ($failures -eq 0) { Write-LaiLog OK 'INTEGRATION TEST PASSED' } else { Write-LaiLog FAIL "INTEGRATION TEST FAILED ($failures)" }
 exit $failures

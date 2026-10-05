@@ -184,6 +184,11 @@ if (-not $SkipWebUI) {
         }
     }
     if ($token) {
+        # A run killed during a RAG self-test leaves its collection and file; the next suite's
+        # leftover check would fail for that reason.
+        foreach ($left in @(Get-LaiWebUISelfTestLeftover -BaseUrl $WebUIUrl -Token $token)) {
+            Invoke-Repair "RAG self-test $($left.Kind) $($left.Id) left by an interrupted run" { Invoke-LaiApi -Method DELETE -Uri $left.Uri -Token $token | Out-Null }
+        }
         $urls = @((Invoke-LaiApi -Uri "$WebUIUrl/ollama/config" -Token $token).OLLAMA_BASE_URLS | ForEach-Object { ([string]$_).TrimEnd('/') })
         if (($urls -join ',') -ne $OllamaUrl) {
             Invoke-Repair "Open WebUI's Ollama connection is $($urls -join ', ') (not $OllamaUrl)" {
