@@ -164,12 +164,6 @@ if (-not (Test-IsAdmin)) {
 $AIRoot = $AIRoot.Trim()
 if ($AIRoot -match '^[A-Za-z]:$') { $AIRoot += '\' }
 elseif ($AIRoot.Length -gt 3) { $AIRoot = $AIRoot.TrimEnd([char]'\', [char]'/') }
-# The Start-menu shortcuts carry the folder three times in a 1024-character limit, and Docker bind
-# paths and model files deep inside it run into the 260-character path limit.
-if ($AIRoot.Length -gt 100) {
-    Write-Host "The install folder '$AIRoot' is $($AIRoot.Length) characters long; choose one of at most 100 (for example D:\AI) and run again. Nothing was changed." -ForegroundColor Red
-    exit 1
-}
 
 $P = @{
     Root      = $AIRoot
@@ -1360,7 +1354,9 @@ Invoke-Stage 'Backup' {
             try { $shell = New-Object -ComObject WScript.Shell } catch { Write-Verbose 'WScript.Shell unavailable' }
             $made = @()
             foreach ($sc in (Get-LaiShortcutSpecs -AIRoot $AIRoot -WebUIPort $script:WebUIPortEffective)) {
-                if ($sc.Kind -eq 'url') {
+                if ($sc.TooLong) {
+                    Write-LaiLog WARN "Start-menu shortcut '$($sc.Name)' skipped: the install folder path is too long for a shortcut (1024 characters). Run $($sc.Script) from $($P.Scripts) instead."
+                } elseif ($sc.Kind -eq 'url') {
                     [System.IO.File]::WriteAllText((Join-Path $menu ($sc.Name + '.url')), "[InternetShortcut]`r`nURL=$($sc.Target)`r`n")
                     $made += $sc.Name
                 } elseif ($shell) {
@@ -1422,7 +1418,8 @@ $report = @(
 )
 $attention = @()
 if ($State.flags.ContainsKey('configureWarnings')) { $attention = @($State.flags['configureWarnings'] | Where-Object { $_ }) }
-if ($attention.Count -gt 0) { $report += @('', '## Settings that need attention', '') + @($attention | ForEach-Object { "- $_" }) }
+# One line each, and '<' escaped: Markdown would hide '<query>' as a tag.
+if ($attention.Count -gt 0) { $report += @('', '## Settings that need attention', '') + @($attention | ForEach-Object { '- ' + (($_ -replace '\s+', ' ') -replace '<', '\<') }) }
 Set-Content -LiteralPath $P.Report -Value $report -Encoding UTF8
 Write-Host ''
 Write-LaiLog OK "Report: $($P.Report)"

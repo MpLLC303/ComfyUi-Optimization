@@ -229,9 +229,13 @@ $scLog = Join-Path (Join-Path $scRoot 'Logs') 'shortcut-Start-LocalAI.log'
 Assert-That ((Test-Path -LiteralPath $scLog) -and ((Get-Content -Raw -LiteralPath $scLog) -match 'FAILED: stub failure')) 'the shortcut run, failure included, is kept in Logs\shortcut-Start-LocalAI.log'
 $updPayload = ($specs | Where-Object { $_.Name -like '*Update toolkit*' }).Arguments
 Assert-That ($updPayload -notmatch 'Start-Transcript') 'Update toolkit is not logged (an installer in that window prints the admin password)'
-$longSpecs = @(Get-LaiShortcutSpecs -AIRoot ('D:\' + ('x' * 120) + '\AI'))
-$maxLen = ($longSpecs | Where-Object { $_.Kind -eq 'lnk' } | ForEach-Object { $_.Arguments.Length } | Measure-Object -Maximum).Maximum
-Assert-That ($maxLen -lt 1024) "every shortcut's arguments fit the 1024-char .lnk limit with a 125-char AI root ($maxLen)"
+$longSpecs = @(Get-LaiShortcutSpecs -AIRoot ('D:\' + ('x' * 120) + '\AI') | Where-Object { $_.Kind -eq 'lnk' })
+$maxLen = ($longSpecs | ForEach-Object { $_.Arguments.Length } | Measure-Object -Maximum).Maximum
+Assert-That ($maxLen -lt 1024 -and @($longSpecs | Where-Object { $_.TooLong }).Count -eq 0 -and @($longSpecs | Where-Object { $_.Arguments -match 'Start-Transcript' }).Count -eq 4) "a 125-char AI root: every shortcut fits the 1024-char .lnk limit, logs included ($maxLen)"
+$longSpecs = @(Get-LaiShortcutSpecs -AIRoot ('D:\' + ('y' * 200) + '\AI') | Where-Object { $_.Kind -eq 'lnk' })
+Assert-That (@($longSpecs | Where-Object { -not $_.TooLong -and $_.Arguments.Length -ge 1024 }).Count -eq 0 -and @($longSpecs | Where-Object { $_.Arguments -match 'Start-Transcript' }).Count -eq 0 -and @($longSpecs | Where-Object { -not $_.TooLong }).Count -ge 4) 'a 205-char AI root: the log is dropped so the shortcuts still fit; none over the limit is offered as usable'
+$longSpecs = @(Get-LaiShortcutSpecs -AIRoot ('D:\' + ('z' * 400) + '\AI') | Where-Object { $_.Kind -eq 'lnk' })
+Assert-That (@($longSpecs | Where-Object { $_.TooLong }).Count -eq $longSpecs.Count) 'a 405-char AI root: every shortcut is marked too long (the installer skips them with a warning)'
 if ($onWindows) {
     $shell = New-Object -ComObject WScript.Shell
     $lnkPath = Join-Path $Work 'test.lnk'
@@ -628,6 +632,8 @@ try {
     $cmp = @(Compare-LaiConfig -Expected @{ R = 0.5 } -Actual ([pscustomobject]@{ R = [double]0.5 }))
 } finally { [System.Threading.Thread]::CurrentThread.CurrentCulture = $savedCulture }
 Assert-That ($cmp.Count -eq 0) 'a decimal compares equal under a comma-decimal culture'
+$cmp = @(Compare-LaiConfig -Expected @{ K = 5; J = 5 } -Actual ('{"K": 5.0, "J": 5.5}' | ConvertFrom-Json))
+Assert-That (($cmp -join '|') -eq 'J: wanted 5, got 5.5') "numbers compare as numbers: JSON 5.0 equals 5, 5.5 does not ($($cmp -join '|'))"
 $mod = Get-Module LocalAI
 & $mod {
     $script:FakeAdmin = @{ ENABLE_SIGNUP = $true; ENABLE_MEMORIES = $false; ENABLE_MEMORY_SYSTEM_CONTEXT = $false; ENABLE_COMMUNITY_SHARING = $true; OTHER = 'kept' }

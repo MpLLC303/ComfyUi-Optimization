@@ -65,8 +65,17 @@ $token = Connect-LaiWebUI -BaseUrl $WebUIUrl -Email $Email -Password $Password
 $oc = ConvertTo-LaiHashtable (Invoke-LaiApi -Uri "$WebUIUrl/ollama/config" -Token $token)
 $ocCfgs = @{}; if ($oc.ContainsKey('OLLAMA_API_CONFIGS') -and $oc['OLLAMA_API_CONFIGS']) { $ocCfgs = $oc['OLLAMA_API_CONFIGS'] }
 Invoke-LaiApi -Method POST -Uri "$WebUIUrl/ollama/config/update" -Token $token -Body @{ ENABLE_OLLAMA_API = $true; OLLAMA_BASE_URLS = [object[]]@($OllamaUrl); OLLAMA_API_CONFIGS = $ocCfgs } | Out-Null
+# Start from values other than the wanted ones (the server's own defaults already equal most of
+# them, so an ignored write would otherwise still read back 'right').
+Set-LaiWebUIRetrievalConfig -BaseUrl $WebUIUrl -Token $token -Settings @{ TOP_K = 3; CHUNK_SIZE = 1000; CHUNK_OVERLAP = 100; web = @{ WEB_SEARCH_RESULT_COUNT = 3 } } | Out-Null
+Set-LaiWebUIAdminConfig -BaseUrl $WebUIUrl -Token $token -Changes @{ ENABLE_MEMORY_SYSTEM_CONTEXT = $false } | Out-Null
+$pre = Get-LaiWebUIRetrievalConfig -BaseUrl $WebUIUrl -Token $token
+if ($pre.TOP_K -ne 3 -or $pre.CHUNK_SIZE -ne 1000 -or $pre.web.WEB_SEARCH_RESULT_COUNT -ne 3) { Write-LaiLog FAIL "could not move the settings away from the wanted values first (top_k=$($pre.TOP_K) chunk=$($pre.CHUNK_SIZE))"; $failures++ }
 $setupWarn = @(Invoke-LaiWebUISetup -BaseUrl $WebUIUrl -Token $token -Models $catalog.Models -ModelResults $results -SystemPrompt $system `
     -DefaultPreset $catalog.DefaultPreset -Collections @('PC & Electronics', 'General References') -SearxngQueryUrl $SearxngQueryUrl)
+$post = Get-LaiWebUIRetrievalConfig -BaseUrl $WebUIUrl -Token $token
+$postAdmin = Invoke-LaiApi -Uri "$WebUIUrl/api/v1/auths/admin/config" -Token $token
+if ($post.TOP_K -ne 5 -or $post.CHUNK_SIZE -ne 2000 -or $post.CHUNK_OVERLAP -ne 200 -or $post.web.WEB_SEARCH_RESULT_COUNT -ne 5 -or $postAdmin.ENABLE_MEMORY_SYSTEM_CONTEXT -ne $true) { Write-LaiLog FAIL 'the configuration pass did not change the moved settings back'; $failures++ }
 # Every setting written must read back from the real server (a mismatch here means the comparison
 # or a payload is wrong, and real installs would print false 'needs attention' lines).
 if ($setupWarn.Count -ne 0) { Write-LaiLog FAIL "the first configuration pass reported settings that did not take: $($setupWarn -join ' | ')"; $failures++ } else { Write-LaiLog OK 'every admin, documents and web search setting read back as written' }

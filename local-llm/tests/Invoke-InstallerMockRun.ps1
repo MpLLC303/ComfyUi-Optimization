@@ -257,8 +257,14 @@ Assert-That ([string]$stG.flags.guardHash -ne '') 'the started render-guard code
 $stG.flags.guardHash = 'hash-of-an-older-version'
 $stG | ConvertTo-Json -Depth 20 | Set-Content (Join-Path $aiRoot 'install-state.json')
 $sw = [Diagnostics.Stopwatch]::StartNew()
+# One optional step fails (a rejected knowledge collection): a warning in the report, not a failed install.
+$env:LOCALAI_TEST_KNOWLEDGE_FAIL = 'PC & Electronics'
 & (Join-Path $aiRoot 'Scripts/Install-LocalAI.ps1') -AIRoot $aiRoot -SkipTests
 $code3 = $LASTEXITCODE
+$env:LOCALAI_TEST_KNOWLEDGE_FAIL = ''
+$st3 = Get-Content -Encoding UTF8 -Raw (Join-Path $aiRoot 'install-state.json') | ConvertFrom-Json
+$rep3 = Get-Content -Encoding UTF8 -Raw (Join-Path $aiRoot 'install-report.md')
+Assert-That (@($st3.flags.configureWarnings).Count -eq 1 -and $null -ne $st3.stages.Backup -and $rep3 -match '## Settings that need attention' -and $rep3 -match "Knowledge collection 'PC & Electronics' was not created") 'a failed optional step is listed under Settings that need attention, and the install still reaches Backup'
 Assert-That ((& $restartCalls) -eq 1) 'changed render_guard.py: the guard is restarted to load it'
 Assert-That ($code3 -eq 0) "re-run completes (exit $code3) in $([int]$sw.Elapsed.TotalSeconds) s"
 # This process lives on after the run (like the -NoExit Administrator window): the setup lock must
@@ -299,6 +305,7 @@ $tp = Get-TestPreset 'trial-standin'
 Assert-That ($tp -and $tp.meta.hidden -eq $true) 'deselected trial preset is hidden (kept for old chats)'
 $p4 = (Get-Content -Encoding UTF8 -Raw (Join-Path $aiRoot 'install-state.json') | ConvertFrom-Json).flags.params
 Assert-That ($p4.SkipVision -eq $true -and $p4.SkipCoder -eq $true) 'older install: skips inferred from the installed models (no surprise 20 GB downloads)'
+Assert-That (@((Get-Content -Encoding UTF8 -Raw (Join-Path $aiRoot 'install-state.json') | ConvertFrom-Json).flags.configureWarnings).Count -eq 0 -and -not (Select-String -LiteralPath (Join-Path $aiRoot 'install-report.md') -Pattern 'need attention' -Quiet)) "the next clean run clears phase 3's warning (no stale attention section)"
 
 # ---- phase 5: a resume that keeps failing stops starting itself -----------------------------------
 Write-Host "`n=== PHASE 5: failing resume gives up after two sign-ins ===" -ForegroundColor Cyan
@@ -381,11 +388,6 @@ New-Item -ItemType Directory -Force -Path $elsewhere | Out-Null
 $c6a = $LASTEXITCODE
 Assert-That ($c6a -ne 0 -and @(Get-ChildItem -LiteralPath $elsewhere).Count -eq 0) "refuses before writing anything through it (exit $c6a)"
 Remove-Item -LiteralPath $logsDir -Force; Rename-Item -LiteralPath (Join-Path $aiRoot 'Logs-real') -NewName 'Logs'
-# A folder path too long for the shortcuts (1024-character arguments) is refused before anything is made.
-$longRoot = Join-Path $Work ('deep-' + ('x' * 100))
-$longOut = (& (Join-Path $aiRoot 'Scripts/Install-LocalAI.ps1') -AIRoot $longRoot -SkipTests 6>&1 | ForEach-Object { "$_" }) -join ' '
-$c6l = $LASTEXITCODE
-Assert-That ($c6l -eq 1 -and -not (Test-Path -LiteralPath $longRoot) -and $longOut -match 'at most 100') "a $($longRoot.Length)-character install folder is refused with a clear message, nothing created (exit $c6l)"
 
 Write-Host "`n=== PHASE 6b: an old 'Update toolkit' shortcut pointing at the wrong folder ===" -ForegroundColor Cyan
 # Older shortcuts ignored -AIRoot and ran against C:\AI. With an install running elsewhere, a fresh

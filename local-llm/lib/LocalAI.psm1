@@ -1312,6 +1312,12 @@ function Compare-LaiConfig {
         if (-not ($a -is [hashtable]) -or -not $a.ContainsKey($k)) { $out += "${name}: not returned"; continue }
         $got = $a[$k]
         if ($want -is [hashtable]) { $out += @(Compare-LaiConfig -Expected $want -Actual $got -Prefix "$name."); continue }
+        # 5.1 reads a JSON 5.0 as [decimal] 5.0, which prints as '5.0': numbers compare as numbers.
+        $num = { param($v) $v -is [int] -or $v -is [long] -or $v -is [double] -or $v -is [decimal] -or $v -is [single] }
+        if ((& $num $want) -and (& $num $got)) {
+            if ([double]$want -ne [double]$got) { $out += "${name}: wanted $([Convert]::ToString($want, $inv)), got $([Convert]::ToString($got, $inv))" }
+            continue
+        }
         $w = if ($null -eq $want) { '' } else { [Convert]::ToString($want, $inv) }
         $g = if ($null -eq $got) { '' } else { [Convert]::ToString($got, $inv) }
         if (-not [string]::Equals($w, $g, [StringComparison]::OrdinalIgnoreCase)) {
@@ -1473,17 +1479,20 @@ function Invoke-LaiWebUISetup {
             Write-LaiLog OK ("RAG: splitter={0}, chunk={1}/{2}, top_k={3}; web search={4} via {5}" -f $rc.TEXT_SPLITTER, $rc.CHUNK_SIZE, $rc.CHUNK_OVERLAP, $rc.TOP_K, $rc.web.ENABLE_WEB_SEARCH, $rc.web.WEB_SEARCH_ENGINE)
         }
     } catch {
-        $warnings.Add("Documents/web search settings failed ($($_.Exception.Message)); run the installer again, or set them in Admin Panel > Settings > Documents and Web Search")
-        Write-LaiLog WARN "Documents/web search settings failed: $($_.Exception.Message)"
+        $why = $_.Exception.Message -replace '\s+', ' '
+        $warnings.Add("Documents/web search settings failed ($why); run the installer again, or set them in Admin Panel > Settings > Documents and Web Search")
+        Write-LaiLog WARN "Documents/web search settings failed: $why"
     }
 
     foreach ($c in $Collections) {
         try {
+            if ($env:LOCALAI_TEST_KNOWLEDGE_FAIL -and $env:LOCALAI_TEST_KNOWLEDGE_FAIL -eq $c) { throw "Test hook: collection '$c' rejected" }
             $k = Add-LaiWebUIKnowledge -BaseUrl $BaseUrl -Token $Token -Name $c -Description "Knowledge collection: $c"
             Write-LaiLog OK "Knowledge collection '$c' $($k.Action)"
         } catch {
-            $warnings.Add("Knowledge collection '$c' was not created ($($_.Exception.Message)); add it in Workspace > Knowledge")
-            Write-LaiLog WARN "Knowledge collection '$c' was not created: $($_.Exception.Message)"
+            $why = $_.Exception.Message -replace '\s+', ' '
+            $warnings.Add("Knowledge collection '$c' was not created ($why); add it in Workspace > Knowledge")
+            Write-LaiLog WARN "Knowledge collection '$c' was not created: $why"
         }
     }
     return $warnings.ToArray()
@@ -1564,7 +1573,7 @@ function Get-LaiShortcutSpecs {
         @{ Name = 'Local AI - Diagnostics (redacted zip)'; Script = 'Get-LocalAIDiagnostics.ps1'; Extra = ' -RunTests' }
         @{ Name = 'Local AI - Update toolkit'; Script = 'Get-LocalAI.ps1'; Extra = ''; Env = 'LOCALAI_ROOT' }
     )
-    $specs = @([pscustomobject]@{ Name = 'Local AI (Open WebUI)'; Kind = 'url'; Target = "http://localhost:$WebUIPort/"; Arguments = '' })
+    $specs = @([pscustomobject]@{ Name = 'Local AI (Open WebUI)'; Kind = 'url'; Script = ''; Target = "http://localhost:$WebUIPort/"; Arguments = ''; TooLong = $false })
     foreach ($i in $items) {
         $path = $scripts + '\' + $i.Script
         if ($i.Env) { $call = "`$env:$($i.Env) = $(& $q $AIRoot.TrimEnd('\')); & $(& $q $path)" }   # bootstrap reads the root from the environment
@@ -1580,12 +1589,21 @@ function Get-LaiShortcutSpecs {
             $logOn = "try { Start-Transcript -LiteralPath $(& $q $logPath) -Force | Out-Null } catch { Write-Host 'This run is not logged.' }; "
             $logOff = 'try { Stop-Transcript | Out-Null } catch { $null = $_ }; '
         }
-        $cmd = "${logOn}try { $call } catch { Write-Host ''; Write-Host ('FAILED: ' + `$_.Exception.Message) -ForegroundColor Red; Write-Host 'For help: Start menu > Local AI - Diagnostics (redacted zip).' -ForegroundColor Yellow } finally { Write-Host ''; ${logOff}Read-Host 'Done - press Enter to close' }"
+        $body = "try { $call } catch { Write-Host ''; Write-Host ('FAILED: ' + `$_.Exception.Message) -ForegroundColor Red; Write-Host 'For help: Start menu > Local AI - Diagnostics (redacted zip).' -ForegroundColor Yellow } finally { Write-Host ''; ${logOff}Read-Host 'Done - press Enter to close' }"
+        $arguments = '-NoProfile -ExecutionPolicy Bypass -Command "' + $logOn + $body + '"'
+        # A .lnk holds at most 1024 characters of arguments, and a long install folder appears up to
+        # three times: drop the log first, and mark the shortcut unusable if it still does not fit.
+        if ($arguments.Length -ge 1024 -and $logOn) {
+            $body = $body.Replace($logOff, '')
+            $arguments = '-NoProfile -ExecutionPolicy Bypass -Command "' + $body + '"'
+        }
         $specs += [pscustomobject]@{
             Name      = $i.Name
             Kind      = 'lnk'
+            Script    = $i.Script
             Target    = 'powershell.exe'
-            Arguments = '-NoProfile -ExecutionPolicy Bypass -Command "' + $cmd + '"'
+            Arguments = $arguments
+            TooLong   = ($arguments.Length -ge 1024)
         }
     }
     return $specs
