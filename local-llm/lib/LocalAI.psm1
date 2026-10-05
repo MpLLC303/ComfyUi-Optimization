@@ -88,6 +88,91 @@ function Get-LaiScriptCommandLine {
     return $s
 }
 
+function Get-LaiHiddenTaskLaunch {
+    # Execute + Argument for a scheduled task that runs powershell.exe with no window at all.
+    # '-WindowStyle Hidden' alone is not enough on Windows 11, where Windows Terminal is the default
+    # console host: the task still opens a terminal (only minimized), and closing it kills the run -
+    # for the backup possibly between stopping and starting Open WebUI. conhost --headless (Windows
+    # 10 2004, build 19041, and later) never creates a window. -WindowStyle Hidden stays in $PsArgs
+    # for the older-Windows fallback. -Build / -ConhostPath: for tests.
+    param([Parameter(Mandatory)][string]$PsArgs, [int]$Build = 0, [string]$ConhostPath = '')
+    if ($Build -le 0) { $Build = [Environment]::OSVersion.Version.Build }
+    if (-not $ConhostPath -and $env:WINDIR) { $ConhostPath = Join-Path $env:WINDIR 'System32\conhost.exe' }
+    if ($Build -ge 19041 -and $ConhostPath -and (Test-Path -LiteralPath $ConhostPath)) {
+        return [pscustomobject]@{ Execute = $ConhostPath; Argument = ('--headless powershell.exe ' + $PsArgs) }
+    }
+    return [pscustomobject]@{ Execute = 'powershell.exe'; Argument = $PsArgs }
+}
+
+function Get-LaiLastDailyRun {
+    # The most recent moment, at or before -Now, at which a daily schedule ('HH:mm') was due.
+    param([Parameter(Mandatory)][string]$At, [datetime]$Now = (Get-Date))
+    $t = [datetime]::ParseExact($At.Trim(), 'HH:mm', [Globalization.CultureInfo]::InvariantCulture)
+    $due = $Now.Date.Add($t.TimeOfDay)
+    if ($due -gt $Now) { $due = $due.AddDays(-1) }
+    return $due
+}
+
+function Invoke-LaiTimedNative {
+    # Runs a native program with a time limit. For CLIs that can wait forever on a stuck service:
+    # Docker Desktop's backend can stop answering after sleep while its pipe still accepts
+    # connections, and every docker command then blocks. A scheduled task would hang until Task
+    # Scheduler kills it, with nothing logged; with this the caller reports it instead. On timeout
+    # the whole process tree is killed (a .cmd wrapper would otherwise leave its child running).
+    # Each argument is quoted for the Windows command line (paths with spaces survive); output is
+    # read as UTF-8 (docker writes UTF-8). Returns ExitCode (-1 on timeout), TimedOut, Out (stdout)
+    # and Text (stdout + stderr, for messages).
+    param([Parameter(Mandatory)][string]$File, [string[]]$Arguments = @(), [int]$TimeoutSec = 30)
+    $exe = Get-Command $File -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+    if (-not $exe) { throw "$File was not found. Is it installed (and on PATH)?" }
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = [string]$exe.Source
+    $psi.Arguments = (@($Arguments | ForEach-Object { ConvertTo-LaiCmdArg ([string]$_) }) -join ' ')
+    $psi.UseShellExecute = $false
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    $psi.CreateNoWindow = $true
+    $utf8 = New-Object System.Text.UTF8Encoding($false)
+    $psi.StandardOutputEncoding = $utf8
+    $psi.StandardErrorEncoding = $utf8
+    $proc = [System.Diagnostics.Process]::Start($psi)
+    $outTask = $proc.StandardOutput.ReadToEndAsync()
+    $errTask = $proc.StandardError.ReadToEndAsync()
+    if (-not $proc.WaitForExit([Math]::Max(1, $TimeoutSec) * 1000)) {
+        if ($env:OS -eq 'Windows_NT') {
+            # Local 'Continue': under 'Stop', Windows PowerShell turns taskkill's stderr into an error.
+            $prevEap = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
+            try { & taskkill.exe /T /F /PID $proc.Id 2>&1 | Out-Null } finally { $ErrorActionPreference = $prevEap }
+        }
+        try { if (-not $proc.HasExited) { $proc.Kill() } } catch { Write-Verbose 'already gone' }
+        return [pscustomobject]@{ ExitCode = -1; TimedOut = $true; Out = ''; Text = "no answer within $TimeoutSec s" }
+    }
+    # Reading has a limit too: a child that outlived the program could keep the pipes open.
+    $out = ''; $err = ''
+    if ([System.Threading.Tasks.Task]::WaitAll([System.Threading.Tasks.Task[]]@($outTask, $errTask), 10000)) { $out = [string]$outTask.Result; $err = [string]$errTask.Result }
+    return [pscustomobject]@{ ExitCode = $proc.ExitCode; TimedOut = $false; Out = $out; Text = ($out + $err).Trim() }
+}
+
+function Get-LaiDockerTimeout {
+    # Seconds a quick docker command (version, inspect, start, exec of a probe) may take before
+    # Docker Desktop counts as not responding. LOCALAI_DOCKER_TIMEOUT: test hook.
+    $s = 30
+    if ($env:LOCALAI_DOCKER_TIMEOUT) { $s = [int]$env:LOCALAI_DOCKER_TIMEOUT }
+    return $s
+}
+
+function Test-LaiDockerEngine {
+    # 'ok'; 'down' (the CLI answered: the engine is not running); 'hung' (no answer within the limit:
+    # Docker Desktop is stuck, as it can be after sleep - restarting it is the fix); 'missing' (no
+    # docker CLI on PATH).
+    param([int]$TimeoutSec = 30)
+    if (-not (Get-Command docker -CommandType Application -ErrorAction SilentlyContinue)) { return 'missing' }
+    $r = Invoke-LaiTimedNative -File 'docker' -Arguments @('version', '--format', '{{.Server.Version}}') -TimeoutSec $TimeoutSec
+    if ($r.TimedOut) { return 'hung' }
+    if ($r.ExitCode -eq 0) { return 'ok' }
+    return 'down'
+}
+
 function ConvertTo-LaiHashtable {
     # PS 5.1 has no ConvertFrom-Json -AsHashtable; this converts PSCustomObject trees recursively.
     param($InputObject)
@@ -463,8 +548,25 @@ function Enter-LaiSetupLock {
 
 #region GPU -------------------------------------------------------------------------------
 
+function ConvertFrom-LaiGpuQuery {
+    # nvidia-smi --query-gpu=name,driver_version,memory.total,memory.used,memory.free (csv, noheader,
+    # nounits) lines -> one object per GPU, in nvidia-smi's (PCI bus) order. Unparsable lines are skipped.
+    param([string[]]$Lines)
+    $gpus = @()
+    foreach ($l in @($Lines)) {
+        $f = @(([string]$l).Split(',') | ForEach-Object { $_.Trim() })
+        $n = 0
+        if ($f.Count -lt 5 -or -not [int]::TryParse($f[2], [ref]$n)) { continue }
+        $gpus += [pscustomobject]@{ Name = $f[0]; DriverVersion = $f[1]; TotalMiB = [int]$f[2]; UsedMiB = [int]$f[3]; FreeMiB = [int]$f[4] }
+    }
+    return , $gpus
+}
+
 function Get-LaiGpuInfo {
-    # First NVIDIA GPU via nvidia-smi, or $null when nvidia-smi is unavailable.
+    # The NVIDIA GPU the models run on, or $null when nvidia-smi is unavailable or lists none.
+    # With several cards this is the one with the most VRAM (Ollama places a model on the card with the
+    # most free memory, and CUDA's default device 0 for ComfyUI is the fastest card), not nvidia-smi's
+    # first line, which is often a small display card. Count and All describe every card.
     $smi = Get-Command nvidia-smi -ErrorAction SilentlyContinue
     if (-not $smi) { return $null }
     # Local 'Continue': in Windows PowerShell 5.1 a native command's stderr becomes a terminating error
@@ -472,14 +574,71 @@ function Get-LaiGpuInfo {
     $ErrorActionPreference = 'Continue'
     $out = & $smi --query-gpu=name,driver_version,memory.total,memory.used,memory.free --format=csv,noheader,nounits 2>$null
     if ($LASTEXITCODE -ne 0 -or -not $out) { return $null }
-    $f = (@($out)[0]).Split(',') | ForEach-Object { $_.Trim() }
+    $all = ConvertFrom-LaiGpuQuery -Lines @($out | ForEach-Object { "$_" })
+    if ($all.Count -eq 0) { return $null }
+    $best = $all[0]
+    foreach ($g in $all) { if ($g.TotalMiB -gt $best.TotalMiB) { $best = $g } }
     return [pscustomobject]@{
-        Name          = $f[0]
-        DriverVersion = $f[1]
-        TotalMiB      = [int]$f[2]
-        UsedMiB       = [int]$f[3]
-        FreeMiB       = [int]$f[4]
+        Name          = $best.Name
+        DriverVersion = $best.DriverVersion
+        TotalMiB      = $best.TotalMiB
+        UsedMiB       = $best.UsedMiB
+        FreeMiB       = $best.FreeMiB
+        Count         = $all.Count
+        All           = $all
     }
+}
+
+function Test-LaiModelFitsVram {
+    # Rough pre-download check: can a model of -DownloadGB load 100% on a card of -TotalMiB at the
+    # installer's 8K checkpoint? Weights (the download size, read as GiB) plus 1 GiB for the 8K KV cache
+    # and compute buffers, against the card minus 1.5 GiB for the desktop and Ollama's overhead.
+    # Generous on purpose: it only has to catch cards that cannot work (a 30B on 16 GB), never refuse a
+    # card that can (every model in the catalog fits a 24 GB RTX 3090/4090; a unit test checks that).
+    param([Parameter(Mandatory)][double]$DownloadGB, [Parameter(Mandatory)][int]$TotalMiB)
+    $needMiB = [Math]::Ceiling($DownloadGB * 1024) + 1024
+    return ($needMiB -le ($TotalMiB - 1536))
+}
+
+function Get-LaiNoNvidiaMessage {
+    # What Preflight says when nvidia-smi finds no GPU: name what this PC has instead of blaming a
+    # broken NVIDIA driver on a PC that has an AMD/Intel GPU or an ARM CPU.
+    param([string[]]$VideoControllers = @(), [string]$Architecture = '')
+    $cards = @($VideoControllers | Where-Object { $_ } | ForEach-Object { $_.Trim() } | Select-Object -Unique)
+    $nvidia = @($cards | Where-Object { $_ -match '(?i)nvidia|geforce|quadro' })
+    if ($Architecture -match '(?i)arm') {
+        return "This PC has an ARM processor ($Architecture). This toolkit needs a 64-bit x86 PC with an NVIDIA GPU with 24 GB of VRAM (RTX 3090/4090); nothing was installed."
+    }
+    if ($nvidia.Count) {
+        return "Windows lists $($nvidia -join ', '), but nvidia-smi does not answer, so the NVIDIA driver is missing or broken. Install the current Game Ready driver from https://www.nvidia.com/Download/index.aspx, reboot, then re-run this script."
+    }
+    if ($cards.Count) {
+        return "No NVIDIA GPU found (this PC has: $($cards -join ', ')). This toolkit needs an NVIDIA GPU with 24 GB of VRAM (RTX 3090/4090) and the NVIDIA driver; nothing was installed."
+    }
+    return 'nvidia-smi was not found, so there is no NVIDIA GPU or its driver is missing or broken. This toolkit needs an NVIDIA GPU with 24 GB of VRAM; if you have one, install the current Game Ready driver from https://www.nvidia.com/Download/index.aspx, reboot, then re-run this script.'
+}
+
+function Get-LaiVirtualizationHint {
+    # The BIOS setting that turns CPU virtualization on, by CPU maker (Win32_Processor.Manufacturer).
+    param([string]$Manufacturer = '')
+    if ($Manufacturer -match '(?i)intel') { return 'Intel Virtualization Technology (VT-x) in the BIOS/UEFI (usually under Advanced > CPU Configuration)' }
+    if ($Manufacturer -match '(?i)amd') { return 'SVM Mode in the BIOS/UEFI (usually under Advanced > CPU Configuration)' }
+    return 'CPU virtualization in the BIOS/UEFI (SVM Mode on AMD, Intel Virtualization Technology / VT-x on Intel)'
+}
+
+function Get-LaiWslMemoryCapGB {
+    # The memory= value for a new .wslconfig, or $null to leave WSL's own default (half the RAM).
+    # 16 GB is a cap only above 32 GB of RAM; on smaller PCs it would RAISE WSL's limit.
+    param([Parameter(Mandatory)][double]$TotalGB)
+    if ($TotalGB -gt 32) { return 16 }
+    return $null
+}
+
+function Test-LaiCpuFallbackFits {
+    # Can the render guard's CPU mode (num_gpu 0, no mmap in Ollama 0.35.1) hold a model of -DownloadGB
+    # in RAM next to Windows, Docker and a ComfyUI render? Weights + ~4 GB KV cache/buffers + ~8 GB.
+    param([Parameter(Mandatory)][double]$DownloadGB, [Parameter(Mandatory)][double]$RamGB)
+    return (($DownloadGB + 12) -le $RamGB)
 }
 
 function Get-LaiGpuApps {
@@ -545,9 +704,190 @@ function Get-LaiModelManifestPath {
     return (Join-Path $p $tag)
 }
 
+function Find-LaiOllamaDir {
+    # The folder of Ollama's tray app ('ollama app.exe'), or $null when Ollama is not installed
+    # (-OrDefault: the default folder instead). Ollama's Windows docs install to a custom folder with
+    # OllamaSetup.exe /DIR=...; its installer registration (fixed AppId) names that folder. Then a
+    # running tray app, then the default %LOCALAPPDATA%\Programs\Ollama. Only a folder that really
+    # holds the app counts (a CLI-only build or a shim on PATH does not).
+    param([string]$LocalAppData = $env:LOCALAPPDATA, [switch]$OrDefault)
+    $ErrorActionPreference = 'Stop'
+    $default = $null; if ($LocalAppData) { $default = Join-Path $LocalAppData 'Programs\Ollama' }
+    $cands = @()
+    foreach ($hive in 'HKCU:', 'HKLM:') {
+        try { $cands += [string](Get-ItemProperty -Path ($hive + '\Software\Microsoft\Windows\CurrentVersion\Uninstall\{44E83376-CE68-45EB-8FC1-393500EB558C}_is1')).InstallLocation }
+        catch { Write-Verbose "no Ollama registration in $hive" }
+    }
+    try { $cands += @(Get-Process -Name 'ollama app' -ErrorAction SilentlyContinue | Where-Object { $_.Path } | ForEach-Object { Split-Path -Parent ([string]$_.Path) }) }
+    catch { Write-Verbose 'no running Ollama app' }
+    $cands += $default
+    foreach ($c in $cands) {
+        if (-not $c) { continue }
+        $d = ([string]$c).TrimEnd('\', '/')
+        if ($d -and (Test-Path -LiteralPath (Join-Path $d 'ollama app.exe'))) { return $d }
+    }
+    if ($OrDefault) { return $default }
+    return $null
+}
+
+function Find-LaiDockerDesktopExe {
+    # 'Docker Desktop.exe', or $null when it is not installed (-OrDefault: the default path instead).
+    # Docker Desktop can be installed with --installation-dir: its uninstall registration names the
+    # folder, else the docker CLI on PATH (<folder>\resources\bin\docker.exe), else Program Files.
+    param([string]$ProgramFiles = $env:ProgramFiles, [switch]$OrDefault)
+    $ErrorActionPreference = 'Stop'
+    $default = $null; if ($ProgramFiles) { $default = Join-Path $ProgramFiles 'Docker\Docker\Docker Desktop.exe' }
+    $dirs = @()
+    foreach ($hive in 'HKLM:', 'HKCU:') {
+        try { $dirs += [string](Get-ItemProperty -Path ($hive + '\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\Docker Desktop')).InstallLocation }
+        catch { Write-Verbose "no Docker Desktop registration in $hive" }
+    }
+    try {
+        $cli = Get-Command docker -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($cli -and $cli.Source) { $dirs += (Split-Path -Parent (Split-Path -Parent (Split-Path -Parent $cli.Source))) }
+    } catch { Write-Verbose 'docker CLI path not usable' }
+    foreach ($d in $dirs) {
+        if (-not $d) { continue }
+        $exe = Join-Path ([string]$d).TrimEnd('\', '/') 'Docker Desktop.exe'
+        if (Test-Path -LiteralPath $exe) { return $exe }
+    }
+    if ($default -and ((Test-Path -LiteralPath $default) -or $OrDefault)) { return $default }
+    return $null
+}
+
+function Get-LaiOllamaServerConfig {
+    # What the Ollama server really runs with, from the newest 'msg="server config"' line of its
+    # server.log: the tray app's own settings (Model location, Expose Ollama to the network) override
+    # the OLLAMA_MODELS / OLLAMA_HOST environment variables when it starts 'ollama serve', and only
+    # this line shows the result. Returns @{ Models; Host; HostIsLoopback } or $null.
+    param([string]$Line)
+    $m = [regex]::Match([string]$Line, 'env="((?:[^"\\]|\\.)*)"')
+    if (-not $m.Success) { return $null }
+    # slog quotes the map Go-style: C:\Users -> C:\\Users. Values may contain spaces, so a value runs
+    # up to the next ' KEY:' (keys are printed in sorted order) or the closing ']'.
+    $map = [regex]::Replace($m.Groups[1].Value, '\\(.)', '$1')
+    $r = @{ Models = $null; Host = $null; HostIsLoopback = $true }
+    foreach ($kv in @(@('OLLAMA_MODELS', 'Models'), @('OLLAMA_HOST', 'Host'))) {
+        $v = [regex]::Match($map, '(?:^map\[| )' + $kv[0] + ':(.*?)(?= [A-Za-z_][A-Za-z0-9_]*:|\]$)')
+        if ($v.Success -and $v.Groups[1].Value) { $r[$kv[1]] = $v.Groups[1].Value }
+    }
+    if ($r['Host']) {
+        $h = [regex]::Match($r['Host'], '^(?:[A-Za-z][A-Za-z0-9+.-]*://)?(\[[^\]]*\]|[^:/]+)').Groups[1].Value
+        $r['HostIsLoopback'] = ($h -match '^(127\.|localhost$|\[::1\]$|::1$)')
+    }
+    return $r
+}
+
+function Get-LaiOllamaLiveConfig {
+    # Get-LaiOllamaServerConfig for the newest 'server config' line of Ollama's server.log, or $null.
+    # Read as UTF-8 (how Ollama writes it): Windows PowerShell 5.1's Select-String reads a file without
+    # a BOM in the ANSI code page, which turns C:\Users\Jos<e-acute> into a different folder.
+    param([string]$LogPath)
+    if (-not $LogPath -or -not (Test-Path -LiteralPath $LogPath)) { return $null }
+    $line = Select-String -LiteralPath $LogPath -Pattern 'msg="server config"' -Encoding UTF8 | Select-Object -Last 1
+    if (-not $line) { return $null }
+    return (Get-LaiOllamaServerConfig -Line $line.Line)
+}
+
+function Test-LaiSamePath {
+    # Same folder, ignoring case, slash direction and a trailing separator (Windows paths).
+    param([string]$A, [string]$B)
+    if (-not $A -or -not $B) { return $false }
+    $na = ($A -replace '/', '\').TrimEnd('\'); $nb = ($B -replace '/', '\').TrimEnd('\')
+    return [string]::Equals($na, $nb, [StringComparison]::OrdinalIgnoreCase)
+}
+
+function Add-LaiPrevEnv {
+    # Records the value a setting had before the installer first wrote it ('' = it was unset), so
+    # Uninstall -ResetOllamaSettings puts the user's own back and removes only what the installer
+    # added. Only before the first write: with -InstallerSetBefore (the Ollama stage has completed
+    # once, also on installs from before this record existed) the current value is the installer's
+    # own, so nothing is recorded. The first value seen wins. Returns $true when it recorded one.
+    param([Parameter(Mandatory)][AllowEmptyCollection()][hashtable]$Saved, [Parameter(Mandatory)][string]$Name,
+        [AllowNull()][AllowEmptyString()][string]$Current, [switch]$InstallerSetBefore)
+    if ($InstallerSetBefore -or $Saved.ContainsKey($Name)) { return $false }
+    $Saved[$Name] = [string]$Current
+    return $true
+}
+
+function Get-LaiEnvResetPlan {
+    # Uninstall -ResetOllamaSettings: each variable goes back to the user's own value from before the
+    # install (recorded by the installer in install-state.json) or, when there was none, is removed.
+    param([string[]]$Names, [hashtable]$Saved = @{})
+    foreach ($n in $Names) {
+        $v = $null
+        if ($Saved -and $Saved.ContainsKey($n) -and [string]$Saved[$n]) { $v = [string]$Saved[$n] }
+        [pscustomobject]@{ Name = $n; Value = $v }
+    }
+}
+
 function Get-LaiOllamaVersion {
     param([string]$BaseUrl = 'http://127.0.0.1:11434')
     return (Invoke-LaiApi -Uri "$BaseUrl/api/version" -TimeoutSec 10).version
+}
+
+function Get-LaiOllamaAppPath {
+    # The Ollama tray app, also when installed to a custom folder (Find-LaiOllamaDir); '' when it is
+    # not installed or this is not Windows.
+    $d = Find-LaiOllamaDir
+    if (-not $d) { return '' }
+    return (Join-Path $d 'ollama app.exe')
+}
+
+function Start-LaiOllamaApp {
+    # Starts the tray app without its window. Since the 0.10 desktop app, a start without 'hidden'
+    # opens the Ollama window, which can take the focus from a full-screen game. '--fast-startup'
+    # leaves a downloaded Ollama update for the next sign-in (a hidden start would install it now),
+    # so a heal never swaps the version the presets were measured on.
+    param([string]$Path = (Get-LaiOllamaAppPath))
+    Start-Process -FilePath $Path -ArgumentList @('hidden', '--fast-startup')
+}
+
+function ConvertFrom-LaiServerConfigLine {
+    # The settings Ollama logs at start (msg="server config" env="map[KEY:value KEY:value ...]") as a
+    # hashtable. A key missing from the line is missing from the result: a newer Ollama that stops
+    # reporting a setting is not the same as the setting being off.
+    param([string]$Line)
+    $map = @{}
+    $envPart = [regex]::Match([string]$Line, 'env="?map\[(.*)\]')
+    if (-not $envPart.Success) { return $map }
+    foreach ($m in [regex]::Matches($envPart.Groups[1].Value, '(?<=^|[\s\[])([A-Z][A-Z0-9_]*):(\S*)')) { $map[$m.Groups[1].Value] = $m.Groups[2].Value }
+    return $map
+}
+
+function Test-LaiOllamaServerSettings {
+    # Checks the settings the tuning relies on against Ollama's start-up log line. Status 'ok';
+    # 'wrong' (reported with another value: Ollama did not pick up the environment, restart it);
+    # 'unknown' (no line, or this Ollama no longer reports the key: a restart cannot change that, the
+    # measured fit and speed are the check then).
+    param([string]$Line, [string]$KvCacheType = 'q8_0')
+    $cfg = ConvertFrom-LaiServerConfigLine -Line $Line
+    $want = [ordered]@{ OLLAMA_FLASH_ATTENTION = 'true'; OLLAMA_KV_CACHE_TYPE = $KvCacheType }
+    $wrong = @(); $missing = @()
+    foreach ($k in $want.Keys) {
+        if (-not $cfg.ContainsKey($k)) { $missing += $k }
+        elseif ([string]$cfg[$k] -ne [string]$want[$k]) { $wrong += ('{0}={1} (wanted {2})' -f $k, $cfg[$k], $want[$k]) }
+    }
+    $status = 'ok'
+    if ($missing.Count) { $status = 'unknown' }
+    if ($wrong.Count) { $status = 'wrong' }
+    return [pscustomobject]@{ Status = $status; Wrong = $wrong; Missing = $missing }
+}
+
+function Get-LaiTuningDrift {
+    # Tuned presets measured on another Ollama version than the running one (the Ollama app installs
+    # its own updates at sign-in). Entries without a recorded version are left out: Update-Models.ps1
+    # re-checks exactly this list, so a notice about anything else could never clear.
+    param([hashtable]$Tuning = @{}, [string]$OllamaVersion = '', [string[]]$Keys = @())
+    $out = @()
+    if (-not $OllamaVersion -or -not $Tuning) { return $out }
+    foreach ($k in @($Tuning.Keys | Sort-Object)) {
+        if ($Keys.Count -and $Keys -notcontains $k) { continue }
+        $t = $Tuning[$k]
+        if (-not ($t -is [hashtable]) -or -not $t['OllamaVersion']) { continue }
+        if ([string]$t['OllamaVersion'] -ne $OllamaVersion) { $out += [pscustomobject]@{ Key = [string]$k; Alias = [string]$t['Alias']; Was = [string]$t['OllamaVersion'] } }
+    }
+    return $out
 }
 
 function Get-LaiOllamaModelNames {
@@ -668,6 +1008,10 @@ function Invoke-LaiOllamaLoad {
         [int]$NumCtx = 0,
         [string]$KeepAlive = '5m'
     )
+    # Test hook (tests/Invoke-ModelUpdateTest.ps1): a re-published tag this Ollama cannot load.
+    if ($env:LOCALAI_TEST_LOAD_FAIL -and (Resolve-LaiModelName $Name) -eq (Resolve-LaiModelName $env:LOCALAI_TEST_LOAD_FAIL)) {
+        throw 'llama-server: this model may be incompatible with your version of Ollama (test hook)'
+    }
     $body = @{ model = $Name; keep_alive = $KeepAlive }
     if ($NumCtx -gt 0) { $body['options'] = @{ num_ctx = $NumCtx } }
     Invoke-LaiApi -Method POST -Uri "$BaseUrl/api/generate" -Body $body -TimeoutSec 900 | Out-Null
@@ -709,6 +1053,7 @@ function Find-LaiMaxContext {
     if ($list.Count -eq 0) { $list = @($limit) }
 
     $result = $null
+    $lastError = ''
     foreach ($ctx in $list) {
         # Each size from an empty card: VRAM freed by the previous size may show up late on Windows.
         Stop-LaiOllamaModels -BaseUrl $BaseUrl
@@ -716,8 +1061,8 @@ function Find-LaiMaxContext {
         catch {
             # E.g. 'cudaMalloc failed: out of memory' when Ollama under-estimates: try the next size
             # instead of failing the whole install.
-            Write-LaiLog WARN ("  ctx {0,6}: load failed ({1}); trying a smaller context" -f $ctx, (Get-LaiHttpErrorText $_))
-            $result = [pscustomobject]@{ Name = $Name; TrainContext = $info.TrainContext; Context = $ctx; GpuPercent = 0; SizeGiB = 0; FreeMiB = -1; Fits = $false }
+            $lastError = Get-LaiHttpErrorText $_
+            Write-LaiLog WARN ("  ctx {0,6}: load failed ({1}); trying a smaller context" -f $ctx, $lastError)
             continue
         }
         # Median of three readings: one other program grabbing VRAM for a moment must not decide the
@@ -740,6 +1085,9 @@ function Find-LaiMaxContext {
         if ($result.Fits) { break }
     }
     Stop-LaiOllamaModels -BaseUrl $BaseUrl
+    # Not one size loaded: the weights themselves are the problem (a re-published tag this Ollama
+    # cannot read, a broken upload), not VRAM. Stop before the caller rebuilds the tuned alias on them.
+    if ($null -eq $result) { throw "$Name could not be loaded at any context (last error: $lastError)" }
     return $result
 }
 
@@ -877,10 +1225,18 @@ function Merge-LaiPresetForm {
     # access, extra parameters - is kept.
     param([Parameter(Mandatory)][hashtable]$Managed, $Existing)
     if (-not $Existing) { return $Managed }
+    # Set when the preset is created, then left to the user:
+    #   think            Open WebUI 0.11.4 re-applies a preset's think over the per-chat Chat Controls
+    #                    switch, so the preset is the only place to turn Local Fast's reasoning on.
+    #   image_generation an image button the user wired to ComfyUI (not code execution, which stays off).
+    $createOnly = @{ params = @('think'); capabilities = @('image_generation'); builtinTools = @('image_generation') }
     $old = ConvertTo-LaiHashtable $Existing
     $params = @{}
     if ($old.ContainsKey('params') -and $old['params'] -is [hashtable]) { $params = $old['params'] }
-    foreach ($k in $Managed['params'].Keys) { $params[$k] = $Managed['params'][$k] }
+    foreach ($k in $Managed['params'].Keys) {
+        if ($createOnly['params'] -contains $k -and $params.ContainsKey($k) -and $null -ne $params[$k]) { continue }
+        $params[$k] = $Managed['params'][$k]
+    }
     $meta = @{}
     if ($old.ContainsKey('meta') -and $old['meta'] -is [hashtable]) { $meta = $old['meta'] }
     foreach ($k in $Managed['meta'].Keys) {
@@ -888,7 +1244,10 @@ function Merge-LaiPresetForm {
         # Replacing the whole set erased the user's own choices (Open WebUI treats a missing tool
         # category as ON, so a calendar or notes tool the user had turned off came back on).
         if ($Managed['meta'][$k] -is [hashtable] -and $meta.ContainsKey($k) -and $meta[$k] -is [hashtable]) {
-            foreach ($leaf in $Managed['meta'][$k].Keys) { $meta[$k][$leaf] = $Managed['meta'][$k][$leaf] }
+            foreach ($leaf in $Managed['meta'][$k].Keys) {
+                if ($createOnly.ContainsKey($k) -and $createOnly[$k] -contains $leaf -and $meta[$k].ContainsKey($leaf) -and $null -ne $meta[$k][$leaf]) { continue }
+                $meta[$k][$leaf] = $Managed['meta'][$k][$leaf]
+            }
         } else { $meta[$k] = $Managed['meta'][$k] }
     }
     $access = $Managed['access_grants']
@@ -1089,12 +1448,18 @@ function Invoke-LaiWebUIChat {
         [Parameter(Mandatory)][string]$Prompt,
         [hashtable]$Features = @{},
         [object[]]$Files = @(),
+        # PNG images (base64, no data: prefix) sent with the prompt, as the browser sends a pasted image.
+        [string[]]$ImageBase64 = @(),
         [int]$TimeoutSec = 900
     )
+    $content = $Prompt
+    if ($ImageBase64.Count -gt 0) {
+        $content = @(@{ type = 'text'; text = $Prompt }) + @($ImageBase64 | ForEach-Object { @{ type = 'image_url'; image_url = @{ url = "data:image/png;base64,$_" } } })
+    }
     $body = @{
         model    = $Model
         stream   = $false
-        messages = @(@{ role = 'user'; content = $Prompt })
+        messages = @(@{ role = 'user'; content = $content })
     }
     if ($Features.Count -gt 0) { $body['features'] = $Features }
     if ($Files.Count -gt 0) { $body['files'] = $Files }
@@ -1107,6 +1472,94 @@ function Test-LaiWebUIChat {
     $answer = Invoke-LaiWebUIChat -BaseUrl $BaseUrl -Token $Token -Model $Model -Prompt 'Respond with exactly: LOCAL AI WORKING'
     # CultureInvariant: on tr-TR, IgnoreCase does not pair I with i ('working' vs 'WORKING').
     return [pscustomobject]@{ Passed = [regex]::IsMatch($answer, 'LOCAL AI WORKING', 'IgnoreCase, CultureInvariant'); Answer = $answer.Trim() }
+}
+
+# 64x64 single-colour PNGs for the image check (a few hundred bytes; no encoder needed on 5.1).
+$script:LaiTestImages = @{
+    red   = 'iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAIAAAAlC+aJAAAAS0lEQVR42u3PQQkAAAgAsetfWiP4FgYrsKZeS0BAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEDgsqnc8OJg6Ln3AAAAAElFTkSuQmCC'
+    green = 'iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAIAAAAlC+aJAAAATElEQVR42u3PQQkAAAgAseufwqhG8C0MVmA1/SYgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgcFlT0gCXrcLQywAAAABJRU5ErkJggg=='
+    blue  = 'iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAIAAAAlC+aJAAAAS0lEQVR42u3PQQkAAAgAsetfWiP4FgYrsGqeExAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBA4LMf88OL0EKXAAAAAAElFTkSuQmCC'
+}
+
+function Test-LaiWebUIVision {
+    # Sends a single-colour image through a preset (browser path: Open WebUI's image conversion, the
+    # render guard, Ollama's projector, llama.cpp) and asks for its colour. A text-only path answers
+    # that it sees no image, or errors. -Colour picks the image (default: random, so a guess rarely
+    # passes).
+    param(
+        [string]$BaseUrl = 'http://127.0.0.1:3000',
+        [Parameter(Mandatory)][string]$Token,
+        [Parameter(Mandatory)][string]$Model,
+        [ValidateSet('', 'red', 'green', 'blue')][string]$Colour = ''
+    )
+    if (-not $Colour) { $Colour = @('red', 'green', 'blue')[(Get-Random -Minimum 0 -Maximum 3)] }
+    $answer = Invoke-LaiWebUIChat -BaseUrl $BaseUrl -Token $Token -Model $Model -ImageBase64 @($script:LaiTestImages[$Colour]) `
+        -Prompt 'What colour is this image? Answer with one word.'
+    return [pscustomobject]@{ Passed = [regex]::IsMatch($answer, "\b$Colour\b", 'IgnoreCase, CultureInvariant'); Expected = $Colour; Answer = $answer.Trim() }
+}
+
+function Test-LaiPresetVision {
+    # A preset's image upload against what Ollama reports for its model: 'ok', 'missing' (the preset
+    # accepts images the model cannot read, so every image errors) or 'unused' (the model reads
+    # images but the preset refuses them).
+    param([bool]$PresetVision, [string[]]$Capabilities = @())
+    $model = @($Capabilities) -contains 'vision'
+    if ($PresetVision -and -not $model) { return 'missing' }
+    if ($model -and -not $PresetVision) { return 'unused' }
+    return 'ok'
+}
+
+function Get-LaiContextOverride {
+    <#
+    .SYNOPSIS
+        Places where Open WebUI sends its own num_ctx / num_batch to Ollama instead of letting the
+        tuned alias decide: the signed-in user's Settings, the admin default model parameters and
+        the presets' Advanced Params. One line per place; empty when there is none. A different
+        context reloads the 19 GB model whenever a background task (titles, follow-ups) asks for the
+        alias's own size, and a larger one spills to the CPU. Per-chat Controls are stored with each
+        chat and cannot be read here. A place that cannot be read is skipped.
+    #>
+    param([string]$BaseUrl = 'http://127.0.0.1:3000', [Parameter(Mandatory)][string]$Token, [string[]]$PresetIds = @())
+    $find = {
+        param($Params)
+        $p = ConvertTo-LaiHashtable $Params
+        $hits = @()
+        if ($p -is [hashtable]) {
+            $sets = @($p)
+            if ($p.ContainsKey('custom_params') -and $p['custom_params'] -is [hashtable]) { $sets += $p['custom_params'] }
+            foreach ($s in $sets) {
+                foreach ($k in 'num_ctx', 'num_batch') {
+                    if ($s.ContainsKey($k) -and $null -ne $s[$k] -and "$($s[$k])" -ne '') { $hits += "$k $($s[$k])" }
+                }
+            }
+        }
+        return $hits
+    }
+    $out = @()
+    try {
+        $us = ConvertTo-LaiHashtable (Invoke-LaiApi -Uri "$BaseUrl/api/v1/users/user/settings" -Token $Token)
+        if ($us -is [hashtable] -and $us['ui'] -is [hashtable]) {
+            $hits = @(& $find $us['ui']['params'])
+            if ($hits.Count) { $out += "your Settings > General > Advanced Parameters ($($hits -join ', '))" }
+        }
+    } catch { Write-Verbose "user settings not readable: $($_.Exception.Message)" }
+    try {
+        $mc = ConvertTo-LaiHashtable (Invoke-LaiApi -Uri "$BaseUrl/api/v1/configs/models" -Token $Token)
+        if ($mc -is [hashtable]) {
+            $hits = @(& $find $mc['DEFAULT_MODEL_PARAMS'])
+            if ($hits.Count) { $out += "Admin Panel > Settings > Models > default parameters ($($hits -join ', '))" }
+        }
+    } catch { Write-Verbose "model defaults not readable: $($_.Exception.Message)" }
+    foreach ($id in $PresetIds) {
+        try {
+            $p = Get-LaiWebUIModel -BaseUrl $BaseUrl -Token $Token -Id $id
+            if (-not $p) { continue }
+            $hits = @(& $find $p.params)
+            $name = [string]$p.name; if (-not $name) { $name = $id }
+            if ($hits.Count) { $out += "Workspace > Models > $name > Advanced Params ($($hits -join ', '))" }
+        } catch { Write-Verbose "preset $id not readable: $($_.Exception.Message)" }
+    }
+    return $out
 }
 
 function Test-LaiWebUIMemory {
@@ -1200,6 +1653,79 @@ function Test-LaiWebUIWebSearch {
     }
 }
 
+function ConvertTo-LaiSearxngDiagnosis {
+    # Reads a SearXNG JSON answer: how many results, and which engines failed and why. Open WebUI keeps
+    # only the results, so an empty search there cannot tell a CAPTCHA (wait) from a scraper broken
+    # by a site change (only a newer SearXNG image fixes that).
+    # Summary: the 'SearXNG search' check's text. WebUIHint: why Open WebUI's own search came back empty.
+    param($Response)
+    $count = 0; $engines = @(); $broken = @(); $blocked = @(); $refused = @()
+    $names = @(); if ($Response -and $Response.PSObject) { $names = @($Response.PSObject.Properties.Name) }
+    if ($names -contains 'results') { $count = @($Response.results | Where-Object { $_ }).Count }
+    if ($names -contains 'unresponsive_engines') {
+        foreach ($u in @($Response.unresponsive_engines)) {
+            $pair = @($u)
+            if ($pair.Count -lt 1 -or -not $pair[0]) { continue }
+            $engine = [string]$pair[0]; $why = ''
+            if ($pair.Count -gt 1) { $why = [string]$pair[1] }
+            $engines += ('{0}: {1}' -f $engine, $why)
+            # SearXNG's own labels (searx/webutils.py); 'Suspended: ' may come first.
+            if ($why -match 'parsing error|unexpected crash') { $broken += $engine }
+            elseif ($why -match 'CAPTCHA|too many requests|access denied') { $blocked += $engine }
+            elseif ($why -match 'HTTP error|server API error') { $refused += $engine }
+        }
+    }
+    $hint = 'the search engines answered with nothing; check the internet connection (docker logs --tail 50 searxng shows the details)'
+    if ($broken.Count) {
+        $hint = "$($broken -join ', ') no longer understands its site's pages (parsing error): only a newer SearXNG fixes that: Update-OpenWebUI.ps1 -SearxngVersion <newer tag from hub.docker.com/r/searxng/searxng/tags>"
+    } elseif ($blocked.Count) {
+        $hint = "$($blocked -join ', ') is rate-limiting this PC (CAPTCHA / too many requests): wait a few minutes to an hour, then search again"
+    } elseif ($refused.Count) {
+        # The site answered, with an error page or an API refusal: not a connection problem.
+        $hint = "$($refused -join ', ') answered but refused the search (the site may be blocking this PC): wait, and if it lasts, a newer SearXNG may help (Update-OpenWebUI.ps1 -SearxngVersion <newer tag from hub.docker.com/r/searxng/searxng/tags>)"
+    }
+    $list = $engines -join '; '
+    if ($count -gt 0) {
+        $summary = "$count results"
+        # Some engines failing while others answer is how a CAPTCHA wave or a broken scraper starts.
+        if ($engines.Count) { $summary += " (not answering: $list)" }
+        # Open WebUI keeps only the pages its web loader could fetch (process_web_search 'filenames').
+        $webui = "SearXNG itself finds $count results, so Open WebUI could not use them: check Admin Settings > Web Search (SearXNG query URL, web loader / SSL verification) and docker logs --tail 50 open-webui"
+    } else {
+        $who = ''; if ($engines.Count) { $who = " ($list)" }
+        $summary = "no results$who - $hint"
+        $webui = "SearXNG finds nothing either$who - $hint"
+    }
+    return [pscustomobject]@{ Count = $count; Engines = $engines; Broken = $broken; Blocked = $blocked; Refused = $refused; Hint = $hint; Summary = $summary; WebUIHint = $webui }
+}
+
+function Get-LaiSearxngProbe {
+    # One search straight against SearXNG's JSON API (no Open WebUI, no model, a few seconds). Waits
+    # for /healthz first: right after 'compose up' recreated the container (a SearXNG update) the
+    # port is already open while SearXNG is still starting, and a search then would fail a working update.
+    # A refused connection (nothing listens: the container is not running) ends the wait after
+    # -RefusedSec instead of the full -WaitSec.
+    param([string]$BaseUrl = 'http://127.0.0.1:8888', [string]$Query = 'Ollama release notes', [int]$TimeoutSec = 30,
+        [int]$WaitSec = 60, [int]$RefusedSec = 10)
+    if ($WaitSec -gt 0) {
+        $deadline = (Get-Date).AddSeconds($WaitSec)
+        $refusedEnd = (Get-Date).AddSeconds([Math]::Min($RefusedSec, $WaitSec))
+        while ($true) {
+            try { Invoke-LaiApi -Uri "$BaseUrl/healthz" -TimeoutSec 10 | Out-Null; break }
+            catch {
+                $now = Get-Date
+                if (($now -ge $refusedEnd -and (Test-LaiConnectionRefused $_)) -or $now -ge $deadline) {
+                    throw "SearXNG at $BaseUrl is not answering ($(Get-LaiHttpErrorText $_))"
+                }
+            }
+            Start-Sleep -Seconds 2
+        }
+    }
+    $r = Invoke-LaiApi -Uri ("$BaseUrl/search?format=json&q=" + [uri]::EscapeDataString($Query)) -TimeoutSec $TimeoutSec
+    if ($null -eq $r -or $r -is [string]) { throw "SearXNG at $BaseUrl did not answer with JSON (its settings.yml must list json under search: formats:)" }
+    return (ConvertTo-LaiSearxngDiagnosis -Response $r)
+}
+
 #endregion
 
 #region High-level setup (shared by the installer and the Linux integration harness) -----
@@ -1218,6 +1744,23 @@ function Get-LaiCatalog {
         Models            = $models
         AllModels         = @($data.Models)
     }
+}
+
+function Get-LaiModelSetupAdvice {
+    # What to do after Update-Models could not set a model up. -Rollback only for a model this run
+    # downloaded anew (-Changed): in the re-check after an Ollama update the files are the same, and
+    # swapping in an older copy left from an earlier update would pin it without touching the cause.
+    param([string]$Why, [string]$Display, [string]$Key, [switch]$Changed, [switch]$HasPrevious)
+    $out = @()
+    $what = "$Display's files"; if ($Changed) { $what = 'the new download' }
+    if ($Why -match 'incompatible with your version|requires a newer version') {
+        $out += "This Ollama cannot load ${what}: Update-Models.ps1 -UpdateOllama upgrades Ollama, and the next run then sets $Display up by itself."
+    } elseif ($Why -match 'out of memory|cudaMalloc|CUDA error') {
+        $out += "The GPU ran out of memory: close ComfyUI and other GPU programs, then run Update-Models.ps1 again."
+    }
+    if ($Changed -and $HasPrevious) { $out += "To go back to the version you had instead: Update-Models.ps1 -Rollback $Key" }
+    elseif ($out.Count -eq 0) { $out += "Run Update-Models.ps1 again once the cause above is fixed; it retries $Display by itself." }
+    return $out
 }
 
 function Invoke-LaiModelSetup {
@@ -1421,6 +1964,36 @@ function New-LaiPresetForm {
     }
 }
 
+function Get-LaiRagWanted {
+    # The documents (RAG), image upload and web search settings the installer writes and reads back;
+    # Test-LocalAI compares the live ones with the same list.
+    param([string]$SearxngQueryUrl = 'http://searxng:8080/search?q=<query>')
+    return @{
+        TEXT_SPLITTER                        = 'token'
+        ENABLE_MARKDOWN_HEADER_TEXT_SPLITTER = $true
+        CHUNK_SIZE                           = 2000
+        CHUNK_OVERLAP                        = 200
+        TOP_K                                = 5
+        # The browser scales an attached image to fit 1920x1920 before sending it. Every image in a
+        # chat is sent again with each message, and a full-size photo costs up to 4,096 of Local
+        # Vision's 32K tokens (llama.cpp's Qwen-VL cap): unscaled, a chat with about seven photos no
+        # longer fits. 1920 leaves 1080p screenshots untouched (readable text) and shrinks a phone
+        # photo to about 2,700 tokens.
+        FILE_IMAGE_COMPRESSION_WIDTH         = 1920
+        FILE_IMAGE_COMPRESSION_HEIGHT        = 1920
+        web                                  = @{
+            ENABLE_WEB_SEARCH            = $true
+            WEB_SEARCH_ENGINE            = 'searxng'
+            SEARXNG_QUERY_URL            = $SearxngQueryUrl
+            WEB_SEARCH_RESULT_COUNT      = 5
+            # A page or PDF the model opens with its fetch_url tool is cut to 32,000 characters
+            # (about 8K tokens). Uncapped, one long page fills Fast's 40K or Vision's 32K context, and
+            # Ollama then silently drops the oldest messages - the user's question first.
+            WEB_FETCH_MAX_CONTENT_LENGTH = 32000
+        }
+    }
+}
+
 function Invoke-LaiWebUISetup {
     # Everything the guide does by clicking through Admin/Workspace settings (Parts 9-18).
     param(
@@ -1485,19 +2058,7 @@ function Invoke-LaiWebUISetup {
     Write-LaiLog OK "Raw models hidden; default model '$default'; selector order: $($order -join ', ')"
 
     Write-LaiLog STEP 'Open WebUI: documents (RAG) and web search settings'
-    $ragWanted = @{
-        TEXT_SPLITTER                        = 'token'
-        ENABLE_MARKDOWN_HEADER_TEXT_SPLITTER = $true
-        CHUNK_SIZE                           = 2000
-        CHUNK_OVERLAP                        = 200
-        TOP_K                                = 5
-        web                                  = @{
-            ENABLE_WEB_SEARCH       = $true
-            WEB_SEARCH_ENGINE       = 'searxng'
-            SEARXNG_QUERY_URL       = $SearxngQueryUrl
-            WEB_SEARCH_RESULT_COUNT = 5
-        }
-    }
+    $ragWanted = Get-LaiRagWanted -SearxngQueryUrl $SearxngQueryUrl
     try {
         Set-LaiWebUIRetrievalConfig -BaseUrl $BaseUrl -Token $Token -Settings $ragWanted | Out-Null
         $rc = Get-LaiWebUIRetrievalConfig -BaseUrl $BaseUrl -Token $Token
@@ -1524,6 +2085,13 @@ function Invoke-LaiWebUISetup {
             $warnings.Add("Knowledge collection '$c' was not created ($why); add it in Workspace > Knowledge")
             Write-LaiLog WARN "Knowledge collection '$c' was not created: $why"
         }
+    }
+
+    # A context set in Open WebUI wins over the tuned alias (kept on purpose: user parameters survive
+    # re-runs), so say where it is instead of silently running at another size.
+    foreach ($o in @(Get-LaiContextOverride -BaseUrl $BaseUrl -Token $Token -PresetIds @($Models | ForEach-Object { $_.Preset }))) {
+        $warnings.Add("Open WebUI overrides the tuned context in $o; set Context Length (and Batch Size) there back to Default so the tuned alias decides")
+        Write-LaiLog WARN "Open WebUI overrides the tuned context in $o"
     }
     return $warnings.ToArray()
 }

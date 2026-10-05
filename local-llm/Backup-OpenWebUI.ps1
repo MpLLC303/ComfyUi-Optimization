@@ -6,10 +6,12 @@
     uploaded documents and their vector index).
 
 .DESCRIPTION
-    Stops the open-webui container for a few seconds so SQLite and the vector store are not copied
-    mid-write, archives the "open-webui" Docker volume to <AIRoot>\Backups\open-webui-<timestamp>.tar.gz,
-    restarts the container, verifies the archive, prunes old archives and optionally mirrors the newest
-    one to a second location. The installer schedules this daily.
+    Stops the open-webui container while the archive is written (seconds to a few minutes; a
+    scheduled run first waits for a chat answer that is still being written) so SQLite and the
+    vector store are not copied mid-write, archives the "open-webui" Docker volume to
+    <AIRoot>\Backups\open-webui-<timestamp>.tar.gz, restarts the container, verifies the archive,
+    prunes old archives and optionally mirrors the newest one to a second location. The installer
+    schedules this daily (and at sign-in, to catch up a missed night).
 
     The models are not backed up (re-download them). Secrets live in <AIRoot>\Secrets: keep a copy of
     that folder in your password manager, not next to the backups.
@@ -44,8 +46,16 @@ param(
     # Deep check: open the archived webui.db with SQLite (integrity_check + user/chat counts) in a
     # throwaway volume. Uses an image that is already local (Open WebUI's own) so nothing is downloaded.
     [switch]$SkipDeepVerify,
-    # Image for the deep check; '' = the Open WebUI version in Stack\.env (skipped if that image is not local).
-    [string]$VerifyImage = ''
+    # Image for the deep check; '' = the Open WebUI version in Stack\.env, or the image Open WebUI
+    # runs when that one is not on this PC (skipped, and counted, if neither is).
+    [string]$VerifyImage = '',
+    # Scheduled runs: before stopping Open WebUI, wait up to this many seconds while a chat answer
+    # is still being written (the render guard counts them), so a run that catches up after wake or
+    # sign-in does not cut one off. 0 = do not wait.
+    [int]$WaitForChatsSec = 0,
+    # Scheduled runs: the daily backup time (HH:mm). A run that finds a nightly backup made since that
+    # time last came round does nothing, so the extra run at sign-in only catches up a missed night.
+    [string]$DailyAt = ''
 )
 $ErrorActionPreference = 'Stop'
 Import-Module (Join-Path (Join-Path $PSScriptRoot 'lib') 'LocalAI.psm1') -Force
@@ -87,6 +97,21 @@ if ($hold -and -not $Tag) {
     exit 0
 }
 
+# The task also runs at sign-in (a missed run of a task that needs you signed in may not catch up on
+# its own); with -DailyAt that extra run does nothing when the last night's backup is already there.
+if ($DailyAt -and -not $Tag) {
+    $due = $null
+    try { $due = Get-LaiLastDailyRun -At $DailyAt } catch { Write-BackupLog WARN "Ignoring -DailyAt '$DailyAt': expected a time like 03:30." }
+    if ($due) {
+        $done = @(Get-ChildItem -LiteralPath $backupDir -Filter 'open-webui-*.tar.gz' -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -match '^open-webui-\d{8}-\d{6}\.tar\.gz$' -and $_.LastWriteTime -ge $due -and $_.LastWriteTime -le (Get-Date).AddHours(1) })
+        if ($done.Count) {
+            Write-LaiLog INFO "Nothing to do: the backup due at $($due.ToString('yyyy-MM-dd HH:mm')) was already made ($($done[0].Name))."
+            exit 0
+        }
+    }
+}
+
 $suffix = ''
 if ($Tag) { $suffix = "-$Tag" }
 $name = 'open-webui-{0}{1}.tar.gz' -f (Get-Date -Format 'yyyyMMdd-HHmmss'), $suffix
@@ -100,13 +125,53 @@ $stopped = $false
 $verifiedOk = $false
 $exitCode = 0
 
+# Each probe has a time limit: a Docker Desktop that stopped answering (it can after sleep) would
+# otherwise hang this run until the task's 1 h limit, with no line in backup.log.
+$dockerLimit = Get-LaiDockerTimeout
 $deadline = (Get-Date).AddSeconds($EngineWaitSec)
-while ((Invoke-Docker -Arguments @('version', '--format', '{{.Server.Version}}') -AllowFail).ExitCode -ne 0) {
+while ($true) {
+    $engine = Test-LaiDockerEngine -TimeoutSec $dockerLimit
+    if ($engine -eq 'ok') { break }
+    if ($engine -eq 'missing') {
+        Write-BackupLog FAIL 'The docker command was not found. Repair Docker Desktop (or re-run the installer); the next run will catch up.'
+        exit 1
+    }
     if ((Get-Date) -ge $deadline) {
-        Write-BackupLog FAIL "Docker engine is not running (waited $EngineWaitSec s). Start Docker Desktop (Start menu > Local AI > Start again); the next run will catch up."
+        if ($engine -eq 'hung') {
+            Write-BackupLog FAIL "Docker Desktop is not responding (docker got no answer within $dockerLimit s; waited $EngineWaitSec s). Restart it (whale icon > Restart); the next run will catch up."
+        } else {
+            Write-BackupLog FAIL "Docker engine is not running (waited $EngineWaitSec s). Start Docker Desktop (Start menu > Local AI > Start again); the next run will catch up."
+        }
         exit 1
     }
     Start-Sleep -Seconds 10
+}
+
+function Get-ChatsInFlight {
+    # Chat answers the render guard is forwarding right now; -1 when it cannot tell (no guard, Docker
+    # not answering, a guard that is off the chat path): then nothing waits. The status page probes
+    # every ComfyUI first; a busy or firewalled one can make that take ~10 s, exactly while chats run
+    # slowly on the CPU: 15 s (tests/test_render_guard.py checks the margin), within $dockerLimit.
+    $py = "import json,urllib.request as u;print(json.load(u.urlopen('http://127.0.0.1:11434/render-guard/status',timeout=15))['inflight'])"
+    try { $r = Invoke-LaiTimedNative -File 'docker' -Arguments @('exec', 'render-guard', 'python3', '-c', $py) -TimeoutSec $dockerLimit } catch { return -1 }
+    $m = [regex]::Match([string]$r.Out, '(?m)^\s*(\d+)\s*$')
+    if ($r.ExitCode -ne 0 -or -not $m.Success) { return -1 }
+    return [int]$m.Groups[1].Value
+}
+if ($WaitForChatsSec -gt 0 -and -not $NoStop) {
+    # A run that catches up after wake or sign-in starts while you may be chatting: stopping Open
+    # WebUI then would cut off the answer being written. Before the volume lock, so Start again or a
+    # restore are not blocked while this waits.
+    $poll = 15; if ($env:LOCALAI_TEST_CHAT_POLL_SEC) { $poll = [int]$env:LOCALAI_TEST_CHAT_POLL_SEC }
+    $chatStart = Get-Date
+    $capped = $false
+    while ((Get-ChatsInFlight) -gt 0) {
+        if (((Get-Date) - $chatStart).TotalSeconds -ge $WaitForChatsSec) { $capped = $true; break }
+        Start-Sleep -Seconds $poll
+    }
+    $waited = [int]((Get-Date) - $chatStart).TotalSeconds
+    if ($capped) { Write-BackupLog WARN "A chat answer was still being written after $waited s; stopping Open WebUI anyway (regenerate that answer if it was cut off)." }
+    elseif ($waited -ge $poll) { Write-BackupLog INFO "Waited $waited s for a chat answer to finish before stopping Open WebUI." }
 }
 
 $lock = $null
@@ -142,6 +207,7 @@ try {
     if ($size -lt 100 -or $listing -notmatch '(?m)^(\./)?webui\.db\s*$') { throw "Archive $name looks incomplete ($size bytes, webui.db missing)." }
     $verified = ''
     if (-not $SkipDeepVerify) {
+        $imageFromEnv = -not $VerifyImage
         if (-not $VerifyImage) {
             $ver = 'v0.11.4'
             $envFile = Join-Path (Join-Path $AIRoot 'Stack') '.env'
@@ -153,9 +219,29 @@ try {
         }
         # webui.db plus its WAL/SHM files if present (a live -NoStop backup can hold recent rows only in the WAL).
         if ((Invoke-Docker -Arguments @('image', 'inspect', $VerifyImage) -AllowFail).ExitCode -ne 0) {
-            # Never pull a multi-GB image from a scheduled task; just say the deep check was skipped.
-            Write-BackupLog WARN "Deep check skipped: image $VerifyImage is not present locally."
-            $SkipDeepVerify = $true
+            # .env can name a version whose download never finished (an update cut off by a restart):
+            # the image Open WebUI actually runs is local and does the check just as well.
+            $runImage = ''
+            if ($imageFromEnv) {
+                $ci = Invoke-Docker -Arguments @('inspect', '-f', '{{.Config.Image}}', $Container) -AllowFail
+                if ($ci.ExitCode -eq 0 -and $ci.Text.Trim() -and (Invoke-Docker -Arguments @('image', 'inspect', $ci.Text.Trim()) -AllowFail).ExitCode -eq 0) { $runImage = $ci.Text.Trim() }
+            }
+            if ($runImage) {
+                Write-BackupLog INFO "Deep check: $VerifyImage (named in Stack\.env) is not on this PC; using the image Open WebUI runs ($runImage)."
+                $VerifyImage = $runImage
+            } else {
+                # Never pull a multi-GB image from a scheduled task. Counted like a check that could not
+                # run: the health watch fails 'Backups' after 3 nights, so it cannot stop for good unnoticed.
+                Write-BackupLog WARN "Deep check skipped: image $VerifyImage is not present locally."
+                $SkipDeepVerify = $true
+                $verified = '; deep check skipped (image not on this PC)'
+                try {
+                    $bstate = Read-LaiState -Path $backupStatePath
+                    $skips = 0; if ($bstate['deepCheckSkips']) { $skips = [int]$bstate['deepCheckSkips'] }
+                    $bstate['deepCheck'] = 'could-not-run'; $bstate['deepCheckSkips'] = $skips + 1
+                    Save-LaiState -State $bstate -Path $backupStatePath
+                } catch { Write-BackupLog WARN "Could not record the skipped deep check: $($_.Exception.Message)" }
+            }
         }
     }
     if (-not $SkipDeepVerify) {

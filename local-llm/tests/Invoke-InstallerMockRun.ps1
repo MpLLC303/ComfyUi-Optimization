@@ -36,6 +36,11 @@ foreach ($d in 'LocalAppData/Ollama', 'ProgramFiles', 'Windows', 'Users/testuser
 $env:LOCALAPPDATA = Join-Path $Work 'LocalAppData'
 $env:ProgramFiles = Join-Path $Work 'ProgramFiles'
 $env:WINDIR = Join-Path $Work 'Windows'
+# conhost.exe present (as on Windows 10 2004+): scheduled tasks must then run with no window at all.
+New-Item -ItemType Directory -Force -Path (Join-Path $Work 'Windows/System32') | Out-Null
+Set-Content -LiteralPath (Join-Path $Work 'Windows/System32/conhost.exe') -Value 'x'
+# The same path spelled the way the module builds it, whichever way this platform reads its backslash.
+[System.IO.File]::WriteAllText((Join-Path $env:WINDIR 'System32\conhost.exe'), 'x')
 $env:USERPROFILE = Join-Path $Work 'Users/testuser'
 $env:SystemDrive = 'C:'
 $env:ProgramData = Join-Path $Work 'ProgramData'
@@ -58,6 +63,11 @@ if ($null -eq $guardBefore) { Write-Host "render guard did not start: $(Get-Cont
 ConvertTo-Json @{ email = $Email; password = $Password } | Set-Content (Join-Path $aiRoot 'Secrets/openwebui-admin.json')
 # Ollama's server log with the settings line the installer verifies.
 $cfgLine = (& /usr/bin/docker logs ollama-test 2>&1 | Where-Object { "$_" -match 'msg="server config"' } | Select-Object -Last 1)
+# As on a Windows PC: Ollama on loopback, models in the folder the installer plans (the default under
+# the user profile; slog doubles backslashes). The container's own 0.0.0.0 and /root/.ollama/models
+# would read as the Ollama app's 'Expose' and 'Model location' settings overriding the installer's.
+$plannedModels = Join-Path $env:USERPROFILE '.ollama\models'
+$cfgLine = ("$cfgLine" -replace 'OLLAMA_MODELS:[^ \]]*', ('OLLAMA_MODELS:' + $plannedModels.Replace('\', '\\'))) -replace 'OLLAMA_HOST:[^ \]]*', 'OLLAMA_HOST:http://127.0.0.1:11434'
 Set-Content (Join-Path $env:LOCALAPPDATA 'Ollama/server.log') "$cfgLine"
 # A "manual install" container + volume, as left behind by the guide's docker run.
 & /usr/bin/docker rm -f open-webui 2>$null | Out-Null
@@ -71,6 +81,16 @@ Set-Content (Join-Path $env:LOCALAPPDATA 'Ollama/server.log') "$cfgLine"
 # Everything below runs in try/finally: the container above has restart=always and comes back after
 # a reboot, and the shared Open WebUI must not keep pointing at this run's render guard.
 try {
+
+# The sandbox's own SearXNG container is not part of the simulated PC (compose is mocked here): park
+# it under the name Reset-Sandbox restores, so the installer's check for a 'searxng' container of
+# another setup sees only what a phase puts there. A rename keeps it running.
+$parkedSearxng = $false
+if (@(& /usr/bin/docker ps -a --filter 'name=^/searxng$' --format '{{.Names}}') -contains 'searxng') {
+    & /usr/bin/docker rename searxng searxng-uninstall-test-keep | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw 'could not move the sandbox searxng container aside' }
+    $parkedSearxng = $true
+}
 
 # ---- patched installer copy ----------------------------------------------------------------
 $inst = Join-Path $copy 'Install-LocalAI.ps1'
@@ -94,15 +114,27 @@ $global:Calls = New-Object System.Collections.ArrayList
 $global:Tasks = @{}
 $global:ConsoleUser = 'MOCKPC\testuser'
 $global:TaskPrincipals = @{}
+$global:TaskExec = @{}
+$global:TaskTriggerArgs = @{}
 $global:WslInstalled = $false
 function global:Record([string]$s) { [void]$global:Calls.Add($s) }
-function global:nvidia-smi { $global:LASTEXITCODE = 0; 'NVIDIA GeForce RTX 3090, 566.36, 24576, 1200, 23376' }
+# Other hardware for the later phases: $global:MockGpu = nvidia-smi line(s) or 'none' (no GPU, exit 6),
+# $global:MockVideo = the display adapters Windows lists, $global:MockRamBytes = installed RAM.
+$global:MockGpu = $null
+$global:MockVideo = @('NVIDIA GeForce RTX 3090')
+$global:MockRamBytes = 64GB
+function global:nvidia-smi {
+    if ($global:MockGpu -eq 'none') { $global:LASTEXITCODE = 6; 'No devices were found'; return }
+    $global:LASTEXITCODE = 0
+    if ($global:MockGpu) { $global:MockGpu } else { 'NVIDIA GeForce RTX 3090, 566.36, 24576, 1200, 23376' }
+}
 function global:Get-CimInstance {
     param([Parameter(Position = 0)][string]$ClassName, [string]$Filter)
     $free = (Get-PSDrive -Name '/').Free
     switch ($ClassName) {
         'Win32_LogicalDisk' { [pscustomobject]@{ DeviceID = 'C:'; FreeSpace = $free } }
-        'Win32_ComputerSystem' { [pscustomobject]@{ TotalPhysicalMemory = 64GB; HypervisorPresent = $true; UserName = $global:ConsoleUser } }
+        'Win32_ComputerSystem' { [pscustomobject]@{ TotalPhysicalMemory = $global:MockRamBytes; HypervisorPresent = $true; UserName = $global:ConsoleUser } }
+        'Win32_VideoController' { foreach ($n in @($global:MockVideo)) { [pscustomobject]@{ Name = $n } } }
         'Win32_Processor' { [pscustomobject]@{ Name = 'AMD Ryzen 9 9950X3D 16-Core Processor'; VirtualizationFirmwareEnabled = $true } }
     }
 }
@@ -143,7 +175,12 @@ function global:New-ScheduledTaskAction { param($Execute, $Argument) [pscustomob
 function global:New-ScheduledTaskTrigger { [pscustomobject]@{ Args = "$args" } }
 function global:New-ScheduledTaskPrincipal { [pscustomobject]@{ Args = "$args" } }
 function global:New-ScheduledTaskSettingsSet { [pscustomobject]@{ Args = "$args" } }
-function global:Register-ScheduledTask { param($TaskName, $Action, $Trigger, $Principal, $Settings, [switch]$Force) $global:Tasks[$TaskName] = $Action.Argument; $global:TaskPrincipals[$TaskName] = [string]$Principal.Args; Record "Register-ScheduledTask $TaskName" }
+function global:Register-ScheduledTask {
+    param($TaskName, $Action, $Trigger, $Principal, $Settings, [switch]$Force)
+    $global:Tasks[$TaskName] = $Action.Argument; $global:TaskPrincipals[$TaskName] = [string]$Principal.Args; $global:TaskExec[$TaskName] = [string]$Action.Execute
+    $global:TaskTriggerArgs[$TaskName] = (@($Trigger) | ForEach-Object { [string]$_.Args }) -join ' | '
+    Record "Register-ScheduledTask $TaskName"
+}
 function global:Unregister-ScheduledTask { param($TaskName, $Confirm) $global:Tasks.Remove($TaskName); Record "Unregister-ScheduledTask $TaskName" }
 function global:Start-Process { param($FilePath, $ArgumentList, [switch]$Wait, [switch]$PassThru, $Verb, $ErrorAction) Record "Start-Process $FilePath $ArgumentList"; if ($Verb -eq 'RunAs') { Record "RUNAS $($ArgumentList -join ' ')" }; if ($PassThru) { [pscustomobject]@{ ExitCode = 0 } } }
 function global:docker {
@@ -196,7 +233,7 @@ Assert-That ($code2 -eq 0) "phase 2 completes (exit $code2)"
 foreach ($s in 'Preflight', 'Ollama', 'Models', 'Tuning', 'WSL', 'Docker', 'Stack', 'Configure', 'Backup') { Assert-That ($null -ne $state.stages.$s) "stage $s recorded" }
 Assert-That (-not $global:Tasks.ContainsKey('LocalAI-Install-Resume')) 'resume task removed at the end'
 Assert-That ($state.flags.PSObject.Properties['configureWarnings'] -and @($state.flags.configureWarnings).Count -eq 0) "Configure read every setting back from the real Open WebUI: no warnings ($(@($state.flags.configureWarnings) -join ' | '))"
-Assert-That (-not (Select-String -LiteralPath (Join-Path $aiRoot 'install-report.md') -Pattern 'need attention' -Quiet)) 'a clean install report has no attention section'
+Assert-That (-not (Select-String -LiteralPath (Join-Path $aiRoot 'install-report.md') -Pattern 'need attention' -Encoding UTF8 -Quiet)) 'a clean install report has no attention section'
 $sel = @($state.flags.selectedModels)
 Assert-That ($sel -contains 'trial-ok') 'trial model that works was added (passed through the reboot/resume)'
 Assert-That ($sel -notcontains 'trial-missing') 'trial model with a missing tag was skipped, not fatal'
@@ -232,8 +269,16 @@ $elevated = Join-Path $env:ProgramFiles 'LocalAI'
 Assert-That ((Test-Path (Join-Path $elevated 'Install-LocalAI.ps1')) -and (Test-Path (Join-Path $elevated 'lib/LocalAI.psm1'))) 'resume copy of the toolkit in Program Files\LocalAI'
 Assert-That (@($global:Calls | Where-Object { $_ -like ('icacls ' + $elevated + ' /inheritance:r /grant:r *' + $userSid + ':(OI)(CI)RX *') }).Count -ge 1) 'that copy is read-only for the user'
 Assert-That ([string]$global:TaskPrincipals['LocalAI-Backup-OpenWebUI'] -match 'Limited' -and [string]$global:TaskPrincipals['LocalAI-Backup-OpenWebUI'] -notmatch 'Highest') 'nightly backup task runs non-elevated'
+# Windows Terminal (Windows 11's default console) shows a window despite -WindowStyle Hidden, and
+# closing it kills the run: both tasks go through conhost --headless.
+foreach ($tn in 'LocalAI-Backup-OpenWebUI', 'LocalAI-Watch') {
+    Assert-That ([string]$global:TaskExec[$tn] -like '*conhost.exe' -and [string]$global:Tasks[$tn] -like '--headless powershell.exe *-WindowStyle Hidden*') "$tn runs with no window at all ($($global:TaskExec[$tn]) $($global:Tasks[$tn]))"
+}
+$bArgs = [string]$global:Tasks['LocalAI-Backup-OpenWebUI']
+Assert-That ($bArgs -match '-WaitForChatsSec [1-9]\d*' -and $bArgs -match '-DailyAt 03:30') "the backup task waits for a chat answer being written and knows its daily time ($bArgs)"
+Assert-That ([string]$global:TaskTriggerArgs['LocalAI-Backup-OpenWebUI'] -match '-Daily' -and [string]$global:TaskTriggerArgs['LocalAI-Backup-OpenWebUI'] -match '-AtLogOn') "the backup task also runs at sign-in, to catch up a night missed while signed out ($($global:TaskTriggerArgs['LocalAI-Backup-OpenWebUI']))"
 Assert-That (@($global:Calls | Where-Object { $_ -like 'docker compose*pull*' }).Count -ge 1 -and @($global:Calls | Where-Object { $_ -like 'docker compose*pull*' -and $_ -notlike '*--policy missing*' }).Count -eq 0) 'image pulls reuse local images (--policy missing)'
-Assert-That (Test-Path (Join-Path $env:USERPROFILE '.wslconfig')) '.wslconfig created'
+Assert-That ((Test-Path (Join-Path $env:USERPROFILE '.wslconfig')) -and (Get-Content -Raw -Encoding UTF8 -LiteralPath (Join-Path $env:USERPROFILE '.wslconfig')) -match 'memory=16GB') '.wslconfig created, with the 16 GB WSL cap on this 64 GB PC'
 Assert-That ((Get-Content -Encoding UTF8 -Raw (Join-Path $aiRoot 'Stack/searxng/settings.yml')) -notmatch '__SEARXNG_SECRET__') 'SearXNG secret filled in'
 Assert-That (Test-Path (Join-Path $aiRoot 'install-report.md')) 'install report written'
 Assert-That ((Get-Content -Encoding UTF8 -Raw (Join-Path $aiRoot 'localai-config.json') | ConvertFrom-Json).SelectedModels.Count -ge 1) 'config written with selected models'
@@ -305,7 +350,7 @@ $tp = Get-TestPreset 'trial-standin'
 Assert-That ($tp -and $tp.meta.hidden -eq $true) 'deselected trial preset is hidden (kept for old chats)'
 $p4 = (Get-Content -Encoding UTF8 -Raw (Join-Path $aiRoot 'install-state.json') | ConvertFrom-Json).flags.params
 Assert-That ($p4.SkipVision -eq $true -and $p4.SkipCoder -eq $true) 'older install: skips inferred from the installed models (no surprise 20 GB downloads)'
-Assert-That (@((Get-Content -Encoding UTF8 -Raw (Join-Path $aiRoot 'install-state.json') | ConvertFrom-Json).flags.configureWarnings).Count -eq 0 -and -not (Select-String -LiteralPath (Join-Path $aiRoot 'install-report.md') -Pattern 'need attention' -Quiet)) "the next clean run clears phase 3's warning (no stale attention section)"
+Assert-That (@((Get-Content -Encoding UTF8 -Raw (Join-Path $aiRoot 'install-state.json') | ConvertFrom-Json).flags.configureWarnings).Count -eq 0 -and -not (Select-String -LiteralPath (Join-Path $aiRoot 'install-report.md') -Pattern 'need attention' -Encoding UTF8 -Quiet)) "the next clean run clears phase 3's warning (no stale attention section)"
 
 # ---- phase 5: a resume that keeps failing stops starting itself -----------------------------------
 Write-Host "`n=== PHASE 5: failing resume gives up after two sign-ins ===" -ForegroundColor Cyan
@@ -424,9 +469,101 @@ Assert-That (-not $managedVol -and $oldKept -and $legacyAfter.Count -eq $legacyB
 & /usr/bin/docker rm -f open-webui 2>$null | Out-Null
 & /usr/bin/docker volume rm owui-empty 2>$null | Out-Null
 
+# ---- phase 7: hardware and setups other than the owner's ----------------------------------------
+function Get-NewestLog { Get-Content -Raw -Encoding UTF8 -LiteralPath (Get-ChildItem (Join-Path $aiRoot 'Logs') -Filter 'install-*.log' | Sort-Object LastWriteTime | Select-Object -Last 1).FullName }  # lai-ok: objects
+
+Write-Host "`n=== PHASE 7a: a 16 GB card, then no NVIDIA GPU: refused before any download ===" -ForegroundColor Cyan
+# The real catalog: Local Main (18.6 GB) cannot load fully on 16 GB, and used to fail the 100%-GPU
+# checkpoint only after 28 GB of downloads.
+$global:MockGpu = 'NVIDIA GeForce RTX 4080, 617.14, 16376, 900, 15476'
+$env:LOCALAI_TEST_CATALOG = Join-Path $copy 'config/models.psd1'
+& (Join-Path $aiRoot 'Scripts/Install-LocalAI.ps1') -AIRoot $aiRoot -SkipTests -TrialModels none
+$c7a = $LASTEXITCODE
+$log7a = Get-NewestLog
+$env:LOCALAI_TEST_CATALOG = Join-Path $copy 'tests/models.test.psd1'
+Assert-That ($c7a -ne 0 -and $log7a -match 'Local Main \([\d.,]+ GB\) cannot load fully on this NVIDIA GeForce RTX 4080' -and $log7a -match '24 GB NVIDIA card' -and $log7a -match 'Nothing was downloaded') "a 16 GB card: stops and says why (exit $c7a)"
+Assert-That ($log7a -notmatch '=+ Ollama =+' -and $log7a -notmatch 'Downloading ') 'it stops in Preflight: no Ollama stage, no download'
+$global:MockGpu = 'none'; $global:MockVideo = @('AMD Radeon RX 7900 XTX')
+& (Join-Path $aiRoot 'Scripts/Install-LocalAI.ps1') -AIRoot $aiRoot -SkipTests -TrialModels none
+$c7a2 = $LASTEXITCODE
+$log7a2 = Get-NewestLog
+$global:MockGpu = $null; $global:MockVideo = @('NVIDIA GeForce RTX 3090')
+Assert-That ($c7a2 -ne 0 -and $log7a2 -match 'AMD Radeon RX 7900 XTX' -and $log7a2 -notmatch 'nvidia\.com/Download') "no NVIDIA GPU: names the AMD card instead of blaming an NVIDIA driver (exit $c7a2)"
+
+Write-Host "`n=== PHASE 7b: the Ollama app's own Model location and Expose settings ===" -ForegroundColor Cyan
+# Ollama 0.35.1's tray app starts 'ollama serve' with its saved Settings, overriding OLLAMA_MODELS /
+# OLLAMA_HOST; only server.log shows it. A model still to download would land on the other drive.
+$serverLog = Join-Path $env:LOCALAPPDATA 'Ollama/server.log'
+$goodCfg = (Get-Content -Raw -Encoding UTF8 -LiteralPath $serverLog).TrimEnd()
+Set-Content -LiteralPath $serverLog -Value (($goodCfg -replace 'OLLAMA_MODELS:[^ \]]*', 'OLLAMA_MODELS:C:\\Users\\testuser\\OllamaApp\\models') -replace 'OLLAMA_HOST:[^ \]]*', 'OLLAMA_HOST:http://0.0.0.0:11434')
+$calls7b = $global:Calls.Count
+& (Join-Path $aiRoot 'Scripts/Install-LocalAI.ps1') -AIRoot $aiRoot -SkipTests -TrialModels trial-missing
+$c7b = $LASTEXITCODE
+$log7b = Get-NewestLog
+$starts7b = @($global:Calls | Select-Object -Skip $calls7b | Where-Object { $_ -like 'Start-Process *ollama app.exe*' })
+$asUser7b = @($starts7b | Where-Object { $_ -like '*explorer.exe*' }).Count
+$mainRestarts7b = [regex]::Matches($log7b, 'Restarting Ollama so it picks up the settings').Count
+Set-Content -LiteralPath $serverLog -Value $goodCfg
+Assert-That ($c7b -ne 0 -and $log7b -match 'Settings > Model location' -and $log7b -match 'Nothing was downloaded') "a model to download while the app's Model location points elsewhere: stops first (exit $c7b)"
+Assert-That ($log7b -notmatch '=+ Models =+' -and $log7b -notmatch 'Downloading ') 'no Models stage, no download'
+Assert-That ($log7b -match 'Expose Ollama to the network') 'Ollama on 0.0.0.0 that the installer did not set is reported'
+# The restart for the Model location runs Ollama as the signed-in user (through Explorer) first; the
+# elevated start from the installer's own session only because the log still shows the other folder.
+Assert-That ($asUser7b -eq $mainRestarts7b + 1 -and $starts7b.Count -ge 2 -and $starts7b[-2] -like '*explorer.exe*' -and $starts7b[-1] -notlike '*explorer.exe*') "Model location restart: as the user first, from the elevated session only as the fallback ($($starts7b.Count) starts, $asUser7b via Explorer, $mainRestarts7b settings restart(s))"
+
+Write-Host "`n=== PHASE 7c: Ollama installed to a custom folder (OllamaSetup.exe /DIR=...) ===" -ForegroundColor Cyan
+$defaultOllama = Join-Path $env:LOCALAPPDATA 'Programs/Ollama'
+$global:CustomOllama = Join-Path $Work 'D-drive/Ollama'
+New-Item -ItemType Directory -Force -Path (Join-Path $Work 'D-drive') | Out-Null
+Move-Item -LiteralPath $defaultOllama -Destination $global:CustomOllama
+# Inno Setup records the folder under Ollama's fixed AppId (InstallLocation, with a trailing backslash).
+function global:Get-ItemProperty { param($Path) if ([string]$Path -like '*44E83376-CE68-45EB-8FC1-393500EB558C*') { return [pscustomobject]@{ InstallLocation = $global:CustomOllama + '\' } }; [pscustomobject]@{ DisplayVersion = '24H2'; UBR = 4317 } }
+$wingetBefore = @($global:Calls | Where-Object { $_ -like 'winget*Ollama.Ollama*' }).Count
+$env:LOCALAI_TEST_FAIL_STAGE = 'Models'
+& (Join-Path $aiRoot 'Scripts/Install-LocalAI.ps1') -AIRoot $aiRoot -SkipTests -TrialModels none
+$env:LOCALAI_TEST_FAIL_STAGE = ''
+$log7c = Get-NewestLog
+Assert-That (@($global:Calls | Where-Object { $_ -like 'winget*Ollama.Ollama*' }).Count -eq $wingetBefore -and -not (Test-Path -LiteralPath (Join-Path $defaultOllama 'ollama.exe'))) 'no winget / vendor installer run over the existing install'
+Assert-That ($log7c -match 'Ollama \S+ on http://127\.0\.0\.1:11434' -and $log7c -match 'Test hook: stage Models failed') 'the Ollama stage passes with the custom folder'
+Assert-That (@($global:Calls | Where-Object { $_ -like '*D-drive*ollama app.exe*' }).Count -ge 1) 'Ollama is started from the custom folder'
+function global:Get-ItemProperty { param($Path) [pscustomobject]@{ DisplayVersion = '24H2'; UBR = 4317 } }
+if (Test-Path -LiteralPath $defaultOllama) { Remove-Item -LiteralPath $defaultOllama -Recurse -Force }
+Move-Item -LiteralPath $global:CustomOllama -Destination $defaultOllama
+
+Write-Host "`n=== PHASE 7d: a PC with 8 GB of RAM ===" -ForegroundColor Cyan
+$global:MockRamBytes = 8GB
+$wslCfgPath = Join-Path $env:USERPROFILE '.wslconfig'
+Remove-Item -LiteralPath $wslCfgPath -Force -ErrorAction SilentlyContinue
+$env:LOCALAI_TEST_FAIL_STAGE = 'Docker'
+& (Join-Path $aiRoot 'Scripts/Install-LocalAI.ps1') -AIRoot $aiRoot -SkipTests -TrialModels none -RenderGuard cpu
+$env:LOCALAI_TEST_FAIL_STAGE = ''
+$global:MockRamBytes = 64GB
+$log7d = Get-NewestLog
+$wsl7d = ''; if (Test-Path -LiteralPath $wslCfgPath) { $wsl7d = Get-Content -Raw -Encoding UTF8 -LiteralPath $wslCfgPath }
+Assert-That ($wsl7d -match 'autoMemoryReclaim' -and $wsl7d -notmatch 'memory=') ".wslconfig keeps WSL's own limit (half the RAM) instead of raising it to 16 GB ($($wsl7d -replace '\s+', ' '))"
+Assert-That ($log7d -match 'This PC has 8 GB of RAM') 'the render guard CPU mode warns that its models do not fit in RAM'
+
+Write-Host "`n=== PHASE 7e: Open WebUI and SearXNG set up from Open WebUI's own guides ===" -ForegroundColor Cyan
+# Its SearXNG guide names the container 'searxng' too. Compose would stop on the clash only after the
+# old Open WebUI was stopped and renamed, and a re-run would no longer see that one.
+& /usr/bin/docker rm -f open-webui 2>$null | Out-Null
+& /usr/bin/docker run -d --label lai-test=1 --name searxng alpine:3.20 sleep 3600 | Out-Null
+& /usr/bin/docker run -d --restart always --label lai-test=1 --name open-webui alpine:3.20 sleep 3600 | Out-Null
+$legacy7e = @(& /usr/bin/docker ps -a --filter 'name=^/open-webui-legacy-' --format '{{.Names}}').Count
+& (Join-Path $aiRoot 'Scripts/Install-LocalAI.ps1') -AIRoot $aiRoot -SkipTests -TrialModels none
+$c7e = $LASTEXITCODE
+$log7e = Get-NewestLog
+$ow7e = (& /usr/bin/docker inspect -f '{{.State.Status}}|{{.HostConfig.RestartPolicy.Name}}' open-webui 2>$null) -join ''
+Assert-That ($c7e -ne 0 -and $log7e -match 'A container named searxng from another setup' -and $log7e -match 'No container was changed') "a 'searxng' container of another setup: stops before changing anything (exit $c7e)"
+Assert-That ($ow7e -eq 'running|always' -and @(& /usr/bin/docker ps -a --filter 'name=^/open-webui-legacy-' --format '{{.Names}}').Count -eq $legacy7e) "the existing Open WebUI keeps running under its name, restart=always ($ow7e)"
+& /usr/bin/docker rm -f searxng open-webui 2>$null | Out-Null
+
 } finally {
     $env:LOCALAI_TEST_FAIL_STAGE = ''
     & /usr/bin/docker rm -f open-webui lai-test-elsewhere 2>$null | Out-Null
+    # A 'searxng' that phase 7e made as another setup's goes; the sandbox's own comes back.
+    foreach ($id in @(& /usr/bin/docker ps -aq --filter 'name=^/searxng$' --filter 'label=lai-test=1')) { if ($id) { & /usr/bin/docker rm -f $id 2>$null | Out-Null } }
+    if ($parkedSearxng) { & /usr/bin/docker rename searxng-uninstall-test-keep searxng 2>$null | Out-Null }
     & /usr/bin/docker volume rm owui-empty 2>$null | Out-Null
     & /usr/bin/docker ps -aq --filter 'name=^/open-webui-legacy-' | ForEach-Object { & /usr/bin/docker rm -f $_ | Out-Null }
     & /usr/bin/docker volume rm open-webui owui-old 2>$null | Out-Null

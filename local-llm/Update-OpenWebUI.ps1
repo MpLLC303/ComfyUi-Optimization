@@ -14,8 +14,11 @@
 .EXAMPLE
     .\Update-OpenWebUI.ps1 -Version v0.11.5     # a specific release
 .EXAMPLE
-    .\Update-OpenWebUI.ps1 -Rollback           # undo the last update: previous image + the data from
-                                                # just before it (the 'before-<version>' backup)
+    .\Update-OpenWebUI.ps1 -Rollback           # undo the last Open WebUI update: previous image + the data
+                                                # from just before it (the 'before-<version>' backup)
+.EXAMPLE
+    .\Update-OpenWebUI.ps1 -SearxngVersion 2026.10.2-19ffbcd30   # SearXNG only; it keeps no data, so going
+                                                # back is the same command with the old tag (printed by the update)
 #>
 param(
     # Install folder (the installer's -AIRoot).
@@ -26,8 +29,9 @@ param(
     [string]$SearxngVersion = '',
     # Skip the backup before the update (then -Rollback has no matching data).
     [switch]$SkipBackup,
-    # Undo the last update: switch back to the previous image and restore the backup taken right
-    # before the update (Open WebUI migrates its database on upgrade, so the old image needs old data).
+    # Undo the last Open WebUI update: switch back to the previous image and restore the backup taken
+    # right before it (Open WebUI migrates its database on upgrade, so the old image needs old data).
+    # SearXNG is not changed by it; a SearXNG update prints its own way back (-SearxngVersion <old tag>).
     [switch]$Rollback,
     # Skip the "type YES" confirmation of -Rollback.
     [switch]$Force
@@ -77,8 +81,62 @@ $config = Read-LaiState -Path $configPath
 $port = 3000; if ($config.ContainsKey('WebUIPort')) { $port = [int]$config['WebUIPort'] }
 $base = @('compose', '--project-directory', $stack, '-f', $compose)
 
+function Invoke-PullFirst {
+    # Downloads the images for the new versions WITHOUT touching .env: docker compose takes a
+    # variable from the environment before the one in .env. .env is switched only once the
+    # download is complete, so a window closed, a restart or a power cut during the multi-GB pull
+    # (no catch or finally runs then) leaves .env on the version that is running. Before, it named
+    # a version that was never downloaded: a re-run said 'Already on', the nightly deep check was
+    # skipped, and the next Start again pulled and migrated outside this script.
+    param([string]$OpenWebUI, [string]$Searxng, [string[]]$Services = @())
+    $envNow = @{}
+    foreach ($l in (Get-Content -Encoding UTF8 -LiteralPath $envPath)) { if ($l -match '^([A-Z_]+)=(.*)$') { $envNow[$Matches[1]] = $Matches[2] } }
+    $tags = @()
+    if ($OpenWebUI) { $tags += $OpenWebUI } else { $tags += [string]$envNow['OPEN_WEBUI_VERSION'] }
+    if (@($Services).Count -eq 0 -or @($Services) -contains 'searxng') { if ($Searxng) { $tags += $Searxng } else { $tags += [string]$envNow['SEARXNG_VERSION'] } }
+    $saved = @{}
+    foreach ($n in @('OPEN_WEBUI_VERSION', 'SEARXNG_VERSION')) { $saved[$n] = [Environment]::GetEnvironmentVariable($n, 'Process') }
+    try {
+        if ($OpenWebUI) { [Environment]::SetEnvironmentVariable('OPEN_WEBUI_VERSION', $OpenWebUI, 'Process') }
+        if ($Searxng) { [Environment]::SetEnvironmentVariable('SEARXNG_VERSION', $Searxng, 'Process') }
+        # Pinned versions already on disk are reused (no registry, no Docker Hub rate limit);
+        # floating tags (main, latest) are re-pulled.
+        Invoke-Docker -Arguments ($base + @('pull', '--policy', (Get-LaiPullPolicy -Tags $tags)) + @($Services))
+    } finally {
+        foreach ($n in @($saved.Keys)) { [Environment]::SetEnvironmentVariable($n, $saved[$n], 'Process') }
+    }
+}
+
+function Get-RunningTag {
+    # The Open WebUI tag the container was created from; '' when there is none (or it is a digest).
+    $ri = Get-DockerResult -Arguments @('inspect', '-f', '{{.Config.Image}}', 'open-webui')
+    if ($ri.ExitCode -eq 0 -and $ri.Text.Trim() -notmatch '@' -and $ri.Text.Trim() -match ':([^:/]+)$') { return $Matches[1] }
+    return ''
+}
+function Get-EnvWebUIVersion {
+    return ((Get-Content -Encoding UTF8 -LiteralPath $envPath | Where-Object { $_ -like 'OPEN_WEBUI_VERSION=*' } | Select-Object -First 1) -replace '^OPEN_WEBUI_VERSION=', '')
+}
+function Repair-EnvFromRunning {
+    # An update by an older version of this script that was cut off mid-download left .env naming
+    # the new version while the old one kept running. Put .env back on what runs before anything
+    # else: otherwise a SearXNG-only update (or the next Start again) pulls and starts that version
+    # on the live data with no backup for it, and '-Version <it>' says 'Already on' and stops.
+    $runningTag = Get-RunningTag; $envTag = Get-EnvWebUIVersion
+    if (-not $runningTag -or -not $envTag -or $runningTag -eq $envTag) { return }
+    $l = Enter-LaiVolumeLock -TimeoutSec 900
+    try {
+        # Again under the lock: an update that held it meanwhile may have switched both already.
+        $runningTag = Get-RunningTag; $envTag = Get-EnvWebUIVersion
+        if ($runningTag -and $envTag -and $runningTag -ne $envTag) {
+            Write-UpdateLog WARN "Stack\.env names Open WebUI $envTag, but $runningTag is running (an earlier update was interrupted during the download). Setting Stack\.env back to $runningTag first."
+            Set-EnvVersion -OpenWebUI $runningTag
+        }
+    } finally { Exit-LaiVolumeLock $l }
+}
+
 $hold = Get-LaiWebUIHold -AIRoot $AIRoot
 if ($hold) { throw "Open WebUI is kept stopped after a failed restore ($($hold['Reason'])); updating now would start it on damaged data. Recover first: $($hold['Recover'])" }
+Repair-EnvFromRunning
 
 if ($Rollback) {
     $prevVer = ''; $archive = ''
@@ -98,14 +156,12 @@ if ($Rollback) {
         # Old image first (it may not start on the migrated database; that is expected), then the
         # restore stops it, swaps in the pre-update data and starts it again.
         $envBefore = @(Get-Content -Encoding UTF8 -LiteralPath $envPath)
+        # Download first, .env after: until the old image is here, .env must keep naming the version
+        # that is running, or the next Start again or installer run would start the old image on the
+        # already-migrated database (also after a closed window or a power cut mid-download).
+        try { Invoke-PullFirst -OpenWebUI $prevVer -Services @('open-webui') }
+        catch { throw "Could not download Open WebUI $prevVer, nothing was changed: $($_.Exception.Message)" }
         Set-EnvVersion -OpenWebUI $prevVer
-        try { Invoke-Docker -Arguments ($base + @('pull', '--policy', (Get-LaiPullPolicy -Tags @($prevVer)), 'open-webui')) }
-        catch {
-            # Leave .env on the version that is running: otherwise the next Start again or installer
-            # run would start the old image on the already-migrated database.
-            [System.IO.File]::WriteAllLines($envPath, [string[]]$envBefore, (New-Object System.Text.UTF8Encoding($false)))
-            throw "Could not download Open WebUI $prevVer, nothing was changed: $($_.Exception.Message)"
-        }
         Invoke-Docker -Arguments ($base + @('up', '-d', 'open-webui'))
         & (Join-Path $PSScriptRoot 'Restore-OpenWebUI.ps1') -AIRoot $AIRoot -Archive $archive -Force
         if ($LASTEXITCODE -ne 0) {
@@ -136,15 +192,17 @@ if ($Version -and (Get-LaiWebUICompat -Version $Version) -eq 'newer') {
     Write-UpdateLog WARN "Open WebUI $Version is newer than the version this toolkit was tested with (0.11.4). It usually works; if the health check after the update fails, Update-OpenWebUI.ps1 -Rollback goes back."
 }
 
+# .env names what runs (Repair-EnvFromRunning above).
+$current = Get-EnvWebUIVersion
 $lines = @(Get-Content -Encoding UTF8 -LiteralPath $envPath)
-$current = ($lines | Where-Object { $_ -like 'OPEN_WEBUI_VERSION=*' } | Select-Object -First 1) -replace '^OPEN_WEBUI_VERSION=', ''
+$currentSx = [string](($lines | Where-Object { $_ -like 'SEARXNG_VERSION=*' } | Select-Object -First 1) -replace '^SEARXNG_VERSION=', '')
+if ($SearxngVersion -and $SearxngVersion -eq $currentSx) { $SearxngVersion = '' }
 if (-not $Version -and -not $SearxngVersion) { Write-UpdateLog INFO 'Nothing to do: pass -Latest, -Version <tag> or -SearxngVersion <tag> (or -Rollback).'; exit 0 }
 if ($Version -and $Version -eq $current) {
     if (-not $SearxngVersion) { Write-UpdateLog OK "Already on $current"; exit 0 }
     $Version = ''   # SearXNG-only: leave Open WebUI and its rollback point alone
 }
 $pre = $null
-$configBefore = Read-LaiState -Path $configPath
 
 # Hold the volume lock for backup + swap, so the health watch does not restart the old container
 # halfway through and a scheduled backup does not run against a half-replaced stack.
@@ -160,35 +218,34 @@ try {
         $pre = Get-ChildItem -LiteralPath (Join-Path $AIRoot 'Backups') -Filter "open-webui-*-$tag.tar.gz" -ErrorAction SilentlyContinue |
             Sort-Object LastWriteTime -Descending | Select-Object -First 1  # lai-ok: objects
     }
+    # Download first, switch after (see Invoke-PullFirst): an interrupted download changes nothing.
+    try { Invoke-PullFirst -OpenWebUI $Version -Searxng $SearxngVersion }
+    catch { throw "Could not pull the new image(s), nothing was changed: $($_.Exception.Message)" }
     if ($Version) {
-        # Record the rollback point now, not after success: if anything below fails, -Rollback must work.
+        # Record the rollback point before the switch, not after success: if starting the new version
+        # fails, -Rollback must work.
         if ($pre) { $config['PreviousOpenWebUIVersion'] = $current; $config['RollbackArchive'] = $pre.FullName }
         else { [void]$config.Remove('PreviousOpenWebUIVersion'); [void]$config.Remove('RollbackArchive') }
         Save-LaiState -State $config -Path $configPath
     }
-
-    # The revert lives in 'finally' so it also runs when the multi-GB download is cancelled with
-    # Ctrl+C (PowerShell skips 'catch' then). Without it, the next Start again would quietly pull
-    # and run the new version outside this script.
-    $pulled = $false
-    try {
-        Set-EnvVersion -OpenWebUI $Version -Searxng $SearxngVersion
-        # Pinned versions already on disk are reused (no registry, no Docker Hub rate limit);
-        # floating tags (main, latest) are re-pulled.
-        $envNow = @{}
-        foreach ($l in (Get-Content -Encoding UTF8 -LiteralPath $envPath)) { if ($l -match '^([A-Z_]+)=(.*)$') { $envNow[$Matches[1]] = $Matches[2] } }
-        Invoke-Docker -Arguments ($base + @('pull', '--policy', (Get-LaiPullPolicy -Tags @($envNow['OPEN_WEBUI_VERSION'], $envNow['SEARXNG_VERSION']))))
-        $pulled = $true
-    } catch {
-        throw "Could not pull the new image(s), nothing was changed: $($_.Exception.Message)"
-    } finally {
-        if (-not $pulled) {
-            [System.IO.File]::WriteAllLines($envPath, [string[]]$lines, (New-Object System.Text.UTF8Encoding($false)))
-            Save-LaiState -State $configBefore -Path $configPath
-        }
+    # The images are on disk now: from here a cut-off run only means the next Start again starts
+    # the new version (no download), just without the health check below.
+    Set-EnvVersion -OpenWebUI $Version -Searxng $SearxngVersion
+    # SearXNG (and the render guard, which runs on its image) keeps no data: going back is re-pinning
+    # the old tag. Recorded and said now, so the way back is known even if the start below fails.
+    $sxUndo = ''
+    if ($SearxngVersion) {
+        $config['SearxngVersion'] = $SearxngVersion
+        if ($currentSx) { $sxUndo = "Update-OpenWebUI.ps1 -SearxngVersion $currentSx"; $config['PreviousSearxngVersion'] = $currentSx }
+        Save-LaiState -State $config -Path $configPath
+        if ($sxUndo) { Write-UpdateLog INFO "SearXNG $currentSx -> $SearxngVersion. If search or chats misbehave, go back with: $sxUndo" }
     }
     try { Invoke-Docker -Arguments ($base + @('up', '-d', '--remove-orphans')) }
-    catch { if ($pre -and $Version) { throw "$($_.Exception.Message). Undo the update with: Update-OpenWebUI.ps1 -Rollback" } else { throw } }
+    catch {
+        if ($pre -and $Version) { throw "$($_.Exception.Message). Undo the update with: Update-OpenWebUI.ps1 -Rollback" }
+        elseif ($sxUndo) { throw "$($_.Exception.Message). Go back to the previous SearXNG with: $sxUndo" }
+        else { throw }
+    }
 } finally { Exit-LaiVolumeLock $lock }
 
 if ($Version) {

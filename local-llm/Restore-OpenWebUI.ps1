@@ -82,6 +82,7 @@ $safety = $null
 $holdPath = Join-Path $AIRoot 'open-webui-hold.json'
 $script:holdArchive = ''
 $script:recoverCmd = ''
+$script:holdWritten = $false
 function Clear-Hold([string]$Note) {
     # Never throws: a hold that cannot be deleted right now (antivirus, a sync client) is a warning,
     # not a reason to abandon a restore that worked. Retries briefly first.
@@ -171,24 +172,40 @@ try {
 
     # 3. Stop everything that uses the volume, then swap.
     $users = @((Invoke-Docker -Arguments @('ps', '-q', '--filter', "volume=$Volume")).Text -split "`n" | Where-Object { $_ })
+    # A run cut off after turning a policy off (below) left the container running with policy 'no'
+    # and the original in its hold: take it from there, or the recovery would keep 'no' for good.
+    $earlier = Get-LaiWebUIHold -AIRoot $AIRoot
+    $toStop = @()
     foreach ($id in $users) {
         $policy = (Invoke-Docker -Arguments @('inspect', '-f', '{{.HostConfig.RestartPolicy.Name}}', $id) -AllowFail).Text.Trim()
         if (-not $policy) { $policy = 'no' }
-        Invoke-Docker -Arguments @('update', '--restart', 'no', $id) -AllowFail | Out-Null   # keep it down even across a reboot
-        Invoke-Docker -Arguments @('stop', '-t', '30', $id) | Out-Null
-        $stoppedContainers += [pscustomobject]@{ Id = $id; Policy = $policy }
+        if ($policy -eq 'no' -and $earlier -and $earlier['Containers']) {
+            foreach ($h in @($earlier['Containers'])) { if ([string]$h['Id'] -eq $id -and $h['Policy']) { $policy = [string]$h['Policy'] } }
+        }
+        $toStop += [pscustomobject]@{ Id = $id; Policy = $policy }
     }
-    if (@((Invoke-Docker -Arguments @('ps', '-q', '--filter', "volume=$Volume")).Text -split "`n" | Where-Object { $_ }).Count -gt 0) {
-        throw "Something restarted a container on volume '$Volume'; aborting before any change."
-    }
-    # Recorded BEFORE the swap: if this window is closed or the PC loses power mid-swap, no catch or
-    # finally runs, and the volume may be half replaced. The hold then keeps the watch, Start again
-    # and the installer from starting Open WebUI on it, and says how to finish. Cleared on success.
+    # Recorded BEFORE any container is touched: if this window is closed or the PC loses power from
+    # here on, no catch or finally runs. Once the swap has started the volume may be half replaced;
+    # even before it, a container may be left with its restart policy off (it would then stay down
+    # after every reboot, with nothing saying why). The hold keeps the watch, Start again and the
+    # installer from starting Open WebUI, says how to finish, and holds the original policies the
+    # recovery puts back. Cleared on success, and on a failure before the swap.
     $priorHold = Test-Path -LiteralPath $holdPath
     if (-not $priorHold) {
         $script:recoverCmd = "& $(ConvertTo-LaiPsQuoted (Join-Path $PSScriptRoot 'Restore-OpenWebUI.ps1')) -AIRoot $(ConvertTo-LaiPsQuoted $AIRoot) -Archive $(ConvertTo-LaiPsQuoted (Get-Item -LiteralPath $Archive).FullName) -SkipSafetyBackup"
         if ($safety) { $script:holdArchive = $safety.FullName }
-        Set-Hold 'a restore was interrupted (or is still running)' $stoppedContainers
+        Set-Hold 'a restore was interrupted (or is still running)' $toStop
+        $script:holdWritten = $true
+    }
+    foreach ($c in $toStop) {
+        # Listed before its policy is turned off: if that or the stop fails (or Ctrl+C), 'finally'
+        # still puts the policy back and starts it.
+        $stoppedContainers += $c
+        Invoke-Docker -Arguments @('update', '--restart', 'no', $c.Id) -AllowFail | Out-Null   # keep it down even across a reboot
+        Invoke-Docker -Arguments @('stop', '-t', '30', $c.Id) | Out-Null
+    }
+    if (@((Invoke-Docker -Arguments @('ps', '-q', '--filter', "volume=$Volume")).Text -split "`n" | Where-Object { $_ }).Count -gt 0) {
+        throw "Something restarted a container on volume '$Volume'; aborting before any change."
     }
     $volumeTouched = $true
     Invoke-Swap $staged
@@ -261,6 +278,10 @@ try {
             Invoke-Docker -Arguments @('start', $c.Id) | Out-Null
         } catch { Write-LaiLog WARN "Could not restart container $($c.Id): $($_.Exception.Message)" }
     }
+    # Stopped before the swap (an error, or Ctrl+C, which skips 'catch' but not 'finally'): the data
+    # was never touched and the containers are back, so drop the in-progress hold this run wrote.
+    # After a good restore it is already gone; after a failed swap volumeTouched keeps it.
+    if ($script:holdWritten -and -not $volumeTouched) { Clear-Hold '' }
     if ($staged -and (Test-Path -LiteralPath $staged)) { Remove-Item -LiteralPath $staged -Force -ErrorAction SilentlyContinue }
     Exit-LaiVolumeLock $lock
 }

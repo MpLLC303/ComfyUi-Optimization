@@ -8,16 +8,19 @@
     Read-mostly checks plus functional tests that go through the real chain
     (browser API -> Open WebUI -> Ollama -> RTX 3090):
 
-      GPU + driver, Ollama, models installed, models 100% on GPU at their tuned context,
-      Docker, containers, Open WebUI login, presets (system prompt + native tool calling),
-      signup off / memories on, RAG + web search settings, a chat per preset, memory recall,
-      document retrieval, web search, backups, and that nothing listens beyond 127.0.0.1.
+      GPU + driver, Ollama, models installed, presets measured on the running Ollama version,
+      models 100% on GPU at their tuned context, a direct SearXNG search (names failed engines),
+      Docker, containers, Open WebUI login, presets (system prompt + native tool calling, image
+      upload matching what Ollama reports for the model), no context size set in Open WebUI over
+      the tuned aliases, signup off / memories on, RAG + web search settings, a chat per preset, an
+      image read by each preset with images (Local Vision), memory recall, document retrieval, web
+      search, backups, and that nothing listens beyond 127.0.0.1.
 
     The functional tests create a temporary memory and a temporary knowledge collection and delete
     both afterwards. Exit code = number of failed checks (0 = V1 complete).
 
 .PARAMETER Quick
-    Skip the model loads and chat/memory/RAG/web tests (takes seconds instead of minutes).
+    Skip the model loads and chat/image/memory/RAG/web tests (takes seconds instead of minutes).
 
 .PARAMETER CpuCheck
     Also measure what the render guard does while ComfyUI renders: load the default preset's model
@@ -75,8 +78,8 @@ function Skip([string]$d) { @{ Status = 'SKIP'; Detail = $d } }
 Write-LaiLog STEP 'Local AI acceptance test'
 $gpu = Get-LaiGpuInfo
 
-Add-Check 'RTX 3090 visible' {
-    if (-not $gpu) { if ($onWindows) { return (Fail 'nvidia-smi not found') } else { return (Skip 'no NVIDIA GPU on this host') } }
+Add-Check 'NVIDIA GPU visible' {
+    if (-not $gpu) { if ($onWindows) { return (Fail 'nvidia-smi not found or lists no GPU') } else { return (Skip 'no NVIDIA GPU on this host') } }
     if ([version]$gpu.DriverVersion -lt [version]'551.61') { return (Fail "driver $($gpu.DriverVersion) < 551.61") }
     Pass "$($gpu.Name), driver $($gpu.DriverVersion), $($gpu.TotalMiB) MiB"
 }
@@ -85,11 +88,24 @@ Add-Check 'RTX 3090 visible' {
 $script:ollamaUp = $false
 $script:engineUp = $true
 $script:webUp = $false
+$script:searxUp = $true
 $startAgain = 'Start menu > Local AI > Start again'
 Add-Check 'Ollama running' {
     try { $v = Get-LaiOllamaVersion -BaseUrl $ollamaUrl } catch { return (Fail "not answering on $ollamaUrl - start Ollama from the Start menu, or $startAgain") }
     $script:ollamaUp = $true
+    $script:ollamaVer = [string]$v
     Pass "v$v on $ollamaUrl"
+}
+
+# The Ollama app installs its own updates at sign-in; the presets were measured on one version.
+Add-Check 'Presets measured on this Ollama' {
+    if (-not $script:ollamaUp) { return (Skip 'Ollama not running') }
+    $known = @($catalog.Models | Where-Object { $tuning.ContainsKey($_.Key) -and $tuning[$_.Key]['OllamaVersion'] })
+    if ($known.Count -eq 0) { return (Skip 'no tuning with a recorded Ollama version') }
+    $drift = @(Get-LaiTuningDrift -Tuning $tuning -OllamaVersion $script:ollamaVer -Keys @($catalog.Models | ForEach-Object { $_.Key }))
+    if ($drift.Count -eq 0) { return (Pass "all $($known.Count) measured on Ollama $($script:ollamaVer)") }
+    $was = @($drift | ForEach-Object { $_.Was } | Select-Object -Unique) -join ', '
+    Warn "Ollama is now $($script:ollamaVer) (it updates itself), but $(@($drift | ForEach-Object { $_.Key }) -join ', ') were measured on $was - run $(Join-Path (Join-Path $AIRoot 'Scripts') 'Update-Models.ps1') to check them on the GPU again"
 }
 
 foreach ($m in $catalog.Models) {
@@ -177,16 +193,30 @@ if ($NoContainers) {
     if (-not ($config.ContainsKey('WebUIOllamaUrl') -and $config['WebUIOllamaUrl'] -and $config['WebUIOllamaUrl'] -notlike '*render-guard*')) { $containers += 'render-guard' }
     foreach ($c in $containers) {
         Add-Check "Container $c" {
+            if ($c -eq 'searxng') { $script:searxUp = $false }
             if (-not $script:engineUp) { return (Skip 'Docker engine down') }
             $prev = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
             $s = (& docker inspect -f '{{.State.Status}} {{if .State.Health}}{{.State.Health.Status}}{{end}} {{.HostConfig.RestartPolicy.Name}}' $c 2>$null); $code = $LASTEXITCODE
             $ErrorActionPreference = $prev
             if ($code -ne 0) { return (Fail "not found - re-run the installer: double-click $(Join-Path (Join-Path $AIRoot 'Scripts') 'Install-LocalAI.cmd') and click Yes") }
             if ($s -notmatch '^running') { return (Fail "$s - $startAgain") }
+            if ($c -eq 'searxng') { $script:searxUp = $true }
             if ($s -match 'unhealthy') { return (Warn $s) }
             Pass $s
         }
     }
+}
+
+# One search straight against SearXNG (also in -Quick: one request, no model): an empty answer names
+# each failed engine and why, which Open WebUI's own web search cannot show. The probe waits up to
+# 60 s for SearXNG to finish starting (an update just recreated the container).
+Add-Check 'SearXNG search' {
+    if (-not $script:engineUp) { return (Skip 'Docker engine down') }
+    if (-not $script:searxUp) { return (Skip 'SearXNG container not running') }
+    try { $p = Get-LaiSearxngProbe -BaseUrl "http://127.0.0.1:$searxPort" }
+    catch { return (Fail "no search answer on http://127.0.0.1:$searxPort ($((Get-LaiHttpErrorText $_))) - $startAgain; if it persists: docker logs --tail 50 searxng") }
+    if ($p.Count -gt 0) { return (Pass $p.Summary) }
+    Warn $p.Summary
 }
 
 Add-Check 'Open WebUI reachable' {
@@ -231,9 +261,27 @@ if ($script:token) {
             if (-not $p) { return (Fail 'not found') }
             if ($p.base_model_id -ne "$($m.Alias):latest") { return (Fail "base is $($p.base_model_id)") }
             if (-not $p.params.system) { return (Fail 'no system prompt') }
+            # Image upload on the preset against what Ollama reports for the model (no model load).
+            $presetVision = $false
+            if ($p.meta -and $p.meta.capabilities -and $p.meta.capabilities.vision -eq $true) { $presetVision = $true }
+            $caps = $null
+            if ($script:ollamaUp) { try { $caps = @((Get-LaiOllamaModelInfo -BaseUrl $ollamaUrl -Name $m.Alias).Capabilities) } catch { Write-Verbose "no model info for $($m.Alias)" } }
+            if ($null -ne $caps) {
+                switch (Test-LaiPresetVision -PresetVision $presetVision -Capabilities $caps) {
+                    'missing' { return (Fail "the preset accepts images, but Ollama reports no vision support for $($m.Alias), so every image fails; if a model update caused this, Update-Models.ps1 -Rollback $($m.Key) brings the previous version back") }
+                    'unused' { return (Warn "Ollama reports vision support for $($m.Alias), but the preset refuses images (Vision = `$false for '$($m.Key)' in config\models.psd1)") }
+                }
+            }
             if ($p.params.function_calling -ne 'native') { return (Warn "function calling = $($p.params.function_calling) (model template has no tool support)") }
-            Pass 'system prompt set, native tool calling, memory/web/knowledge tools on'
+            Pass "system prompt set, native tool calling, memory/web/knowledge tools on$(if ($presetVision) { ', images on' })"
         }
+    }
+    Add-Check 'Context decided by the tuned aliases' {
+        $over = @(Get-LaiContextOverride -BaseUrl $webUrl -Token $token -PresetIds @($catalog.Models | ForEach-Object { $_.Preset }))
+        if ($over.Count -gt 0) {
+            return (Warn "Open WebUI sets its own context in $($over -join '; '). Chats then run at that size, reload the model for background tasks or spill to the CPU: set Context Length (and Batch Size) back to Default there")
+        }
+        Pass 'no num_ctx/num_batch in your settings, the default parameters or the presets'
     }
     Add-Check 'Ollama connection' {
         $expected = 'http://render-guard:11434'
@@ -263,8 +311,11 @@ if ($script:token) {
         $rc = Get-LaiWebUIRetrievalConfig -BaseUrl $webUrl -Token $token
         $d = "splitter=$($rc.TEXT_SPLITTER) chunk=$($rc.CHUNK_SIZE)/$($rc.CHUNK_OVERLAP) top_k=$($rc.TOP_K) web=$($rc.web.WEB_SEARCH_ENGINE)"
         if (-not $rc.web.ENABLE_WEB_SEARCH -or $rc.web.WEB_SEARCH_ENGINE -ne 'searxng') { return (Fail $d) }
-        if ($rc.CHUNK_SIZE -ne 2000 -or $rc.CHUNK_OVERLAP -ne 200 -or $rc.TOP_K -ne 5) { return (Warn "$d (changed from the installer's values)") }
-        Pass $d
+        # Everything else the installer writes (chunking, image scaling, the web-page cap); the SearXNG
+        # address depends on the install.
+        $changed = @(Compare-LaiConfig -Expected (Get-LaiRagWanted) -Actual $rc | Where-Object { $_ -notlike 'web.SEARXNG_QUERY_URL:*' })
+        if ($changed.Count -gt 0) { return (Warn "$d; changed from the installer's values: $($changed -join '; ') - re-run the installer to restore them") }
+        Pass "$d, images scaled to $($rc.FILE_IMAGE_COMPRESSION_WIDTH) px, fetched pages cut at $($rc.web.WEB_FETCH_MAX_CONTENT_LENGTH) characters"
     }
 
     if (-not $Quick) {
@@ -275,6 +326,16 @@ if ($script:token) {
                 $r = Test-LaiWebUIChat -BaseUrl $webUrl -Token $token -Model $m.Preset
                 if (-not $r.Passed) { return (Fail "answer: $($r.Answer)") }
                 Pass $r.Answer
+            }
+            # Right after its text chat, while the model is still loaded: a real image through the
+            # browser's path (Open WebUI's image conversion, render guard, Ollama's projector).
+            if ($m.Vision) {
+                Add-Check "Vision: $($m.Display) reads an image" {
+                    try { $r = Test-LaiWebUIVision -BaseUrl $webUrl -Token $token -Model $m.Preset }
+                    catch { return (Fail "the image request failed ($((Get-LaiHttpErrorText $_))); if this started after an update, roll it back (Update-Models.ps1 -Rollback $($m.Key) or Update-OpenWebUI.ps1 -Rollback)") }
+                    if (-not $r.Passed) { return (Warn "asked for the colour of a plain $($r.Expected) test image, got: $($r.Answer) - attach a picture in a $($m.Display) chat to see whether images reach the model") }
+                    Pass "named the colour of a $($r.Expected) test image"
+                }
             }
         }
         Add-Check 'Memory across conversations' {
@@ -290,7 +351,13 @@ if ($script:token) {
         Add-Check 'Web search (SearXNG)' {
             $r = Test-LaiWebUIWebSearch -BaseUrl $webUrl -Token $token
             if ($r.Status -eq 'ok') { return (Pass "$($r.Count) results, e.g. $($r.Detail)") }
-            if ($r.Status -eq 'no-results') { return (Warn 'SearXNG answered but its engines returned nothing (rate limit/captcha); retry later') }
+            if ($r.Status -eq 'no-results') {
+                # Ask SearXNG itself why: a CAPTCHA passes, a scraper broken by a site change does not,
+                # and results there mean Open WebUI could not load the pages.
+                $why = 'SearXNG answered with nothing; see the SearXNG search check above'
+                try { $why = (Get-LaiSearxngProbe -BaseUrl "http://127.0.0.1:$searxPort").WebUIHint } catch { Write-Verbose 'direct SearXNG probe failed' }
+                return (Warn "Open WebUI's web search returned no pages: $why")
+            }
             Fail "$($r.Detail) - check: docker logs --tail 50 searxng"
         }
         try { Stop-LaiOllamaModels -BaseUrl $ollamaUrl } catch { Write-Verbose 'unload failed' }
@@ -304,7 +371,7 @@ Add-Check 'Backups' {
     # Age is judged on the nightly archives only, so a tagged one cannot hide a broken nightly task.
     $daily = $all | Where-Object { $_.Name -match '^open-webui-\d{8}-\d{6}\.tar\.gz$' } | Select-Object -First 1
     if ($all.Count -gt 0 -and $all[0].Name -like '*-CORRUPT.tar.gz') {
-        return (Fail "the newest backup $($all[0].Name) failed its database check; the live Open WebUI data may be damaged (restore from $(if ($newest) { $newest.Name } else { 'an older archive' }) with Restore-OpenWebUI.ps1 -Archive, see the README's Maintain section)")
+        return (Fail "the newest backup $($all[0].Name) failed its database check; the live Open WebUI data may be damaged (restore the last good one with Restore-OpenWebUI.ps1 -Archive $(if ($newest) { "'$($newest.FullName)'" } else { '<an older archive>' }), see the README's Maintain section)")
     }
     if (-not $newest) { return (Fail "no archive in $dir") }
     if (-not $daily) { return (Warn "no nightly archive yet (newest: $($newest.Name)); the nightly backup task has not run yet; if this stays, run Start menu > Local AI - Update toolkit to set it up again") }
@@ -329,7 +396,7 @@ Add-Check 'Nothing exposed beyond localhost' {
     if ($onlyOllama -and (Get-NetFirewallRule -DisplayName 'LocalAI - Block Ollama from LAN' -ErrorAction SilentlyContinue)) {
         return (Warn "Ollama listens on all interfaces (Docker fallback) but the LAN block rule is in place: $($bad -join ', ')")
     }
-    Fail "listening beyond loopback: $($bad -join ', ') - reachable from your network; run Start menu > Local AI - Update toolkit to restore the localhost-only settings"
+    Fail "listening beyond loopback: $($bad -join ', ') - reachable from your network; run Start menu > Local AI - Update toolkit to restore the localhost-only settings (for 11434 also turn off 'Expose Ollama to the network' in the Ollama app's Settings, which overrides them)"
 }
 
 $fails = @($results | Where-Object { $_.Status -eq 'FAIL' }).Count

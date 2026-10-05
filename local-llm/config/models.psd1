@@ -10,7 +10,10 @@
 #               that stays 100% on the GPU.
 #   Parameters  Sampling defaults from the Qwen model cards (instruct: 0.7/0.8/20,
 #               thinking: 0.6/0.95/20, coder adds repeat_penalty 1.05).
-#   Think       $false = preset sends think:false (no reasoning trace, faster first token).
+#   Think       $false = preset sends think:false (no reasoning trace, faster first token). Set when
+#               the preset is created; a Think value changed later on the preset is kept by re-runs.
+#               Open WebUI 0.11.4 re-applies the preset's value over the per-chat Chat Controls
+#               switch, so the preset (Workspace > Models) is the only place to change it.
 #   MinTokensPerSec  Below this, the install report flags the model as probably spilling
 #                    out of VRAM. Set at roughly half of what a healthy RTX 3090 delivers.
 #   Trial       $true = newer model offered as an extra preset only when asked for with
@@ -36,7 +39,7 @@
             Think           = $false
             MinTokensPerSec = 40
             Parameters      = @{ temperature = 0.6; top_p = 0.95; top_k = 20; min_p = 0.0 }
-            Description     = 'Qwen3 14B abliterated (dense, hybrid reasoning). Thinking is off by default; turn it on in Chat Controls for step-by-step answers.'
+            Description     = 'Qwen3 14B abliterated (dense, hybrid reasoning). Thinking is off; for step-by-step answers set Think on in Workspace > Models > Local Fast > Advanced Params (the per-chat Chat Controls switch cannot override it).'
         }
         @{
             Key             = 'main'

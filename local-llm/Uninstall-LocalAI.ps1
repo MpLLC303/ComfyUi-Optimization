@@ -21,6 +21,8 @@
       -RemoveModels     also delete the catalog's source models from Ollama (and OLLAMA_MODELS).
       -ResetOllamaSettings  remove the OLLAMA_* user variables the installer set (flash attention,
                         q8_0 KV cache, keep-alive, ...), plus OLLAMA_HOST and its LAN firewall block.
+                        A value you had set yourself before the first install (this toolkit
+                        version or later) is put back instead.
 
 .EXAMPLE
     .\Uninstall-LocalAI.ps1 -WhatIf        # show what would happen
@@ -87,7 +89,7 @@ $volumeExists = $dockerUp -and ((Invoke-Docker @('volume', 'inspect', 'open-webu
 # Without the engine there is no final backup and the data volume stays, but -RemoveData would
 # still delete Secrets: the stored admin password for data that is still there. Refuse instead.
 $dockerInstalled = [bool](Get-Command docker -ErrorAction SilentlyContinue)
-if (-not $dockerInstalled -and $env:ProgramFiles) { $dockerInstalled = Test-Path -LiteralPath (Join-Path $env:ProgramFiles 'Docker\Docker\resources\bin\docker.exe') }
+if (-not $dockerInstalled) { $dockerInstalled = [bool](Find-LaiDockerDesktopExe) }
 if ($RemoveData -and -not $dockerUp -and $dockerInstalled -and $WhatIfPreference) {
     Write-LaiLog WARN 'Docker is not running: without -WhatIf, -RemoveData would refuse until Docker Desktop is started.'
 } elseif ($RemoveData -and -not $dockerUp -and $dockerInstalled) {
@@ -201,8 +203,16 @@ if ($onWindows -and ($ResetOllamaSettings -or $RemoveModels)) {
             'OLLAMA_KEEP_ALIVE', 'OLLAMA_NO_CLOUD', 'OLLAMA_IGPU_ENABLE', 'OLLAMA_HOST'
     }
     if ($RemoveModels) { $vars += 'OLLAMA_MODELS' }
-    foreach ($v in $vars) {
-        if ([Environment]::GetEnvironmentVariable($v, 'User')) {
+    # A value the user had before the install (for other Ollama clients) goes back instead of away.
+    $prevEnv = @{}
+    $instState = Read-LaiState -Path (Join-Path $AIRoot 'install-state.json')
+    if ($instState['flags'] -is [hashtable] -and $instState['flags']['prevOllamaEnv'] -is [hashtable]) { $prevEnv = $instState['flags']['prevOllamaEnv'] }
+    foreach ($step in (Get-LaiEnvResetPlan -Names $vars -Saved $prevEnv)) {
+        $v = $step.Name; $old = $step.Value
+        $cur = [Environment]::GetEnvironmentVariable($v, 'User')
+        if ($old) {
+            if ($cur -ne $old) { Invoke-Step "user variable $v" { [Environment]::SetEnvironmentVariable($v, $old, 'User'); Write-LaiLog OK "Put back your own $v=$old (from before the install)" } }
+        } elseif ($cur) {
             Invoke-Step "user variable $v" { [Environment]::SetEnvironmentVariable($v, $null, 'User'); Write-LaiLog OK "Removed user variable $v" }
         }
     }

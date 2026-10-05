@@ -7,12 +7,17 @@
 .DESCRIPTION
     Checks, in about a second and without loading any model or signing in:
       Ollama API, Docker engine, Open WebUI /health, SearXNG /healthz, the render-guard container,
-      the newest backup (younger than 50 h and not quarantined as -CORRUPT), and free disk space on
-      the drives holding the models, backups and Docker's data (at least -MinFreeGB).
+      whether Open WebUI reaches Ollama (the path chats take), the newest backup (younger than 50 h
+      and not quarantined as -CORRUPT), and free disk space on the drives holding the models, backups
+      and Docker's data (at least -MinFreeGB).
     Self-heals what is safe to heal (starts a stopped container, relaunches the Ollama tray app) unless
     -NoHeal. Docker Desktop is never started by the watch (you may have quit it on purpose to free
-    RAM); a stopped engine is reported once instead. Shows a Windows notification once when a check has failed on two runs in a row (and once
-    when it recovers), so neither a slow Docker start nor a lasting outage spams you. Log: <AIRoot>\Logs\watch.log.
+    RAM); a stopped engine is reported once instead, and so is one that stopped answering (every
+    docker call has a time limit). Shows a Windows notification once when a check has failed on two
+    runs in a row (and once when it recovers), so neither a slow Docker start nor a lasting outage
+    spams you. Log: <AIRoot>\Logs\watch.log.
+    Also notifies once when Ollama has updated itself since the presets were tuned (Update-Models.ps1
+    re-checks them on the GPU).
 
 .EXAMPLE
     .\Watch-LocalAI.ps1              # one check, as the scheduled task runs it
@@ -65,12 +70,9 @@ function ConvertTo-WatchDate($Value) {
     try { return [datetime]::Parse([string]$Value, [Globalization.CultureInfo]::InvariantCulture) } catch { return $null }
 }
 
-function Test-DockerEngine {
-    if (-not (Get-Command docker -ErrorAction SilentlyContinue)) { return $null }
-    $prev = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
-    try { & docker version --format '{{.Server.Version}}' 2>$null | Out-Null; $code = $LASTEXITCODE } finally { $ErrorActionPreference = $prev }
-    return ($code -eq 0)
-}
+# Every docker call has a time limit: a Docker Desktop that stopped answering (it can after sleep)
+# would otherwise hang this run until Task Scheduler ends it, with no log line and no notification.
+$dockerLimit = Get-LaiDockerTimeout
 
 function Get-FreeSpaceProblem {
     # Returns '' when every relevant drive has room, else e.g. 'C:\ 7.2 GB free'.
@@ -97,17 +99,16 @@ function Test-Url {
 
 function Get-ContainerState {
     param([string]$Name)
-    if (-not (Get-Command docker -ErrorAction SilentlyContinue)) { return 'no-docker' }
-    $prev = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
-    try { $s = (& docker inspect -f '{{.State.Status}}' $Name 2>$null); $code = $LASTEXITCODE } finally { $ErrorActionPreference = $prev }
-    if ($code -ne 0) { return 'missing' }
-    return ([string]$s).Trim()
+    if (-not (Get-Command docker -CommandType Application -ErrorAction SilentlyContinue)) { return 'no-docker' }
+    $r = Invoke-LaiTimedNative -File 'docker' -Arguments @('inspect', '-f', '{{.State.Status}}', $Name) -TimeoutSec $dockerLimit
+    if ($r.TimedOut) { return 'no answer' }
+    if ($r.ExitCode -ne 0) { return 'missing' }
+    return ([string]$r.Out).Trim()
 }
 
 function Start-Container {
     param([string]$Name)
-    $prev = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
-    try { & docker start $Name 2>&1 | Out-Null } finally { $ErrorActionPreference = $prev }
+    Invoke-LaiTimedNative -File 'docker' -Arguments @('start', $Name) -TimeoutSec (2 * $dockerLimit) | Out-Null
 }
 
 function Send-Notification {
@@ -166,20 +167,22 @@ $details = @{}
 $healed = @()
 $maintenance = $false
 
-$results['Ollama'] = Test-Url "$ollamaUrl/api/version"
+$ollamaVer = ''
+try { $ollamaVer = [string](Invoke-LaiApi -Uri "$ollamaUrl/api/version" -TimeoutSec 5).version; $results['Ollama'] = $true } catch { $results['Ollama'] = $false }
 if (-not $results['Ollama'] -and $onWindows -and (Test-CanHeal)) {
-    $app = Join-Path $env:LOCALAPPDATA 'Programs\Ollama\ollama app.exe'
-    if (Test-Path -LiteralPath $app) {
-        Start-Process -FilePath $app
-        try { Wait-LaiHttp -Uri "$ollamaUrl/api/version" -TimeoutSec 60 | Out-Null; $results['Ollama'] = $true; $healed += 'Ollama' } catch { Write-Verbose 'Ollama did not come back' }
+    $app = Get-LaiOllamaAppPath
+    if ($app -and (Test-Path -LiteralPath $app)) {
+        Start-LaiOllamaApp -Path $app
+        try { $ollamaVer = [string](Wait-LaiHttp -Uri "$ollamaUrl/api/version" -TimeoutSec 60).version; $results['Ollama'] = $true; $healed += 'Ollama' } catch { Write-Verbose 'Ollama did not come back' }
     }
 }
 
-$engine = Test-DockerEngine
-if ($engine -eq $false) {
+$engine = Test-LaiDockerEngine -TimeoutSec $dockerLimit
+if ($engine -eq 'down' -or $engine -eq 'hung') {
     # Everything in the stack is down with it; report the cause once instead of three symptoms.
     $results['Docker'] = $false
-    $details['Docker'] = 'engine not running - start Docker Desktop'
+    if ($engine -eq 'hung') { $details['Docker'] = "not responding (no answer within $dockerLimit s) - restart Docker Desktop (whale icon > Restart)" }
+    else { $details['Docker'] = 'engine not running - start Docker Desktop' }
 } else {
     foreach ($c in @(@{ Name = 'open-webui'; Url = "http://127.0.0.1:$webPort/health"; Key = 'Open WebUI' },
                      @{ Name = 'searxng'; Url = "http://127.0.0.1:$searxPort/healthz"; Key = 'SearXNG' })) {
@@ -214,6 +217,22 @@ if ($engine -eq $false) {
             if ($rgOk) { $healed += 'Render guard' }
         }
         $results['Render guard'] = $rgOk
+        if ($rgState -eq 'no answer') { $details['Render guard'] = "docker did not answer within $dockerLimit s - restart Docker Desktop (whale icon > Restart)" }
+    }
+
+    # The path chats actually take: from inside the Open WebUI container to the Ollama URL it was
+    # given (normally the render guard, which forwards to Ollama on this PC). A firewall rule that no
+    # longer matches Docker's network after a reboot, or Docker's host networking broken after
+    # sleep, makes every chat fail while each part above still looks fine on its own.
+    if ($results['Ollama'] -and $results['Open WebUI'] -and -not $maintenance -and (Get-ContainerState 'open-webui') -eq 'running') {
+        $chatUrl = 'http://render-guard:11434'
+        if ($config.ContainsKey('WebUIOllamaUrl') -and $config['WebUIOllamaUrl']) { $chatUrl = [string]$config['WebUIOllamaUrl'] }
+        $probe = "import sys,urllib.request as u;u.urlopen(sys.argv[1].rstrip('/')+'/api/version',timeout=10)"
+        $r = Invoke-LaiTimedNative -File 'docker' -Arguments @('exec', 'open-webui', 'python3', '-c', $probe, $chatUrl) -TimeoutSec $dockerLimit
+        $results['Chats reach Ollama'] = ($r.ExitCode -eq 0)
+        if (-not $results['Chats reach Ollama']) {
+            $details['Chats reach Ollama'] = "Open WebUI cannot reach Ollama at $chatUrl - restart Docker Desktop; if that does not help, run Start menu > Local AI - Update toolkit"
+        }
     }
 }
 
@@ -273,6 +292,40 @@ $diskProblem = Get-FreeSpaceProblem -Paths @($AIRoot, $modelDir, $dockerData) -M
 $results['Disk space'] = (-not $diskProblem)
 if ($diskProblem) { $details['Disk space'] = $diskProblem }
 
+# ---- Ollama replaced by its own updater -------------------------------------------------------
+# The Ollama app downloads updates by itself and installs them at the next sign-in (on by default).
+# The presets' contexts were measured on one version; a new one can place layers differently, so a
+# preset may now spill to the CPU. Not a failure (everything still answers): one notice per new
+# version, outside the two-strike/reminder logic. $null = leave the record as it is.
+$ollamaNotice = $null
+$prevNotice = ''; if ($previous.ContainsKey('ollamaNotifiedFor')) { $prevNotice = [string]$previous['ollamaNotifiedFor'] }
+if ($ollamaVer) {
+    $inst = Read-LaiState -Path (Join-Path $AIRoot 'install-state.json')
+    $tun = @{}; if ($inst['tuning'] -is [hashtable]) { $tun = $inst['tuning'] }
+    $sel = @(); if ($config.ContainsKey('SelectedModels') -and $config['SelectedModels']) { $sel = @($config['SelectedModels']) }
+    $drift = @(Get-LaiTuningDrift -Tuning $tun -OllamaVersion $ollamaVer -Keys $sel)
+    if ($drift.Count -eq 0) { $ollamaNotice = '' }
+    elseif ($prevNotice -ne $ollamaVer) {
+        $was = @($drift | ForEach-Object { $_.Was } | Select-Object -Unique) -join ', '
+        $which = @($drift | ForEach-Object { $_.Key }) -join ', '
+        $updScript = Join-Path (Join-Path $AIRoot 'Scripts') 'Update-Models.ps1'
+        $text = "Ollama updated itself to $ollamaVer; $which were measured on $was and may now run slower. Run $updScript to check them on the GPU again (about a minute each)."
+        # Its settings too (a file read, no model load): a new version may no longer apply them.
+        if ($onWindows -and $env:LOCALAPPDATA) {
+            $kv = 'q8_0'
+            foreach ($t in $tun.Values) { if ($t -is [hashtable] -and [string]$t['Fingerprint'] -match '(^|;)kv=([^;]+)') { $kv = $Matches[2]; break } }
+            $srvLog = Join-Path $env:LOCALAPPDATA 'Ollama\server.log'
+            $cfgLine = $null
+            try { $cfgLine = Select-String -LiteralPath $srvLog -Pattern 'msg="server config"' -Encoding UTF8 -ErrorAction Stop | Select-Object -Last 1 } catch { Write-Verbose 'no server.log' }
+            if ($cfgLine) {
+                $chk = Test-LaiOllamaServerSettings -Line $cfgLine.Line -KvCacheType $kv
+                if ($chk.Status -eq 'wrong') { $text += ' Its log also shows ' + ($chk.Wrong -join ', ') + ': Start menu > Local AI - Update toolkit applies the settings again.' }
+            }
+        }
+        if (Send-Notification 'Local AI: Ollama was updated' $text) { $ollamaNotice = $ollamaVer }
+    }
+}
+
 # ---- report ---------------------------------------------------------------------------------
 # Two strikes before a notification: right after sign-in Docker Desktop needs a minute or two, and
 # one failed check would otherwise toast every morning. A failure is reported when it has been seen
@@ -309,7 +362,7 @@ if ($toNotify.Count -gt 0) {
     if ($heldNow -and $failed -contains 'Open WebUI') {
         # Start again would refuse; the only fix is the recovery restore (the command is in the details).
         $hint = 'Open WebUI is stopped on purpose after a failed restore. The fix is the Recover line in ' + (Join-Path $AIRoot 'open-webui-hold.json') + ': paste it into PowerShell.'
-    } elseif ($failed -contains 'Docker' -or $failed -contains 'Open WebUI' -or $failed -contains 'SearXNG' -or $failed -contains 'Render guard' -or $failed -contains 'Ollama') {
+    } elseif ($failed -contains 'Docker' -or $failed -contains 'Open WebUI' -or $failed -contains 'SearXNG' -or $failed -contains 'Render guard' -or $failed -contains 'Ollama' -or $failed -contains 'Chats reach Ollama') {
         $hint = 'Use Start menu > Local AI - Start again. If that does not help, restart Docker Desktop (whale icon > Restart) and use Start again once more.'
     } elseif ($failed -contains 'Disk space') {
         $hint = 'Free some disk space (old backups in ' + (Join-Path $AIRoot 'Backups') + ', unused models).'
@@ -341,5 +394,6 @@ $final = Read-LaiState -Path $statePath
 $final['failed'] = $failed; $final['notified'] = $notified; $final['checked'] = (Get-Date).ToString('s')
 if ($notified.Count -and $notifiedAt) { $final['notifiedAt'] = [string]$notifiedAt } else { $final.Remove('notifiedAt') }
 if ($recoveryFailed) { $final['pendingRecovered'] = @($recovered) } else { $final.Remove('pendingRecovered') }
+if ($null -ne $ollamaNotice) { if ($ollamaNotice) { $final['ollamaNotifiedFor'] = $ollamaNotice } else { $final.Remove('ollamaNotifiedFor') } }
 Save-LaiState -State $final -Path $statePath
 exit $failed.Count

@@ -197,15 +197,41 @@ if ($Rollback.Count -gt 0) {
     }
 }
 
+$failedSetups = @()
+function Invoke-ModelSetup {
+    # One model at a time: a model that cannot be set up (e.g. a re-published tag this Ollama cannot
+    # load) must not lose the others' results, and its own tuned alias stays as it was.
+    # -Changed: this run downloaded the model anew (only then is -Rollback the way back).
+    param([object]$Model, [hashtable]$SetupArgs, [switch]$Changed)
+    try {
+        $r = Invoke-LaiModelSetup -BaseUrl $ollamaUrl -Models @($Model) -Candidates $catalog.ContextCandidates -SystemPrompt $system `
+            -MinFreeMiB $minFree -AllowCpu:$allowCpu @SetupArgs
+        foreach ($k in $r.Keys) { $state['tuning'][$k] = $r[$k] }
+        Save-LaiState -State $state -Path $statePath
+        return $true
+    } catch {
+        $why = Get-LaiHttpErrorText $_
+        if (-not $why) { $why = $_.Exception.Message }
+        $script:failedSetups += $Model.Display
+        Write-LaiLog FAIL "  $($Model.Display): not set up ($why)"
+        $hasPrev = $false
+        if ($Changed) {
+            try { $hasPrev = Test-LaiOllamaModel -BaseUrl $ollamaUrl -Name (Get-PrevName $Model.Source) } catch { Write-Verbose 'could not look for the previous version' }
+        }
+        foreach ($line in (Get-LaiModelSetupAdvice -Why $why -Display $Model.Display -Key $Model.Key -Changed:$Changed -HasPrevious:$hasPrev)) { Write-LaiLog INFO "  $line" }
+        return $false
+    }
+}
+
 if ($changed.Count -gt 0) {
     Stop-LaiOllamaModels -BaseUrl $ollamaUrl
     $gpu = Wait-LaiGpuIdle -MaxUsedMiB $maxBusy -TimeoutSec 600
     $fingerprint = Get-CurrentFingerprint $gpu
-    $results = Invoke-LaiModelSetup -BaseUrl $ollamaUrl -Models $changed -Candidates $catalog.ContextCandidates -SystemPrompt $system `
-        -Fingerprint $fingerprint -MinFreeMiB $minFree -Retune -AllowCpu:$allowCpu
-    foreach ($k in $results.Keys) { $state['tuning'][$k] = $results[$k] }
-    Save-LaiState -State $state -Path $statePath
-    Write-LaiLog OK "Re-tuned: $(($changed | ForEach-Object { $_.Display }) -join ', ')"
+    $done = @()
+    foreach ($m in $changed) {
+        if (Invoke-ModelSetup -Model $m -SetupArgs @{ Fingerprint = $fingerprint; Retune = $true } -Changed) { $done += $m.Display }
+    }
+    if ($done.Count) { Write-LaiLog OK "Re-tuned: $($done -join ', ')" }
 } else {
     Write-LaiLog OK 'All models are current; nothing to re-tune.'
 }
@@ -215,8 +241,9 @@ if ($changed.Count -gt 0) {
 $ollamaNow = ''
 try { $ollamaNow = [string](Get-LaiOllamaVersion -BaseUrl $ollamaUrl) } catch { Write-Verbose 'version unknown' }
 $changedKeys = @($changed | ForEach-Object { $_.Key })
-$toVerify = @($catalog.Models | Where-Object { $changedKeys -notcontains $_.Key -and $state['tuning'].ContainsKey($_.Key) -and
-        $state['tuning'][$_.Key]['OllamaVersion'] -and [string]$state['tuning'][$_.Key]['OllamaVersion'] -ne $ollamaNow })
+# The same list the health watch and Test-LocalAI report, so running this clears their notice.
+$driftKeys = @(Get-LaiTuningDrift -Tuning $state['tuning'] -OllamaVersion $ollamaNow -Keys @($catalog.Models | ForEach-Object { $_.Key }) | ForEach-Object { $_.Key })
+$toVerify = @($catalog.Models | Where-Object { $changedKeys -notcontains $_.Key -and $driftKeys -contains $_.Key })
 if ($ollamaNow -and $toVerify.Count -gt 0) {
     Write-LaiLog STEP "Ollama is now ${ollamaNow}: checking that $(($toVerify | ForEach-Object { $_.Display }) -join ', ') still fit fully on the GPU"
     Stop-LaiOllamaModels -BaseUrl $ollamaUrl
@@ -224,15 +251,21 @@ if ($ollamaNow -and $toVerify.Count -gt 0) {
     # Today's driver too: after a driver update the stored fingerprint no longer matches, so those
     # models are measured again instead of keeping a result recorded under the old driver.
     $vfp = Get-CurrentFingerprint $gpu
-    $results = Invoke-LaiModelSetup -BaseUrl $ollamaUrl -Models $toVerify -Candidates $catalog.ContextCandidates -SystemPrompt $system `
-        -Previous $state['tuning'] -Fingerprint $vfp -MinFreeMiB $minFree -AllowCpu:$allowCpu
-    foreach ($k in $results.Keys) { $state['tuning'][$k] = $results[$k] }
-    Save-LaiState -State $state -Path $statePath
+    foreach ($m in $toVerify) { Invoke-ModelSetup -Model $m -SetupArgs @{ Previous = $state['tuning']; Fingerprint = $vfp } | Out-Null }
 }
 
-if ($failedPulls.Count -gt 0) { Write-LaiLog WARN "Not updated (download failed): $($failedPulls -join ', '). Run Update-Models.ps1 again later." }
+if ($failedPulls.Count -gt 0) {
+    Write-LaiLog WARN "Not updated (download failed): $($failedPulls -join ', ')."
+    if ($offline) { Write-LaiLog INFO 'Run Update-Models.ps1 again when the PC is online.' }
+    else {
+        # Online, so retrying later rarely helps: the reason is in the download messages above.
+        Write-LaiLog INFO ("If the messages above say 'file does not exist', that tag was removed upstream: pick another in config\models.psd1. " +
+            "If they say the model requires a newer version of Ollama, run Update-Models.ps1 -UpdateOllama. Otherwise run Update-Models.ps1 again later.")
+    }
+}
+$problems = $failedPulls.Count + $failedSetups.Count
 if (-not $SkipTests) {
     & (Join-Path $PSScriptRoot 'Test-LocalAI.ps1') -AIRoot $AIRoot -Quick
-    exit [Math]::Max($LASTEXITCODE, $failedPulls.Count)
+    exit [Math]::Max($LASTEXITCODE, $problems)
 }
-exit $failedPulls.Count
+exit $problems

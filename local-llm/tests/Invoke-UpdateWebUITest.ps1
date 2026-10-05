@@ -25,6 +25,21 @@ function Invoke-DockerText([string[]]$DockerArgs) {
 function Get-Marker { return (Invoke-DockerText @('run', '--rm', '-v', 'open-webui:/d', 'alpine:3.20', 'cat', '/d/marker')) }
 function Set-Marker([string]$Value) { Invoke-DockerText @('run', '--rm', '-v', 'open-webui:/d', 'alpine:3.20', 'sh', '-c', "echo $Value > /d/marker") | Out-Null }
 function Get-Image { return (Invoke-DockerText @('inspect', '-f', '{{.Config.Image}}', 'open-webui')) }
+function New-DockerShim([string]$Name, [string]$Body) {
+    # A 'docker' first on PATH that does something special, then hands everything else to the real
+    # one. REALDOCKER in $Body is replaced by the real docker's path.
+    $dir = Join-Path $Work $Name
+    New-Item -ItemType Directory -Force -Path $dir | Out-Null
+    $real = (Get-Command docker -CommandType Application | Select-Object -First 1).Source
+    Set-Content -LiteralPath (Join-Path $dir 'docker') -Value ($Body.Replace("`r", '').Replace('REALDOCKER', $real))
+    & chmod +x (Join-Path $dir 'docker')
+    return $dir
+}
+function Invoke-WithPath([string]$Dir, [scriptblock]$Body) {
+    $saved = $env:PATH
+    $env:PATH = $Dir + [System.IO.Path]::PathSeparator + $saved
+    try { return (& $Body) } finally { $env:PATH = $saved }
+}
 function Invoke-Update([string[]]$Arguments) {
     $prev = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
     $out = & pwsh -NoProfile -File (Join-Path $src 'Update-OpenWebUI.ps1') -AIRoot $aiRoot @Arguments 2>&1 | ForEach-Object { "$_" }
@@ -90,8 +105,46 @@ try {
     $cfg = Read-LaiState -Path (Join-Path $aiRoot 'localai-config.json')
     Assert-That ($cfg['RollbackArchive'] -eq $rollbackArchive -and $cfg['PreviousOpenWebUIVersion'] -eq '3.19') 'rollback point untouched'
     Assert-That ((Get-Content -Encoding UTF8 -LiteralPath (Join-Path $stack '.env')) -contains 'SEARXNG_VERSION=x2') 'SearXNG version changed'
+    # SearXNG keeps no data: the way back is re-pinning the old tag, so that tag must be kept and said.
+    Assert-That ($cfg['PreviousSearxngVersion'] -eq 'x1' -and $cfg['SearxngVersion'] -eq 'x2') "the SearXNG tag it replaced is recorded ($($cfg['PreviousSearxngVersion']) -> $($cfg['SearxngVersion']))"
+    $ulog = Get-Content -Encoding UTF8 -Raw -LiteralPath (Join-Path (Join-Path $aiRoot 'Logs') 'update.log')
+    Assert-That ($ulog -match 'SearXNG x1 -> x2' -and $ulog -match 'Update-OpenWebUI\.ps1 -SearxngVersion x1' -and $r.Text -match 'Update-OpenWebUI\.ps1 -SearxngVersion x1') 'update.log and the output name the SearXNG change and the way back'
     $r = Invoke-Update @()
     Assert-That ($r.Code -eq 0 -and $r.Text -match 'Nothing to do') 'no arguments: explains instead of re-pulling'
+
+    Write-Host "`n=== 2c. an update cut off during the download (window closed, power cut) changes nothing ===" -ForegroundColor Cyan
+    # This docker kills the update's own process as the pull starts: no catch or finally runs.
+    $shimBody = @'
+#!/bin/sh
+case " $* " in *' pull '*) kill -9 $PPID; exit 1;; esac
+exec 'REALDOCKER' "$@"
+'@
+    $killDir = New-DockerShim 'kill-on-pull' $shimBody
+    $envFile = Join-Path $stack '.env'; $cfgFile = Join-Path $aiRoot 'localai-config.json'
+    $envText = [System.IO.File]::ReadAllText($envFile); $cfgText2 = [System.IO.File]::ReadAllText($cfgFile)
+    $r = Invoke-WithPath $killDir { Invoke-Update @('-Version', '3.19', '-SkipBackup') }
+    Assert-That ($r.Code -ne 0 -and [System.IO.File]::ReadAllText($envFile) -eq $envText) "killed mid-download (exit $($r.Code)): .env still names the version that is running"
+    Assert-That ([System.IO.File]::ReadAllText($cfgFile) -eq $cfgText2 -and (Get-Image) -eq 'alpine:3.20') 'rollback point and running container untouched'
+    $r = Invoke-Update @('-Version', '3.19', '-SkipBackup')
+    Assert-That ($r.Code -eq 0 -and $r.Text -notmatch 'Already on' -and (Get-Image) -eq 'alpine:3.19') "running it again updates instead of saying 'Already on' (exit $($r.Code))"
+    # Back to what step 1 left: the steps below roll back from 3.20 with its rollback point.
+    [System.IO.File]::WriteAllText($envFile, $envText); [System.IO.File]::WriteAllText($cfgFile, $cfgText2)
+    Invoke-DockerText @('compose', '--project-directory', $stack, '-f', (Join-Path $stack 'docker-compose.yml'), 'up', '-d') | Out-Null
+    Assert-That ((Get-Image) -eq 'alpine:3.20') 'setup for the next steps: 3.20 runs again'
+
+    Write-Host "`n=== 2d. an install left behind by the old order (.env names a version that never ran) is repaired first ===" -ForegroundColor Cyan
+    # What an older Update-OpenWebUI.ps1 cut off mid-download left: .env on 3.19 while 3.20 runs.
+    $badEnv = $envText -replace 'OPEN_WEBUI_VERSION=[^\r\n]*', 'OPEN_WEBUI_VERSION=3.19'
+    [System.IO.File]::WriteAllText($envFile, $badEnv)
+    $r = Invoke-Update @('-SearxngVersion', 'x3', '-SkipBackup')
+    $envNow = @(Get-Content -Encoding UTF8 -LiteralPath $envFile)
+    Assert-That ($r.Text -match 'names Open WebUI 3\.19, but 3\.20 is running' -and (Get-Image) -eq 'alpine:3.20' -and $envNow -contains 'OPEN_WEBUI_VERSION=3.20' -and $envNow -contains 'SEARXNG_VERSION=x3') "a SearXNG-only update sets .env back to 3.20 and does not start 3.19 on the data (exit $($r.Code), $(Get-Image))"
+    [System.IO.File]::WriteAllText($envFile, $badEnv)
+    $r = Invoke-Update @('-Version', '3.19', '-SkipBackup')
+    Assert-That ($r.Code -eq 0 -and $r.Text -match 'names Open WebUI 3\.19, but 3\.20 is running' -and $r.Text -notmatch 'Already on' -and (Get-Image) -eq 'alpine:3.19') "-Version 3.19 updates instead of saying 'Already on' (exit $($r.Code), $(Get-Image))"
+    [System.IO.File]::WriteAllText($envFile, $envText); [System.IO.File]::WriteAllText($cfgFile, $cfgText2)
+    Invoke-DockerText @('compose', '--project-directory', $stack, '-f', (Join-Path $stack 'docker-compose.yml'), 'up', '-d') | Out-Null
+    Assert-That ((Get-Image) -eq 'alpine:3.20') 'setup for the next steps: 3.20 runs again'
 
     Write-Host "`n=== 3. retention keeps the rollback archive ===" -ForegroundColor Cyan
     # Age it through a container: on Linux the archive is owned by root (Docker wrote it), so a
@@ -149,6 +202,46 @@ try {
     Assert-That ($code -ne 0) "backup of a volume without webui.db fails (exit $code)"
     Assert-That (@(Get-ChildItem -LiteralPath $bdir -Filter 'open-webui-*.tar.gz').Count -eq $countBefore) 'no new archive counted as a backup'
     Assert-That (@(Get-ChildItem -LiteralPath $bdir -Filter 'incomplete-*').Count -eq 0) 'the half-written file and an older leftover are removed'
+
+    Write-Host "`n=== 3c. a scheduled run waits for a chat answer being written; the sign-in run skips a night already done ===" -ForegroundColor Cyan
+    # 'docker exec render-guard ...' answers the in-flight count from a list, one line per call.
+    $answers = Join-Path $Work 'inflight.txt'
+    $shimBody = @'
+#!/bin/sh
+if [ "$1" = exec ] && [ "$2" = render-guard ]; then
+  n=$(head -n 1 'ANSWERS'); sed -i 1d 'ANSWERS'; echo "${n:-0}"; exit 0
+fi
+exec 'REALDOCKER' "$@"
+'@
+    $chatDir = New-DockerShim 'chat-shim' ($shimBody.Replace('ANSWERS', $answers))
+    $runBackup = {
+        param([string[]]$More)
+        $prevPref = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
+        $o = & pwsh -NoProfile -File (Join-Path $src 'Backup-OpenWebUI.ps1') -AIRoot $aiRoot -SkipDeepVerify -NoPrune -NoMirror @More 2>&1 | ForEach-Object { "$_" }
+        $c = $LASTEXITCODE; $ErrorActionPreference = $prevPref
+        return [pscustomobject]@{ Code = $c; Text = ($o -join "`n") }
+    }
+    $env:LOCALAI_TEST_CHAT_POLL_SEC = '1'
+    try {
+        Set-Content -LiteralPath $answers -Value @('1', '1', '0')
+        $b = Invoke-WithPath $chatDir { & $runBackup @('-WaitForChatsSec', '60') }
+        Assert-That ($b.Code -eq 0 -and $b.Text -match 'Waited \d+ s for a chat answer to finish') "Open WebUI is stopped only after the answer being written is done (exit $($b.Code))"
+        Set-Content -LiteralPath $answers -Value @('1', '1', '1', '1', '1', '1', '1', '1', '1', '1')
+        $b = Invoke-WithPath $chatDir { & $runBackup @('-WaitForChatsSec', '2') }
+        Assert-That ($b.Code -eq 0 -and $b.Text -match 'still being written after \d+ s; stopping Open WebUI anyway') "the wait has a limit, then the backup goes ahead (exit $($b.Code))"
+    } finally { $env:LOCALAI_TEST_CHAT_POLL_SEC = '' }
+    $nightly = { @(Get-ChildItem -LiteralPath (Join-Path $aiRoot 'Backups') -Filter 'open-webui-*.tar.gz' | Where-Object { $_.Name -match '^open-webui-\d{8}-\d{6}\.tar\.gz$' }).Count }
+    $n0 = & $nightly
+    $b = & $runBackup @('-DailyAt', (Get-Date).AddMinutes(1).ToString('HH:mm', [Globalization.CultureInfo]::InvariantCulture))
+    Assert-That ($b.Code -eq 0 -and (& $nightly) -eq $n0 -and $b.Text -match 'Nothing to do: the backup due at') "the sign-in run does nothing when the night's backup is already there (exit $($b.Code))"
+    # A missed night: the due time is later than every nightly archive, so the sign-in run backs up.
+    $newest = Get-ChildItem -LiteralPath (Join-Path $aiRoot 'Backups') -Filter 'open-webui-*.tar.gz' | Where-Object { $_.Name -match '^open-webui-\d{8}-\d{6}\.tar\.gz$' } |
+        Sort-Object LastWriteTime -Descending | Select-Object -First 1  # lai-ok: objects
+    $t = (Get-Date); if ($newest) { $t = $newest.LastWriteTime }
+    $dueAt = $t.Date.AddHours($t.Hour).AddMinutes($t.Minute + 1)
+    while ((Get-Date) -lt $dueAt) { Start-Sleep -Milliseconds 500 }   # at most a minute
+    $b = & $runBackup @('-DailyAt', $dueAt.ToString('HH:mm', [Globalization.CultureInfo]::InvariantCulture))
+    Assert-That ($b.Code -eq 0 -and $b.Text -notmatch 'Nothing to do' -and (& $nightly) -eq $n0 + 1) "the sign-in run catches up a missed night: due $($dueAt.ToString('HH:mm')), after the newest backup (exit $($b.Code))"
 
     Write-Host "`n=== 4. -Rollback ===" -ForegroundColor Cyan
     Set-Marker 'DATA-v2'
@@ -250,6 +343,37 @@ try {
     try { $r = & $runScript 'Restore-OpenWebUI.ps1' @('-Archive', $good.FullName, '-Force') } finally { $env:DOCKER_HOST = $savedDockerHost }
     Assert-That ($r.Code -ne 0 -and $r.Text -match 'Docker Desktop is not running' -and $r.Text -notmatch 'not a valid Open WebUI backup') 'with Docker down the restore says so (it used to call a good backup invalid)'
 
+    Write-Host "`n=== 5e. a restore cut off right after it turned auto-restart off ===" -ForegroundColor Cyan
+    # This docker kills the restore's own process right after 'update --restart no' (window closed,
+    # power cut): no catch or finally runs.
+    $shimBody = @'
+#!/bin/sh
+'REALDOCKER' "$@"; rc=$?
+case " $* " in *' update --restart no '*) kill -9 $PPID;; esac
+exit $rc
+'@
+    $offDir = New-DockerShim 'kill-after-restart-off' $shimBody
+    $r = Invoke-WithPath $offDir { & $runScript 'Restore-OpenWebUI.ps1' @('-Archive', $good.FullName, '-Force', '-SkipSafetyBackup') }
+    $hk = Read-LaiState -Path $holdFile
+    $pol = Invoke-DockerText @('inspect', '-f', '{{.State.Status}} {{.HostConfig.RestartPolicy.Name}}', 'open-webui')
+    $kept = @(@($hk['Containers']) | Where-Object { $_ -and $_['Policy'] -eq 'always' }).Count -gt 0
+    Assert-That ($r.Code -ne 0 -and ($pol -eq 'running always' -or $kept)) "cut off with auto-restart off ($pol): a hold already records the original policy (hold: $($hk['Reason']))"
+    $r = & $runScript 'Restore-OpenWebUI.ps1' @('-Archive', $good.FullName, '-Force', '-SkipSafetyBackup')
+    Assert-That ($r.Code -eq 0 -and -not (Test-Path -LiteralPath $holdFile) -and (Invoke-DockerText @('inspect', '-f', '{{.State.Status}} {{.HostConfig.RestartPolicy.Name}}', 'open-webui')) -eq 'running always') "running the restore again finishes it, auto-restart back on (exit $($r.Code))"
+
+    Write-Host "`n=== 5f. a restore whose 'docker stop' fails puts the container back and leaves no hold ===" -ForegroundColor Cyan
+    # The data is never touched: the container must end running with its policy, and no hold may
+    # keep Start again, backups and updates refusing.
+    $shimBody = @'
+#!/bin/sh
+case " $* " in *' stop '*) exit 1;; esac
+exec 'REALDOCKER' "$@"
+'@
+    $stopDir = New-DockerShim 'fail-stop' $shimBody
+    $r = Invoke-WithPath $stopDir { & $runScript 'Restore-OpenWebUI.ps1' @('-Archive', $good.FullName, '-Force', '-SkipSafetyBackup') }
+    $pol = Invoke-DockerText @('inspect', '-f', '{{.State.Status}} {{.HostConfig.RestartPolicy.Name}}', 'open-webui')
+    Assert-That ($r.Code -ne 0 -and -not (Test-Path -LiteralPath $holdFile) -and $pol -eq 'running always') "failed stop: exit $($r.Code), container '$pol', hold left: $(Test-Path -LiteralPath $holdFile)"
+
     Write-Host "`n=== 6. admin password rotation (real Open WebUI) ===" -ForegroundColor Cyan
     $credPath = Join-Path (Join-Path $aiRoot 'Secrets') 'openwebui-admin.json'
     $r = & $runScript 'Set-OpenWebUIPassword.ps1' @('-NewPassword', 'Rotated-Password-456', '-Quiet')
@@ -321,6 +445,14 @@ try {
     $b = & $runScript 'Backup-OpenWebUI.ps1' @('-Volume', 'lai-ok-test', '-Container', 'lai-no-such-container', '-Tag', 'nocheck', '-NoPrune', '-VerifyImage', $verifyImage)
     $bs3 = Read-LaiState -Path $bsPath
     Assert-That ($bs3['deepCheck'] -eq 'ok' -and [int]$bs3['deepCheckSkips'] -eq 0) 'and the count resets after a check that ran'
+    # A check image that is not on this PC is counted too (it was skipped silently, night after night).
+    $b = & $runScript 'Backup-OpenWebUI.ps1' @('-Volume', 'lai-ok-test', '-Container', 'lai-no-such-container', '-Tag', 'noimage', '-NoPrune', '-VerifyImage', 'lai-no-such-image:0')
+    $bs4 = Read-LaiState -Path $bsPath
+    Assert-That ($b.Code -eq 0 -and $b.Text -match 'Deep check skipped' -and [int]$bs4['deepCheckSkips'] -eq 1) "a missing check image counts toward the watch's 3-night alarm (exit $($b.Code), count $($bs4['deepCheckSkips']))"
+    # .env names a version that was never downloaded (an update cut off mid-download): the image
+    # Open WebUI runs does the check instead.
+    $b = & $runScript 'Backup-OpenWebUI.ps1' @('-Volume', 'lai-ok-test', '-Container', 'open-webui', '-NoStop', '-Tag', 'noimage', '-NoPrune')
+    Assert-That ($b.Code -eq 0 -and $b.Text -match 'using the image Open WebUI runs \(alpine:') "with the .env image missing, the check uses the image Open WebUI runs (exit $($b.Code))"
     Invoke-DockerText @('volume', 'rm', 'lai-ok-test') | Out-Null
     Invoke-DockerText @('volume', 'rm', 'lai-deep-test') | Out-Null
 } finally {

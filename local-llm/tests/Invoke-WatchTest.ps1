@@ -192,6 +192,78 @@ services:
     Invoke-Watch @('-NoHeal', '-MinFreeGB', "$limit") | Out-Null
     Assert-That ((& $lastFail) -match 'Disk space') 'but after a low-space failure it needs 2 GB more before it counts as fixed (no toast flapping)'
     $c5 = Read-LaiState -Path $cfgFile; $c5.Remove('BackupMirror'); Save-LaiState -State $c5 -Path $cfgFile
+
+    Write-Host "`n=== 6. Ollama updated itself since the presets were tuned: one notice, then quiet ===" -ForegroundColor Cyan
+    # The sandbox's real Ollama stands in for one the tray app replaced; the tuning says 0.0.1.
+    $realVer = [string](Invoke-LaiApi -Uri 'http://127.0.0.1:11434/api/version' -TimeoutSec 10).version
+    $instPath = Join-Path $aiRoot 'install-state.json'
+    Save-LaiState -State @{ tuning = @{ main = @{ Alias = 'localai-main'; OllamaVersion = '0.0.1'; Fingerprint = 'driver=1;kv=q8_0' }; old = @{ Alias = 'localai-old' } } } -Path $instPath
+    $updLines = { @((Get-WatchLog) -split "`n" | Where-Object { $_ -match 'NOTIFY Local AI: Ollama was updated' }) }
+    $u0 = @(& $updLines).Count
+    Invoke-Watch @('-NoHeal') | Out-Null
+    Invoke-Watch @('-NoHeal') | Out-Null
+    $upd = @(& $updLines)
+    Assert-That ($upd.Count -eq $u0 + 1) "two runs, exactly one notice ($($upd.Count - $u0))"
+    $updLine = ''; if ($upd.Count) { $updLine = [string]$upd[-1] }
+    Assert-That ($updLine -match [regex]::Escape("Ollama updated itself to $realVer; main were measured on 0.0.1") -and $updLine -match 'Update-Models\.ps1') "it names the new and the measured version, only the preset with a recorded version, and Update-Models ($updLine)"
+    $ws = Read-LaiState -Path $statePath
+    Assert-That ([string]$ws['ollamaNotifiedFor'] -eq $realVer -and @(@($ws['failed']) | Where-Object { "$_" -match 'Ollama|tuning|preset' }).Count -eq 0) 'recorded as told for this version, never as a failed check (no reminders, no exit code)'
+    # Update-Models re-checked them: the tuning now records the running version.
+    $st6 = Read-LaiState -Path $instPath; $st6['tuning']['main']['OllamaVersion'] = $realVer; Save-LaiState -State $st6 -Path $instPath
+    Invoke-Watch @('-NoHeal') | Out-Null
+    Assert-That (@(& $updLines).Count -eq $u0 + 1 -and -not (Read-LaiState -Path $statePath).ContainsKey('ollamaNotifiedFor')) 'after the re-check: no further notice, and a later update is announced again'
+    Remove-Item -LiteralPath $instPath -Force
+
+    Write-Host "`n=== 7. a Docker Desktop that stopped answering (after sleep): reported, not a silent hang ===" -ForegroundColor Cyan
+    # A docker CLI that never answers. Its process id (kept by exec) must be gone afterwards.
+    $hangDir = Join-Path $Work 'hang-shim'
+    New-Item -ItemType Directory -Force -Path $hangDir | Out-Null
+    $pidFile = Join-Path $hangDir 'pids.txt'
+    Set-Content -LiteralPath (Join-Path $hangDir 'docker') -Value ("#!/bin/sh`necho `$`$ >> '{0}'`nexec sleep 617" -f $pidFile)
+    & chmod +x (Join-Path $hangDir 'docker')
+    $savedPATH = $env:PATH
+    $env:PATH = $hangDir + [System.IO.Path]::PathSeparator + $savedPATH
+    $env:LOCALAI_DOCKER_TIMEOUT = '3'
+    try {
+        Save-LaiState -State @{ failed = @() } -Path $statePath
+        $sw = [Diagnostics.Stopwatch]::StartNew()
+        Invoke-Watch @('-NoHeal') | Out-Null
+        $watchSec = $sw.Elapsed.TotalSeconds
+        $hangLine = & $lastFail
+        Assert-That ($watchSec -lt 90 -and $hangLine -match 'FAIL .*Docker \(not responding' -and @((Read-LaiState -Path $statePath)['failed']) -contains 'Docker') ("the watch reports Docker as not responding, and logs and saves its state instead of hanging ({0:N0} s: {1})" -f $watchSec, $hangLine)
+        $sw = [Diagnostics.Stopwatch]::StartNew()
+        $prev = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
+        & pwsh -NoProfile -File (Join-Path $src 'Backup-OpenWebUI.ps1') -AIRoot $aiRoot -EngineWaitSec 20 2>&1 | Out-Null
+        $bcode = $LASTEXITCODE; $ErrorActionPreference = $prev
+        $backupSec = $sw.Elapsed.TotalSeconds
+        $bl = Join-Path (Join-Path $aiRoot 'Logs') 'backup.log'
+        $blog = ''; if (Test-Path -LiteralPath $bl) { $blog = Get-Content -Raw -LiteralPath $bl }
+        Assert-That ($bcode -eq 1 -and $backupSec -lt 120 -and $blog -match '\[FAIL\] Docker Desktop is not responding') ("the nightly backup writes a FAIL line to backup.log and exits 1 instead of hanging (exit {0}, {1:N0} s)" -f $bcode, $backupSec)
+    } finally { $env:PATH = $savedPATH; $env:LOCALAI_DOCKER_TIMEOUT = '' }
+    $pids = @(Get-Content -LiteralPath $pidFile -ErrorAction SilentlyContinue | Where-Object { $_ -match '^\d+$' })
+    # Still running = /proc entry that is not a zombie.
+    $alive = @($pids | Where-Object { (Test-Path -LiteralPath "/proc/$_/stat") -and ((Get-Content -Raw -LiteralPath "/proc/$_/stat" -ErrorAction SilentlyContinue) -notmatch '^\d+ \(.*\) Z') })
+    Assert-That ($pids.Count -ge 2 -and $alive.Count -eq 0) "every docker call that hung was stopped ($($pids.Count) started, $($alive.Count) still running)"
+
+    Write-Host "`n=== 8. Open WebUI up, but unable to reach Ollama (the path chats take) ===" -ForegroundColor Cyan
+    # A stand-in Open WebUI on the host network that answers /health on port 3998 and has python3
+    # (SearXNG's image), so the watch probes Ollama from inside it as it would from the real one.
+    $pyImage = Invoke-DockerText @('inspect', '-f', '{{.Config.Image}}', 'searxng')
+    Invoke-DockerText @('rm', '-f', 'open-webui') | Out-Null
+    $srv = "import http.server as h;C=type('C',(h.BaseHTTPRequestHandler,),{'do_GET':lambda s:(s.send_response(200),s.end_headers(),s.wfile.write(b'{}'))});h.HTTPServer(('127.0.0.1',3998),C).serve_forever()"
+    # Labelled as a test container: if this suite is killed before 'finally', Reset-Sandbox removes it.
+    Invoke-DockerText @('run', '-d', '--name', 'open-webui', '--label', 'lai-test=1', '--network', 'host', '--entrypoint', 'python3', $pyImage, '-c', $srv) | Out-Null
+    $c7 = Read-LaiState -Path $cfgFile; $c7['WebUIPort'] = 3998; $c7['WebUIOllamaUrl'] = 'http://127.0.0.1:9'; Save-LaiState -State $c7 -Path $cfgFile
+    $up = $false
+    for ($i = 0; $i -lt 30 -and -not $up; $i++) { try { Invoke-LaiApi -Uri 'http://127.0.0.1:3998/health' -TimeoutSec 2 | Out-Null; $up = $true } catch { Start-Sleep -Seconds 1 } }
+    Assert-That $up "setup: the stand-in Open WebUI answers on port 3998 ($(Get-State 'open-webui'))"
+    Invoke-Watch @('-NoHeal') | Out-Null
+    $l7 = & $lastFail
+    Assert-That ($l7 -match 'Chats reach Ollama \(Open WebUI cannot reach Ollama at http://127\.0\.0\.1:9 ') "Open WebUI answering but unable to reach Ollama is a failed check that names the URL ($l7)"
+    $c7['WebUIOllamaUrl'] = 'http://127.0.0.1:11434'; Save-LaiState -State $c7 -Path $cfgFile
+    Invoke-Watch @('-NoHeal') | Out-Null
+    $l7 = & $lastFail
+    Assert-That ($l7 -notmatch 'Chats reach Ollama') "and passes once Ollama answers at that URL ($l7)"
 } finally {
     if ($holder -and -not $holder.HasExited) { $holder.Kill() }
     $tc = Join-Path (Join-Path $aiRoot 'Stack') 'docker-compose.yml'

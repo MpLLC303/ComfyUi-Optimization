@@ -75,7 +75,7 @@ if (Test-Path -LiteralPath $envFile) {
 }
 $searxSettings = Join-Path (Join-Path (Join-Path $AIRoot 'Stack') 'searxng') 'settings.yml'
 if (Test-Path -LiteralPath $searxSettings) {
-    $m = Select-String -LiteralPath $searxSettings -Pattern 'secret_key:\s*"?([^"\s]+)' | Select-Object -First 1
+    $m = Select-String -LiteralPath $searxSettings -Pattern 'secret_key:\s*"?([^"\s]+)' -Encoding UTF8 | Select-Object -First 1
     if ($m) { Add-Secret $m.Matches[0].Groups[1].Value }
 }
 if ($env:USERNAME) { [void]$names.Add($env:USERNAME) }
@@ -159,6 +159,13 @@ foreach ($scope in @('User', 'Machine')) {
         $v = [Environment]::GetEnvironmentVariable($k, $scope)
         if ($v) { $ollamaEnv += "$scope $k=$v" }
     }
+    # Ollama passes its whole environment to llama-server, which decides the GPU/CPU split itself and
+    # reads LLAMA_ARG_* (e.g. LLAMA_ARG_FIT_TARGET, LLAMA_ARG_N_GPU_LAYERS): one left behind by another
+    # llama.cpp-based tool silently changes how the models are placed.
+    try {
+        $all = [Environment]::GetEnvironmentVariables($scope)
+        foreach ($k in @($all.Keys | ForEach-Object { [string]$_ } | Where-Object { $_ -like 'LLAMA_ARG_*' } | Sort-Object)) { $ollamaEnv += "$scope $k=$($all[$k])" }
+    } catch { Write-Verbose "LLAMA_ARG_* not readable for $scope" }
 }
 Save-Part 'ollama.txt' (@("version: $ollamaVer", '', 'models:', ($tags -join "`n"), '', 'loaded:', ($ps -join "`n"), '', 'environment:', ($ollamaEnv -join "`n")) -join "`n")
 if ($onWindows -and $env:LOCALAPPDATA) { Save-Part 'ollama-server.log' (Get-Tail (Join-Path $env:LOCALAPPDATA 'Ollama\server.log') 300) }

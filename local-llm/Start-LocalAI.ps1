@@ -43,10 +43,9 @@ try {
     $ollamaOk = $true
     try { Get-LaiOllamaVersion -BaseUrl $ollamaUrl | Out-Null } catch { $ollamaOk = $false }
     if (-not $ollamaOk) {
-        $app = ''
-        if ($env:LOCALAPPDATA) { $app = Join-Path $env:LOCALAPPDATA 'Programs\Ollama\ollama app.exe' }
-        if ($onWindows -and (Test-Path -LiteralPath $app)) {
-            Start-Process -FilePath $app
+        $app = Get-LaiOllamaAppPath
+        if ($onWindows -and $app -and (Test-Path -LiteralPath $app)) {
+            Start-LaiOllamaApp -Path $app
             Wait-LaiHttp -Uri "$ollamaUrl/api/version" -TimeoutSec 90 | Out-Null
             Write-LaiLog OK 'Ollama started'
         } else {
@@ -61,8 +60,8 @@ try {
         Write-LaiLog INFO 'Starting Docker Desktop (takes a minute or two)'
         $r = Invoke-Docker @('desktop', 'start')
         if ($r.ExitCode -ne 0) {
-            $exe = Join-Path $env:ProgramFiles 'Docker\Docker\Docker Desktop.exe'
-            if (-not (Test-Path -LiteralPath $exe)) { throw "Docker Desktop not found at $exe" }
+            $exe = Find-LaiDockerDesktopExe
+            if (-not $exe) { throw 'Docker Desktop.exe was not found (not in its registered install folder, next to the docker command or in Program Files). Start Docker Desktop from the Start menu, then use Start menu > Local AI - Start again.' }
             Start-Process -FilePath $exe
         }
         $deadline = (Get-Date).AddSeconds($TimeoutSec)

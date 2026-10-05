@@ -11,6 +11,8 @@
     - Start-menu shortcuts: real .lnk files are written and read back; the -Command payload parses.
     - Watch-LocalAI: pause / unpause / a full run with nothing installed must not throw.
     - Uninstall-LocalAI -WhatIf and Stop-LocalAI on an empty AI root must not throw.
+    - Scheduled tasks: the no-window launch (conhost --headless), the daily-time math, and native
+      calls with a time limit (a CLI that never answers is stopped, not waited on).
     Exit code = number of failed assertions.
 #>
 param([string]$Work = (Join-Path ([System.IO.Path]::GetTempPath()) 'lai-wintest'))
@@ -554,6 +556,28 @@ if ($onWindows) {
     }
 } else { Skip 'task command-line round trip runs on Windows only' }
 
+Write-Host "`n=== scheduled tasks: no window, the daily time, docker calls with a time limit ===" -ForegroundColor Cyan
+# Windows Terminal (Windows 11's default console) shows a window despite -WindowStyle Hidden, and
+# closing it kills the run: tasks go through conhost --headless where it exists.
+$fakeConhost = Join-Path $Work 'conhost.exe'
+Set-Content -LiteralPath $fakeConhost -Value 'x'
+$hl = Get-LaiHiddenTaskLaunch -PsArgs '-NoProfile -WindowStyle Hidden -File "x.ps1"' -Build 26200 -ConhostPath $fakeConhost
+Assert-That ($hl.Execute -eq $fakeConhost -and $hl.Argument -eq '--headless powershell.exe -NoProfile -WindowStyle Hidden -File "x.ps1"') "Windows 11: conhost --headless, which never opens a window ($($hl.Execute) $($hl.Argument))"
+$hl = Get-LaiHiddenTaskLaunch -PsArgs '-NoProfile -WindowStyle Hidden -File "x.ps1"' -Build 18363 -ConhostPath $fakeConhost
+Assert-That ($hl.Execute -eq 'powershell.exe' -and $hl.Argument -like '*-WindowStyle Hidden*') 'before Windows 10 2004 (no --headless): powershell.exe -WindowStyle Hidden'
+$hl = Get-LaiHiddenTaskLaunch -PsArgs '-File "x.ps1"' -Build 26200 -ConhostPath (Join-Path $Work 'no-such-conhost.exe')
+Assert-That ($hl.Execute -eq 'powershell.exe') 'no conhost.exe: powershell.exe'
+# The backup's sign-in run is a no-op when the backup due at the last daily time exists.
+Assert-That ((Get-LaiLastDailyRun -At '03:30' -Now ([datetime]::new(2026, 10, 5, 9, 0, 0))) -eq [datetime]::new(2026, 10, 5, 3, 30, 0)) 'last daily run at 09:00: today 03:30'
+Assert-That ((Get-LaiLastDailyRun -At '03:30' -Now ([datetime]::new(2026, 10, 5, 2, 0, 0))) -eq [datetime]::new(2026, 10, 4, 3, 30, 0)) 'last daily run at 02:00: yesterday 03:30'
+Assert-That ((Get-LaiLastDailyRun -At '03:30' -Now ([datetime]::new(2026, 10, 5, 3, 30, 0))) -eq [datetime]::new(2026, 10, 5, 3, 30, 0)) 'the 03:30 run itself is due today'
+# A CLI that never answers (Docker Desktop stuck after sleep) is stopped at the limit, not waited on.
+$sw = [Diagnostics.Stopwatch]::StartNew()
+$tn = Invoke-LaiTimedNative -File $childExe -Arguments @('-NoProfile', '-Command', 'Start-Sleep -Seconds 120') -TimeoutSec 3
+Assert-That ($tn.TimedOut -and $tn.ExitCode -eq -1 -and $sw.Elapsed.TotalSeconds -lt 30) ("a program that never answers is stopped after the limit ({0:N0} s)" -f $sw.Elapsed.TotalSeconds)
+$tn = Invoke-LaiTimedNative -File $childExe -Arguments @('-NoProfile', '-Command', "Write-Output 'a b|c'; exit 7") -TimeoutSec 120
+Assert-That (-not $tn.TimedOut -and $tn.ExitCode -eq 7 -and ([string]$tn.Out).Trim() -eq 'a b|c') "arguments with spaces arrive intact; output and exit code come back (exit $($tn.ExitCode): $($tn.Out))"
+
 Write-Host "`n=== context search (Find-LaiMaxContext) with a mocked Ollama and nvidia-smi ===" -ForegroundColor Cyan
 # The integration test runs the tuner on a CPU box with -AllowCpu, so the search itself (step-down,
 # headroom, failed loads) never runs there. Mocks inside the module: load results and VRAM readings.
@@ -580,6 +604,29 @@ Assert-That ((@($loads) -join ',') -eq '65536,57344') "candidates tried largest 
 & $mod { $script:MockLoads = @(); $script:MockTrain = 16384; $script:MockFree.Clear() }
 $fit = Find-LaiMaxContext -Name 'm' -Candidates @(32768, 65536) -MinFreeMiB 768
 Assert-That ($fit.Context -eq 16384 -and (@(& $mod { $script:MockLoads }) -join ',') -eq '16384') 'a model trained on less than every candidate is tried at its own limit'
+# A re-published tag this Ollama cannot load at all: every size fails. The search must stop there,
+# before the tuned alias (the preset the user chats with) is rebuilt on those weights.
+& $mod {
+    $script:MockLoads = @(); $script:MockTrain = 131072; $script:Creates = @()
+    function script:Invoke-LaiOllamaLoad {
+        param($BaseUrl, $Name, $NumCtx, $KeepAlive)
+        $null = $BaseUrl, $Name, $KeepAlive
+        $script:MockLoads += $NumCtx
+        throw '500 llama-server: this model may be incompatible with your version of Ollama'
+    }
+    function script:Set-LaiOllamaDerivedModel { param($BaseUrl, $Name, $From, $NumCtx, $Parameters, $System) $null = $BaseUrl, $From, $NumCtx, $Parameters, $System; $script:Creates += $Name }
+    function script:Get-LaiOllamaVersion { param($BaseUrl) $null = $BaseUrl; '0.35.1' }
+    function script:Get-LaiOllamaDigest { param($BaseUrl, $Name) $null = $BaseUrl, $Name; 'digest-new' }
+    function script:Test-LaiOllamaModel { param($BaseUrl, $Name) $null = $BaseUrl, $Name; $true }
+}
+$fitErr = ''
+try { Find-LaiMaxContext -Name 'm' -Candidates @(65536, 32768, 8192) -MinFreeMiB 768 | Out-Null } catch { $fitErr = $_.Exception.Message }
+Assert-That ($fitErr -match '^m could not be loaded at any context' -and $fitErr -match 'incompatible') "no size loads: an error naming the model and Ollama's reason, not '8192, does not fit' ($fitErr)"
+Assert-That ((@(& $mod { $script:MockLoads }) -join ',') -eq '65536,32768,8192') 'every size was tried before giving up'
+$setupErr = ''
+$um = @(@{ Key = 'main'; Display = 'Main'; Source = 'src:2'; Alias = 'localai-main'; MaxContext = 0; MinTokensPerSec = 40; Parameters = @{} })
+try { Invoke-LaiModelSetup -Models $um -Candidates @(65536, 8192) -SystemPrompt 'x' -Retune | Out-Null } catch { $setupErr = $_.Exception.Message }
+Assert-That ($setupErr -match 'could not be loaded at any context' -and @(& $mod { $script:Creates }).Count -eq 0) "unloadable weights: the setup stops and the tuned alias is not rebuilt on them (alias writes: $(@(& $mod { $script:Creates }).Count))"
 Import-Module (Join-Path (Join-Path $src 'lib') 'LocalAI.psm1') -Force
 $mod = Get-Module LocalAI
 & $mod {
@@ -620,6 +667,88 @@ Assert-That ((& $runSetup $old)['Reused']) 'a result from before candidates were
 Assert-That ((Test-LaiWebUIWebSearch -Token 't').Status -eq 'no-results') 'an empty web-search result is no-results, not ok'
 Import-Module (Join-Path (Join-Path $src 'lib') 'LocalAI.psm1') -Force
 
+Write-Host "`n=== Ollama drift: settings line parsed, versions compared, tray app started hidden ===" -ForegroundColor Cyan
+# A real 0.35.1 line (shortened). A key a newer Ollama stops logging must read as 'unknown', not as
+# a wrong setting (which would kill Ollama twice and advise a pointless -Retune).
+$srvLine = 'time=2026-10-04T23:07:51.129Z level=INFO source=routes.go:2117 msg="server config" env="map[CUDA_VISIBLE_DEVICES: LLAMA_ARG_FIT_TARGET: OLLAMA_CONTEXT_LENGTH:0 OLLAMA_FLASH_ATTENTION:true OLLAMA_KV_CACHE_TYPE:q8_0 OLLAMA_MODELS:C:\Users\x\.ollama\models OLLAMA_ORIGINS:[http://localhost https://localhost app://*] OLLAMA_REMOTES:[ollama.com] ROCR_VISIBLE_DEVICES: http_proxy: no_proxy:]"'
+$srv = ConvertFrom-LaiServerConfigLine -Line $srvLine
+Assert-That ($srv['OLLAMA_KV_CACHE_TYPE'] -eq 'q8_0' -and $srv['OLLAMA_FLASH_ATTENTION'] -eq 'true' -and $srv['OLLAMA_MODELS'] -eq 'C:\Users\x\.ollama\models' -and $srv.ContainsKey('LLAMA_ARG_FIT_TARGET') -and $srv['LLAMA_ARG_FIT_TARGET'] -eq '' -and $srv['OLLAMA_REMOTES'] -eq '[ollama.com]') "server config line parsed: values, empty values, a Windows path ($($srv.Count) keys)"
+Assert-That ((Test-LaiOllamaServerSettings -Line $srvLine -KvCacheType 'q8_0').Status -eq 'ok') 'settings applied: ok'
+$chkWrong = Test-LaiOllamaServerSettings -Line ($srvLine -replace 'OLLAMA_KV_CACHE_TYPE:q8_0', 'OLLAMA_KV_CACHE_TYPE:') -KvCacheType 'q8_0'
+Assert-That ($chkWrong.Status -eq 'wrong' -and ($chkWrong.Wrong -join ' ') -match 'OLLAMA_KV_CACHE_TYPE= \(wanted q8_0\)') "a key logged with another value (empty = f16): wrong, so Ollama is restarted ($($chkWrong.Wrong -join ' '))"
+$chkGone = Test-LaiOllamaServerSettings -Line ($srvLine -replace 'OLLAMA_FLASH_ATTENTION:true ', '') -KvCacheType 'q8_0'
+Assert-That ($chkGone.Status -eq 'unknown' -and @($chkGone.Missing) -contains 'OLLAMA_FLASH_ATTENTION') 'a key this Ollama no longer logs: unknown, not wrong'
+Assert-That ((Test-LaiOllamaServerSettings -Line '' -KvCacheType 'q8_0').Status -eq 'unknown') 'no settings line at all: unknown'
+# Presets measured on another Ollama version (the tray app updates itself at sign-in).
+$tn = @{ main = @{ Alias = 'localai-main'; OllamaVersion = '0.35.1' }; fast = @{ OllamaVersion = '0.36.0' }; old = @{ Alias = 'localai-old' }; vision = @{ OllamaVersion = '0.35.1' } }
+$drift = @(Get-LaiTuningDrift -Tuning $tn -OllamaVersion '0.36.0' -Keys @('main', 'fast', 'old'))
+Assert-That ((@($drift | ForEach-Object { $_.Key }) -join ',') -eq 'main' -and $drift[0].Was -eq '0.35.1') "only selected presets measured on another version count; one without a recorded version is left out ($(@($drift | ForEach-Object { $_.Key }) -join ','))"
+Assert-That (@(Get-LaiTuningDrift -Tuning $tn -OllamaVersion '').Count -eq 0 -and @(Get-LaiTuningDrift -Tuning $tn -OllamaVersion '0.35.1' -Keys @('main', 'vision')).Count -eq 0) 'Ollama not answering, or the same version: nothing to report'
+$mod = Get-Module LocalAI
+& $mod { $script:Started = ''; function script:Start-Process { param($FilePath, $ArgumentList) $script:Started = "$FilePath|$(@($ArgumentList) -join ' ')" } }
+Start-LaiOllamaApp -Path 'C:\x\ollama app.exe'
+Assert-That ((& $mod { $script:Started }) -eq 'C:\x\ollama app.exe|hidden --fast-startup') "the tray app is started hidden (no Ollama window over a game) and without installing a pending update ($(& $mod { $script:Started }))"
+Import-Module (Join-Path (Join-Path $src 'lib') 'LocalAI.psm1') -Force
+
+Write-Host "`n=== SearXNG: an empty search names each failed engine and the fix ===" -ForegroundColor Cyan
+$sxAll = '{"query":"x","results":[],"unresponsive_engines":[["brave","Suspended: too many requests"],["duckduckgo","Suspended: CAPTCHA"],["google cse","parsing error"]]}' | ConvertFrom-Json
+$dg = ConvertTo-LaiSearxngDiagnosis -Response $sxAll
+Assert-That ($dg.Count -eq 0 -and @($dg.Engines).Count -eq 3 -and (@($dg.Engines) -join '; ') -match 'duckduckgo: Suspended: CAPTCHA') "every failed engine is named with its reason ($(@($dg.Engines) -join '; '))"
+Assert-That ((@($dg.Broken) -join ',') -eq 'google cse' -and $dg.Hint -match '-SearxngVersion' -and $dg.Hint -match 'google cse') "a parsing error points at a SearXNG update and names the engine ($($dg.Hint))"
+$dg1 = ConvertTo-LaiSearxngDiagnosis -Response ('{"results":[],"unresponsive_engines":[["brave","Suspended: too many requests"]]}' | ConvertFrom-Json)
+Assert-That (@($dg1.Engines).Count -eq 1 -and (@($dg1.Blocked) -join ',') -eq 'brave' -and $dg1.Hint -match 'wait' -and $dg1.Hint -notmatch 'SearxngVersion') "one rate-limited engine: wait, no update advice ($($dg1.Hint))"
+$dg2 = ConvertTo-LaiSearxngDiagnosis -Response ('{"results":[{"url":"https://a.example"},{"url":"https://b.example"}],"unresponsive_engines":[]}' | ConvertFrom-Json)
+Assert-That ($dg2.Count -eq 2 -and @($dg2.Engines).Count -eq 0) 'results counted when the search works'
+# A site that answered but refused (SearXNG's 'server API error' / 'HTTP error') is not a connection problem.
+$dg3 = ConvertTo-LaiSearxngDiagnosis -Response ('{"results":[],"unresponsive_engines":[["mojeek","server API error"],["qwant","Suspended: HTTP error"]]}' | ConvertFrom-Json)
+Assert-That ((@($dg3.Refused) -join ',') -eq 'mojeek,qwant' -and $dg3.Hint -match 'mojeek, qwant answered but refused' -and $dg3.Hint -notmatch 'internet connection') "a refused search names the engines and does not blame the connection ($($dg3.Hint))"
+# Results, but some engines failing: the PASS text still names them (a CAPTCHA wave starts that way).
+$dg4 = ConvertTo-LaiSearxngDiagnosis -Response ('{"results":[{"url":"https://a.example"}],"unresponsive_engines":[["duckduckgo","Suspended: CAPTCHA"]]}' | ConvertFrom-Json)
+Assert-That ($dg4.Summary -eq '1 results (not answering: duckduckgo: Suspended: CAPTCHA)') "results with a failing engine: the summary names it ($($dg4.Summary))"
+Assert-That ($dg2.Summary -eq '2 results' -and $dg1.Summary -match '^no results \(brave: Suspended: too many requests\) - brave is rate-limiting') "summary without failures, and for an empty search ($($dg1.Summary))"
+# Open WebUI's search empty while SearXNG finds pages: Open WebUI keeps only pages its web loader fetched.
+Assert-That ($dg4.WebUIHint -match 'SearXNG itself finds 1 results, so Open WebUI could not use them' -and $dg4.WebUIHint -match 'web loader' -and $dg1.WebUIHint -match 'brave') "Open WebUI empty but SearXNG not: points at Open WebUI's web loader settings ($($dg4.WebUIHint))"
+# The probe right after an update recreated the container: the port answers before SearXNG does.
+$mod = Get-Module LocalAI
+& $mod {
+    $script:SxCalls = @(); $script:SxAnswer = $null; $script:SxRefuse = $false
+    function script:Invoke-LaiApi {
+        param($Method, $Uri, $Body, $Token, $TimeoutSec)
+        $null = $Method, $Body, $Token, $TimeoutSec
+        $script:SxCalls += [string]$Uri
+        # Nothing listening at all (the container is not running).
+        if ($script:SxRefuse) { throw (New-Object System.Net.Sockets.SocketException 10061) }
+        # Starting: the first /healthz (and any search before it answers) gets a dropped connection.
+        $ready = @($script:SxCalls | Where-Object { $_ -like '*/healthz' }).Count -ge 2
+        if (-not $ready) { throw 'The underlying connection was closed: An unexpected error occurred on a receive.' }
+        if ([string]$Uri -like '*/healthz') { return 'OK' }
+        return $script:SxAnswer
+    }
+    $script:SxAnswer = '{"results":[{"url":"https://a.example"}],"unresponsive_engines":[]}' | ConvertFrom-Json
+}
+$sxp = $null; $sxErr = ''
+try { $sxp = Get-LaiSearxngProbe -BaseUrl 'http://127.0.0.1:8888' -WaitSec 20 } catch { $sxErr = $_.Exception.Message }
+$sxCalls = @(& $mod { $script:SxCalls })
+Assert-That ($null -ne $sxp -and $sxp.Count -eq 1 -and ($sxCalls -join ' ') -match 'healthz.*healthz.*search\?format=json') "a SearXNG still starting is waited for (/healthz), not reported as down ($sxErr; $($sxCalls -join ' '))"
+& $mod { $script:SxCalls = @('x/healthz'); $script:SxAnswer = 'Not JSON at all' }
+$sxErr = ''
+try { Get-LaiSearxngProbe -BaseUrl 'http://127.0.0.1:8888' -WaitSec 20 | Out-Null } catch { $sxErr = $_.Exception.Message }
+Assert-That ($sxErr -match 'did not answer with JSON') "a SearXNG that answers without JSON is an error naming the settings.yml fix ($sxErr)"
+& $mod { $script:SxCalls = @(); $script:SxRefuse = $true }
+$sxErr = ''
+try { Get-LaiSearxngProbe -BaseUrl 'http://127.0.0.1:8888' -WaitSec 60 -RefusedSec 0 | Out-Null } catch { $sxErr = $_.Exception.Message }
+$sxCalls = @(& $mod { $script:SxCalls })
+Assert-That ($sxErr -match 'not answering' -and ($sxCalls -join ' ') -eq 'http://127.0.0.1:8888/healthz') "nothing listening: reported at once, not after the full wait ($sxErr; $($sxCalls -join ' '))"
+Import-Module (Join-Path (Join-Path $src 'lib') 'LocalAI.psm1') -Force
+
+Write-Host "`n=== Update-Models: what to do after a model could not be set up ===" -ForegroundColor Cyan
+$adv = @(Get-LaiModelSetupAdvice -Why 'm could not be loaded at any context (last error: this model may be incompatible with your version of Ollama)' -Display 'Main' -Key 'main' -Changed -HasPrevious) -join ' | '
+Assert-That ($adv -match 'Update-Models\.ps1 -UpdateOllama' -and $adv -match 'Update-Models\.ps1 -Rollback main') "a new download this Ollama cannot load: a newer Ollama, or -Rollback ($adv)"
+$adv = @(Get-LaiModelSetupAdvice -Why 'cudaMalloc failed: out of memory' -Display 'Main' -Key 'main' -HasPrevious) -join ' | '
+Assert-That ($adv -notmatch 'Rollback' -and $adv -match 'close ComfyUI') "a re-check after an Ollama update (model unchanged, an old -prev still there): no -Rollback; out of memory names the GPU programs ($adv)"
+$adv = @(Get-LaiModelSetupAdvice -Why 'connection refused' -Display 'Main' -Key 'main') -join ' | '
+Assert-That ($adv -match 'run Update-Models\.ps1 again' -and $adv -notmatch 'Rollback') "anything else: run it again ($adv)"
+
 Write-Host "`n=== Open WebUI setup: settings are read back; optional steps only warn ===" -ForegroundColor Cyan
 $cmp = @(Compare-LaiConfig -Expected @{ A = $true; N = 2000; S = 'searxng'; web = @{ U = 'http://x/?q=<query>'; C = 5 } } `
     -Actual ([pscustomobject]@{ A = $true; N = [long]2000; S = 'searxng'; web = [pscustomobject]@{ U = 'http://x/?q=<query>'; C = 5 } }))
@@ -638,7 +767,11 @@ $mod = Get-Module LocalAI
 & $mod {
     $script:FakeAdmin = @{ ENABLE_SIGNUP = $true; ENABLE_MEMORIES = $false; ENABLE_MEMORY_SYSTEM_CONTEXT = $false; ENABLE_COMMUNITY_SHARING = $true; OTHER = 'kept' }
     $script:DropSignup = $false; $script:OldTopK = $null; $script:RagThrows = $false; $script:Rag = @{}; $script:Kbs = @()
+    $script:NullKey = $null; $script:RagSent = @{}; $script:UserParams = $null
     function script:Invoke-LaiApi { param($Method, $Uri, $Body, $Token, $TimeoutSec) $null = $Token, $TimeoutSec
+        # The context-override lookup at the end of the setup (read-only).
+        if ($Uri -like '*/api/v1/users/user/settings') { return [pscustomobject]@{ ui = [pscustomobject]@{ params = $script:UserParams } } }
+        if ($Uri -like '*/api/v1/configs/models') { return [pscustomobject]@{ DEFAULT_MODEL_PARAMS = $null } }
         if ($Uri -notlike '*/api/v1/auths/admin/config') { throw "unexpected call $Uri" }
         if ($Method -eq 'POST') { foreach ($k in @($Body.Keys)) { if (-not ($script:DropSignup -and $k -eq 'ENABLE_SIGNUP')) { $script:FakeAdmin[$k] = $Body[$k] } } }
         return [pscustomobject]$script:FakeAdmin }
@@ -649,8 +782,10 @@ $mod = Get-Module LocalAI
     function script:Set-LaiWebUIModelsConfig { param($BaseUrl, $Token, $DefaultModel, $Order) $null = $BaseUrl, $Token, $DefaultModel, $Order }
     function script:Set-LaiWebUIRetrievalConfig { param($BaseUrl, $Token, $Settings) $null = $BaseUrl, $Token
         if ($script:RagThrows) { throw 'HTTP 500 Internal Server Error' }
+        $script:RagSent = ConvertTo-LaiHashtable $Settings
         $script:Rag = ConvertTo-LaiHashtable $Settings
-        if ($null -ne $script:OldTopK) { $script:Rag['TOP_K'] = $script:OldTopK } }
+        if ($null -ne $script:OldTopK) { $script:Rag['TOP_K'] = $script:OldTopK }
+        if ($script:NullKey) { $script:Rag[$script:NullKey] = $null } }
     function script:Get-LaiWebUIRetrievalConfig { param($BaseUrl, $Token) $null = $BaseUrl, $Token; [pscustomobject]$script:Rag }
     function script:Add-LaiWebUIKnowledge { param($BaseUrl, $Token, $Name, $Description) $null = $BaseUrl, $Token, $Description
         if ($Name -eq 'Rejected') { throw 'HTTP 400 Bad Request' }
@@ -665,7 +800,20 @@ Assert-That ((@(& $mod { $script:Kbs }) -join ',') -eq 'Notes') 'the collections
 & $mod { $script:OldTopK = 3; $script:Kbs = @() }
 $w = @(Invoke-LaiWebUISetup @setupArgs)
 Assert-That (@($w | Where-Object { $_ -like '*TOP_K: wanted 5, got 3*' }).Count -eq 1) "a RAG setting the server did not keep is reported by name ($($w -join ' | '))"
-& $mod { $script:OldTopK = $null; $script:RagThrows = $true }
+# Context budget: full-size images re-sent every turn overflow Local Vision's 32K after ~7 photos, and
+# one uncapped fetched page fills Fast/Vision so Ollama silently drops the user's question.
+& $mod { $script:OldTopK = $null; $script:NullKey = 'FILE_IMAGE_COMPRESSION_WIDTH' }
+$w = @(Invoke-LaiWebUISetup @setupArgs)
+$sent = & $mod { $script:RagSent }
+Assert-That ($sent['FILE_IMAGE_COMPRESSION_WIDTH'] -eq 1920 -and $sent['FILE_IMAGE_COMPRESSION_HEIGHT'] -eq 1920) "attached images are scaled to fit 1920 px (sent: $($sent['FILE_IMAGE_COMPRESSION_WIDTH']) x $($sent['FILE_IMAGE_COMPRESSION_HEIGHT']))"
+$fetchCap = 0; if ($sent['web'] -is [hashtable] -and $null -ne $sent['web']['WEB_FETCH_MAX_CONTENT_LENGTH']) { $fetchCap = [int]$sent['web']['WEB_FETCH_MAX_CONTENT_LENGTH'] }
+Assert-That ($fetchCap -gt 0 -and $fetchCap -le 40000) "a page the model fetches is capped at about 10K tokens or less (sent: $fetchCap characters)"
+Assert-That (@($w | Where-Object { $_ -like '*FILE_IMAGE_COMPRESSION_WIDTH: wanted 1920, got nothing*' }).Count -eq 1) "an Open WebUI that does not keep the image scaling is reported by name ($($w -join ' | '))"
+# A context set in the user's own Settings wins over the tuned alias: the install report names it.
+& $mod { $script:NullKey = $null; $script:UserParams = [pscustomobject]@{ num_ctx = 8192 } }
+$w = @(Invoke-LaiWebUISetup @setupArgs)
+Assert-That (@($w | Where-Object { $_ -like '*overrides the tuned context in your Settings*num_ctx 8192*' }).Count -eq 1) "a context override in the user's Settings is in the install report ($($w -join ' | '))"
+& $mod { $script:UserParams = $null; $script:RagThrows = $true }
 $w = @(Invoke-LaiWebUISetup @setupArgs)
 Assert-That (@($w | Where-Object { $_ -like 'Documents/web search settings failed (HTTP 500*' }).Count -eq 1) 'a failing RAG update is a warning, and the setup carries on'
 & $mod { $script:RagThrows = $false; $script:DropSignup = $true; $script:FakeAdmin['ENABLE_SIGNUP'] = $true }
@@ -695,6 +843,123 @@ $mod = Get-Module LocalAI
 }
 $chg = Set-LaiWebUIOllamaUrl -Token 't' -OllamaUrl 'http://render-guard:11434'
 Assert-That (-not $chg -and (& $mod { $script:Posts }) -eq 0) "a renamed connection list is left alone, not overwritten with ours alone (the user's connections would be deleted)"
+Import-Module (Join-Path (Join-Path $src 'lib') 'LocalAI.psm1') -Force
+
+Write-Host "`n=== presets: Think and image generation stay the user's; context overrides, vision and images are checked ===" -ForegroundColor Cyan
+# Open WebUI 0.11.4 re-applies a preset's think over the per-chat Chat Controls switch, so the preset is
+# the only place to turn Local Fast's reasoning on: a re-run must not switch it off again.
+$fastEntry = @{ Preset = 'local-fast'; Alias = 'localai-fast'; Display = 'Local Fast'; Description = 'd'; Vision = $false; Think = $false; Trial = $false }
+$fastForm = New-LaiPresetForm -Entry $fastEntry -NativeTools $true -SystemPrompt 'sys'
+Assert-That ($fastForm.params['think'] -eq $false -and $fastForm.meta.capabilities['image_generation'] -eq $false) 'a new preset starts with Think = $false (catalog) and image generation off'
+$userFast = [pscustomobject]@{ id = 'local-fast'; name = 'Local Fast'; base_model_id = 'localai-fast:latest'; params = [pscustomobject]@{ think = $true; system = 'old' }
+    meta = [pscustomobject]@{ capabilities = [pscustomobject]@{ image_generation = $true; code_interpreter = $true }; builtinTools = [pscustomobject]@{ image_generation = $true; code_interpreter = $true } } }
+$mFast = Merge-LaiPresetForm -Managed $fastForm -Existing $userFast
+Assert-That ($mFast.params['think'] -eq $true -and $mFast.params['system'] -eq 'sys') "Think turned on in the preset survives a re-run (think=$($mFast.params['think'])), the system prompt is still refreshed"
+Assert-That ($mFast.meta.capabilities['image_generation'] -eq $true -and $mFast.meta.builtinTools['image_generation'] -eq $true) 'image generation the user switched on (ComfyUI hookup) survives a re-run'
+Assert-That ($mFast.meta.capabilities['code_interpreter'] -eq $false -and $mFast.meta.builtinTools['code_interpreter'] -eq $false) 'code execution is still forced off'
+$resetFast = [pscustomobject]@{ id = 'local-fast'; name = 'Local Fast'; params = [pscustomobject]@{ think = $null }; meta = [pscustomobject]@{} }
+$mReset = Merge-LaiPresetForm -Managed $fastForm -Existing $resetFast
+Assert-That ($mReset.params['think'] -eq $false) 'a preset whose Think was set back to Default gets the catalog value again'
+$catData = Import-PowerShellDataFile -Path (Join-Path (Join-Path $src 'config') 'models.psd1')
+$promise = @($catData.Models | Where-Object { $_.Think -eq $false -and $_.Description -match '(?i)chat controls' -and $_.Description -notmatch '(?i)cannot' } | ForEach-Object { $_.Key })
+Assert-That ($promise.Count -eq 0) "no catalog entry with Think = `$false promises a Chat Controls switch that the preset overrides ($($promise -join ', '))"
+$readme = Get-Content -LiteralPath (Join-Path $src 'README.md') -Raw -Encoding UTF8
+Assert-That ($readme -notmatch '(?i)turn it back on per chat|turn it on in Chat Controls') 'the README does not promise a per-chat Think switch'
+# The measured speeds are for a nearly empty context; a row that quotes tok/s without saying so
+# sends a normal long-chat slowdown to the VRAM-spilling fixes.
+$header = ''; $inTable = $false; $speedRows = @()
+foreach ($line in ($readme -split "`n")) {
+    $isRow = $line -match '^\s*\|'
+    if ($isRow -and -not $inTable) { $header = $line }
+    $inTable = $isRow
+    if ($isRow -and $line -match 'tok/s' -and ($line + ' ' + $header) -notmatch '(?i)short prompt|short chat|long chat') { $speedRows += $line.Trim() }
+}
+Assert-That ($speedRows.Count -eq 0) "every README table row with a tok/s figure says what chat length it applies to ($($speedRows -join ' || '))"
+
+$need = @('Test-LaiPresetVision', 'Test-LaiWebUIVision', 'Get-LaiContextOverride', 'Get-LaiRagWanted')
+$missingFn = @($need | Where-Object { -not (Get-Command $_ -ErrorAction SilentlyContinue) })
+Assert-That ($missingFn.Count -eq 0) "the module has the vision, image and context-override checks ($($missingFn -join ', ') missing)"
+$tlText = Get-Content -LiteralPath (Join-Path $src 'Test-LocalAI.ps1') -Raw -Encoding UTF8
+Assert-That (@($need | Where-Object { $tlText -notmatch $_ }).Count -eq 0) 'Test-LocalAI uses all four (image read for Vision presets, preset vision against Ollama, context overrides, every installer RAG setting)'
+# A rollback hint must say which model: typed bare, Update-Models.ps1 -Rollback stops with "Missing an
+# argument for parameter 'Rollback'" (a catalog key, 'all', or a placeholder the code fills in).
+$rbKeys = @($catData.Models | ForEach-Object { $_.Key }) + @('all')
+$rbBad = @()
+$rbFiles = @(Get-ChildItem -LiteralPath $src -File | Where-Object { $_.Extension -in '.ps1', '.md' -and $_.Name -ne 'IMPROVEMENTS.md' }) + @(Get-Item -LiteralPath (Join-Path (Join-Path $src 'lib') 'LocalAI.psm1'))
+foreach ($f in $rbFiles) {
+    foreach ($rm in [regex]::Matches((Get-Content -LiteralPath $f.FullName -Raw -Encoding UTF8), 'Update-Models\.ps1 -Rollback(?::|[ \t]+)?([^\s,;)`|]*)')) {
+        $rv = $rm.Groups[1].Value
+        if (-not ($rbKeys -contains $rv -or $rv -match '^(\$|\{\d+\}|<)')) { $rbBad += "$($f.Name): $($rm.Value)" }
+    }
+}
+Assert-That ($rbBad.Count -eq 0) "every Update-Models.ps1 -Rollback hint names the model to roll back ($($rbBad -join ' | '))"
+if ($missingFn.Count -eq 0) {
+    Assert-That ((Test-LaiPresetVision -PresetVision $true -Capabilities @('completion', 'tools')) -eq 'missing') 'a preset that accepts images for a model without vision is found'
+    Assert-That ((Test-LaiPresetVision -PresetVision $false -Capabilities @('completion', 'vision')) -eq 'unused') 'a model that reads images behind a preset that refuses them is found'
+    Assert-That ((Test-LaiPresetVision -PresetVision $true -Capabilities @('vision')) -eq 'ok' -and (Test-LaiPresetVision -PresetVision $false -Capabilities @()) -eq 'ok') 'matching vision settings are ok'
+    $mod = Get-Module LocalAI
+    & $mod {
+        $script:Planted = $true; $script:LastBody = $null; $script:VisionAnswer = ''
+        function script:Invoke-LaiApi { param($Method, $Uri, $Body, $Token, $TimeoutSec) $null = $Method, $Token, $TimeoutSec
+            if ($Uri -like '*/api/chat/completions') {
+                $script:LastBody = $Body
+                return [pscustomobject]@{ choices = @([pscustomobject]@{ message = [pscustomobject]@{ content = $script:VisionAnswer } }) }
+            }
+            if (-not $script:Planted) {
+                if ($Uri -like '*/api/v1/models/model*') { return [pscustomobject]@{ name = 'Local Main'; params = [pscustomobject]@{ temperature = 0.3 } } }
+                return [pscustomobject]@{ ui = [pscustomobject]@{ params = [pscustomobject]@{ temperature = 0.5 } } }
+            }
+            if ($Uri -like '*/api/v1/users/user/settings') { return [pscustomobject]@{ ui = [pscustomobject]@{ params = [pscustomobject]@{ num_ctx = 8192 } } } }
+            if ($Uri -like '*/api/v1/configs/models') { return [pscustomobject]@{ DEFAULT_MODELS = 'local-main'; DEFAULT_MODEL_PARAMS = [pscustomobject]@{ custom_params = [pscustomobject]@{ num_ctx = '16384' } } } }
+            if ($Uri -like '*id=local-main') { return [pscustomobject]@{ name = 'Local Main'; params = [pscustomobject]@{ num_batch = 256; temperature = 0.3 } } }
+            if ($Uri -like '*id=local-fast') { return [pscustomobject]@{ name = 'Local Fast'; params = [pscustomobject]@{ num_ctx = $null } } }
+            throw "unexpected call $Uri" }
+    }
+    $over = @(Get-LaiContextOverride -Token 't' -PresetIds @('local-main', 'local-fast'))
+    Assert-That ($over.Count -eq 3 -and $over[0] -match 'Settings > General.*num_ctx 8192' -and $over[1] -match 'default parameters.*num_ctx 16384' -and $over[2] -match 'Local Main.*num_batch 256') "num_ctx/num_batch in the user's settings, the default parameters (custom) and a preset are each named ($($over -join ' | '))"
+    & $mod { $script:Planted = $false }
+    $over = @(Get-LaiContextOverride -Token 't' -PresetIds @('local-main'))
+    Assert-That ($over.Count -eq 0) "no override in a clean Open WebUI ($($over -join ' | '))"
+    # The image check: the request has the browser's shape, and each embedded test image really is
+    # the colour the check asks for (decoded here: PNG chunks, zlib, first pixel).
+    foreach ($colour in 'red', 'green', 'blue') {
+        & $mod { param($c) $script:VisionAnswer = "It is $c." } $colour
+        $v = Test-LaiWebUIVision -Token 't' -Model 'local-vision' -Colour $colour
+        $sentBody = & $mod { $script:LastBody }
+        $parts = @($sentBody['messages'][0]['content'])
+        $url = ''; $shapeOk = $false
+        try {
+            if ($parts.Count -eq 2 -and $parts[0] -is [hashtable] -and $parts[1] -is [hashtable] -and $parts[1]['image_url']) { $url = [string]$parts[1]['image_url']['url'] }
+            $shapeOk = $parts[0]['type'] -eq 'text' -and $parts[1]['type'] -eq 'image_url' -and $url.StartsWith('data:image/png;base64,')
+        } catch { $shapeOk = $false }
+        Assert-That ($v.Passed -and $shapeOk) "the $colour test image is sent as a text part plus an image_url data URI, and a correct answer passes"
+        $rgb = @(); $sigOk = $false
+        try {
+            $png = [Convert]::FromBase64String($url.Substring('data:image/png;base64,'.Length))
+            $sigOk = ($png.Length -gt 8 -and $png[0] -eq 0x89 -and $png[1] -eq 0x50 -and $png[2] -eq 0x4E -and $png[3] -eq 0x47)
+            $pos = 8; $idat = $null
+            while ($pos + 8 -le $png.Length) {
+                $len = ([int]$png[$pos] -shl 24) -bor ([int]$png[$pos + 1] -shl 16) -bor ([int]$png[$pos + 2] -shl 8) -bor [int]$png[$pos + 3]
+                $type = [System.Text.Encoding]::ASCII.GetString($png, $pos + 4, 4)
+                if ($type -eq 'IDAT') { $idat = New-Object byte[] $len; [Array]::Copy($png, $pos + 8, $idat, 0, $len) }
+                $pos += 12 + $len
+            }
+            $ms = New-Object System.IO.MemoryStream -ArgumentList (, $idat)
+            $ms.Position = 2   # zlib header
+            $ds = New-Object System.IO.Compression.DeflateStream -ArgumentList $ms, ([System.IO.Compression.CompressionMode]::Decompress)
+            $px = New-Object byte[] 4; $got = 0
+            while ($got -lt 4) { $n = $ds.Read($px, $got, 4 - $got); if ($n -le 0) { break }; $got += $n }
+            $ds.Dispose()
+            $rgb = @([int]$px[1], [int]$px[2], [int]$px[3])
+        } catch { Write-Host "  (PNG decode failed: $($_.Exception.Message))" }
+        $want = @{ red = 0; green = 1; blue = 2 }[$colour]
+        $isColour = $rgb.Count -eq 3 -and @(0, 1, 2 | Where-Object { $_ -ne $want -and $rgb[$_] -ge $rgb[$want] }).Count -eq 0 -and $rgb[$want] -ge 128
+        Assert-That ($sigOk -and $isColour) "the embedded $colour test image is a valid PNG of that colour (first pixel RGB $($rgb -join ','))"
+    }
+    & $mod { $script:VisionAnswer = 'I cannot see any image in your message.' }
+    $v = Test-LaiWebUIVision -Token 't' -Model 'local-vision'
+    Assert-That (-not $v.Passed -and @('red', 'green', 'blue') -contains $v.Expected) "an answer without the colour fails the check (expected $($v.Expected))"
+}
 Import-Module (Join-Path (Join-Path $src 'lib') 'LocalAI.psm1') -Force
 # A moved endpoint: Open WebUI answers any unknown path with its web page (status 200).
 $htmlPort = Get-Random -Minimum 41000 -Maximum 49000
@@ -808,6 +1073,135 @@ if ($onWindows) {
     Assert-That ($res.Text -match [regex]::Escape($jose)) "a path with an accent comes back intact ($($res.Text))"
     Assert-That ([Console]::OutputEncoding.CodePage -eq $encBefore) 'the console encoding is restored afterwards'
 } else { Skip 'console code pages exist on Windows only' }
+
+Write-Host "`n=== other hardware: GPU size, several GPUs, no NVIDIA GPU, RAM ===" -ForegroundColor Cyan
+Import-Module (Join-Path (Join-Path $src 'lib') 'LocalAI.psm1') -Force
+# The owner's card must keep passing: every model of the real catalog fits a 24 GB RTX 3090.
+$realCatalog = Get-LaiCatalog -Path (Join-Path (Join-Path $src 'config') 'models.psd1') -IncludeTrials
+foreach ($cm in $realCatalog.Models) {
+    Assert-That (Test-LaiModelFitsVram -DownloadGB $cm.DownloadGB -TotalMiB 24576) "$($cm.Display) ($($cm.DownloadGB) GB) fits a 24 GB card"
+}
+$mainGB = @($realCatalog.Models | Where-Object { $_.Key -eq 'main' })[0].DownloadGB
+$fastGB = @($realCatalog.Models | Where-Object { $_.Key -eq 'fast' })[0].DownloadGB
+Assert-That (-not (Test-LaiModelFitsVram -DownloadGB $mainGB -TotalMiB 16376)) 'Local Main does not fit a 16 GB RTX 4080 (refused before its download)'
+Assert-That (Test-LaiModelFitsVram -DownloadGB $fastGB -TotalMiB 16376) 'Local Fast fits a 16 GB card'
+Assert-That (-not (Test-LaiModelFitsVram -DownloadGB $fastGB -TotalMiB 8192)) 'Local Fast does not fit an 8 GB card'
+# Two GPUs: nvidia-smi lists them in PCI order, often the small display card first. A stand-in
+# nvidia-smi inside the module: an alias (Get-Command finds it before any real one) for a function
+# with an approved verb, so PSScriptAnalyzer's PSUseApprovedVerbs stays quiet.
+$smiLines = @('NVIDIA GeForce RTX 3060, 617.14, 12288, 3900, 8388', 'NVIDIA GeForce RTX 3090, 617.14, 24576, 300, 24276')
+$mod = Get-Module LocalAI
+& $mod { function script:Get-FakeNvidiaSmiOutput { $script:LASTEXITCODE = $script:FakeSmiCode; $script:FakeSmi }; Set-Alias -Name nvidia-smi -Value Get-FakeNvidiaSmiOutput -Scope Script }
+foreach ($order in @(@(0, 1), @(1, 0))) {
+    $twoCards = @($smiLines[$order[0]], $smiLines[$order[1]])
+    & $mod { param($Lines) $script:FakeSmi = $Lines; $script:FakeSmiCode = 0 } $twoCards
+    $g2 = Get-LaiGpuInfo
+    Assert-That ($g2 -and $g2.Name -eq 'NVIDIA GeForce RTX 3090' -and $g2.TotalMiB -eq 24576 -and $g2.Count -eq 2 -and @($g2.All).Count -eq 2) "two GPUs ($($twoCards[0].Split(',')[0]) listed first): the 24 GB card is the one measured ($($g2.Name), count $($g2.Count))"
+    $idle = $null
+    try { $idle = Wait-LaiGpuIdle -MaxUsedMiB 3500 -TimeoutSec 0 -PollSec 0 } catch { $idle = $null }
+    Assert-That ($idle -and $idle.UsedMiB -eq 300) 'a busy display card does not make the GPU-idle wait time out'
+}
+& $mod { $script:FakeSmi = @('No devices were found'); $script:FakeSmiCode = 6 }
+Assert-That ($null -eq (Get-LaiGpuInfo)) "nvidia-smi without a GPU ('No devices were found', exit 6) reads as no GPU"
+Import-Module (Join-Path (Join-Path $src 'lib') 'LocalAI.psm1') -Force
+$msg = Get-LaiNoNvidiaMessage -VideoControllers @('AMD Radeon RX 7900 XTX', 'Microsoft Basic Display Adapter') -Architecture 'AMD64'
+Assert-That ($msg -match 'AMD Radeon RX 7900 XTX' -and $msg -match '24 GB' -and $msg -notmatch 'nvidia\.com/Download') "an AMD card is named, not blamed on a broken NVIDIA driver ($msg)"
+$msg = Get-LaiNoNvidiaMessage -VideoControllers @('Qualcomm(R) Adreno(TM) X1-85 GPU') -Architecture 'ARM64'
+Assert-That ($msg -match 'ARM' -and $msg -notmatch 'nvidia\.com/Download') "an ARM64 PC is told so ($msg)"
+$msg = Get-LaiNoNvidiaMessage -VideoControllers @('NVIDIA GeForce RTX 3090') -Architecture 'AMD64'
+Assert-That ($msg -match 'nvidia\.com/Download' -and $msg -match 'RTX 3090') 'an NVIDIA card Windows lists but nvidia-smi does not: the driver advice stays'
+Assert-That ((Get-LaiVirtualizationHint -Manufacturer 'GenuineIntel') -match 'VT-x' -and (Get-LaiVirtualizationHint -Manufacturer 'GenuineIntel') -notmatch 'SVM') 'an Intel PC is told to enable VT-x, not SVM Mode'
+Assert-That ((Get-LaiVirtualizationHint -Manufacturer 'AuthenticAMD') -match 'SVM') 'an AMD PC is told to enable SVM Mode'
+foreach ($c in @(@{ Ram = 8; Want = $null }, @{ Ram = 16; Want = $null }, @{ Ram = 24; Want = $null }, @{ Ram = 32; Want = $null }, @{ Ram = 48; Want = 16 }, @{ Ram = 64; Want = 16 })) {
+    $cap = Get-LaiWslMemoryCapGB -TotalGB $c.Ram
+    Assert-That ($cap -eq $c.Want) "WSL memory cap for $($c.Ram) GB of RAM: $(if ($null -eq $cap) { 'WSL default (half)' } else { "$cap GB" }) (never above WSL's own default of half the RAM)"
+}
+Assert-That (-not (Test-LaiCpuFallbackFits -DownloadGB $mainGB -RamGB 16) -and (Test-LaiCpuFallbackFits -DownloadGB $mainGB -RamGB 64)) 'the render guard CPU mode: Local Main does not fit 16 GB of RAM, fits 64 GB'
+
+Write-Host "`n=== the Ollama app's own settings (server.log) ===" -ForegroundColor Cyan
+# A real Ollama 0.35.1 'server config' line (slog doubles the backslashes); the path has a space and an apostrophe.
+$cfgLine = 'time=2026-10-04T23:07:51.129Z level=INFO source=routes.go:2117 msg="server config" env="map[CUDA_VISIBLE_DEVICES: HTTPS_PROXY: OLLAMA_FLASH_ATTENTION:true OLLAMA_GPU_OVERHEAD:536870912 OLLAMA_HOST:http://127.0.0.1:11434 OLLAMA_IGPU_ENABLE:false OLLAMA_KV_CACHE_TYPE:q8_0 OLLAMA_MODELS:C:\\Users\\Jo O''Neil\\.ollama\\models OLLAMA_NOHISTORY:false OLLAMA_ORIGINS:[http://localhost https://localhost app://*] OLLAMA_REMOTES:[ollama.com] no_proxy:]"'
+$live = Get-LaiOllamaServerConfig -Line $cfgLine
+Assert-That ($live -and $live['Models'] -eq "C:\Users\Jo O'Neil\.ollama\models" -and $live['Host'] -eq 'http://127.0.0.1:11434' -and $live['HostIsLoopback']) "server config line: model folder and host read back ($($live['Models']) / $($live['Host']))"
+$live = Get-LaiOllamaServerConfig -Line ($cfgLine -replace '127\.0\.0\.1:11434', '0.0.0.0:11434')
+Assert-That ($live -and -not $live['HostIsLoopback']) "the app's 'Expose Ollama to the network' (0.0.0.0) is seen"
+Assert-That ($null -eq (Get-LaiOllamaServerConfig -Line 'time=x level=INFO msg="inference compute"')) 'another log line is not a config'
+Assert-That ((Test-LaiSamePath 'C:\Users\a\.ollama\models\' 'c:/users/A/.ollama/models') -and -not (Test-LaiSamePath 'C:\x' 'D:\x')) 'folders compare without case, slash direction or a trailing separator'
+# Ollama writes server.log as UTF-8 without a BOM and keeps a printable accent as is; Windows
+# PowerShell 5.1's Select-String would read it as ANSI and see a different (garbled) folder.
+$joseModels = 'C:\Users\Jos' + [char]0x00E9 + '\.ollama\models'
+$logDir = Join-Path $Work 'ollama-log'
+New-Item -ItemType Directory -Force -Path $logDir | Out-Null
+$logFile = Join-Path $logDir 'server.log'
+$joseLine = $cfgLine.Replace("OLLAMA_MODELS:C:\\Users\\Jo O'Neil\\.ollama\\models", 'OLLAMA_MODELS:' + $joseModels.Replace('\', '\\'))
+[System.IO.File]::WriteAllText($logFile, ("time=x level=INFO msg=`"inference compute`"`n" + $joseLine + "`n"), (New-Object System.Text.UTF8Encoding($false)))
+$live = Get-LaiOllamaLiveConfig -LogPath $logFile
+Assert-That ($joseLine -ne $cfgLine -and $live -and $live['Models'] -eq $joseModels) "server.log read as UTF-8: a user folder with an accent comes back unchanged ($(if ($live) { $live['Models'] }))"
+Assert-That ($null -eq (Get-LaiOllamaLiveConfig -LogPath (Join-Path $logDir 'missing.log'))) 'no server.log yet: no config'
+
+Write-Host "`n=== Ollama / Docker Desktop installed to a custom folder ===" -ForegroundColor Cyan
+$lad = Join-Path $Work 'lad'; $customOllama = Join-Path $Work 'D-Ollama'
+foreach ($d in @((Join-Path $lad 'Programs/Ollama'), $customOllama)) { New-Item -ItemType Directory -Force -Path $d | Out-Null }
+Set-Content -LiteralPath (Join-Path $customOllama 'ollama app.exe') -Value 'x'
+$mod = Get-Module LocalAI
+# Inno Setup records the folder chosen with OllamaSetup.exe /DIR=... under Ollama's fixed AppId.
+# No real Ollama app or docker CLI may leak in: on the owner's PC Ollama runs and Docker Desktop's
+# docker.exe is on PATH, which the locators also look at.
+& $mod { function script:Get-Process { param($Name, $ErrorAction) $null = $Name, $ErrorAction }; function script:Get-Command { param($Name, $CommandType, $ErrorAction) $null = $Name, $CommandType, $ErrorAction } }
+& $mod { param($c) $script:FakeLoc = $c; function script:Get-ItemProperty { param($Path) if ([string]$Path -like '*44E83376-CE68-45EB-8FC1-393500EB558C*' -or [string]$Path -like '*Uninstall\Docker Desktop') { return [pscustomobject]@{ InstallLocation = $script:FakeLoc } }; throw 'no such key' } } ($customOllama + [System.IO.Path]::DirectorySeparatorChar)
+Assert-That ((Find-LaiOllamaDir -LocalAppData $lad) -eq $customOllama) 'Ollama in its registered custom folder is found (no reinstall over it)'
+Remove-Item -LiteralPath (Join-Path $customOllama 'ollama app.exe')
+Assert-That ($null -eq (Find-LaiOllamaDir -LocalAppData $lad)) 'a registration whose folder has no app, and no app in the default folder: not installed'
+Assert-That ((Find-LaiOllamaDir -LocalAppData $lad -OrDefault) -eq (Join-Path $lad 'Programs\Ollama')) '-OrDefault gives the default folder to install into'
+Set-Content -LiteralPath (Join-Path (Join-Path $lad 'Programs/Ollama') 'ollama app.exe') -Value 'x'
+Assert-That ((Find-LaiOllamaDir -LocalAppData $lad) -eq (Join-Path $lad 'Programs\Ollama')) 'the default folder is used when the registered one is empty'
+Set-Content -LiteralPath (Join-Path $customOllama 'Docker Desktop.exe') -Value 'x'
+$fakePf = Join-Path $Work 'pf'
+Assert-That ((Find-LaiDockerDesktopExe -ProgramFiles $fakePf) -eq (Join-Path $customOllama 'Docker Desktop.exe')) 'Docker Desktop in its registered install folder is found'
+& $mod { function script:Get-ItemProperty { param($Path) $null = $Path; throw 'no such key' } }
+Assert-That ($null -eq (Find-LaiDockerDesktopExe -ProgramFiles $fakePf) -and (Find-LaiDockerDesktopExe -ProgramFiles $fakePf -OrDefault) -eq (Join-Path $fakePf 'Docker\Docker\Docker Desktop.exe')) 'not installed: $null, or the default path with -OrDefault'
+# No registration, but the docker CLI on PATH sits in <install folder>\resources\bin.
+& $mod { param($c) $script:FakeCli = $c; function script:Get-Command { param($Name, $CommandType, $ErrorAction) $null = $CommandType, $ErrorAction; if ($Name -eq 'docker') { [pscustomobject]@{ Source = $script:FakeCli } } } } (Join-Path (Join-Path (Join-Path $customOllama 'resources') 'bin') 'docker.exe')
+Assert-That ((Find-LaiDockerDesktopExe -ProgramFiles $fakePf) -eq (Join-Path $customOllama 'Docker Desktop.exe')) 'Docker Desktop found from the docker CLI on PATH (three folders up)'
+Import-Module (Join-Path (Join-Path $src 'lib') 'LocalAI.psm1') -Force
+
+Write-Host "`n=== the user's own OLLAMA_* values are recorded and put back ===" -ForegroundColor Cyan
+# First install (the Ollama stage never completed): every variable is recorded as it was, '' = unset.
+$savedEnv = @{}
+Assert-That (Add-LaiPrevEnv -Saved $savedEnv -Name 'OLLAMA_NUM_PARALLEL' -Current '4') "a user's own OLLAMA_NUM_PARALLEL=4 is recorded before the installer sets 1"
+Assert-That (-not (Add-LaiPrevEnv -Saved $savedEnv -Name 'OLLAMA_NUM_PARALLEL' -Current '1')) "a resumed run does not record the installer's own value over it"
+Assert-That ((Add-LaiPrevEnv -Saved $savedEnv -Name 'OLLAMA_KEEP_ALIVE' -Current '') -and (Add-LaiPrevEnv -Saved $savedEnv -Name 'OLLAMA_FLASH_ATTENTION' -Current '1')) 'an unset variable and one already equal to the installer value are recorded too'
+$plan = @(Get-LaiEnvResetPlan -Names @('OLLAMA_NUM_PARALLEL', 'OLLAMA_KEEP_ALIVE', 'OLLAMA_FLASH_ATTENTION') -Saved $savedEnv)
+Assert-That ($plan.Count -eq 3 -and $plan[0].Value -eq '4' -and $null -eq $plan[1].Value -and $plan[2].Value -eq '1') "-ResetOllamaSettings puts back 4, removes OLLAMA_KEEP_ALIVE, keeps the user's own OLLAMA_FLASH_ATTENTION=1 ($(($plan | ForEach-Object { "$($_.Name)=$($_.Value)" }) -join ', '))"
+# A later run (README: re-run with -KeepAlive 5m), and every install from before this record: the
+# current values are the installer's own, so nothing is recorded and the reset removes them.
+$savedLater = @{}
+Assert-That (-not (Add-LaiPrevEnv -Saved $savedLater -Name 'OLLAMA_KEEP_ALIVE' -Current '15m' -InstallerSetBefore) -and $savedLater.Count -eq 0) "after the first install, the installer's own OLLAMA_KEEP_ALIVE=15m is not recorded as the user's"
+$plan = @(Get-LaiEnvResetPlan -Names @('OLLAMA_KEEP_ALIVE') -Saved $savedLater)
+Assert-That ($plan.Count -eq 1 -and $null -eq $plan[0].Value) '-ResetOllamaSettings then removes OLLAMA_KEEP_ALIVE instead of setting 15m again'
+$instText = Get-Content -LiteralPath (Join-Path $src 'Install-LocalAI.ps1') -Raw -Encoding UTF8
+Assert-That ($instText -match "-InstallerSetBefore:\(\[bool\]\`$State\.stages\['Ollama'\]\)") 'the installer records only before its Ollama stage first completed'
+$ustText = Get-Content -LiteralPath (Join-Path $src 'Uninstall-LocalAI.ps1') -Raw -Encoding UTF8
+Assert-That ($ustText -match 'Get-LaiEnvResetPlan' -and $ustText -match 'prevOllamaEnv') 'Uninstall-LocalAI.ps1 restores from the recorded values instead of only deleting'
+
+Write-Host "`n=== installer port choice: a port Docker holds for another project is not this stack's ===" -ForegroundColor Cyan
+$instAst4 = [System.Management.Automation.Language.Parser]::ParseFile((Join-Path $src 'Install-LocalAI.ps1'), [ref]$null, [ref]$null)
+$sfpDef = $instAst4.Find({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Select-FreePort' }, $true)
+$portCases = @(
+    @{ Ps = @('grafana|monitoring'); Code = 0; Want = 3001; What = "another project's container" }
+    @{ Ps = @(); Code = 0; Want = 3001; What = 'a Docker/WSL listener with no container' }
+    @{ Ps = @('open-webui|localai'); Code = 0; Want = 3000; What = "this stack's own container" }
+    @{ Ps = @(); Code = 1; Want = 3000; What = 'a docker CLI that does not answer (kept, as before)' }
+)
+foreach ($pc in $portCases) {
+    $gotPort = & {
+        . ([scriptblock]::Create($sfpDef.Extent.Text))
+        function Get-PortOwner { param([int]$Port) if ($Port -eq 3000) { 'com.docker.backend' } else { $null } }
+        function Invoke-Native { param([string]$File, [string[]]$Arguments, [switch]$Capture, [switch]$AllowFail) $null = $File, $Arguments, $Capture, $AllowFail; [pscustomobject]@{ ExitCode = $pc.Code; Output = @($pc.Ps); Text = (@($pc.Ps) -join "`n") } }
+        Select-FreePort -Preferred 3000
+    }
+    Assert-That ($gotPort -eq $pc.Want) "port 3000 held by Docker for $($pc.What) -> $gotPort (want $($pc.Want))"
+}
 
 if ($failures -eq 0) { Write-Host "`nWINDOWS UNIT TESTS PASSED" -ForegroundColor Green } else { Write-Host "`nWINDOWS UNIT TESTS FAILED ($failures)" -ForegroundColor Red }
 exit $failures

@@ -101,6 +101,40 @@ try {
     $r = Invoke-Update @() $variant
     Assert-That ($r.Text -notmatch 'Ollama is now') 'nothing to re-check on the next run'
 
+    Write-Host "`n=== 2c. a re-published tag this Ollama cannot load keeps the working preset ===" -ForegroundColor Cyan
+    # LOCALAI_TEST_LOAD_FAIL makes every load of the tag fail the way Ollama reports weights it cannot
+    # read; the alias (what Open WebUI chats with) still loads, as it would on its old blobs.
+    $aliasBefore = Get-Digest $alias
+    $tunedBefore = [string](Read-LaiState -Path $stPath)['tuning']['main']['Digest']
+    $env:LOCALAI_TEST_LOAD_FAIL = $tag
+    try { $r = Invoke-Update @() $BaseModel } finally { $env:LOCALAI_TEST_LOAD_FAIL = '' }
+    Assert-That ($r.Code -ne 0 -and $r.Text -match 'could not be loaded at any context') "the run ends with an error that says the new download does not load (exit $($r.Code))"
+    Assert-That ((Get-Digest $alias) -eq $aliasBefore) 'the tuned alias was not rebuilt on the unloadable weights'
+    Assert-That ([string](Read-LaiState -Path $stPath)['tuning']['main']['Digest'] -eq $tunedBefore) 'install-state still records the version the alias was tuned on'
+    Assert-That ($r.Text -match 'Update-Models\.ps1 -UpdateOllama' -and $r.Text -match 'Update-Models\.ps1 -Rollback main') 'it names both ways out: a newer Ollama, or -Rollback main'
+    Assert-That ($r.Text -notmatch 'does not fit fully in VRAM') "no misleading 'does not fit in VRAM' warning"
+    # Fixed (here: the hook gone, as after -UpdateOllama): the next run sets it up by itself.
+    $r = Invoke-Update @() $BaseModel
+    Assert-That ($r.Code -eq 0 -and $r.Text -match 'Re-tuned') "the next run retries and re-tunes it (exit $($r.Code))"
+    # Back to the state the steps below expect: the tag on the variant, the original kept as -prev.
+    $r = Invoke-Update @() $variant
+    Assert-That ($r.Code -eq 0 -and (Get-Digest $tag) -eq (Get-Digest $variant) -and (Get-Digest $prev) -eq $original) 'setup for the next steps: tag on the variant again, original kept as -prev'
+
+    Write-Host "`n=== 2d. a failed re-check after an Ollama update does not advise -Rollback ===" -ForegroundColor Cyan
+    # Nothing was downloaded (the tag is unchanged; a -prev from the earlier update is still there):
+    # the model did not change, so swapping in that older copy would not touch the cause.
+    $st4 = Read-LaiState -Path $stPath
+    $st4['tuning']['main']['OllamaVersion'] = '0.0.1'
+    Save-LaiState -State $st4 -Path $stPath
+    $env:LOCALAI_TEST_LOAD_FAIL = $alias
+    try { $r = Invoke-Update @() $variant } finally { $env:LOCALAI_TEST_LOAD_FAIL = '' }
+    Assert-That ($r.Code -ne 0 -and $r.Text -match 'Ollama is now' -and $r.Text -match 'not set up') "the re-check fails and the run exits non-zero (exit $($r.Code))"
+    Assert-That ($r.Text -notmatch '-Rollback main' -and $r.Text -match 'Update-Models\.ps1 -UpdateOllama') 'it advises a newer Ollama, not -Rollback of a model that did not change'
+    Assert-That ((Get-Digest $prev) -eq $original -and (Get-Digest $tag) -eq (Get-Digest $variant)) 'nothing was rolled back or swapped by itself'
+    $r = Invoke-Update @() $variant
+    $st5 = Read-LaiState -Path $stPath
+    Assert-That ($r.Code -eq 0 -and [string]$st5['tuning']['main']['OllamaVersion'] -eq (Get-LaiOllamaVersion -BaseUrl $OllamaUrl)) "the next run re-checks it and records this Ollama (exit $($r.Code))"
+
     Write-Host "`n=== 3. -Rollback main ===" -ForegroundColor Cyan
     $r = Invoke-Update @('-Rollback', 'main') ''
     Assert-That ($r.Code -eq 0) "rollback exits 0 (got $($r.Code))"

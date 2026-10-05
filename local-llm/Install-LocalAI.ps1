@@ -54,9 +54,12 @@ param(
     # Ollama tuning. q8_0 halves KV-cache VRAM vs f16 at negligible quality cost, which roughly
     # doubles the context that fits next to a 19 GB model on 24 GB.
     [ValidateSet('f16', 'q8_0', 'q4_0')][string]$KvCacheType = 'q8_0',
-    # VRAM Ollama leaves untouched for the desktop/browser (keep <= 1024 or Ollama's default context drops to 4K).
+    # OLLAMA_GPU_OVERHEAD. Since Ollama's llama-server runner (0.35) it only lowers the VRAM figure
+    # Ollama picks its own default context from (keep <= 1024 or that drops to 4K); it reserves no VRAM.
+    # For more room for the desktop/browser raise -MinFreeVramMiB instead.
     [ValidateRange(0, 1024)][int]$GpuOverheadMiB = 512,
-    # The context tuner requires at least this much VRAM still free with the model loaded.
+    # The context tuner requires at least this much VRAM still free with the model loaded (the real
+    # desktop/browser margin).
     [int]$MinFreeVramMiB = 768,
     # Before loading/tuning models, wait until other programs use at most this much VRAM (desktop is ~1.5-2.5 GB).
     [int]$MaxBusyVramMiB = 3500,
@@ -179,9 +182,11 @@ $P = @{
     Report    = Join-Path $AIRoot 'install-report.md'
 }
 $OllamaUrl = 'http://127.0.0.1:11434'
-$OllamaDir = Join-Path $env:LOCALAPPDATA 'Programs\Ollama'
-$DockerExe = Join-Path $env:ProgramFiles 'Docker\Docker\Docker Desktop.exe'
-$DockerBin = Join-Path $env:ProgramFiles 'Docker\Docker\resources\bin'
+# Where Ollama and Docker Desktop really are: both can be installed to a custom folder (to save C:),
+# and running their vendor installer again over that fails. Default folders when not installed yet.
+$OllamaDir = Find-LaiOllamaDir -OrDefault
+$DockerExe = Find-LaiDockerDesktopExe -OrDefault
+$DockerBin = Join-Path (Split-Path -Parent $DockerExe) 'resources\bin'
 $ResumeTask = 'LocalAI-Install-Resume'
 $ToolkitItems = @('Install-LocalAI.ps1', 'Install-LocalAI.cmd', 'Test-LocalAI.ps1', 'Backup-OpenWebUI.ps1', 'Update-OpenWebUI.ps1', 'Release-GPU.ps1', 'Set-OpenWebUIPassword.ps1', 'Restore-OpenWebUI.ps1', 'Update-Models.ps1', 'Start-ComfyUI.ps1', 'Enable-TailscaleAccess.ps1', 'Watch-LocalAI.ps1', 'Uninstall-LocalAI.ps1', 'Stop-LocalAI.ps1', 'Start-LocalAI.ps1', 'Get-LocalAIDiagnostics.ps1', 'Get-LocalAI.ps1', 'VERSION', 'README.md', 'lib', 'config', 'stack')
 # After a reboot the resume task (not elevated) starts this copy, which asks for admin rights with a
@@ -329,6 +334,14 @@ function Start-AsUser {
     Start-Process -FilePath (Join-Path $env:WINDIR 'explorer.exe') -ArgumentList ('"{0}"' -f $Target)
 }
 
+function Start-OllamaAsUser {
+    # Explorer passes no arguments, so 'hidden' cannot be given: the Ollama window opens once, while
+    # the user watches the install. Not via Ollama's Startup\Ollama.lnk: the app treats that as a
+    # sign-in start (hidden, no --fast-startup) and installs a pending update right then, swapping
+    # Ollama in the middle of the install (the presets would be measured on the old version).
+    Start-AsUser (Join-Path $OllamaDir 'ollama app.exe')  # lai-ok: hidden
+}
+
 function Set-UserEnv {
     # Persists a user environment variable (broadcasts WM_SETTINGCHANGE) and applies it to this process.
     param([Parameter(Mandatory)][string]$Name, [AllowEmptyString()][string]$Value)
@@ -339,6 +352,25 @@ function Set-UserEnv {
     Set-Item -Path "Env:$Name" -Value $Value -ErrorAction SilentlyContinue
     if ($null -eq $Value) { Remove-Item -Path "Env:$Name" -ErrorAction SilentlyContinue }
     return $true
+}
+
+function Save-PrevUserEnv {
+    # Before the installer first writes its OLLAMA_* variables, records what each one was ('' = unset),
+    # so Uninstall -ResetOllamaSettings puts a value of the user's own back (e.g. OLLAMA_NUM_PARALLEL=4
+    # for an IDE agent) and removes only the installer's. Once the Ollama stage has completed, the
+    # values are the installer's own (an earlier -KeepAlive, an older default): nothing is recorded.
+    param([Parameter(Mandatory)][string[]]$Names)
+    $saved = @{}
+    if ($State.flags['prevOllamaEnv'] -is [hashtable]) { $saved = $State.flags['prevOllamaEnv'] }
+    $any = $false
+    foreach ($n in $Names) {
+        $cur = [Environment]::GetEnvironmentVariable($n, 'User')
+        if (Add-LaiPrevEnv -Saved $saved -Name $n -Current $cur -InstallerSetBefore:([bool]$State.stages['Ollama'])) {
+            $any = $true
+            if ($cur) { Write-LaiLog INFO "$n was '$cur' (your own setting); Uninstall-LocalAI.ps1 -ResetOllamaSettings puts it back" }
+        }
+    }
+    if ($any) { $State.flags['prevOllamaEnv'] = $saved; Save-State }
 }
 
 function Add-SessionPath {
@@ -392,6 +424,12 @@ function Get-FreeGB {
     $disk = Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='$qualifier'"
     if (-not $disk) { return 0 }
     return [Math]::Round($disk.FreeSpace / 1GB, 1)
+}
+
+function Get-OllamaLiveConfig {
+    # OLLAMA_MODELS / OLLAMA_HOST as the Ollama server last started with them (its server.log), after
+    # the tray app's own settings overrode the environment; $null when there is no such log line.
+    return (Get-LaiOllamaLiveConfig -LogPath (Join-Path $env:LOCALAPPDATA 'Ollama\server.log'))
 }
 
 function Install-App {
@@ -448,7 +486,8 @@ function Register-ResumeTask {
     }
     $scriptPath = Join-Path $ElevatedDir 'Install-LocalAI.ps1'
     $cmd = Get-RelaunchCommand -ScriptPath $scriptPath -AddResume
-    $action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument "-NoProfile -ExecutionPolicy Bypass -NoExit -Command $cmd"
+    # Visible on purpose: the resumed installer shows its progress and waits for you (-NoExit).
+    $action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument "-NoProfile -ExecutionPolicy Bypass -NoExit -Command $cmd"   # lai-ok: window
     $trigger = New-ScheduledTaskTrigger -AtLogOn -User $CurrentUser
     # Not elevated: at sign-in it starts the installer, which asks for administrator rights with a
     # normal UAC prompt (as on the first run). A task that ran the installer elevated without asking
@@ -510,12 +549,25 @@ function Get-PortOwner {
 }
 
 function Select-FreePort {
-    # Keeps the requested port if it is free or already served by Docker; otherwise the next free one.
+    # Keeps the requested port if it is free or already published by this stack's own container;
+    # otherwise the next free one. Docker's listener can also be another project's container (Grafana
+    # on 3000, Jupyter on 8888) or a WSL service: compose would then stop with "port is already allocated".
     param([int]$Preferred)
     $dockerProcs = @('com.docker.backend', 'wslrelay', 'vpnkit', 'com.docker.proxy', 'docker-proxy')
     for ($port = $Preferred; $port -lt $Preferred + 20; $port++) {
         $owner = Get-PortOwner -Port $port
-        if (-not $owner -or $dockerProcs -contains $owner) { return $port }
+        if (-not $owner) { return $port }
+        if ($dockerProcs -contains $owner) {
+            $pub = Invoke-Native -File 'docker' -Arguments @('ps', '-a', '--filter', "publish=$port", '--format', '{{.Names}}|{{.Label `com.docker.compose.project`}}') -Capture -AllowFail
+            # docker not answering: keep the port, as before (it is most likely this stack's).
+            if ($pub.ExitCode -ne 0) { return $port }
+            $users = @($pub.Output | Where-Object { $_ })
+            if (@($users | Where-Object { $_ -match '\|localai$' }).Count) { return $port }
+            $who = 'a program behind Docker/WSL'
+            if ($users.Count) { $who = 'the container ' + (@($users | ForEach-Object { ($_ -split '\|')[0] }) -join ', ') + ' (not part of this stack)' }
+            Write-LaiLog WARN "Port $port is used by $who; trying $($port + 1)."
+            continue
+        }
         Write-LaiLog WARN "Port $port is used by '$owner'; trying $($port + 1)."
     }
     throw "No free port found near $Preferred."
@@ -671,13 +723,20 @@ Invoke-Stage 'Preflight' {
 
     $gpu = Get-LaiGpuInfo
     if (-not $gpu) {
-        throw 'nvidia-smi was not found, so the NVIDIA driver is missing or broken. Install the current Game Ready driver from https://www.nvidia.com/Download/index.aspx, reboot, then re-run this script.'
+        # Say what this PC has: an AMD/Intel GPU or an ARM CPU is not a broken NVIDIA driver.
+        $videoNames = @()
+        try { $videoNames = @(Get-CimInstance Win32_VideoController | ForEach-Object { [string]$_.Name }) } catch { Write-Verbose 'video controllers not readable' }
+        throw (Get-LaiNoNvidiaMessage -VideoControllers $videoNames -Architecture ([string]$env:PROCESSOR_ARCHITECTURE))
     }
     Write-LaiLog OK "GPU: $($gpu.Name), driver $($gpu.DriverVersion), $($gpu.TotalMiB) MiB VRAM ($($gpu.FreeMiB) MiB free)"
+    if ($gpu.Count -gt 1) {
+        $gpuList = @($gpu.All | ForEach-Object { '{0} ({1} MiB)' -f $_.Name, $_.TotalMiB }) -join '; '
+        Write-LaiLog WARN ("{0} NVIDIA GPUs: {1}. The VRAM checks and the context tuning use the largest, {2}. Ollama spreads a model that does not fit in 80% of one card's free memory over all cards, which is slower; to keep it on one card, set the user environment variable CUDA_VISIBLE_DEVICES to that card's UUID (nvidia-smi -L lists them), then quit and restart Ollama." -f $gpu.Count, $gpuList, $gpu.Name)
+    }
     if ([version]$gpu.DriverVersion -lt [version]'551.61') {
         throw "NVIDIA driver $($gpu.DriverVersion) is older than 551.61, the minimum Ollama supports on Windows. Update from https://www.nvidia.com/Download/index.aspx, reboot, re-run."
     }
-    if ($gpu.TotalMiB -lt 23000) { Write-LaiLog WARN 'The model catalog is sized for a 24 GB card; the 30B models will partly run on the CPU.' }
+    if ($gpu.TotalMiB -lt 23000) { Write-LaiLog WARN "This $($gpu.Name) has $($gpu.TotalMiB) MiB of VRAM; the model catalog is sized for a 24 GB card. Models that cannot load fully on it are left out (or the install stops) before anything is downloaded." }
     if ($gpu.UsedMiB -gt 3000) {
         Write-LaiLog WARN "$($gpu.UsedMiB) MiB of VRAM is already in use (ComfyUI/Forge/games?). Close GPU-heavy apps before the context tuning step for accurate results."
     }
@@ -690,9 +749,10 @@ Invoke-Stage 'Preflight' {
         Write-LaiLog WARN "You are signed in as $($cs.UserName), but the installer runs as $CurrentUser (credentials typed at the UAC prompt). Local AI is set up for $CurrentUser. To use it from $($cs.UserName), make that account an administrator and run the installer there."
     }
     $cpu = Get-CimInstance Win32_Processor | Select-Object -First 1
-    Write-LaiLog INFO ("CPU: {0}; RAM: {1} GB" -f $cpu.Name.Trim(), [Math]::Round($cs.TotalPhysicalMemory / 1GB))
+    $ramGB = [Math]::Round($cs.TotalPhysicalMemory / 1GB)
+    Write-LaiLog INFO ("CPU: {0}; RAM: {1} GB" -f $cpu.Name.Trim(), $ramGB)
     if (-not $cs.HypervisorPresent -and -not $cpu.VirtualizationFirmwareEnabled) {
-        Write-LaiLog WARN 'CPU virtualization looks disabled in firmware. Docker needs it: enable SVM Mode (AMD) in the BIOS (Advanced > CPU Configuration).'
+        Write-LaiLog WARN ('CPU virtualization looks disabled in firmware. Docker needs it: enable ' + (Get-LaiVirtualizationHint -Manufacturer ([string]$cpu.Manufacturer)) + '.')
     }
 
     # Disk planning: decide where models go and whether the optional models fit.
@@ -705,8 +765,26 @@ Invoke-Stage 'Preflight' {
     }
     $trialKeys = @($catalogAll.Models | Where-Object { $_.Trial } | ForEach-Object { $_.Key })
     foreach ($t in $trialWanted) { if ($trialKeys -notcontains $t) { Write-LaiLog WARN "Unknown trial model '$t' (known: $($trialKeys -join ', '))" } }
+
+    # VRAM before disk: a model that cannot load fully on this card would fail the Models stage's
+    # 100%-GPU checkpoint only after its download (Fast + Main = 28 GB), on every re-run.
+    $tooBigForGpu = @()
+    foreach ($m in $catalogAll.Models) {
+        if ($m.Trial -and $trialWanted -notcontains $m.Key) { continue }
+        if (Test-LaiModelFitsVram -DownloadGB $m.DownloadGB -TotalMiB $gpu.TotalMiB) { continue }
+        if (-not $m.Optional) {
+            throw ("{0} ({1} GB) cannot load fully on this {2} ({3} MiB of VRAM): this toolkit's models are sized for a 24 GB NVIDIA card (RTX 3090/4090). Nothing was downloaded. For a smaller card the catalog has to be edited (README: Maintain > Add or swap a model)." -f $m.Display, $m.DownloadGB, $gpu.Name, $gpu.TotalMiB)
+        }
+        $tooBigForGpu += $m.Key
+    }
+
     $defaultModels = Join-Path $env:USERPROFILE '.ollama\models'
+    # User scope first (the installer's own), then a system-wide one, then the folder the running
+    # Ollama really uses (its app's Settings > Model location overrides both variables).
     $envModels = [Environment]::GetEnvironmentVariable('OLLAMA_MODELS', 'User')
+    if (-not $envModels) { $envModels = [Environment]::GetEnvironmentVariable('OLLAMA_MODELS', 'Machine') }
+    $liveCfg = Get-OllamaLiveConfig
+    if (-not $envModels -and $liveCfg -and $liveCfg['Models'] -and -not (Test-LaiSamePath $liveCfg['Models'] $defaultModels)) { $envModels = $liveCfg['Models'] }
     $target = $defaultModels
     if ($ModelDir) { $target = $ModelDir }
     elseif ($State.flags.ContainsKey('modelDir')) { $target = $State.flags['modelDir'] }
@@ -749,6 +827,7 @@ Invoke-Stage 'Preflight' {
         if ($present -contains (Resolve-LaiModelName $m.Source)) { $need = 0 }
         if ($m.Optional) {
             if (($m.Key -eq 'vision' -and $SkipVision) -or ($m.Key -eq 'code' -and $SkipCoder)) { Write-LaiLog INFO "Skipping $($m.Display) (switch, or not installed before; add it with -Skip$(if ($m.Key -eq 'vision') { 'Vision' } else { 'Coder' }):`$false)"; continue }
+            if ($tooBigForGpu -contains $m.Key) { Write-LaiLog WARN "Skipping $($m.Display): about $($m.DownloadGB) GB of weights cannot load fully on this card's $($gpu.TotalMiB) MiB of VRAM (nothing downloaded)."; continue }
             if ($need -gt 0 -and $need -gt $budget) { Write-LaiLog WARN "Skipping $($m.Display): needs $need GB, only $([Math]::Round($budget,1)) GB to spare on $target"; continue }
         } elseif ($need -gt 0 -and $need -gt $budget) {
             throw "Not enough disk space on ${target}: $($m.Display) needs $need GB plus a 15 GB margin; $freeGB GB free. Free space or pass -ModelDir <path on a bigger drive>."
@@ -758,6 +837,14 @@ Invoke-Stage 'Preflight' {
     }
     $State.flags['selectedModels'] = $selected
     Write-LaiLog OK "Models: $($selected -join ', ') -> $target ($freeGB GB free)"
+    # The render guard's CPU mode loads the whole model into RAM (Ollama turns mmap off for num_gpu 0):
+    # on a PC with little RAM such a chat pages to disk and slows the render it is meant to protect.
+    if ($RenderGuard -eq 'cpu') {
+        $ramShort = @($catalogAll.Models | Where-Object { $selected -contains $_.Key -and -not (Test-LaiCpuFallbackFits -DownloadGB $_.DownloadGB -RamGB $ramGB) } | ForEach-Object { $_.Display })
+        if ($ramShort.Count) {
+            Write-LaiLog WARN ("This PC has $ramGB GB of RAM. While ComfyUI renders, the render guard runs chats on the CPU, and $($ramShort -join ', ') need(s) about its download size plus 12 GB of RAM for that: such a chat pages to disk, crawls and slows the render. Wait for renders to finish before chatting with them; the rest of the time they run on the GPU as usual.")
+        }
+    }
     # Docker Desktop's WSL disk lives under %LOCALAPPDATA% (the profile's drive), not necessarily C:.
     $dockerDataPath = $env:SystemDrive + '\'; if ($env:LOCALAPPDATA) { $dockerDataPath = $env:LOCALAPPDATA }
     if ((Get-FreeGB $dockerDataPath) -lt 15) { Write-LaiLog WARN "Less than 15 GB free on $(Get-DriveOf $dockerDataPath); Docker images and WSL need about 10 GB there." }
@@ -802,8 +889,10 @@ $Catalog = Get-LaiCatalog -Path $CatalogPath -IncludeKeys @($State.flags['select
 Invoke-Stage 'Ollama' {
     $ollamaExe = Join-Path $OllamaDir 'ollama.exe'
     if (-not (Test-Path -LiteralPath $ollamaExe)) {
+        # Found again afterwards: winget or the vendor installer may reuse an earlier custom folder.
         Install-App -WingetId 'Ollama.Ollama' -Publisher 'Ollama' -Url 'https://ollama.com/download/OllamaSetup.exe' -FileName 'OllamaSetup.exe' `
-            -InstallerArgs @('/VERYSILENT', '/NORESTART', '/SUPPRESSMSGBOXES') -IsInstalled { Test-Path -LiteralPath $ollamaExe }
+            -InstallerArgs @('/VERYSILENT', '/NORESTART', '/SUPPRESSMSGBOXES') -IsInstalled { $d = Find-LaiOllamaDir; $d -and (Test-Path -LiteralPath (Join-Path $d 'ollama.exe')) }
+        $script:OllamaDir = Find-LaiOllamaDir -OrDefault
     }
     Add-SessionPath $OllamaDir
 
@@ -822,6 +911,9 @@ Invoke-Stage 'Ollama' {
         $settings['OLLAMA_MODELS'] = $State.flags['modelDir']
     }
     if ($State.flags['ollamaLanFallback']) { $settings['OLLAMA_HOST'] = '0.0.0.0:11434' }
+    # Every variable Uninstall -ResetOllamaSettings / -RemoveModels touches, also the two set only
+    # sometimes (OLLAMA_HOST by the Stack stage's LAN fallback, OLLAMA_MODELS by a later -ModelDir).
+    Save-PrevUserEnv -Names (@($settings.Keys) + @('OLLAMA_HOST', 'OLLAMA_MODELS') | Select-Object -Unique)
     $changed = $false
     foreach ($k in $settings.Keys) { if (Set-UserEnv -Name $k -Value $settings[$k]) { $changed = $true; Write-LaiLog INFO "set $k=$($settings[$k])" } }
 
@@ -831,11 +923,11 @@ Invoke-Stage 'Ollama' {
         Write-LaiLog INFO 'Restarting Ollama so it picks up the settings'
         Get-Process -Name 'ollama app', 'ollama', 'llama-server' -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
         Start-Sleep -Seconds 3
-        Start-AsUser (Join-Path $OllamaDir 'ollama app.exe')
+        Start-OllamaAsUser
         try { Wait-LaiHttp -Uri "$OllamaUrl/api/version" -TimeoutSec 60 | Out-Null }
         catch {
             Write-LaiLog WARN 'Ollama did not start via Explorer; starting it directly.'
-            Start-Process -FilePath (Join-Path $OllamaDir 'ollama app.exe')
+            Start-LaiOllamaApp -Path (Join-Path $OllamaDir 'ollama app.exe')
             Wait-LaiHttp -Uri "$OllamaUrl/api/version" -TimeoutSec 90 | Out-Null
         }
     }
@@ -844,25 +936,69 @@ Invoke-Stage 'Ollama' {
 
     $log = Join-Path $env:LOCALAPPDATA 'Ollama\server.log'
     if (Test-Path -LiteralPath $log) {
-        $cfgLine = Select-String -LiteralPath $log -Pattern 'msg="server config"' | Select-Object -Last 1
+        $cfgLine = Select-String -LiteralPath $log -Pattern 'msg="server config"' -Encoding UTF8 | Select-Object -Last 1
         if ($cfgLine) {
-            $ok = ($cfgLine.Line -match 'OLLAMA_FLASH_ATTENTION:true') -and ($cfgLine.Line -match "OLLAMA_KV_CACHE_TYPE:$KvCacheType")
-            if (-not $ok) {
+            # Parsed, not searched for: a key a newer Ollama no longer logs is 'unknown' (a restart
+            # cannot change that), only a key logged with another value means the settings were missed.
+            $chk = Test-LaiOllamaServerSettings -Line $cfgLine.Line -KvCacheType $KvCacheType
+            if ($chk.Status -eq 'wrong') {
                 # Explorer may not have refreshed its environment yet; this process has the new values.
-                Write-LaiLog WARN 'Ollama did not pick up the new settings; restarting it from this session.'
+                Write-LaiLog WARN "Ollama did not pick up the new settings ($($chk.Wrong -join ', ')); restarting it from this session."
                 Get-Process -Name 'ollama app', 'ollama', 'llama-server' -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
                 Start-Sleep -Seconds 3
-                Start-Process -FilePath (Join-Path $OllamaDir 'ollama app.exe')
+                Start-LaiOllamaApp -Path (Join-Path $OllamaDir 'ollama app.exe')
                 Wait-LaiHttp -Uri "$OllamaUrl/api/version" -TimeoutSec 90 | Out-Null
                 Start-Sleep -Seconds 2
-                $cfgLine = Select-String -LiteralPath $log -Pattern 'msg="server config"' | Select-Object -Last 1
-                $ok = $cfgLine -and ($cfgLine.Line -match 'OLLAMA_FLASH_ATTENTION:true') -and ($cfgLine.Line -match "OLLAMA_KV_CACHE_TYPE:$KvCacheType")
+                $cfgLine = Select-String -LiteralPath $log -Pattern 'msg="server config"' -Encoding UTF8 | Select-Object -Last 1
+                $line2 = ''; if ($cfgLine) { $line2 = $cfgLine.Line }
+                $chk = Test-LaiOllamaServerSettings -Line $line2 -KvCacheType $KvCacheType
             }
-            if ($ok) { Write-LaiLog OK "Server running with flash attention + $KvCacheType KV cache" }
-            else { Write-LaiLog WARN 'Ollama server log still does not show the new settings; sign out and in again, then re-run with -Retune.' }
+            if ($chk.Status -eq 'ok') { Write-LaiLog OK "Server running with flash attention + $KvCacheType KV cache" }
+            elseif ($chk.Status -eq 'unknown') { Write-LaiLog INFO "This Ollama no longer reports $($chk.Missing -join ', ') in server.log; the context tuning below checks the real fit and speed instead." }
+            else { Write-LaiLog WARN "Ollama server log still shows $($chk.Wrong -join ', '); sign out and in again, then re-run with -Retune." }
         }
-        $gpuLine = Select-String -LiteralPath $log -Pattern 'inference compute' | Select-Object -Last 1
+        $gpuLine = Select-String -LiteralPath $log -Pattern 'inference compute' -Encoding UTF8 | Select-Object -Last 1
         if ($gpuLine) { Write-LaiLog INFO ($gpuLine.Line -replace '^.*msg="inference compute"\s*', 'inference compute: ') }
+    }
+
+    # The Ollama app's own Settings win over the variables set above (it starts 'ollama serve' with
+    # them): Model location sends every download to a folder other than the one planned and checked
+    # for space, and 'Expose Ollama to the network' opens Ollama to the LAN.
+    $live = Get-OllamaLiveConfig
+    $missing = @()
+    if ($live -and $live['Models'] -and -not (Test-LaiSamePath $live['Models'] $State.flags['modelDir'])) {
+        $missing = @($Catalog.Models | Where-Object { -not (Test-LaiOllamaModel -BaseUrl $OllamaUrl -Name $_.Source) })
+    }
+    # Only when a download would go to the wrong folder (every model present: a warning below, Ollama
+    # keeps running). As the signed-in user first, so Ollama does not run with admin rights; from this
+    # session only if that still shows the old folder (Explorer may hand out the old OLLAMA_MODELS).
+    foreach ($how in @('user', 'session')) {
+        if (-not $missing.Count -or -not $live -or (Test-LaiSamePath $live['Models'] $State.flags['modelDir'])) { break }
+        Write-LaiLog INFO "Ollama uses $($live['Models']) for models; restarting it to apply $($State.flags['modelDir'])"
+        Get-Process -Name 'ollama app', 'ollama', 'llama-server' -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+        Start-Sleep -Seconds 3
+        # Explorer cannot pass 'hidden', so the user start may show the Ollama window once (the user is
+        # at the installer anyway); the direct start hides it.
+        if ($how -eq 'user') { Start-AsUser (Join-Path $OllamaDir 'ollama app.exe') }   # lai-ok: hidden
+        else { Start-LaiOllamaApp -Path (Join-Path $OllamaDir 'ollama app.exe') }
+        try { Wait-LaiHttp -Uri "$OllamaUrl/api/version" -TimeoutSec 90 | Out-Null }
+        catch {
+            if ($how -eq 'session') { throw }
+            Write-LaiLog WARN 'Ollama did not start via Explorer; starting it directly.'
+            continue
+        }
+        Start-Sleep -Seconds 2
+        $live = Get-OllamaLiveConfig
+    }
+    if ($live -and -not $live['HostIsLoopback'] -and -not $State.flags['ollamaLanFallback']) {
+        Write-LaiLog WARN "Ollama listens on $($live['Host']), so other devices on your network can use it; the installer did not set that. Turn off 'Expose Ollama to the network' in the Ollama app's Settings (or remove an OLLAMA_HOST variable you set), then quit and restart Ollama from the tray."
+    }
+    if ($live -and $live['Models'] -and -not (Test-LaiSamePath $live['Models'] $State.flags['modelDir'])) {
+        $why = "Ollama keeps its models in $($live['Models']), not in $($State.flags['modelDir']): the Ollama app's own Settings > Model location overrides the OLLAMA_MODELS variable."
+        if ($missing.Count) {
+            throw "$why Nothing was downloaded. Open the Ollama app > Settings and set Model location to $($State.flags['modelDir']) (or re-run the installer with -ModelDir '$($live['Models'])'), quit Ollama from the tray, then run the installer again."
+        }
+        Write-LaiLog WARN "$why Every model is already there, so nothing changes now. Set Model location in the Ollama app (or re-run the installer with -ModelDir '$($live['Models'])') so the disk checks and the health watch look at the right drive."
     }
 }
 #endregion
@@ -977,12 +1113,19 @@ Invoke-Stage 'WSL' {
     if ($wslVer -and ([version]$wslVer -lt [version]'2.1.5')) { throw "WSL $wslVer is older than 2.1.5 (Docker minimum) and 'wsl --update' did not fix it." }
     Write-LaiLog OK "WSL $wslVer"
 
-    # Cap the WSL VM so Docker's page cache cannot crowd out RAM that Ollama/ComfyUI need (only if you have no .wslconfig yet).
+    # Cap the WSL VM so Docker's page cache cannot crowd out RAM that Ollama/ComfyUI need (only if you
+    # have no .wslconfig yet). WSL's own default is half the RAM, so 16 GB is a cap only above 32 GB;
+    # on a 16 or 24 GB PC it would raise the limit, and the default is left alone there.
     $wslConfig = Join-Path $env:USERPROFILE '.wslconfig'
     if (-not (Test-Path -LiteralPath $wslConfig)) {
-        $content = "[wsl2]`r`nmemory=16GB`r`n`r`n[experimental]`r`nautoMemoryReclaim=gradual`r`n"
+        $ramGB = [Math]::Round((Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory / 1GB)
+        $capGB = Get-LaiWslMemoryCapGB -TotalGB $ramGB
+        $content = ''
+        if ($capGB) { $content = "[wsl2]`r`nmemory=${capGB}GB`r`n`r`n" }
+        $content += "[experimental]`r`nautoMemoryReclaim=gradual`r`n"
         [System.IO.File]::WriteAllText($wslConfig, $content, (New-Object System.Text.UTF8Encoding($false)))
-        Write-LaiLog OK "Created $wslConfig (WSL memory cap 16 GB, gradual reclaim)"
+        if ($capGB) { Write-LaiLog OK "Created $wslConfig (WSL memory cap $capGB GB, gradual reclaim)" }
+        else { Write-LaiLog OK "Created $wslConfig (gradual reclaim; WSL keeps its default limit of half the RAM, $([Math]::Floor($ramGB / 2)) GB)" }
     }
 }
 #endregion
@@ -992,9 +1135,11 @@ Invoke-Stage 'Docker' {
     if (-not (Test-Path -LiteralPath $DockerExe)) {
         Install-App -WingetId 'Docker.DockerDesktop' -Publisher 'Docker' -Url 'https://desktop.docker.com/win/main/amd64/Docker%20Desktop%20Installer.exe' `
             -FileName 'DockerDesktopInstaller.exe' -InstallerArgs @('install', '--quiet', '--accept-license', '--backend=wsl-2', '--always-run-service') `
-            -IsInstalled { Test-Path -LiteralPath $DockerExe }
+            -IsInstalled { [bool](Find-LaiDockerDesktopExe) }
         $State.flags['dockerInstalledAt'] = (Get-Date).ToString('s')
         Save-State
+        $script:DockerExe = Find-LaiDockerDesktopExe -OrDefault
+        $script:DockerBin = Join-Path (Split-Path -Parent $DockerExe) 'resources\bin'
     }
     Add-SessionPath $DockerBin
 
@@ -1012,6 +1157,9 @@ Invoke-Stage 'Docker' {
 
     # Start Docker Desktop at sign-in so the restart:always containers come back after reboots.
     Set-ItemProperty -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run' -Name 'Docker Desktop' -Value ('"{0}"' -f $DockerExe)
+    # Docker Desktop manages that entry itself from its own setting (off by default) and may drop it
+    # when its settings are saved; its settings file is not ours to edit while it runs, so say it.
+    Write-LaiLog INFO "Docker Desktop starts at sign-in. If you change Docker Desktop's settings later, also tick 'Start Docker Desktop when you sign in' (Settings > General), or it may stop starting by itself."
 
     if (-not (Test-DockerEngine)) {
         Write-LaiLog INFO 'Starting Docker Desktop (first start initialises its WSL VM; this can take a few minutes)'
@@ -1025,8 +1173,10 @@ Invoke-Stage 'Docker' {
             $State.flags['rebootPending'] = $false
             Request-Reboot -Reason 'Docker Desktop was installed (group membership and services need a fresh sign-in)'
         }
+        $cpuMaker = ''
+        try { $cpuMaker = [string](Get-CimInstance Win32_Processor | Select-Object -First 1).Manufacturer } catch { Write-Verbose 'CPU maker unknown' }
         throw ('Docker engine did not start. Open Docker Desktop once: accept the agreement if asked, wait for "Engine running", ' +
-            'then re-run. If it reports virtualization errors, enable SVM Mode in the BIOS.')
+            'then re-run. If it reports virtualization errors, enable ' + (Get-LaiVirtualizationHint -Manufacturer $cpuMaker) + '.')
     }
     $server = (Invoke-Native -File 'docker' -Arguments @('version', '--format', '{{.Server.Version}}') -Capture).Text
     Write-LaiLog OK "Docker engine $server"
@@ -1061,6 +1211,20 @@ Invoke-Stage 'Stack' {
     if (-not (Test-Path -LiteralPath $searxSettings)) {
         $tpl = Get-Content -Encoding UTF8 -LiteralPath (Join-Path $SourceRoot 'stack\searxng\settings.yml') -Raw
         [System.IO.File]::WriteAllText($searxSettings, $tpl.Replace('__SEARXNG_SECRET__', (New-LaiSecret)), (New-Object System.Text.UTF8Encoding($false)))
+    }
+
+    # Containers from another setup with the names this stack uses (Open WebUI's own SearXNG guide
+    # also calls its container 'searxng'): compose would stop on the clash only after the old Open
+    # WebUI below was stopped and renamed, and a re-run would no longer find that one. Checked first.
+    $clash = @()
+    foreach ($cn in @('searxng', 'render-guard')) {
+        $r = Invoke-Native -File 'docker' -Arguments @('ps', '-a', '--filter', "name=^/$cn`$", '--format', '{{.Names}}|{{.Label `com.docker.compose.project`}}') -Capture -AllowFail
+        if ($r.ExitCode -ne 0) { throw "docker ps failed: $($r.Text)" }
+        $clash += @($r.Output | Where-Object { $_ -and $_ -notmatch '\|localai$' } | ForEach-Object { ($_ -split '\|')[0] })
+    }
+    if ($clash.Count) {
+        $first = $clash[0]
+        throw ("A container named {0} from another setup is in the way: this stack's own containers need the names searxng and render-guard. No container was changed. Keep it under another name with 'docker rename {1} {1}-old' (stop it first if it uses port {2} or {3}), or remove it if you no longer need it, then run the installer again." -f ($clash -join ', '), $first, $script:WebUIPortEffective, $script:SearxngPortEffective)
     }
 
     # A container from the guide's manual "docker run" would clash with the compose-managed one.
@@ -1193,7 +1357,7 @@ Invoke-Stage 'Stack' {
         if ($switched) {
             Get-Process -Name 'ollama app', 'ollama', 'llama-server' -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
             Start-Sleep -Seconds 3
-            Start-AsUser (Join-Path $OllamaDir 'ollama app.exe')
+            Start-OllamaAsUser
             Wait-LaiHttp -Uri "$OllamaUrl/api/version" -TimeoutSec 90 | Out-Null
         }
         $r = Invoke-Native -File 'docker' -Arguments @('exec', 'open-webui', 'python', '-c', $probe) -Capture -AllowFail
@@ -1317,8 +1481,23 @@ Invoke-Stage 'Backup' {
 
     $backupScript = Join-Path $P.Scripts 'Backup-OpenWebUI.ps1'
     # -EngineWaitSec: a missed 03:30 run starts at sign-in, while Docker Desktop may need several minutes.
-    $action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument (Get-LaiScriptCommandLine -ScriptPath $backupScript -AIRoot $AIRoot -Extra '-EngineWaitSec 1200' -Hidden)
-    $trigger = New-ScheduledTaskTrigger -Daily -At $BackupTime
+    # -WaitForChatsSec: that catch-up run may start while you chat; it waits for an answer being
+    # written before stopping Open WebUI (1200 + 600 s still leave half of the 1 h time limit).
+    # -DailyAt: the extra run at sign-in does nothing when the night's backup is already there.
+    # No -WakeToRun: waking the PC every night (fans, possibly in a bedroom) is not worth it; a PC
+    # asleep at 03:30 backs up shortly after it wakes instead.
+    $backupExtra = '-EngineWaitSec 1200 -WaitForChatsSec 600'
+    $dailyAt = ''
+    try { $dailyAt = ([datetime]::Parse($BackupTime, [Globalization.CultureInfo]::InvariantCulture)).ToString('HH:mm', [Globalization.CultureInfo]::InvariantCulture) } catch { Write-Verbose "BackupTime '$BackupTime' not read as a time of day" }
+    if ($dailyAt) { $backupExtra += ' -DailyAt ' + $dailyAt }
+    # Hidden for real (no Windows Terminal window that closing would kill mid-backup): see Get-LaiHiddenTaskLaunch.
+    $launch = Get-LaiHiddenTaskLaunch -PsArgs (Get-LaiScriptCommandLine -ScriptPath $backupScript -AIRoot $AIRoot -Extra $backupExtra -Hidden) -Build ([Environment]::OSVersion.Version.Build)
+    $action = New-ScheduledTaskAction -Execute $launch.Execute -Argument $launch.Argument
+    # Also at sign-in: a task that needs you signed in may not run its missed start when you were
+    # signed out at 03:30 (or signed in long after booting). Only with -DailyAt, which makes that
+    # run a no-op on a normal day.
+    $trigger = @(New-ScheduledTaskTrigger -Daily -At $BackupTime)
+    if ($dailyAt) { $trigger += New-ScheduledTaskTrigger -AtLogOn -User $CurrentUser }
     # Not elevated: docker-users membership, the volume mutex and C:\AI\Backups are all it needs, and
     # an elevated task would run code from C:\AI, which the user controls (see $ElevatedDir).
     # Non-elevated also sees mapped network drives, so a NAS mirror on a drive letter works.
@@ -1326,18 +1505,14 @@ Invoke-Stage 'Backup' {
     $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit (New-TimeSpan -Hours 1) `
         -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 15)
     Register-ScheduledTask -TaskName $BackupTask -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Force | Out-Null
-    Write-LaiLog OK "Scheduled task '$BackupTask' runs daily at $BackupTime (missed runs catch up at next sign-in)"
+    Write-LaiLog OK "Scheduled task '$BackupTask' runs daily at $BackupTime; a night missed while the PC was off, asleep or signed out is caught up after it wakes or at the next sign-in"
 
     # Health watch every 15 minutes while signed in: restarts a stopped container or Ollama and
-    # shows a notification only when something breaks or recovers. Runs non-elevated; conhost
-    # --headless (Windows 10 2004+) keeps a console window from flashing every 15 minutes.
+    # shows a notification only when something breaks or recovers. Runs non-elevated, with no
+    # console window (Get-LaiHiddenTaskLaunch), so nothing flashes every 15 minutes.
     $watchArgs = Get-LaiScriptCommandLine -ScriptPath (Join-Path $P.Scripts 'Watch-LocalAI.ps1') -AIRoot $AIRoot -Hidden
-    $conhost = Join-Path $env:WINDIR 'System32\conhost.exe'
-    if ([Environment]::OSVersion.Version.Build -ge 19041 -and (Test-Path -LiteralPath $conhost)) {
-        $watchAction = New-ScheduledTaskAction -Execute $conhost -Argument ('--headless powershell.exe ' + $watchArgs)
-    } else {
-        $watchAction = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument $watchArgs
-    }
+    $watchLaunch = Get-LaiHiddenTaskLaunch -PsArgs $watchArgs -Build ([Environment]::OSVersion.Version.Build)
+    $watchAction = New-ScheduledTaskAction -Execute $watchLaunch.Execute -Argument $watchLaunch.Argument
     $watchTrigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(5) -RepetitionInterval (New-TimeSpan -Minutes 15)
     $watchPrincipal = New-ScheduledTaskPrincipal -UserId $CurrentUser -LogonType Interactive -RunLevel Limited
     $watchSettings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -MultipleInstances IgnoreNew -ExecutionTimeLimit (New-TimeSpan -Minutes 10)
