@@ -194,6 +194,15 @@ $WatchTask = 'LocalAI-Watch'
 $CurrentUser = [Security.Principal.WindowsIdentity]::GetCurrent().Name
 $CurrentUserSid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
 
+# This runs as administrator in folders the user controls: if one of them is a junction or symbolic
+# link, the writes, permission changes and transcript below would land wherever it points.
+foreach ($d in @($P.Root, $P.Logs, $P.Secrets, $P.Backups, $P.Downloads, $P.Scripts, $P.Stack)) {
+    $link = Get-LaiReparsePath -Path $d
+    if ($link) {
+        Write-Host "$link is a junction or symbolic link. The installer runs as administrator and does not write through links; replace it with a normal folder, then run again." -ForegroundColor Red
+        exit 1
+    }
+}
 foreach ($d in @($P.Root, $P.Logs, $P.Secrets, $P.Backups, $P.Downloads)) {
     if (-not (Test-Path -LiteralPath $d)) { New-Item -ItemType Directory -Force -Path $d | Out-Null }
 }
@@ -405,7 +414,12 @@ function Install-App {
         if (& $IsInstalled) { return }
         Write-LaiLog WARN "winget did not install $WingetId; falling back to a direct download."
     }
-    $dest = Join-Path $P.Downloads $FileName
+    # An administrators-only folder: in C:\AI\Downloads (the user's), anything running as the user could
+    # swap the file between the signature check and Start-Process, which runs it as administrator.
+    $dlDir = Join-Path $env:ProgramFiles 'LocalAI-Downloads'
+    if (-not (Test-Path -LiteralPath $dlDir)) { New-Item -ItemType Directory -Force -Path $dlDir | Out-Null }
+    if (Get-LaiReparsePath -Path $dlDir) { throw "$dlDir is a link; refusing to download an installer there." }
+    $dest = Join-Path $dlDir $FileName
     Write-LaiLog INFO "Downloading $Url"
     Invoke-LaiRetry -What "download $FileName" -Action { Invoke-WebRequest -Uri $Url -OutFile $dest -UseBasicParsing } | Out-Null
     $sig = Get-AuthenticodeSignature -FilePath $dest
@@ -417,12 +431,13 @@ function Install-App {
     $proc = Start-Process -FilePath $dest -ArgumentList $InstallerArgs -Wait -PassThru
     if ($proc.ExitCode -ne 0 -and $proc.ExitCode -ne 3010) { throw "$FileName exited with code $($proc.ExitCode)" }
     if ($proc.ExitCode -eq 3010) { $State.flags['rebootPending'] = $true }
+    Remove-Item -LiteralPath $dest -Force -ErrorAction SilentlyContinue
     if (-not (& $IsInstalled)) { throw "$FileName finished but the product is still not detected." }
 }
 
 function Register-ResumeTask {
     if ($SourceRoot.TrimEnd('\', '/') -ne $ElevatedDir.TrimEnd('\', '/')) {
-        if (Test-Path -LiteralPath $ElevatedDir) { Remove-Item -LiteralPath $ElevatedDir -Recurse -Force }
+        if (Test-Path -LiteralPath $ElevatedDir) { Remove-LaiTree -Path $ElevatedDir }
         New-Item -ItemType Directory -Force -Path $ElevatedDir | Out-Null
         foreach ($item in $ToolkitItems) {
             $src = Join-Path $SourceRoot $item
@@ -601,16 +616,28 @@ function Repair-LegacyInstall {
     }
     # 2. The first bootstrap unpacked the toolkit into C:\AI\Installer; double-clicking that old copy
     #    would rewrite .env, drop the render guard and register an elevated task again.
+    #    Only exactly what it made (ComfyUi-Optimization-<ref>\local-llm with the toolkit, nothing
+    #    else): a folder of the user's that happens to be called Installer is left alone.
     $oldInstaller = Join-Path $P.Root 'Installer'
-    if ((Test-Path -LiteralPath $oldInstaller) -and -not ($SourceRoot.TrimEnd('\', '/') + [IO.Path]::DirectorySeparatorChar).StartsWith($oldInstaller.TrimEnd('\', '/') + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase)) {
-        try { Remove-Item -LiteralPath $oldInstaller -Recurse -Force -ErrorAction Stop; Write-LaiLog OK "Removed the outdated toolkit copy in $oldInstaller" }
+    $isOldCopy = $false
+    if (Test-Path -LiteralPath $oldInstaller -PathType Container) {
+        $entries = @(Get-ChildItem -LiteralPath $oldInstaller -Force)
+        $isOldCopy = $entries.Count -gt 0 -and @($entries | Where-Object {
+                -not ($_.PSIsContainer -and $_.Name -like 'ComfyUi-Optimization-*' -and
+                    (Test-Path -LiteralPath (Join-Path $_.FullName 'local-llm/Install-LocalAI.ps1')) -and
+                    (Test-Path -LiteralPath (Join-Path $_.FullName 'local-llm/lib/LocalAI.psm1'))) }).Count -eq 0
+        if (-not $isOldCopy) { Write-Verbose "$oldInstaller is not the old toolkit copy; left alone" }
+    }
+    if ($isOldCopy -and -not ($SourceRoot.TrimEnd('\', '/') + [IO.Path]::DirectorySeparatorChar).StartsWith($oldInstaller.TrimEnd('\', '/') + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase)) {
+        try { Remove-LaiTree -Path $oldInstaller; Write-LaiLog OK "Removed the outdated toolkit copy in $oldInstaller" }
         catch { Write-LaiLog WARN "Could not remove the outdated toolkit copy in ${oldInstaller}: $($_.Exception.Message)" }
     }
     # 3. Early versions copied the guide's secret key into Secrets instead of moving it.
     $rootSecret = Join-Path $P.Root 'openwebui-secret.txt'
     $managedSecret = Join-Path $P.Secrets 'openwebui-secret.txt'
     if ((Test-Path -LiteralPath $rootSecret) -and (Test-Path -LiteralPath $managedSecret)) {
-        if ((Get-Content -LiteralPath $rootSecret -Raw -Encoding UTF8).Trim() -eq (Get-Content -LiteralPath $managedSecret -Raw -Encoding UTF8).Trim()) {
+        $a = ([string](Get-Content -LiteralPath $rootSecret -Raw -Encoding UTF8)).Trim(); $b = ([string](Get-Content -LiteralPath $managedSecret -Raw -Encoding UTF8)).Trim()
+        if ($a -and $a -eq $b) {
             Remove-Item -LiteralPath $rootSecret -Force
             Write-LaiLog OK "Removed a second copy of the Open WebUI secret key outside $($P.Secrets)"
         }

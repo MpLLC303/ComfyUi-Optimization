@@ -131,17 +131,47 @@ services:
     $future = Join-Path $bdir ('open-webui-{0}.tar.gz' -f (Get-Date -Format 'yyyyMMdd-HHmmss'))
     Set-Content -LiteralPath $future -Value 'x'; (Get-Item -LiteralPath $future).LastWriteTime = (Get-Date).AddDays(365)
     Invoke-Watch @('-NoHeal') | Out-Null
-    Assert-That ((& $lastFail) -match 'Backups \(newest backup is dated [^)]*in the future') "a backup dated in the future fails the check ($(& $lastFail))"
+    Assert-That ((& $lastFail) -match 'Backups \(open-webui-[^)]*in the future[^)]*delete it\)') "a backup dated in the future fails the check and says to delete it ($(& $lastFail))"
+    # ...also next to a fresh one (clock fixed since): it would otherwise block pruning and restores for a year.
+    Set-Content -LiteralPath (Join-Path $bdir ('open-webui-{0}.tar.gz' -f (Get-Date).AddHours(-1).ToString('yyyyMMdd-HHmmss'))) -Value 'x'
+    Invoke-Watch @('-NoHeal') | Out-Null
+    Assert-That ((& $lastFail) -match 'Backups \(open-webui-[^)]*in the future') 'a future-dated archive is reported even when a fresh backup exists'
     Remove-Item -LiteralPath $future -Force
+    Get-ChildItem -LiteralPath $bdir -File | Remove-Item -Force
     # (c) A configured mirror that did not get the newest backup.
     Set-Content -LiteralPath (Join-Path $bdir ('open-webui-{0}.tar.gz' -f (Get-Date -Format 'yyyyMMdd-HHmmss'))) -Value 'x'
     $c5 = Read-LaiState -Path $cfgFile; $c5['BackupMirror'] = '\\nas\gone'; Save-LaiState -State $c5 -Path $cfgFile
     Save-LaiState -State @{ mirrorError = 'The network path was not found' } -Path (Join-Path $aiRoot 'backup-state.json')
     Invoke-Watch @('-NoHeal') | Out-Null
     Assert-That ((& $lastFail) -match 'Backup mirror \(newest backup not copied to [^)]*network path was not found\)' -and (& $lastFail) -notmatch 'Backups \(') "a mirror that stopped is a failed check with its reason ($(& $lastFail))"
-    Save-LaiState -State @{ mirrorOkAt = (Get-Date).ToString('s') } -Path (Join-Path $aiRoot 'backup-state.json')
+    Save-LaiState -State @{ mirrorOkAt = (Get-Date).ToString('s'); mirrorTarget = '\\nas\other' } -Path (Join-Path $aiRoot 'backup-state.json')
+    Invoke-Watch @('-NoHeal') | Out-Null
+    Assert-That ((& $lastFail) -match 'Backup mirror') 'a success recorded for a different mirror target does not count'
+    Save-LaiState -State @{ mirrorOkAt = (Get-Date).ToString('s'); mirrorTarget = '\\nas\gone' } -Path (Join-Path $aiRoot 'backup-state.json')
     Invoke-Watch @('-NoHeal') | Out-Null
     Assert-That ((& $lastFail) -notmatch 'Backup mirror') 'and passes once the newest backup was mirrored'
+    # No record yet (an update installed this check hours before its first backup): look at the mirror itself.
+    $mdir = Join-Path $Work 'mirror-folder'; New-Item -ItemType Directory -Force -Path $mdir | Out-Null
+    $c5 = Read-LaiState -Path $cfgFile; $c5['BackupMirror'] = $mdir; Save-LaiState -State $c5 -Path $cfgFile
+    Remove-Item -LiteralPath (Join-Path $aiRoot 'backup-state.json') -Force
+    Copy-Item -LiteralPath @(Get-ChildItem -LiteralPath $bdir -Filter 'open-webui-*.tar.gz')[0].FullName -Destination $mdir
+    Invoke-Watch @('-NoHeal') | Out-Null
+    Assert-That ((& $lastFail) -notmatch 'Backup mirror') 'without a record, a newest backup present in the mirror passes (no false alarm after an update)'
+    Get-ChildItem -LiteralPath $mdir -File | Remove-Item -Force
+    Invoke-Watch @('-NoHeal') | Out-Null
+    Assert-That ((& $lastFail) -match 'Backup mirror') 'and missing from the mirror fails'
+    # The database check of the nightly backups has not run for 3 nights.
+    Save-LaiState -State @{ deepCheckSkips = 3 } -Path (Join-Path $aiRoot 'backup-state.json')
+    Invoke-Watch @('-NoHeal') | Out-Null
+    Assert-That ((& $lastFail) -match 'Backups \(the database check of the nightly backup could not run for 3 nights') "a database check that keeps failing to run is a failed check ($(& $lastFail))"
+    Remove-Item -LiteralPath (Join-Path $aiRoot 'backup-state.json') -Force
+    # A 'back to normal' toast that fails is retried on the next run.
+    Save-LaiState -State @{ failed = @('Backups'); notified = @('Backups'); notifiedAt = (Get-Date).ToString('s') } -Path $statePath
+    $env:LOCALAI_TEST_TOAST_FAIL = '1'
+    try { Invoke-Watch @('-NoHeal') | Out-Null } finally { $env:LOCALAI_TEST_TOAST_FAIL = '' }
+    Assert-That (@((Read-LaiState -Path $statePath)['pendingRecovered']) -contains 'Backups') 'a recovery toast that failed is kept for the next run'
+    Invoke-Watch @('-NoHeal') | Out-Null
+    Assert-That ((Get-WatchLog) -match 'NOTIFY Local AI: [^\n]*(recovered Backups|Working again: Backups)' -and -not (Read-LaiState -Path $statePath).ContainsKey('pendingRecovered')) 'and is sent on the next run'
     # (d) Disk hysteresis: 'low' clears only with 2 GB to spare above the limit.
     $freeGB = [Math]::Floor([System.IO.DriveInfo]::new([System.IO.Path]::GetPathRoot($aiRoot)).AvailableFreeSpace / 1GB)
     $limit = [int]$freeGB - 1

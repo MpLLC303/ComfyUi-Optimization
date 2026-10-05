@@ -523,6 +523,41 @@ if ($onWindows) {
     }
 } else { Skip 'task command-line round trip runs on Windows only' }
 
+Write-Host "`n=== Remove-LaiTree never follows a junction / symbolic link ===" -ForegroundColor Cyan
+# The elevated installer and uninstaller delete trees in C:\AI, which the user controls. A link planted
+# there must be removed as a link: what it points at (here a 'victim' folder outside) stays.
+$victim = Join-Path $Work 'victim'; $tree = Join-Path $Work 'tree-to-delete'
+foreach ($d in $victim, (Join-Path $tree 'a/b')) { New-Item -ItemType Directory -Force -Path $d | Out-Null }
+Set-Content -LiteralPath (Join-Path $victim 'important.txt') -Value 'keep'
+Set-Content -LiteralPath (Join-Path $tree 'a/b/f.txt') -Value 'x'
+$linkMade = $false
+if ($onWindows) {
+    # A directory junction needs no admin rights: exactly what a standard-user process can plant.
+    $prev = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
+    & cmd.exe /c mklink /J (Join-Path $tree 'a\junction') $victim 2>&1 | Out-Null
+    $ErrorActionPreference = $prev
+    $linkMade = Test-Path -LiteralPath (Join-Path $tree 'a\junction\important.txt')
+} else {
+    & ln -s $victim (Join-Path $tree 'a/dirlink'); & ln -s (Join-Path $victim 'important.txt') (Join-Path $tree 'filelink')
+    $linkMade = Test-Path -LiteralPath (Join-Path $tree 'a/dirlink/important.txt')
+}
+Assert-That $linkMade 'setup: a link inside the tree reaches the victim folder'
+Remove-LaiTree -Path $tree
+Assert-That (-not (Test-Path -LiteralPath $tree)) 'the tree is gone'
+Assert-That ((Test-Path -LiteralPath (Join-Path $victim 'important.txt')) -and (Get-Content -LiteralPath (Join-Path $victim 'important.txt')) -eq 'keep') 'what the link pointed at is untouched'
+
+Write-Host "`n=== permission changes and installer folders refuse links ===" -ForegroundColor Cyan
+$lroot = Join-Path $Work 'linkroot'; $outside = Join-Path $Work 'outside-target'
+foreach ($d in $lroot, $outside) { New-Item -ItemType Directory -Force -Path $d | Out-Null }
+$linkPath = Join-Path $lroot 'Secrets'
+if ($onWindows) { $prev = $ErrorActionPreference; $ErrorActionPreference = 'Continue'; & cmd.exe /c mklink /J $linkPath $outside 2>&1 | Out-Null; $ErrorActionPreference = $prev }
+else { & ln -s $outside $linkPath }
+Assert-That ((Get-LaiReparsePath -Path (Join-Path $linkPath 'openwebui-admin.json')) -eq $linkPath) 'a link anywhere above a path is found'
+Assert-That ($null -eq (Get-LaiReparsePath -Path (Join-Path $lroot 'plain/file.txt'))) 'a normal path has none'
+$refused = $false
+try { Set-LaiPrivateAcl -Path $linkPath -UserSid 'S-1-5-21-1-2-3-1001' | Out-Null } catch { $refused = $_.Exception.Message -match 'through a link' }
+Assert-That $refused 'Set-LaiPrivateAcl refuses to change permissions through a link (icacls would change the target)'
+
 Write-Host "`n=== docker template from the installer reaches docker intact (Windows PowerShell 5.1) ===" -ForegroundColor Cyan
 if ($onWindows) {
     # 5.1 leaves inner double quotes unescaped in native arguments; a docker.cmd stand-in records the

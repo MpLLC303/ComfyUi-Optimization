@@ -111,7 +111,7 @@ function Set-Hold([string]$Why, [object[]]$Held) {
 # nightly backup.
 if (-not $Archive) {
     $newest = Get-ChildItem -LiteralPath $backupDir -Filter 'open-webui-*.tar.gz' -ErrorAction SilentlyContinue |
-        Where-Object { $_.Name -match '^open-webui-\d{8}-\d{6}\.tar\.gz$' } | Sort-Object LastWriteTime -Descending | Select-Object -First 1  # lai-ok: objects
+        Where-Object { $_.Name -match '^open-webui-\d{8}-\d{6}\.tar\.gz$' -and $_.LastWriteTime -le (Get-Date).AddHours(1) } | Sort-Object LastWriteTime -Descending | Select-Object -First 1  # lai-ok: objects (never one dated in the future)
     if (-not $newest) { throw "No daily backups found in $backupDir. Pass -Archive <file>." }
     $Archive = $newest.FullName
 }
@@ -129,7 +129,7 @@ try {
     # 1. Archive selection and staging copy.
     if (-not $Archive) {
         $newest = Get-ChildItem -LiteralPath $backupDir -Filter 'open-webui-*.tar.gz' -ErrorAction SilentlyContinue |
-            Where-Object { $_.Name -match '^open-webui-\d{8}-\d{6}\.tar\.gz$' } | Sort-Object LastWriteTime -Descending | Select-Object -First 1  # lai-ok: objects
+            Where-Object { $_.Name -match '^open-webui-\d{8}-\d{6}\.tar\.gz$' -and $_.LastWriteTime -le (Get-Date).AddHours(1) } | Sort-Object LastWriteTime -Descending | Select-Object -First 1  # lai-ok: objects (never one dated in the future)
         if (-not $newest) { throw "No daily backups found in $backupDir. Pass -Archive <file>." }
         $Archive = $newest.FullName
     }

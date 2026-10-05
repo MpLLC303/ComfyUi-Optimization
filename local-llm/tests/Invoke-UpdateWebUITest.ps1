@@ -72,7 +72,7 @@ try {
     Assert-That ((Get-Image) -eq 'alpine:3.20') 'new image running'
     Assert-That ($cfg['PreviousOpenWebUIVersion'] -eq '3.19' -and (Test-Path -LiteralPath ([string]$cfg['RollbackArchive']))) 'rollback point recorded'
     Assert-That ($r.Text -match 'Rollback') 'prints how to roll back'
-    $tagsNow = @(Invoke-DockerText @('images', '--format', '{{.Repository}}:{{.Tag}}', 'alpine') -split "`n")
+    $tagsNow = @((Invoke-DockerText @('images', '--format', '{{.Repository}}:{{.Tag}}', 'alpine')) -split "`n")
     Assert-That ($tagsNow -notcontains 'alpine:lai-old-test' -and $tagsNow -contains 'alpine:3.20' -and $tagsNow -contains 'alpine:3.19') "after a good update, older images go; the running one and the rollback one stay ($($tagsNow -join ', '))"
     $rollbackArchive = [string]$cfg['RollbackArchive']
 
@@ -265,7 +265,14 @@ try {
     foreach ($i in 1..3) { Set-Content -LiteralPath (Join-Path (Join-Path $aiRoot 'Backups') ("open-webui-2020010$i-000000-old-CORRUPT.tar.gz")) -Value 'x'; (Get-Item -LiteralPath (Join-Path (Join-Path $aiRoot 'Backups') ("open-webui-2020010$i-000000-old-CORRUPT.tar.gz"))).LastWriteTime = (Get-Date).AddDays(-30 + $i) }
     Start-Sleep -Seconds 1
     $b = & $runScript 'Backup-OpenWebUI.ps1' @('-Volume', 'lai-deep-test', '-Container', 'lai-no-such-container', '-Tag', 'deeptest', '-NoPrune', '-VerifyImage', $verifyImage)
-    Assert-That ($b.Code -ne 0 -and @(Get-ChildItem -LiteralPath (Join-Path $aiRoot 'Backups') -Filter '*-CORRUPT.tar.gz').Count -eq 2) 'at most two quarantined (-CORRUPT) archives are kept'
+    $corNow = @(Get-ChildItem -LiteralPath (Join-Path $aiRoot 'Backups') -Filter '*-CORRUPT.tar.gz' | ForEach-Object { $_.Name })
+    Assert-That ($b.Code -ne 0 -and $corNow.Count -eq 2 -and $corNow -contains 'open-webui-20200101-000000-old-CORRUPT.tar.gz') "two quarantined archives are kept: the oldest (closest to the last good state) and the newest ($($corNow -join ', '))"
+    # An empty webui.db (0 bytes: integrity_check says ok, but there are no tables) is not a backup.
+    Invoke-DockerText @('volume', 'create', 'lai-ok-test') | Out-Null
+    Invoke-DockerText @('run', '--rm', '-v', 'lai-ok-test:/d', 'alpine:3.20', 'sh', '-c', ': > /d/webui.db') | Out-Null
+    $b = & $runScript 'Backup-OpenWebUI.ps1' @('-Volume', 'lai-ok-test', '-Container', 'lai-no-such-container', '-Tag', 'emptydb', '-NoPrune', '-VerifyImage', $verifyImage)
+    Assert-That ($b.Code -ne 0 -and @(Get-ChildItem -LiteralPath (Join-Path $aiRoot 'Backups') -Filter '*-emptydb-CORRUPT.tar.gz').Count -eq 1 -and @(Get-ChildItem -LiteralPath (Join-Path $aiRoot 'Backups') -Filter '*-emptydb.tar.gz').Count -eq 0) "an empty database is quarantined, never kept as a normal backup (exit $($b.Code))"
+    Invoke-DockerText @('volume', 'rm', 'lai-ok-test') | Out-Null
     # A deep check that cannot run at all (here: an image without python3) says nothing about the data.
     Invoke-DockerText @('volume', 'create', 'localai-verify-20200101000000') | Out-Null
     Invoke-DockerText @('volume', 'create', 'lai-ok-test') | Out-Null

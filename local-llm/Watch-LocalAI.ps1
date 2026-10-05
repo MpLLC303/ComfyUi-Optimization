@@ -114,6 +114,8 @@ function Send-Notification {
     # Returns $true when the message went out (or notifications are off and the log is the channel),
     # $false when the toast failed: the caller then tries again on the next run.
     param([string]$Title, [string]$Text)
+    # Test hook (tests/Invoke-WatchTest.ps1): a toast that fails, as with a broken notification service.
+    if ($env:LOCALAI_TEST_TOAST_FAIL) { Write-WatchLog ('{0} NOTIFY (toast failed) {1}: {2}' -f (Get-Date -Format 's'), $Title, $Text); return $false }
     if (-not $notify) { Write-WatchLog ('{0} NOTIFY {1}: {2}' -f (Get-Date -Format 's'), $Title, $Text); return $true }
     $shown = $false
     try {
@@ -219,22 +221,37 @@ $backupDir = Join-Path $AIRoot 'Backups'
 $all = @(Get-ChildItem -LiteralPath $backupDir -Filter 'open-webui-*.tar.gz' -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending)  # lai-ok: objects
 # Freshness counts only the nightly archives: a tagged one (pre-restore, before-update, ...) must not
 # hide a nightly task that stopped working.
+# An archive dated in the future (written while the clock was wrong) must not count as fresh (it would
+# hide a dead nightly task for months) and never ages out by itself: judge freshness on the others
+# and ask for it to be deleted.
+$soon = (Get-Date).AddHours(1)
+$futureDaily = @($all | Where-Object { $_.Name -match '^open-webui-\d{8}-\d{6}\.tar\.gz$' -and $_.LastWriteTime -gt $soon })
+$all = @($all | Where-Object { $_.LastWriteTime -le $soon })
 $daily = @($all | Where-Object { $_.Name -match '^open-webui-\d{8}-\d{6}\.tar\.gz$' })
 $results['Backups'] = ($all.Count -gt 0) -and ($all[0].Name -notlike '*-CORRUPT.tar.gz') -and ($daily.Count -gt 0) -and (((Get-Date) - $daily[0].LastWriteTime).TotalHours -le 50)
-# An archive dated in the future (written while the clock was wrong) would look fresh for months
-# while the nightly task is dead, and would always count as one of the three protected newest.
-if ($daily.Count -gt 0 -and $daily[0].LastWriteTime -gt (Get-Date).AddHours(1)) {
+$bstate = Read-LaiState -Path (Join-Path $AIRoot 'backup-state.json')
+if ($futureDaily.Count) {
     $results['Backups'] = $false
-    $details['Backups'] = "newest backup is dated $($daily[0].LastWriteTime.ToString('s')), in the future: check the PC's clock"
+    $details['Backups'] = "$($futureDaily[0].Name) is dated $($futureDaily[0].LastWriteTime.ToString('s')), in the future (the PC clock was wrong when it was made): delete it"
+} elseif ($bstate['deepCheckSkips'] -and [int]$bstate['deepCheckSkips'] -ge 3) {
+    # Backups exist, but their database check has not run for 3 nights: an empty or damaged webui.db
+    # would not be noticed.
+    $results['Backups'] = $false
+    $details['Backups'] = "the database check of the nightly backup could not run for $([int]$bstate['deepCheckSkips']) nights (see backup.log)"
 }
 # The second copy (NAS, other drive): a mirror that stopped working is otherwise only a line in backup.log.
 $mirrorTarget = ''
 if ($config.ContainsKey('BackupMirror') -and $config['BackupMirror']) { $mirrorTarget = [string]$config['BackupMirror'] }
 if ($mirrorTarget -and $daily.Count -gt 0) {
-    $bstate = Read-LaiState -Path (Join-Path $AIRoot 'backup-state.json')
-    $okAt = ConvertTo-WatchDate $bstate['mirrorOkAt']
-    # The newest nightly archive must have been mirrored (within its own run).
-    $results['Backup mirror'] = [bool]($okAt -and $okAt -ge $daily[0].LastWriteTime.AddHours(-2))
+    $okAt = $null
+    if ([string]$bstate['mirrorTarget'] -eq $mirrorTarget) { $okAt = ConvertTo-WatchDate $bstate['mirrorOkAt'] }
+    if ($okAt -or $bstate['mirrorError']) {
+        # The newest nightly archive must have been mirrored (within its own run).
+        $results['Backup mirror'] = [bool]($okAt -and $okAt -ge $daily[0].LastWriteTime.AddHours(-2))
+    } else {
+        # No record yet (made by a version before this check, or a newly set mirror): look for the file.
+        $results['Backup mirror'] = Test-Path -LiteralPath (Join-Path $mirrorTarget $daily[0].Name)
+    }
     if (-not $results['Backup mirror']) {
         $why = 'newest backup not copied to ' + $mirrorTarget
         if ($bstate['mirrorError']) { $why += ': ' + [string]$bstate['mirrorError'] }
@@ -273,6 +290,11 @@ if ($reminder) { $toNotify = $stillReported }
 $notified = @($failed | Where-Object { ($prevNotified -contains $_) -or ($toNotify -contains $_) })
 $recovered = @($prevNotified | Where-Object { $failed -notcontains $_ })
 $notifiedAt = $previous['notifiedAt']
+# A 'back to normal' that could not be shown is retried (else the last word stays 'problem detected').
+$pendingRecovered = @()
+if ($previous.ContainsKey('pendingRecovered') -and $previous['pendingRecovered']) { $pendingRecovered = @($previous['pendingRecovered'] | Where-Object { $failed -notcontains $_ }) }
+$recovered = @(@($recovered) + @($pendingRecovered | Where-Object { $recovered -notcontains $_ }))
+$recoveryFailed = $false
 
 $failedText = @($failed | ForEach-Object { if ($details.ContainsKey($_)) { '{0} ({1})' -f $_, $details[$_] } else { $_ } }) -join ', '
 $line = '{0} {1}{2}' -f (Get-Date -Format 's'), $(if ($failed.Count) { 'FAIL ' + $failedText } else { 'OK' }), $(if ($healed.Count) { ' (restarted: ' + ($healed -join ', ') + ')' } else { '' })
@@ -297,23 +319,27 @@ if ($toNotify.Count -gt 0) {
         $hint = 'Check that the backup mirror drive or NAS share is reachable and has free space.'
     }
     $title = 'Local AI: problem detected'; if ($reminder) { $title = 'Local AI: still not working' }
-    if (Send-Notification $title ("Not working: {0}. {1}" -f $failedText, $hint)) { $notifiedAt = (Get-Date).ToString('s') }
+    $prefix = ''; if ($recovered.Count) { $prefix = 'Working again: ' + ($recovered -join ', ') + '. ' }
+    if (Send-Notification $title ("{0}Not working: {1}. {2}" -f $prefix, $failedText, $hint)) { $notifiedAt = (Get-Date).ToString('s') }
     else {
-        # Not shown: keep them unreported so the next run tries again.
+        # Not shown: keep them unreported so the next run tries again (and any recovery news too).
         $notified = @($notified | Where-Object { $toNotify -notcontains $_ -or $stillReported -contains $_ })
+        if ($recovered.Count) { $recoveryFailed = $true }
     }
 } elseif ($recovered.Count -gt 0 -or ($healed.Count -gt 0 -and $failed.Count -eq 0)) {
     $parts = @()
     if ($healed.Count -gt 0) { $parts += 'restarted ' + ($healed -join ', ') }
     $other = @($recovered | Where-Object { $healed -notcontains $_ })
     if ($other.Count -gt 0) { $parts += 'recovered ' + ($other -join ', ') }
-    if ($failed.Count -eq 0) { [void](Send-Notification 'Local AI: back to normal' (($parts -join '; ') + '.')) }
-    else { [void](Send-Notification 'Local AI: partly recovered' ((($parts -join '; ') + '. Still not working: ' + $failedText + '.'))) }
+    if ($failed.Count -eq 0) { $sent = Send-Notification 'Local AI: back to normal' (($parts -join '; ') + '.') }
+    else { $sent = Send-Notification 'Local AI: partly recovered' ((($parts -join '; ') + '. Still not working: ' + $failedText + '.')) }
+    if (-not $sent -and $recovered.Count) { $recoveryFailed = $true }
 }
 
 # Merge into the current file so a pause set while this run was busy survives.
 $final = Read-LaiState -Path $statePath
 $final['failed'] = $failed; $final['notified'] = $notified; $final['checked'] = (Get-Date).ToString('s')
 if ($notified.Count -and $notifiedAt) { $final['notifiedAt'] = [string]$notifiedAt } else { $final.Remove('notifiedAt') }
+if ($recoveryFailed) { $final['pendingRecovered'] = @($recovered) } else { $final.Remove('pendingRecovered') }
 Save-LaiState -State $final -Path $statePath
 exit $failed.Count

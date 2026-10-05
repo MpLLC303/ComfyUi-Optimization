@@ -259,6 +259,12 @@ deliberately not inside the backup archives.
     normal Windows prompt. The installer works on files in `C:\AI`, which you control (you could
     even swap folders in it), so it must never get admin rights without asking.
   - That resume runs a copy in `C:\Program Files\LocalAI`, which only an administrator can change.
+  - While it runs as administrator, the installer refuses to work through a junction or symbolic
+    link in `C:\AI` (it stops with a message), deletes folders there without following links, and
+    downloads the Ollama/Docker installers into an administrators-only folder before checking
+    their signature and running them.
+  - Like any installer, the first run trusts the copy you downloaded: it runs from your user
+    folders, so anything already running as you could have changed it before you clicked Yes.
   - Members of the `docker-users` group (you) are effectively administrators anyway, because Docker
     can mount any drive. Don't add other accounts to it.
 - **If the installer had to open Ollama beyond 127.0.0.1** (only when containers couldn't reach it):

@@ -332,7 +332,10 @@ function global:Get-ScheduledTask {
 function global:Set-ScheduledTask { param($TaskName, $Principal) $global:TaskPrincipals[$TaskName] = [string]$Principal.Args; Record "Set-ScheduledTask $TaskName" }
 $global:Tasks['LocalAI-Backup-OpenWebUI'] = '-File "C:\AI\Scripts\Backup-OpenWebUI.ps1" -AIRoot "C:\AI"'; $global:TaskPrincipals['LocalAI-Backup-OpenWebUI'] = '-UserId x -LogonType Interactive -RunLevel Highest'
 $global:Tasks['LocalAI-Install-Resume'] = '-File "C:\AI\Scripts\Install-LocalAI.ps1"'; $global:TaskPrincipals['LocalAI-Install-Resume'] = '-UserId x -LogonType Interactive -RunLevel Highest'
-New-Item -ItemType Directory -Force -Path (Join-Path $aiRoot 'Installer') | Out-Null; Set-Content -LiteralPath (Join-Path (Join-Path $aiRoot 'Installer') 'Install-LocalAI.cmd') -Value 'old'
+# Exactly what the first bootstrap unpacked: Installer\ComfyUi-Optimization-<ref>\local-llm\...
+$oldCopy = Join-Path $aiRoot 'Installer/ComfyUi-Optimization-main/local-llm'
+New-Item -ItemType Directory -Force -Path (Join-Path $oldCopy 'lib') | Out-Null
+Set-Content -LiteralPath (Join-Path $oldCopy 'Install-LocalAI.ps1') -Value '# old'; Set-Content -LiteralPath (Join-Path $oldCopy 'lib/LocalAI.psm1') -Value '# old'
 Copy-Item -LiteralPath (Join-Path $aiRoot 'Secrets/openwebui-secret.txt') -Destination (Join-Path $aiRoot 'openwebui-secret.txt')
 $env:LOCALAI_TEST_FAIL_STAGE = 'Preflight'
 & (Join-Path $aiRoot 'Scripts/Install-LocalAI.ps1') -AIRoot $aiRoot -SkipTests
@@ -345,9 +348,28 @@ $p6 = (Read-LaiState -Path $statePath).flags['params']
 Assert-That ($p6 -and [int]$p6['BackupRetentionDays'] -eq 90 -and [string]$p6['BackupMirror'] -eq (Join-Path $Work 'nas-mirror') -and [string]$p6['KeepAlive'] -eq '30m') 'retention, mirror and keep-alive carried over from the old config (no pruning of 15-90-day-old backups)'
 Assert-That ($p6 -and [int]$p6['GpuOverheadMiB'] -eq 600 -and [string]$p6['BackupTime'] -eq '02:15') 'VRAM overhead from the tuning fingerprint (no needless re-tune) and backup time from the old task'
 Assert-That (-not (Test-Path -LiteralPath (Join-Path $aiRoot 'Installer'))) 'the outdated AI\Installer toolkit copy is removed'
+# A folder of the user's that happens to be called Installer is not ours to delete.
+New-Item -ItemType Directory -Force -Path (Join-Path $aiRoot 'Installer') | Out-Null; Set-Content -LiteralPath (Join-Path $aiRoot 'Installer/my-notes.txt') -Value 'mine'
+$env:LOCALAI_TEST_FAIL_STAGE = 'Preflight'
+& (Join-Path $aiRoot 'Scripts/Install-LocalAI.ps1') -AIRoot $aiRoot -SkipTests
+$env:LOCALAI_TEST_FAIL_STAGE = ''
+Assert-That (Test-Path -LiteralPath (Join-Path $aiRoot 'Installer/my-notes.txt')) "a user's own folder named Installer is left alone"
+Remove-Item -LiteralPath (Join-Path $aiRoot 'Installer') -Recurse -Force
 Assert-That (-not (Test-Path -LiteralPath (Join-Path $aiRoot 'openwebui-secret.txt')) -and (Test-Path -LiteralPath (Join-Path $aiRoot 'Secrets/openwebui-secret.txt'))) 'the second copy of the secret key outside Secrets is removed'
 Remove-Item -Path 'function:Get-ScheduledTask', 'function:Set-ScheduledTask' -ErrorAction SilentlyContinue
 Assert-That (-not (Get-Command Get-ScheduledTask -ErrorAction SilentlyContinue)) 'task mocks removed for the next phase'
+
+Write-Host "`n=== PHASE 6a: a folder in the install root replaced by a link ===" -ForegroundColor Cyan
+# Anything running as the user can swap C:\AI\Logs for a link; the elevated installer must not write
+# (its transcript, here) through it.
+$logsDir = Join-Path $aiRoot 'Logs'; $elsewhere = Join-Path $Work 'elsewhere-logs'
+Rename-Item -LiteralPath $logsDir -NewName 'Logs-real'
+New-Item -ItemType Directory -Force -Path $elsewhere | Out-Null
+& ln -s $elsewhere $logsDir
+& (Join-Path $aiRoot 'Scripts/Install-LocalAI.ps1') -AIRoot $aiRoot -SkipTests
+$c6a = $LASTEXITCODE
+Assert-That ($c6a -ne 0 -and @(Get-ChildItem -LiteralPath $elsewhere).Count -eq 0) "refuses before writing anything through it (exit $c6a)"
+Remove-Item -LiteralPath $logsDir -Force; Rename-Item -LiteralPath (Join-Path $aiRoot 'Logs-real') -NewName 'Logs'
 
 Write-Host "`n=== PHASE 6b: an old 'Update toolkit' shortcut pointing at the wrong folder ===" -ForegroundColor Cyan
 # Older shortcuts ignored -AIRoot and ran against C:\AI. With an install running elsewhere, a fresh

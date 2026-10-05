@@ -225,11 +225,11 @@ if ($desktop) {
 # The administrators-only copy the resume task runs (see Install-LocalAI.ps1, $ElevatedDir).
 if ($env:ProgramFiles) {
     $elevated = Join-Path $env:ProgramFiles 'LocalAI'
-    if (Test-Path -LiteralPath $elevated) { Invoke-Step $elevated { Remove-Item -LiteralPath $elevated -Recurse -Force; Write-LaiLog OK "Deleted $elevated" } }
+    if (Test-Path -LiteralPath $elevated) { Invoke-Step $elevated { Remove-LaiTree -Path $elevated; Write-LaiLog OK "Deleted $elevated" } }
 }
 if ($env:ProgramData) {
     $menu = Join-Path $env:ProgramData 'Microsoft\Windows\Start Menu\Programs\Local AI'
-    if (Test-Path -LiteralPath $menu) { Invoke-Step 'Start-menu folder' { Remove-Item -LiteralPath $menu -Recurse -Force; Write-LaiLog OK "Removed Start-menu folder 'Local AI'" } }
+    if (Test-Path -LiteralPath $menu) { Invoke-Step 'Start-menu folder' { Remove-LaiTree -Path $menu; Write-LaiLog OK "Removed Start-menu folder 'Local AI'" } }
 }
 
 if ($RemoveData) {
@@ -239,7 +239,9 @@ if ($RemoveData) {
     foreach ($item in (@('Stack', 'Secrets', 'Logs', 'Downloads', 'install-report.md', 'open-webui-hold.json') + $stateFiles)) {
         $path = Join-Path $AIRoot $item
         if (-not (Test-Path -LiteralPath $path)) { continue }
-        Invoke-Step $path { Remove-Item -LiteralPath $path -Recurse -Force; Write-LaiLog OK "Deleted $path" }
+        # Never Remove-Item -Recurse here: this runs as administrator in a folder the user controls,
+        # and Windows PowerShell 5.1 follows junctions inside it (deleting whatever they point at).
+        Invoke-Step $path { Remove-LaiTree -Path $path; Write-LaiLog OK "Deleted $path" }
     }
     # The running script lives in AIRoot\Scripts when started from there: delete it last, or tell the user.
     $scripts = Join-Path $AIRoot 'Scripts'
@@ -248,7 +250,7 @@ if ($RemoveData) {
         if ($here -eq $scriptsFull -or $here.StartsWith($scriptsFull + [IO.Path]::DirectorySeparatorChar)) {
             Write-LaiLog INFO "Delete $scripts yourself after this window closes (this script is running from it)."
         } else {
-            Invoke-Step $scripts { Remove-Item -LiteralPath $scripts -Recurse -Force; Write-LaiLog OK "Deleted $scripts" }
+            Invoke-Step $scripts { Remove-LaiTree -Path $scripts; Write-LaiLog OK "Deleted $scripts" }
         }
     }
 }

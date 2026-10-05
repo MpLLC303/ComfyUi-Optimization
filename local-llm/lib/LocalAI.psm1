@@ -45,6 +45,26 @@ function ConvertTo-LaiCmdArg {
     return $sb.ToString()
 }
 
+function Remove-LaiTree {
+    # Deletes a file or directory tree WITHOUT following a junction or symbolic link inside it: a link
+    # is removed as a link, never what it points at. Windows PowerShell 5.1's Remove-Item -Recurse
+    # follows directory junctions, so in the elevated installer, working in C:\AI (which the user and
+    # anything running as the user controls), a planted junction would make it delete system files.
+    param([Parameter(Mandatory)][string]$Path)
+    $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+    if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) {
+        if ($item.PSIsContainer) { [IO.Directory]::Delete($item.FullName, $false) } else { [IO.File]::Delete($item.FullName) }
+        return
+    }
+    if (-not $item.PSIsContainer) {
+        $item.Attributes = [IO.FileAttributes]::Normal
+        [IO.File]::Delete($item.FullName)
+        return
+    }
+    foreach ($child in @((New-Object System.IO.DirectoryInfo($item.FullName)).GetFileSystemInfos())) { Remove-LaiTree -Path $child.FullName }
+    [IO.Directory]::Delete($item.FullName, $false)
+}
+
 function ConvertTo-LaiPsQuoted {
     # A path as a PowerShell single-quoted literal, for commands printed for the user to paste.
     # PowerShell also ends a single-quoted string at the typographic quotes U+2018-U+201B: doubled too.
@@ -172,6 +192,24 @@ function Get-LaiBlockRange {
     return $out
 }
 
+function Get-LaiReparsePath {
+    # The path itself or the first folder above it that is a junction or symbolic link, else $null.
+    # The elevated installer works in C:\AI, which the user (and anything running as the user)
+    # controls: a planted link would point its permission changes and writes somewhere else.
+    param([Parameter(Mandatory)][string]$Path)
+    $p = [System.IO.Path]::GetFullPath($Path)
+    while ($p) {
+        if (Test-Path -LiteralPath $p) {
+            $item = Get-Item -LiteralPath $p -Force -ErrorAction SilentlyContinue
+            if ($item -and ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) { return $p }
+        }
+        $parent = [System.IO.Path]::GetDirectoryName($p)
+        if (-not $parent -or $parent -eq $p) { break }
+        $p = $parent
+    }
+    return $null
+}
+
 function Set-LaiPrivateAcl {
     <#
     .SYNOPSIS
@@ -181,6 +219,10 @@ function Set-LaiPrivateAcl {
         code and output.
     #>
     param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][string]$UserSid, [ValidateSet('Full', 'ReadOnly')][string]$UserAccess = 'Full')
+    # icacls changes what a symbolic link points at: granting the user full control there would hand
+    # them any file or folder on the system. Refuse links anywhere on the path.
+    $link = Get-LaiReparsePath -Path $Path
+    if ($link) { throw "Refusing to change permissions through a link: $link is a junction or symbolic link. Remove it and run again." }
     $inherit = ''
     if ((Get-Item -LiteralPath $Path -Force) -is [System.IO.DirectoryInfo]) { $inherit = '(OI)(CI)' }
     $userGrant = $inherit + 'F'

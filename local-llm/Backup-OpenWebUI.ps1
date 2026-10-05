@@ -166,34 +166,55 @@ try {
             $extract = @('run', '--rm', '-v', "${scratch}:/d", '-v', "${backupDir}:/backup:ro", $HelperImage, 'tar', 'xzf', "/backup/$workName", '-C', '/d') + $members
             Invoke-Docker -Arguments $extract | Out-Null
             # Single quotes only inside the Python code: PS 5.1 mangles double quotes in native arguments.
+            # One line per step, so a failure part-way still tells what SQLite saw:
+            #   T <tables> <has user> <has chat>   I <integrity_check>   C <users> <chats>
             $py = "import sqlite3;c=sqlite3.connect('/d/webui.db');" +
-                "r=c.execute('pragma integrity_check').fetchone()[0];" +
-                "n=lambda t:c.execute('select count(*) from '+t).fetchone()[0];" +
-                "print(r,n('user'),n('chat'))"
+                "t=[x[0] for x in c.execute('select name from sqlite_master where type=?',('table',))];" +
+                "print('T',len(t),int('user' in t),int('chat' in t),flush=True);" +
+                "print('I',c.execute('pragma integrity_check').fetchone()[0],flush=True);" +
+                "n=lambda x:c.execute('select count(*) from '+x).fetchone()[0];" +
+                "print('C',n('user'),n('chat'))"
             $run = Invoke-Docker -Arguments @('run', '--rm', '--entrypoint', 'python3', '-v', "${scratch}:/d", $VerifyImage, '-c', $py) -AllowFail
             $out = $run.Text.Trim()
-            $parts = ($out -split '\s+')
-            # Corrupt only when SQLite itself says so: integrity_check printed something other than 'ok',
-            # or the file is not a readable database. A check that could not run (docker error, out of
-            # memory, an image without python3, a renamed table in a newer Open WebUI) says nothing about
-            # the data, and quarantining every nightly archive for it would stop pruning and fill the disk.
-            $sqliteSaysBad = ($run.ExitCode -eq 0 -and $parts[0] -ne 'ok') -or ($out -match 'DatabaseError|malformed|not a database|file is encrypted')
+            $tLine = [regex]::Match($out, '(?m)^T (\d+) ([01]) ([01])\s*$')
+            $iLine = [regex]::Match($out, '(?m)^I (.+?)\s*$')
+            $cLine = [regex]::Match($out, '(?m)^C (\d+) (\d+)\s*$')
+            # Corrupt when SQLite itself says so: integrity_check is not 'ok', the database has no
+            # tables at all (an empty or truncated webui.db), or SQLite cannot read the file. A check that
+            # could not run (docker error, out of memory, an image without python3, tables renamed by a
+            # newer Open WebUI) says nothing about the data: quarantining every nightly archive for it
+            # would stop pruning and fill the disk.
+            $sqliteSaysBad = ($iLine.Success -and $iLine.Groups[1].Value -ne 'ok') -or
+                ($tLine.Success -and [int]$tLine.Groups[1].Value -eq 0) -or
+                ($out -match 'DatabaseError|malformed|not a database|file is encrypted|disk I/O error')
+            $bstate = Read-LaiState -Path $backupStatePath
             if ($sqliteSaysBad) {
                 # Keep it for inspection, but tagged so it never counts as one of the three protected daily backups.
                 $bad = $archive -replace '\.tar\.gz$', '-CORRUPT.tar.gz'
                 Move-Item -LiteralPath $work -Destination $bad -Force
-                # Two quarantined archives are enough to investigate; more just fill the disk night after night.
-                Get-ChildItem -LiteralPath $backupDir -Filter 'open-webui-*-CORRUPT.tar.gz' | Sort-Object LastWriteTime -Descending | Select-Object -Skip 2 |  # lai-ok: objects
-                    ForEach-Object { Remove-Item -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue }
+                # Two quarantined archives are enough to investigate: the OLDEST (closest to the last good
+                # state) and the newest. More just fill the disk night after night. An uninstall's final
+                # backup is never touched.
+                $cor = @(Get-ChildItem -LiteralPath $backupDir -Filter 'open-webui-*-CORRUPT.tar.gz' | Where-Object { $_.Name -notmatch '-pre-uninstall-CORRUPT\.tar\.gz$' } | Sort-Object LastWriteTime)  # lai-ok: objects
+                if ($cor.Count -gt 2) {
+                    $cor[1..($cor.Count - 2)] | ForEach-Object { Remove-Item -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue }
+                }
+                try { $bstate['deepCheck'] = 'corrupt'; $bstate['deepCheckSkips'] = 0; Save-LaiState -State $bstate -Path $backupStatePath } catch { Write-Verbose 'backup state not saved' }
                 $reason = ($out -split "`n" | Select-Object -Last 1)
                 throw "Archive ${name}: webui.db failed the SQLite check ($reason). Kept as $(Split-Path -Leaf $bad). Your live data may be damaged: do not delete older backups."
             }
-            if ($run.ExitCode -ne 0 -or $parts.Count -lt 3) {
+            if ($cLine.Success) {
+                $verified = "; database OK ($($cLine.Groups[1].Value) users, $($cLine.Groups[2].Value) chats)"
+                $bstate['deepCheck'] = 'ok'; $bstate['deepCheckSkips'] = 0; $bstate['deepCheckOkAt'] = (Get-Date).ToString('s')
+            } else {
+                # Counted: the health watch fails 'Backups' after 3 nights in a row, so a check that has
+                # quietly stopped working (new image, renamed tables) does not stay unnoticed.
+                $skips = 0; if ($bstate['deepCheckSkips']) { $skips = [int]$bstate['deepCheckSkips'] }
+                $bstate['deepCheck'] = 'could-not-run'; $bstate['deepCheckSkips'] = $skips + 1
                 Write-BackupLog WARN "Deep check could not run (exit $($run.ExitCode): $(($out -split "`n" | Select-Object -Last 1))); the archive is kept as a normal backup."
                 $verified = '; deep check could not run'
-            } else {
-                $verified = "; database OK ($($parts[1]) users, $($parts[2]) chats)"
             }
+            try { Save-LaiState -State $bstate -Path $backupStatePath } catch { Write-BackupLog WARN "Could not record the deep-check result: $($_.Exception.Message)" }
         } finally {
             Invoke-Docker -Arguments @('volume', 'rm', '-f', $scratch) -AllowFail | Out-Null
         }
@@ -248,8 +269,10 @@ try {
             Move-Item -LiteralPath $mirrorTmp -Destination (Join-Path $Mirror $name) -Force -ErrorAction Stop
             Write-BackupLog OK "Mirrored to $Mirror"
             # The health watch reads this: a mirror that stops working must not go unnoticed for months.
-            $bs = Read-LaiState -Path $backupStatePath; $bs['mirrorOkAt'] = (Get-Date).ToString('s'); $bs['mirrorTarget'] = $Mirror; $bs.Remove('mirrorError')
-            Save-LaiState -State $bs -Path $backupStatePath
+            try {
+                $bs = Read-LaiState -Path $backupStatePath; $bs['mirrorOkAt'] = (Get-Date).ToString('s'); $bs['mirrorTarget'] = $Mirror; $bs.Remove('mirrorError')
+                Save-LaiState -State $bs -Path $backupStatePath
+            } catch { Write-BackupLog WARN "Mirror copy done, but its state could not be recorded: $($_.Exception.Message)" }
             Get-ChildItem -LiteralPath $Mirror -Filter 'incomplete-open-webui-*' -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
             if (-not $NoPrune) { & $prune $Mirror }
         } catch {

@@ -39,6 +39,8 @@ $files = Get-ChildItem -Path $Root -Recurse -File -Include *.ps1, *.psm1, *.psd1
 #   HELP     a user-facing script (toolkit root) with a parameter its help never mentions: no
 #            .PARAMETER entry, no comment right above it, no -Name in the help text.
 #   DOCPARAM README.md tells the user to run a script with a -Switch that script does not have.
+#   RECURSE  Remove-Item -Recurse in a script that runs as administrator (installer, uninstaller):
+#            Windows PowerShell 5.1 follows junctions in the user-controlled C:\AI. Use Remove-LaiTree.
 #   COMPOSELOG a service in stack/docker-compose.yml without 'logging:' (Docker keeps container logs
 #            forever by default; on an always-on PC they grow without limit).
 #   NATIVEQUOTE a literal double quote inside an argument for a native program (docker, wsl, ...):
@@ -90,6 +92,10 @@ function Find-Pitfall([System.Management.Automation.Language.Ast]$Ast, [string[]
                 Where-Object { $_.Value -match '"' })
             if ($quoted.Count) { & $add 'NATIVEQUOTE' $c "argument with a double quote for a native program ($($quoted[0].Extent.Text)): 5.1 strips it; use backticks in Go templates or avoid the quote" }
         }
+        if (@('Install-LocalAI.ps1', 'Uninstall-LocalAI.ps1') -contains $FileName -and @('Remove-Item', 'rm', 'del', 'rmdir', 'rd', 'ri', 'erase') -contains $name -and
+            @($c.CommandElements | Where-Object { $_ -is [System.Management.Automation.Language.CommandParameterAst] -and ($_.ParameterName -like 'rec*' -or $_.ParameterName -eq 'r') }).Count -and -not (& $marker $c 'recurse')) {
+            & $add 'RECURSE' $c 'Remove-Item -Recurse as administrator follows junctions in C:\AI on Windows PowerShell 5.1; use Remove-LaiTree'
+        }
         # Get-Content of a config/state/env/secret file without -Encoding: Windows PowerShell 5.1 reads
         # BOM-less UTF-8 (how .env must be written for docker compose) as ANSI and garbles non-ASCII.
         if (@('Get-Content', 'gc', 'cat', 'type') -contains $name -and -not (& $marker $c 'encoding')) {
@@ -108,12 +114,16 @@ function Find-Pitfall([System.Management.Automation.Language.Ast]$Ast, [string[]
         for ($i = 2; $i -lt $els.Count -and $name -match '^[A-Za-z]+-[A-Za-z]+$'; $i++) {
             $prevEl = $els[$i - 1]
             $isText = $prevEl -is [System.Management.Automation.Language.ParenExpressionAst] -or
+                $prevEl -is [System.Management.Automation.Language.ArrayExpressionAst] -or
                 $prevEl -is [System.Management.Automation.Language.ExpandableStringExpressionAst] -or
                 ($prevEl -is [System.Management.Automation.Language.StringConstantExpressionAst] -and $prevEl.StringConstantType -ne 'BareWord')
             if (-not $isText) { continue }
             $el = $els[$i]
             $op = $null
             if ($el -is [System.Management.Automation.Language.CommandParameterAst] -and $el.ParameterName -eq 'f') { $op = '-f' }
+            # String operators no cmdlet here has as a parameter: '@(Get-X @(...) -split "`n")' passes
+            # -split to Get-X and never splits.
+            elseif ($el -is [System.Management.Automation.Language.CommandParameterAst] -and $el.ParameterName -match '^[ci]?(split|join|replace)$') { $op = '-' + $el.ParameterName }
             elseif ($el -is [System.Management.Automation.Language.StringConstantExpressionAst] -and $el.StringConstantType -eq 'BareWord' -and $el.Value -eq '+') { $op = '+' }
             if ($op -and -not (& $marker $c 'format')) {
                 & $add 'FORMAT' $c "$name gets '$op' as a separate argument (command mode); wrap the whole expression: $name ((...) $op ...)"
@@ -196,16 +206,23 @@ function Find-DocParam([string]$Text, [hashtable]$ParamsByScript) {
 }
 
 function Find-ComposeLogGap([string]$Text) {
-    # Service names under 'services:' whose block has no 'logging:' key.
-    $missing = @(); $inServices = $false; $svc = $null; $hasLog = $false
-    foreach ($l in (($Text -split "`n") + @('end:'))) {
+    # Service names under 'services:' whose block has no 'logging:' (or a '<<:' merge that may carry
+    # it). Comments and blank lines are skipped; the service indent is taken from the first service.
+    $missing = @(); $inServices = $false; $svc = $null; $hasLog = $false; $ind = $null
+    foreach ($raw in (($Text -split "`n") + @('end:'))) {
+        $l = $raw.TrimEnd("`r")
+        if ($l -match '^\s*(#|$)') { continue }
         if ($l -match '^\S') {
             if ($svc -and -not $hasLog) { $missing += $svc }
-            $svc = $null; $inServices = ($l -match '^services:\s*$'); continue
+            $svc = $null; $ind = $null; $inServices = ($l -match '^services:\s*(#.*)?$'); continue
         }
         if (-not $inServices) { continue }
-        if ($l -match '^  ([A-Za-z0-9_-]+):\s*$') { if ($svc -and -not $hasLog) { $missing += $svc }; $svc = $Matches[1]; $hasLog = $false }
-        elseif ($l -match '^    logging:') { $hasLog = $true }
+        $lead = $l.Length - $l.TrimStart(' ').Length
+        if ($null -eq $ind) { $ind = $lead }
+        if ($lead -eq $ind -and $l -match '^\s*([A-Za-z0-9_.-]+):\s*(#.*)?$') {
+            if ($svc -and -not $hasLog) { $missing += $svc }
+            $svc = $Matches[1]; $hasLog = $false
+        } elseif ($lead -eq 2 * $ind -and $l -match '^\s*(logging|<<):') { $hasLog = $true }
     }
     return , $missing
 }
@@ -221,6 +238,9 @@ $canaries = @(
     @{ Rule = 'FORMAT'; Fire = $true; Code = 'Write-Host ''Disk: '' + $gb' }
     @{ Rule = 'FORMAT'; Fire = $true; Code = 'Write-UpdateLog "x $a" -f $b' }
     @{ Rule = 'FORMAT'; Fire = $false; Code = 'Write-LaiLog WARN (("{0} free") -f $gb)' }
+    @{ Rule = 'FORMAT'; Fire = $true; Code = '$t = @(Invoke-DockerText @(''images'', ''x'') -split "`n")' }
+    @{ Rule = 'FORMAT'; Fire = $true; Code = 'Write-Host "a,b" -replace '','', '';''' }
+    @{ Rule = 'FORMAT'; Fire = $false; Code = '$t = @((Invoke-DockerText @(''images'', ''x'')) -split "`n")' }
     @{ Rule = 'FORMAT'; Fire = $false; Code = '& docker inspect -f ''{{.State.Status}}'' open-webui' }
     @{ Rule = 'FORMAT'; Fire = $false; Code = 'Remove-Item $p -f' }
     @{ Rule = 'FORMAT'; Fire = $false; Code = '& docker compose --project-directory (Join-Path $r ''S'') -f (Join-Path $r ''c.yml'') up' }
@@ -230,6 +250,10 @@ $canaries = @(
     @{ Rule = 'ELEVATED'; Fire = $false; File = 'Install-LocalAI.ps1'; Code = '$x = Join-Path $P.Scripts ''Watch-LocalAI.ps1''' }
     @{ Rule = 'ELEVATED'; Fire = $true; File = 'Install-LocalAI.ps1'; Code = "`$b = Join-Path `$P.Scripts 'Backup-OpenWebUI.ps1'`n& `$b -AIRoot `$AIRoot" }
     @{ Rule = 'ELEVATED'; Fire = $false; File = 'Install-LocalAI.ps1'; Code = "`$b = Join-Path `$SourceRoot 'Backup-OpenWebUI.ps1'`n& `$b -AIRoot `$AIRoot" }
+    @{ Rule = 'RECURSE'; Fire = $true; File = 'Uninstall-LocalAI.ps1'; Code = 'Remove-Item -LiteralPath $p -Recurse -Force' }
+    @{ Rule = 'RECURSE'; Fire = $true; File = 'Install-LocalAI.ps1'; Code = 'rm $p -r' }
+    @{ Rule = 'RECURSE'; Fire = $false; File = 'Install-LocalAI.ps1'; Code = 'Remove-LaiTree -Path $p' }
+    @{ Rule = 'RECURSE'; Fire = $false; File = 'Backup-OpenWebUI.ps1'; Code = 'Remove-Item -LiteralPath $p -Recurse -Force' }
     @{ Rule = 'NOSILENT'; Fire = $true; Code = '$p = New-ScheduledTaskPrincipal -UserId $u -LogonType Interactive -RunLevel Highest' }
     @{ Rule = 'NOSILENT'; Fire = $false; Code = '$p = New-ScheduledTaskPrincipal -UserId $u -LogonType Interactive -RunLevel Limited' }
     @{ Rule = 'ENCODING'; Fire = $true; Code = 'foreach ($l in (Get-Content -LiteralPath $envPath)) { $l }' }
@@ -264,9 +288,14 @@ $docCanaries = @(
     @{ Fire = $false; Text = 'Run `Update-OpenWebUI.ps1 -Latest` or `Install-LocalAI.cmd -RenderGuard off` (or -Foo outside the span).' }
     @{ Fire = $false; Text = '.\Uninstall-LocalAI.ps1 -WhatIf   # -NotAParam in a comment' }
 )
-foreach ($k in @(
-        @{ Fire = $true; Text = "services:`n  a:`n    image: x`n    logging: *l`n  b:`n    image: y`nvolumes:`n  v:" }
-        @{ Fire = $false; Text = "services:`n  a:`n    image: x`n    logging: *l`nvolumes:`n  v:" })) {
+$composeCanaries = @(
+    @{ Fire = $true; Text = "services:`n  a:`n    image: x`n    logging: *l`n  b:`n    image: y`nvolumes:`n  v:" }
+    @{ Fire = $false; Text = "services:`n  a:`n    image: x`n    logging: *l`nvolumes:`n  v:" }
+    @{ Fire = $true; Text = "services:`n  a:`n    logging: *l`n# a comment at column 0`n  b:`n    image: y" }
+    @{ Fire = $true; Text = "services:`n    a:`n        image: x`n    b:`n        logging: *l" }
+    @{ Fire = $true; Text = "services:`n  a:   # first`n    image: x`n  b:`n    logging: *l" }
+    @{ Fire = $false; Text = "services:`n  a:`n    <<: *common`n  b:   # second`n    logging: *l" })
+foreach ($k in $composeCanaries) {
     if (((Find-ComposeLogGap $k.Text).Count -gt 0) -ne $k.Fire) {
         $canaryFail++; $problems++
         Write-Host ("CANARY   rule COMPOSELOG {0}" -f $(if ($k.Fire) { 'did not fire' } else { 'fired wrongly' })) -ForegroundColor Red
@@ -289,7 +318,7 @@ foreach ($k in $canaries) {
         Write-Host ("CANARY   rule {0} {1} on: {2}" -f $k.Rule, $(if ($k.Fire) { 'did not fire' } else { 'fired wrongly' }), $k.Code) -ForegroundColor Red
     }
 }
-Write-Host ("Pitfall-rule canaries: {0}/{1} OK" -f ($canaries.Count + $docCanaries.Count + 2 - $canaryFail), ($canaries.Count + $docCanaries.Count + 2)) -ForegroundColor $(if ($canaryFail) { 'Red' } else { 'Green' })
+Write-Host ("Pitfall-rule canaries: {0}/{1} OK" -f ($canaries.Count + $docCanaries.Count + $composeCanaries.Count - $canaryFail), ($canaries.Count + $docCanaries.Count + $composeCanaries.Count)) -ForegroundColor $(if ($canaryFail) { 'Red' } else { 'Green' })
 
 foreach ($f in $files) {
     $tokens = $null; $errs = $null
