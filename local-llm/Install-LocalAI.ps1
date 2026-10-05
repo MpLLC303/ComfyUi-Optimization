@@ -223,6 +223,31 @@ if (-not $State.flags.ContainsKey('params') -or $null -eq $State.flags['params']
         if ($had -notcontains 'vision') { $State.flags['params']['SkipVision'] = $true }
         if ($had -notcontains 'code') { $State.flags['params']['SkipCoder'] = $true }
     }
+    # Those installs kept some settings only in localai-config.json and in the tuning fingerprint.
+    # Without this, the first update reset them: a 90-day retention became 14 (the first backup then
+    # pruned 15-90-day-old archives), a backup mirror stopped, a custom KV cache forced a full re-tune.
+    if (-not $ForgetSettings) {
+        $oldCfg = Read-LaiState -Path $P.Config
+        foreach ($k in @('BackupRetentionDays', 'BackupMirror', 'KeepAlive')) {
+            if ($oldCfg.ContainsKey($k) -and $null -ne $oldCfg[$k] -and [string]$oldCfg[$k] -ne '') { $State.flags['params'][$k] = $oldCfg[$k] }
+        }
+        $fp = @($State.tuning.Values | Where-Object { $_ -is [hashtable] -and $_['Fingerprint'] } | ForEach-Object { [string]$_['Fingerprint'] }) | Select-Object -First 1
+        if ($fp) {
+            $kvOld = [regex]::Match($fp, '(?:^|;)kv=([^;]+)'); $ohOld = [regex]::Match($fp, '(?:^|;)overhead=(\d+)'); $frOld = [regex]::Match($fp, '(?:^|;)free=(\d+)')
+            if ($kvOld.Success -and @('f16', 'q8_0', 'q4_0') -contains $kvOld.Groups[1].Value) { $State.flags['params']['KvCacheType'] = $kvOld.Groups[1].Value }
+            if ($ohOld.Success -and [int]$ohOld.Groups[1].Value -le 1024) { $State.flags['params']['GpuOverheadMiB'] = [int]$ohOld.Groups[1].Value }
+            if ($frOld.Success) { $State.flags['params']['MinFreeVramMiB'] = [int]$frOld.Groups[1].Value }
+        }
+        if (Get-Command Get-ScheduledTask -ErrorAction SilentlyContinue) {
+            try {
+                $bt = Get-ScheduledTask -TaskName 'LocalAI-Backup-OpenWebUI' -ErrorAction Stop
+                $sb = [string](@($bt.Triggers)[0].StartBoundary)
+                if ($sb -match 'T(\d{2}:\d{2})') { $State.flags['params']['BackupTime'] = $Matches[1] }
+            } catch { Write-Verbose 'no earlier backup task' }
+        }
+        $inferred = @($State.flags['params'].Keys | Sort-Object)
+        if ($inferred.Count) { Write-LaiLog INFO "Settings carried over from the earlier install: $($inferred -join ', ')" }
+    }
 }
 $savedParams = $State.flags['params']
 foreach ($name in $RememberedParams) {
@@ -552,7 +577,60 @@ if (-not $Resume -and $SourceRoot.TrimEnd('\') -eq $P.Scripts.TrimEnd('\')) {
 }
 if ($Resume) { Write-LaiLog INFO 'Resuming after reboot/sign-in.' }
 
+function Repair-LegacyInstall {
+    # Leftovers of earlier versions that must not wait until a stage near the end (which a failed or
+    # interrupted run never reaches).
+    # 1. Before the no-silent-elevation change, the backup and resume tasks ran elevated (RunLevel
+    #    Highest) and executed code from C:\AI, which the user controls: an admin escalation path.
+    if (Get-Command Get-ScheduledTask -ErrorAction SilentlyContinue) {
+        foreach ($tn in @($BackupTask, $WatchTask)) {
+            $t = Get-ScheduledTask -TaskName $tn -ErrorAction SilentlyContinue
+            if ($t -and [string]$t.Principal.RunLevel -eq 'Highest') {
+                Set-ScheduledTask -TaskName $tn -Principal (New-ScheduledTaskPrincipal -UserId $CurrentUser -LogonType Interactive -RunLevel Limited) | Out-Null
+                Write-LaiLog OK "Scheduled task '$tn' from an earlier version no longer runs as administrator"
+            }
+        }
+        $rt = Get-ScheduledTask -TaskName $ResumeTask -ErrorAction SilentlyContinue
+        if ($rt) {
+            $acts = @($rt.Actions | ForEach-Object { [string]$_.Arguments }) -join ' '
+            if ([string]$rt.Principal.RunLevel -eq 'Highest' -or $acts -notlike "*$ElevatedDir*") {
+                if ($Resume) { Register-ResumeTask } else { Unregister-ScheduledTask -TaskName $ResumeTask -Confirm:$false }
+                Write-LaiLog OK 'Replaced the after-reboot task of an earlier version (it ran the installer as administrator without asking)'
+            }
+        }
+    }
+    # 2. The first bootstrap unpacked the toolkit into C:\AI\Installer; double-clicking that old copy
+    #    would rewrite .env, drop the render guard and register an elevated task again.
+    $oldInstaller = Join-Path $P.Root 'Installer'
+    if ((Test-Path -LiteralPath $oldInstaller) -and -not ($SourceRoot.TrimEnd('\', '/') + [IO.Path]::DirectorySeparatorChar).StartsWith($oldInstaller.TrimEnd('\', '/') + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase)) {
+        try { Remove-Item -LiteralPath $oldInstaller -Recurse -Force -ErrorAction Stop; Write-LaiLog OK "Removed the outdated toolkit copy in $oldInstaller" }
+        catch { Write-LaiLog WARN "Could not remove the outdated toolkit copy in ${oldInstaller}: $($_.Exception.Message)" }
+    }
+    # 3. Early versions copied the guide's secret key into Secrets instead of moving it.
+    $rootSecret = Join-Path $P.Root 'openwebui-secret.txt'
+    $managedSecret = Join-Path $P.Secrets 'openwebui-secret.txt'
+    if ((Test-Path -LiteralPath $rootSecret) -and (Test-Path -LiteralPath $managedSecret)) {
+        if ((Get-Content -LiteralPath $rootSecret -Raw -Encoding UTF8).Trim() -eq (Get-Content -LiteralPath $managedSecret -Raw -Encoding UTF8).Trim()) {
+            Remove-Item -LiteralPath $rootSecret -Force
+            Write-LaiLog OK "Removed a second copy of the Open WebUI secret key outside $($P.Secrets)"
+        }
+    }
+    # 4. An old "Update toolkit" shortcut ignored -AIRoot and ran against C:\AI: a fresh state here
+    #    next to a running install somewhere else would build a second, broken install.
+    if (-not $State.stages.Count -and (Get-Command docker -ErrorAction SilentlyContinue)) {
+        $wd = Invoke-Native -File 'docker' -Arguments @('ps', '-a', '--filter', 'label=com.docker.compose.project=localai', '--filter', 'label=com.docker.compose.service=open-webui', '--format', '{{.Label `com.docker.compose.project.working_dir`}}') -Capture -AllowFail
+        if ($wd.ExitCode -eq 0) {
+            $other = @($wd.Output | Where-Object { $_ -and $_.TrimEnd('\', '/') -ne $P.Stack.TrimEnd('\', '/') } | Select-Object -Unique)
+            if ($other.Count) {
+                throw "Local AI is already installed with its stack in $($other[0]), not in $($P.Stack). Run the installer with -AIRoot '$(Split-Path -Parent $other[0])' (nothing was changed)."
+            }
+        }
+    }
+}
+
 try {
+Repair-LegacyInstall
+
 
 #region 1. Preflight ------------------------------------------------------------------------
 Invoke-Stage 'Preflight' {
@@ -642,7 +720,7 @@ Invoke-Stage 'Preflight' {
         if ($m.Trial -and $trialWanted -notcontains $m.Key) { continue }
         if ($present -contains (Resolve-LaiModelName $m.Source)) { $need = 0 }
         if ($m.Optional) {
-            if (($m.Key -eq 'vision' -and $SkipVision) -or ($m.Key -eq 'code' -and $SkipCoder)) { Write-LaiLog INFO "Skipping $($m.Display) (switch)"; continue }
+            if (($m.Key -eq 'vision' -and $SkipVision) -or ($m.Key -eq 'code' -and $SkipCoder)) { Write-LaiLog INFO "Skipping $($m.Display) (switch, or not installed before; add it with -Skip$(if ($m.Key -eq 'vision') { 'Vision' } else { 'Coder' }):`$false)"; continue }
             if ($need -gt 0 -and $need -gt $budget) { Write-LaiLog WARN "Skipping $($m.Display): needs $need GB, only $([Math]::Round($budget,1)) GB to spare on $target"; continue }
         } elseif ($need -gt 0 -and $need -gt $budget) {
             throw "Not enough disk space on ${target}: $($m.Display) needs $need GB plus a 15 GB margin; $freeGB GB free. Free space or pass -ModelDir <path on a bigger drive>."
@@ -1047,6 +1125,15 @@ Invoke-Stage 'Stack' {
     # (Docker Hub rate-limits anonymous pulls). A floating tag (main, latest) is always re-pulled.
     $pullPolicy = Get-LaiPullPolicy -Tags @($OpenWebUIVersion, $SearxngVersion)
     Invoke-LaiRetry -What 'docker compose pull' -Attempts 3 -DelaySeconds 15 -Action { Invoke-Compose -Arguments @('pull', '--policy', $pullPolicy) | Out-Null } | Out-Null
+    # Earlier versions on Windows PowerShell 5.1 mistook their own container for a manual install on
+    # every re-run (a docker template with inner quotes) and renamed it to open-webui-legacy-<time>.
+    # Those still carry this project's labels, so compose would see two open-webui containers. Their
+    # data is in the open-webui volume; a real manual install's container has no such label and stays.
+    $own = Invoke-Native -File 'docker' -Arguments @('ps', '-a', '--filter', 'label=com.docker.compose.project=localai', '--filter', 'label=com.docker.compose.service=open-webui', '--format', '{{.Names}}') -Capture -AllowFail
+    foreach ($n in @($own.Output | Where-Object { $_ -and $_ -ne 'open-webui' })) {
+        Invoke-Native -File 'docker' -Arguments @('rm', '-f', $n) -Capture -AllowFail | Out-Null
+        Write-LaiLog OK "Removed $n (this installer's own earlier container, renamed by mistake; its data is in the open-webui volume)"
+    }
     Invoke-ComposeUp -Arguments @('up', '-d', '--remove-orphans')
     $guardStarted = $true
     if ($guardChanged) {
@@ -1241,7 +1328,8 @@ Invoke-Stage 'Backup' {
         } catch { Write-LaiLog WARN "Could not create the Start-menu shortcuts: $($_.Exception.Message)" }
     }
 
-    & $backupScript -AIRoot $AIRoot
+    # This copy, not the one in AI\Scripts (a folder the user controls): the installer runs elevated.
+    & (Join-Path $SourceRoot 'Backup-OpenWebUI.ps1') -AIRoot $AIRoot
     if ($LASTEXITCODE -ne 0) { throw 'The first backup failed; see the messages above.' }
 }
 #endregion

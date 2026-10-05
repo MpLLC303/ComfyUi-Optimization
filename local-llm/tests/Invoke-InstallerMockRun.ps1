@@ -184,6 +184,9 @@ Assert-That ($code1b -eq 10 -and $runas) "not elevated: relaunches through a UAC
 Assert-That ($runas -match '-Resume' -and $runas -match [regex]::Escape((Join-Path $env:ProgramFiles 'LocalAI'))) 'the elevated relaunch keeps -Resume (2-strike limit) and runs the Program Files copy'
 
 Write-Host "`n=== PHASE 2: resume after reboot ===" -ForegroundColor Cyan
+# What older versions on Windows PowerShell 5.1 left behind: the installer's OWN container, renamed
+# as if it were a manual install (compose labels intact). It must go; the manual one must stay.
+& /usr/bin/docker create --name open-webui-legacy-20250101000000 --label lai-test=1 --label com.docker.compose.project=localai --label com.docker.compose.service=open-webui alpine:3.20 true | Out-Null
 $global:WslInstalled = $true
 Invoke-Expression $cmd
 $code2 = $LASTEXITCODE
@@ -214,6 +217,8 @@ Assert-That (($envFile -contains 'WEBUI_ADMIN_PASSWORD=') -and ($envFile -match 
 Assert-That (@(Get-ChildItem (Join-Path $aiRoot 'Backups') -Filter 'open-webui-*-pre-compose.tar.gz').Count -eq 1) 'legacy container volume backed up before replacement'
 Assert-That (@(Get-ChildItem (Join-Path $aiRoot 'Backups') -Filter 'open-webui-*.tar.gz').Count -ge 2) 'scheduled-style backup created too'
 Assert-That ((& /usr/bin/docker run --rm -v open-webui:/d:ro alpine:3.20 cat /d/marker.txt) -eq 'legacy-marker') 'old data copied from the legacy volume into open-webui'
+$legacyNow = @(& /usr/bin/docker ps -a --filter 'name=^/open-webui-legacy-' --format '{{.Names}}')
+Assert-That ($legacyNow -notcontains 'open-webui-legacy-20250101000000' -and $legacyNow.Count -eq 1) "the installer's own mis-renamed container is removed, the manual install's is kept ($($legacyNow -join ', '))"
 Assert-That ((& /usr/bin/docker inspect -f '{{.HostConfig.RestartPolicy.Name}}' (& /usr/bin/docker ps -aq --filter 'name=^/open-webui-legacy-')) -eq 'no') 'legacy container restart policy disabled'
 Assert-That ($null -eq (& /usr/bin/docker ps -a --filter 'name=^/open-webui$' --format '{{.ID}}') -and (& /usr/bin/docker ps -a --filter 'name=^/open-webui-legacy-' --format '{{.Status}}') -match 'Exited') 'legacy container stopped and renamed (kept)'
 Assert-That (@($global:Calls | Where-Object { $_ -like 'docker compose*up -d*' }).Count -ge 2) 'compose up ran (initial + after password removal)'
@@ -306,9 +311,59 @@ $env:LOCALAI_TEST_FAIL_STAGE = ''
 & (Join-Path $aiRoot 'Scripts/Install-LocalAI.ps1') -AIRoot $aiRoot -SkipTests
 Assert-That ($LASTEXITCODE -eq 0 -and -not (Get-Content -Encoding UTF8 -Raw (Join-Path $aiRoot 'install-state.json') | ConvertFrom-Json).flags.PSObject.Properties['resumeFailures']) 'a good run clears the failure count'
 
+Write-Host "`n=== PHASE 6: update over an install made by an early version ===" -ForegroundColor Cyan
+# Early versions: no remembered settings (they lived in localai-config.json and the tuning
+# fingerprint), backup and resume tasks elevated, a toolkit copy in AI\Installer, the secret key
+# copied rather than moved. The run fails at the first stage: the fixes must already be done.
+Import-Module (Join-Path $copy 'lib/LocalAI.psm1')
+$statePath = Join-Path $aiRoot 'install-state.json'; $cfgPath = Join-Path $aiRoot 'localai-config.json'
+$st6 = Read-LaiState -Path $statePath
+$st6.flags.Remove('params')
+foreach ($k in @($st6.tuning.Keys)) { if ($st6.tuning[$k] -is [hashtable] -and $st6.tuning[$k]['Fingerprint']) { $st6.tuning[$k]['Fingerprint'] = ([string]$st6.tuning[$k]['Fingerprint']) -replace 'overhead=\d+', 'overhead=600' } }
+Save-LaiState -State $st6 -Path $statePath
+$cfg6 = Read-LaiState -Path $cfgPath; $cfg6['BackupRetentionDays'] = 90; $cfg6['BackupMirror'] = (Join-Path $Work 'nas-mirror'); $cfg6['KeepAlive'] = '30m'; Save-LaiState -State $cfg6 -Path $cfgPath
+$global:TaskTriggers = @{ 'LocalAI-Backup-OpenWebUI' = '2025-01-01T02:15:00' }
+function global:Get-ScheduledTask {
+    param($TaskName, $ErrorAction)
+    if (-not $global:Tasks.ContainsKey($TaskName)) { if ($ErrorAction -eq 'Stop') { throw "no task $TaskName" }; return $null }
+    $lvl = 'Limited'; if ([string]$global:TaskPrincipals[$TaskName] -match 'Highest') { $lvl = 'Highest' }
+    [pscustomobject]@{ TaskName = $TaskName; Principal = [pscustomobject]@{ RunLevel = $lvl }; Actions = @([pscustomobject]@{ Arguments = [string]$global:Tasks[$TaskName] }); Triggers = @([pscustomobject]@{ StartBoundary = [string]$global:TaskTriggers[$TaskName] }) }
+}
+function global:Set-ScheduledTask { param($TaskName, $Principal) $global:TaskPrincipals[$TaskName] = [string]$Principal.Args; Record "Set-ScheduledTask $TaskName" }
+$global:Tasks['LocalAI-Backup-OpenWebUI'] = '-File "C:\AI\Scripts\Backup-OpenWebUI.ps1" -AIRoot "C:\AI"'; $global:TaskPrincipals['LocalAI-Backup-OpenWebUI'] = '-UserId x -LogonType Interactive -RunLevel Highest'
+$global:Tasks['LocalAI-Install-Resume'] = '-File "C:\AI\Scripts\Install-LocalAI.ps1"'; $global:TaskPrincipals['LocalAI-Install-Resume'] = '-UserId x -LogonType Interactive -RunLevel Highest'
+New-Item -ItemType Directory -Force -Path (Join-Path $aiRoot 'Installer') | Out-Null; Set-Content -LiteralPath (Join-Path (Join-Path $aiRoot 'Installer') 'Install-LocalAI.cmd') -Value 'old'
+Copy-Item -LiteralPath (Join-Path $aiRoot 'Secrets/openwebui-secret.txt') -Destination (Join-Path $aiRoot 'openwebui-secret.txt')
+$env:LOCALAI_TEST_FAIL_STAGE = 'Preflight'
+& (Join-Path $aiRoot 'Scripts/Install-LocalAI.ps1') -AIRoot $aiRoot -SkipTests
+$c6 = $LASTEXITCODE
+$env:LOCALAI_TEST_FAIL_STAGE = ''
+Assert-That ($c6 -ne 0) "the run stops at the first stage (exit $c6)"
+Assert-That ([string]$global:TaskPrincipals['LocalAI-Backup-OpenWebUI'] -match 'Limited' -and [string]$global:TaskPrincipals['LocalAI-Backup-OpenWebUI'] -notmatch 'Highest') 'an elevated backup task from an early version is made non-elevated before anything can fail'
+Assert-That (-not $global:Tasks.ContainsKey('LocalAI-Install-Resume')) "an elevated after-reboot task from an early version is removed"
+$p6 = (Read-LaiState -Path $statePath).flags['params']
+Assert-That ($p6 -and [int]$p6['BackupRetentionDays'] -eq 90 -and [string]$p6['BackupMirror'] -eq (Join-Path $Work 'nas-mirror') -and [string]$p6['KeepAlive'] -eq '30m') 'retention, mirror and keep-alive carried over from the old config (no pruning of 15-90-day-old backups)'
+Assert-That ($p6 -and [int]$p6['GpuOverheadMiB'] -eq 600 -and [string]$p6['BackupTime'] -eq '02:15') 'VRAM overhead from the tuning fingerprint (no needless re-tune) and backup time from the old task'
+Assert-That (-not (Test-Path -LiteralPath (Join-Path $aiRoot 'Installer'))) 'the outdated AI\Installer toolkit copy is removed'
+Assert-That (-not (Test-Path -LiteralPath (Join-Path $aiRoot 'openwebui-secret.txt')) -and (Test-Path -LiteralPath (Join-Path $aiRoot 'Secrets/openwebui-secret.txt'))) 'the second copy of the secret key outside Secrets is removed'
+Remove-Item -Path 'function:Get-ScheduledTask', 'function:Set-ScheduledTask' -ErrorAction SilentlyContinue
+Assert-That (-not (Get-Command Get-ScheduledTask -ErrorAction SilentlyContinue)) 'task mocks removed for the next phase'
+
+Write-Host "`n=== PHASE 6b: an old 'Update toolkit' shortcut pointing at the wrong folder ===" -ForegroundColor Cyan
+# Older shortcuts ignored -AIRoot and ran against C:\AI. With an install running elsewhere, a fresh
+# folder must not become a second, broken install.
+& /usr/bin/docker create --name lai-test-elsewhere --label lai-test=1 --label com.docker.compose.project=localai --label com.docker.compose.service=open-webui --label com.docker.compose.project.working_dir=/elsewhere/AI/Stack alpine:3.20 true | Out-Null
+$ai2 = Join-Path $Work 'AI-second'
+& (Join-Path $aiRoot 'Scripts/Install-LocalAI.ps1') -AIRoot $ai2 -SkipTests
+$c6b = $LASTEXITCODE
+& /usr/bin/docker rm -f lai-test-elsewhere 2>$null | Out-Null
+$log6b = (Get-ChildItem -LiteralPath (Join-Path $ai2 'Logs') -Filter 'install-*.log' -ErrorAction SilentlyContinue | ForEach-Object { Get-Content -Raw -LiteralPath $_.FullName }) -join "`n"
+$st6b = Read-LaiState -Path (Join-Path $ai2 'install-state.json')
+Assert-That ($c6b -ne 0 -and $log6b -match 'already installed with its stack in /elsewhere/AI/Stack' -and -not ($st6b['stages'] -and $st6b['stages'].Count)) "refuses and names the existing install's folder (exit $c6b)"
+
 } finally {
     $env:LOCALAI_TEST_FAIL_STAGE = ''
-    & /usr/bin/docker rm -f open-webui 2>$null | Out-Null
+    & /usr/bin/docker rm -f open-webui lai-test-elsewhere 2>$null | Out-Null
     & /usr/bin/docker ps -aq --filter 'name=^/open-webui-legacy-' | ForEach-Object { & /usr/bin/docker rm -f $_ | Out-Null }
     & /usr/bin/docker volume rm open-webui owui-old 2>$null | Out-Null
     # The installer pointed the shared Open WebUI at the guard on :11435; point it back at Ollama.

@@ -54,7 +54,9 @@ only re-applies it (it warns you). If your install is older than the Start-menu 
 one-liner.
 
 A re-run is safe, and it keeps your chats, models, image versions set by `Update-OpenWebUI.ps1`,
-render-guard mode and trial models.
+render-guard mode and trial models. Updating an install made by an early version of this toolkit
+also carries over its backup retention, backup mirror, keep-alive and VRAM settings, makes its
+scheduled tasks run without administrator rights, and removes the old `C:\AI\Installer` copy.
 - **Time:** a few minutes when nothing changed. Models that are installed and already passed the
   GPU check are not loaded again, and the stored context tuning is reused. The health check at the
   end still loads each model once to measure its speed (skip it with `-SkipTests`).

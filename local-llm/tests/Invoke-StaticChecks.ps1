@@ -45,6 +45,13 @@ function Find-Pitfall([System.Management.Automation.Language.Ast]$Ast, [string[]
     $found = New-Object System.Collections.Generic.List[object]
     $add = { param($Rule, $Node, $Msg) $found.Add([pscustomobject]@{ Rule = $Rule; Line = $Node.Extent.StartLineNumber; Message = $Msg }) }
     $marker = { param($Node, $Tag) $Lines[$Node.Extent.StartLineNumber - 1] -match ('#\s*lai-ok:\s*' + $Tag) }
+    # Variables that hold a path under $P.Scripts (for ELEVATED: '& $backupScript' is the same as
+    # '& (Join-Path $P.Scripts ...)').
+    $scriptsVars = @()
+    if ($FileName -eq 'Install-LocalAI.ps1') {
+        $scriptsVars = @($Ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.AssignmentStatementAst] -and $n.Left -is [System.Management.Automation.Language.VariableExpressionAst] -and $n.Right.Extent.Text -match '\$P\.Scripts' }, $true) |
+            ForEach-Object { $_.Left.VariablePath.UserPath })
+    }
 
     foreach ($c in $Ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] }, $true)) {
         $name = $c.GetCommandName()
@@ -62,8 +69,10 @@ function Find-Pitfall([System.Management.Automation.Language.Ast]$Ast, [string[]
         }
         # The installer runs elevated (silently, from the resume task): it must never run code from
         # AI\Scripts, which lives in a folder the user controls. Use $SourceRoot (its own copy).
+        $viaVar = ($c.InvocationOperator -eq 'Ampersand' -or $c.InvocationOperator -eq 'Dot') -and $c.CommandElements[0] -is [System.Management.Automation.Language.VariableExpressionAst] -and
+            $scriptsVars -contains $c.CommandElements[0].VariablePath.UserPath
         if ($FileName -eq 'Install-LocalAI.ps1' -and ($c.InvocationOperator -eq 'Ampersand' -or $c.InvocationOperator -eq 'Dot' -or $name -eq 'Import-Module') -and
-            $c.Extent.Text -match '\$P\.Scripts' -and -not (& $marker $c 'elevated')) {
+            ($c.Extent.Text -match '\$P\.Scripts' -or $viaVar) -and -not (& $marker $c 'elevated')) {
             & $add 'ELEVATED' $c 'the elevated installer runs code from AI\Scripts (user-controlled folder); run it from $SourceRoot'
         }
         # No scheduled task may run elevated: the scripts work on C:\AI, which the user controls.
@@ -202,6 +211,8 @@ $canaries = @(
     @{ Rule = 'ELEVATED'; Fire = $true; File = 'Install-LocalAI.ps1'; Code = 'Import-Module (Join-Path $P.Scripts ''lib\LocalAI.psm1'')' }
     @{ Rule = 'ELEVATED'; Fire = $false; File = 'Install-LocalAI.ps1'; Code = '& (Join-Path $SourceRoot ''Test-LocalAI.ps1'') -AIRoot $AIRoot' }
     @{ Rule = 'ELEVATED'; Fire = $false; File = 'Install-LocalAI.ps1'; Code = '$x = Join-Path $P.Scripts ''Watch-LocalAI.ps1''' }
+    @{ Rule = 'ELEVATED'; Fire = $true; File = 'Install-LocalAI.ps1'; Code = "`$b = Join-Path `$P.Scripts 'Backup-OpenWebUI.ps1'`n& `$b -AIRoot `$AIRoot" }
+    @{ Rule = 'ELEVATED'; Fire = $false; File = 'Install-LocalAI.ps1'; Code = "`$b = Join-Path `$SourceRoot 'Backup-OpenWebUI.ps1'`n& `$b -AIRoot `$AIRoot" }
     @{ Rule = 'NOSILENT'; Fire = $true; Code = '$p = New-ScheduledTaskPrincipal -UserId $u -LogonType Interactive -RunLevel Highest' }
     @{ Rule = 'NOSILENT'; Fire = $false; Code = '$p = New-ScheduledTaskPrincipal -UserId $u -LogonType Interactive -RunLevel Limited' }
     @{ Rule = 'ENCODING'; Fire = $true; Code = 'foreach ($l in (Get-Content -LiteralPath $envPath)) { $l }' }
