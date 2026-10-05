@@ -749,6 +749,14 @@ Assert-That ($adv -notmatch 'Rollback' -and $adv -match 'close ComfyUI') "a re-c
 $adv = @(Get-LaiModelSetupAdvice -Why 'connection refused' -Display 'Main' -Key 'main') -join ' | '
 Assert-That ($adv -match 'run Update-Models\.ps1 again' -and $adv -notmatch 'Rollback') "anything else: run it again ($adv)"
 
+Write-Host "`n=== process environment: a variable restored to 'not set' is removed, not left empty ===" -ForegroundColor Cyan
+Remove-Item -LiteralPath 'Env:LAI_UNIT_ENV' -ErrorAction SilentlyContinue
+$before = [Environment]::GetEnvironmentVariable('LAI_UNIT_ENV', 'Process')
+Set-LaiProcessEnv -Name 'LAI_UNIT_ENV' -Value '3.20'
+$during = [Environment]::GetEnvironmentVariable('LAI_UNIT_ENV', 'Process')
+Set-LaiProcessEnv -Name 'LAI_UNIT_ENV' -Value $before
+Assert-That ($during -eq '3.20' -and -not (Test-Path -LiteralPath 'Env:LAI_UNIT_ENV')) "set, then restored to not set: the variable is gone (docker compose would prefer an empty one over .env)"
+
 Write-Host "`n=== Open WebUI setup: settings are read back; optional steps only warn ===" -ForegroundColor Cyan
 $cmp = @(Compare-LaiConfig -Expected @{ A = $true; N = 2000; S = 'searxng'; web = @{ U = 'http://x/?q=<query>'; C = 5 } } `
     -Actual ([pscustomobject]@{ A = $true; N = [long]2000; S = 'searxng'; web = [pscustomobject]@{ U = 'http://x/?q=<query>'; C = 5 } }))

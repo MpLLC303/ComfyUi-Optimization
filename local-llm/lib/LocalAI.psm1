@@ -826,6 +826,16 @@ function Get-LaiOllamaVersion {
     return (Invoke-LaiApi -Uri "$BaseUrl/api/version" -TimeoutSec 10).version
 }
 
+function Set-LaiProcessEnv {
+    # Sets a variable for this process and the programs it starts; $null (a variable that was not
+    # set before) REMOVES it. [Environment]::SetEnvironmentVariable with $null passes '' from
+    # PowerShell: Windows then deletes it, but PowerShell 7 on Linux keeps an empty variable, which
+    # docker compose prefers over .env (an image 'alpine:' with no tag).
+    param([Parameter(Mandatory)][string]$Name, [AllowNull()][string]$Value)
+    if ($null -eq $Value -or $Value -eq '') { Remove-Item -LiteralPath "Env:$Name" -ErrorAction SilentlyContinue }
+    else { Set-Item -LiteralPath "Env:$Name" -Value $Value }
+}
+
 function Get-LaiOllamaAppPath {
     # The Ollama tray app, also when installed to a custom folder (Find-LaiOllamaDir); '' when it is
     # not installed or this is not Windows.

@@ -97,13 +97,13 @@ function Invoke-PullFirst {
     $saved = @{}
     foreach ($n in @('OPEN_WEBUI_VERSION', 'SEARXNG_VERSION')) { $saved[$n] = [Environment]::GetEnvironmentVariable($n, 'Process') }
     try {
-        if ($OpenWebUI) { [Environment]::SetEnvironmentVariable('OPEN_WEBUI_VERSION', $OpenWebUI, 'Process') }
-        if ($Searxng) { [Environment]::SetEnvironmentVariable('SEARXNG_VERSION', $Searxng, 'Process') }
+        if ($OpenWebUI) { Set-LaiProcessEnv -Name 'OPEN_WEBUI_VERSION' -Value $OpenWebUI }
+        if ($Searxng) { Set-LaiProcessEnv -Name 'SEARXNG_VERSION' -Value $Searxng }
         # Pinned versions already on disk are reused (no registry, no Docker Hub rate limit);
         # floating tags (main, latest) are re-pulled.
         Invoke-Docker -Arguments ($base + @('pull', '--policy', (Get-LaiPullPolicy -Tags $tags)) + @($Services))
     } finally {
-        foreach ($n in @($saved.Keys)) { [Environment]::SetEnvironmentVariable($n, $saved[$n], 'Process') }
+        foreach ($n in @($saved.Keys)) { Set-LaiProcessEnv -Name $n -Value $saved[$n] }
     }
 }
 

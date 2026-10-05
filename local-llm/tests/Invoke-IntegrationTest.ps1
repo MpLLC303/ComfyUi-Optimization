@@ -225,10 +225,10 @@ foreach ($k in $rgEnv.Keys) { $rgEnvBefore[$k] = [Environment]::GetEnvironmentVa
 try {
     $rgProcs += Start-Process -FilePath 'python3' -ArgumentList @('-m', 'http.server', "$comfyPort", '--bind', '127.0.0.1', '--directory', $rgDir) -PassThru `
         -RedirectStandardOutput (Join-Path $rgDir 'comfy.log') -RedirectStandardError (Join-Path $rgDir 'comfy.err')
-    foreach ($k in $rgEnv.Keys) { [Environment]::SetEnvironmentVariable($k, $rgEnv[$k]) }
+    foreach ($k in $rgEnv.Keys) { Set-LaiProcessEnv -Name $k -Value $rgEnv[$k] }
     $rgProcs += Start-Process -FilePath 'python3' -ArgumentList @('-u', (Join-Path $root 'stack/render-guard/render_guard.py')) -PassThru `
         -RedirectStandardOutput (Join-Path $rgDir 'guard.log') -RedirectStandardError (Join-Path $rgDir 'guard.err')
-    foreach ($k in $rgEnv.Keys) { [Environment]::SetEnvironmentVariable($k, $rgEnvBefore[$k]) }
+    foreach ($k in $rgEnv.Keys) { Set-LaiProcessEnv -Name $k -Value $rgEnvBefore[$k] }
     $rgUrl = "http://127.0.0.1:$rgPort"
     $up = $null
     for ($i = 0; $i -lt 60 -and -not ($up -and $up.comfyui -and $up.comfyui.busy); $i++) {
@@ -254,7 +254,7 @@ try {
 } catch {
     Write-LaiLog FAIL "render guard against the real Ollama: $($_.Exception.Message)"; $failures++
 } finally {
-    foreach ($k in $rgEnv.Keys) { [Environment]::SetEnvironmentVariable($k, $rgEnvBefore[$k]) }
+    foreach ($k in $rgEnv.Keys) { Set-LaiProcessEnv -Name $k -Value $rgEnvBefore[$k] }
     foreach ($p in $rgProcs) { try { if (-not $p.HasExited) { Stop-Process -Id $p.Id -Force } } catch { Write-Verbose 'already gone' } }
     try { Stop-LaiOllamaModels -BaseUrl $OllamaUrl } catch { Write-Verbose 'unload failed' }
     Remove-Item -LiteralPath $rgDir -Recurse -Force -ErrorAction SilentlyContinue

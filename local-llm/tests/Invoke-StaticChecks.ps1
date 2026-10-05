@@ -54,6 +54,10 @@ $files = Get-ChildItem -Path $Root -Recurse -File -Include *.ps1, *.psm1, *.psd1
 #   HIDDENTASK a scheduled task action that runs powershell.exe directly: on Windows 11 (Windows
 #            Terminal as console host) -WindowStyle Hidden still shows a window, and closing it kills
 #            the run. Use Get-LaiHiddenTaskLaunch (conhost --headless).
+#   ENVRESTORE [Environment]::SetEnvironmentVariable for this process (no 'User'/'Machine' target):
+#            restoring a variable that was not set passes '' from PowerShell, which PowerShell 7 on
+#            Linux keeps as an empty variable (docker compose then prefers it over .env). Use
+#            Set-LaiProcessEnv, which removes the variable for $null.
 #   ENVFIRST Update-OpenWebUI.ps1 writing the new version into .env before the image is pulled: a run
 #            cut off mid-download then leaves .env naming an image that is not there.
 #   MDTABLE  a README.md table row with more or fewer cells than its header (two rows joined by a
@@ -263,6 +267,14 @@ function Find-Pitfall([System.Management.Automation.Language.Ast]$Ast, [string[]
         }
     }
 
+    # A process-scope environment variable set directly (Set-LaiProcessEnv removes one restored to $null).
+    foreach ($im in $Ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.InvokeMemberExpressionAst] -and [string]$n.Member.Value -eq 'SetEnvironmentVariable' }, $true)) {
+        $target = ''; if (@($im.Arguments).Count -ge 3) { $target = [string]$im.Arguments[2].Extent.Text }
+        if ($target -notmatch "(?i)'(User|Machine)'|EnvironmentVariableTarget\]::(User|Machine)" -and -not (& $marker $im 'env')) {
+            & $add 'ENVRESTORE' $im "process environment set with SetEnvironmentVariable: a `$null value leaves an empty variable on PowerShell 7/Linux; use Set-LaiProcessEnv"
+        }
+    }
+
     # Every parameter of a user-facing script is explained somewhere Get-Help shows it.
     $help = $null
     if ($UserFacing -and $Ast -is [System.Management.Automation.Language.ScriptBlockAst] -and $Ast.ParamBlock) { $help = $Ast.GetHelpContent() }
@@ -421,6 +433,10 @@ $canaries = @(
     @{ Rule = 'BOUND'; Fire = $false; Code = 'function F { param($X) $PSBoundParameters.ContainsKey(''X'') }' }
     @{ Rule = 'BOUND'; Fire = $false; Code = 'function F { param($X) $PSBoundParameters.Keys | ForEach-Object { $PSBoundParameters[$_] } }' }
     @{ Rule = 'HELP'; Fire = $true; UserFacing = $true; Code = "<#`n.SYNOPSIS`n  x`n#>`nparam(`n  [switch]`$Force`n)" }
+    @{ Rule = 'ENVRESTORE'; Fire = $true; Code = 'foreach ($n in @($saved.Keys)) { [Environment]::SetEnvironmentVariable($n, $saved[$n], ''Process'') }' }
+    @{ Rule = 'ENVRESTORE'; Fire = $true; Code = '[Environment]::SetEnvironmentVariable($k, $before[$k])' }
+    @{ Rule = 'ENVRESTORE'; Fire = $false; Code = '[Environment]::SetEnvironmentVariable(''OLLAMA_HOST'', $v, ''User'')' }
+    @{ Rule = 'ENVRESTORE'; Fire = $false; Code = 'Set-LaiProcessEnv -Name $n -Value $saved[$n]' }
     @{ Rule = 'HELP'; Fire = $false; UserFacing = $true; Code = "<#`n.SYNOPSIS`n  x`n.PARAMETER Force`n  y`n#>`nparam(`n  [switch]`$Force`n)" }
     @{ Rule = 'HELP'; Fire = $false; UserFacing = $true; Code = "<#`n.SYNOPSIS`n  x`n#>`nparam(`n  # skip the prompt`n  [switch]`$Force`n)" }
     @{ Rule = 'HELP'; Fire = $false; UserFacing = $true; Code = "<#`n.SYNOPSIS`n  x`n.DESCRIPTION`n  -Force skips the prompt.`n#>`nparam(`n  [switch]`$Force`n)" }
