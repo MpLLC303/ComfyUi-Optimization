@@ -79,21 +79,28 @@ if (Test-Path -LiteralPath $searxSettings) {
     if ($m) { Add-Secret $m.Matches[0].Groups[1].Value }
 }
 if ($env:USERNAME) { [void]$names.Add($env:USERNAME) }
+# The profile folder keeps its first name after an account rename (and differs for Microsoft/Azure AD
+# accounts), and it is in every path.
+if ($env:USERPROFILE) { [void]$names.Add((Split-Path -Leaf $env:USERPROFILE)) }
 # The computer name shows up in transcripts (Machine:, HOST\user) and container logs.
 if ($env:COMPUTERNAME) { [void]$names.Add($env:COMPUTERNAME) }
 
 function Protect-Text([string]$Text) {
     if (-not $Text) { return $Text }
     foreach ($s in $secrets) { $Text = $Text.Replace($s, '[REDACTED]') }
-    $Text = [regex]::Replace($Text, '(?i)(password|passwd|secret|secret_key|api_key|token)(["'']?\s*[:=]\s*["'']?)[^\s"'',;}]+', '$1$2[REDACTED]')
-    $Text = [regex]::Replace($Text, '(?i)Bearer\s+[A-Za-z0-9\-._~+/]+=*', 'Bearer [REDACTED]')
+    # CultureInvariant: under tr-TR, IgnoreCase does not pair I/i, so OPENAI_API_KEY would not match.
+    $ci = [System.Text.RegularExpressions.RegexOptions]'IgnoreCase, CultureInvariant'
+    $Text = [regex]::Replace($Text, '(password|passwd|secret|secret_key|api_key|token)(["'']?\s*[:=]\s*["'']?)[^\s"'',;}]+', '$1$2[REDACTED]', $ci)
+    $Text = [regex]::Replace($Text, 'Bearer\s+[A-Za-z0-9\-._~+/]+=*', 'Bearer [REDACTED]', $ci)
     $Text = [regex]::Replace($Text, 'eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}', '[JWT]')
     $Text = [regex]::Replace($Text, '\b[0-9a-fA-F]{48,}\b', '[HEX]')
     if (-not $KeepNames) {
         # Any e-mail address (other accounts, addresses in logs), not only the admin's.
         $Text = [regex]::Replace($Text, '[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}', '<email>')
         foreach ($n in $names) {
-            if ($n -and $n.Length -ge 3) { $Text = [regex]::Replace($Text, [regex]::Escape($n), '<user>', 'IgnoreCase') }
+            # Two characters is a whole name in Chinese/Japanese/Korean (and 'Li'). Whole words only, so
+            # 'Li' does not turn 'Limited' or 'client' into '<user>mited' and 'c<user>ent'.
+            if ($n -and $n.Length -ge 2) { $Text = [regex]::Replace($Text, '(?<![\p{L}\p{N}])' + [regex]::Escape($n) + '(?![\p{L}\p{N}])', '<user>', $ci) }
         }
     }
     return $Text
@@ -105,12 +112,21 @@ function Save-Part([string]$Name, [string]$Text) {
 function Invoke-Capture([string]$File, [string[]]$Arguments) {
     if (-not (Get-Command $File -ErrorAction SilentlyContinue)) { return "($File not found)" }
     $prev = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
-    try { $out = @(& $File @Arguments 2>&1 | ForEach-Object { "$_" }) } finally { $ErrorActionPreference = $prev }
+    # docker/ollama/nvidia-smi write UTF-8: decode it as such, or a non-ASCII user name in a path is
+    # mangled and slips past the redaction.
+    $prevEnc = $null
+    try { $prevEnc = [Console]::OutputEncoding; [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false) } catch { $prevEnc = $null }
+    try { $out = @(& $File @Arguments 2>&1 | ForEach-Object { "$_" }) }
+    finally {
+        $ErrorActionPreference = $prev
+        if ($prevEnc) { try { [Console]::OutputEncoding = $prevEnc } catch { Write-Verbose 'console encoding not restored' } }
+    }
     return ($out -join "`n")
 }
 function Get-Tail([string]$Path, [int]$Lines = 200) {
     if (-not (Test-Path -LiteralPath $Path)) { return "(missing: $Path)" }
-    return ((Get-Content -LiteralPath $Path -Tail $Lines) -join "`n")
+    # Ollama's and the toolkit's logs are UTF-8 (5.1 would read them as ANSI and garble names).
+    return ((Get-Content -LiteralPath $Path -Tail $Lines -Encoding UTF8) -join "`n")
 }
 function Invoke-Safely([scriptblock]$Block) { try { return (& $Block) } catch { return "(unavailable: $($_.Exception.Message))" } }
 

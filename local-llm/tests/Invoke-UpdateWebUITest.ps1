@@ -190,8 +190,12 @@ try {
     Assert-That ($u.Code -ne 0 -and $u.Text -match 'kept stopped after a failed restore' -and (Invoke-DockerText @('inspect', '-f', '{{.State.Status}}', 'open-webui')) -eq 'exited') 'Update-OpenWebUI refuses while held'
     $hj = Read-LaiState -Path $holdFile
     Assert-That ([string]$hj['Recover'] -match [regex]::Escape((Join-Path $src 'Restore-OpenWebUI.ps1'))) 'recovery command has the full script path'
-    $r = & $runScript 'Restore-OpenWebUI.ps1' @('-Archive', [string]$h1['Archive'], '-Force', '-SkipSafetyBackup')
-    Assert-That ($r.Code -eq 0 -and -not (Test-Path -LiteralPath $holdFile)) "recovery restore clears the hold (exit $($r.Code))"
+    # The printed command itself, pasted as is (plus -Force for the YES prompt): it must name this
+    # install's folder (not the default C:\AI) and survive quotes in paths.
+    $prevPref = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
+    $ro = & pwsh -NoProfile -Command ([string]$hj['Recover'] + ' -Force') 2>&1 | ForEach-Object { "$_" }
+    $r = [pscustomobject]@{ Code = $LASTEXITCODE; Text = ($ro -join "`n") }; $ErrorActionPreference = $prevPref
+    Assert-That ($r.Code -eq 0 -and -not (Test-Path -LiteralPath $holdFile)) "the printed recovery command, pasted as is, restores and clears the hold (exit $($r.Code))"
     Assert-That ((Invoke-DockerText @('inspect', '-f', '{{.State.Status}} {{.HostConfig.RestartPolicy.Name}}', 'open-webui')) -eq 'running always') 'container running again with its original restart policy'
 
     Write-Host "`n=== 5b. a restore killed mid-swap (window closed, power cut) ===" -ForegroundColor Cyan

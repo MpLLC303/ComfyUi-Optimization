@@ -39,6 +39,8 @@ $files = Get-ChildItem -Path $Root -Recurse -File -Include *.ps1, *.psm1, *.psd1
 #   HELP     a user-facing script (toolkit root) with a parameter its help never mentions: no
 #            .PARAMETER entry, no comment right above it, no -Name in the help text.
 #   DOCPARAM README.md tells the user to run a script with a -Switch that script does not have.
+#   NATIVEQUOTE a literal double quote inside an argument for a native program (docker, wsl, ...):
+#            Windows PowerShell 5.1 does not escape it, so the program receives it stripped.
 function Find-Pitfall([System.Management.Automation.Language.Ast]$Ast, [string[]]$Lines, [string]$FileName = '', [switch]$UserFacing) {
     $found = New-Object System.Collections.Generic.List[object]
     $add = { param($Rule, $Node, $Msg) $found.Add([pscustomobject]@{ Rule = $Rule; Line = $Node.Extent.StartLineNumber; Message = $Msg }) }
@@ -67,6 +69,15 @@ function Find-Pitfall([System.Management.Automation.Language.Ast]$Ast, [string[]
         # No scheduled task may run elevated: the scripts work on C:\AI, which the user controls.
         if ($name -eq 'New-ScheduledTaskPrincipal' -and $c.Extent.Text -match '(?i)-RunLevel\s+Highest' -and -not (& $marker $c 'elevated')) {
             & $add 'NOSILENT' $c 'scheduled task with -RunLevel Highest: it would run toolkit code elevated without a UAC prompt'
+        }
+        # A double quote inside an argument for a native program: 5.1 wraps an argument with spaces in
+        # quotes but leaves inner ones unescaped (docker got '{{.Label com.docker...}}' and failed).
+        $nativeNames = @('docker', 'docker.exe', 'wsl', 'wsl.exe', 'ollama', 'ollama.exe', 'icacls', 'schtasks', 'netsh', 'tailscale', 'nvidia-smi', 'winget', 'cmd', 'cmd.exe', 'git')
+        $wrappers = @('Invoke-Native', 'Invoke-Docker', 'Invoke-DockerText', 'Invoke-DockerCli', 'Invoke-DockerQuiet', 'Invoke-Compose', 'Invoke-Tailscale', 'Invoke-Capture')
+        if (($nativeNames -contains $name -or $wrappers -contains $name) -and -not (& $marker $c 'quote')) {
+            $quoted = @($c.FindAll({ param($n) ($n -is [System.Management.Automation.Language.StringConstantExpressionAst] -and $n.StringConstantType -ne 'BareWord') -or $n -is [System.Management.Automation.Language.ExpandableStringExpressionAst] }, $true) |
+                Where-Object { $_.Value -match '"' })
+            if ($quoted.Count) { & $add 'NATIVEQUOTE' $c "argument with a double quote for a native program ($($quoted[0].Extent.Text)): 5.1 strips it; use backticks in Go templates or avoid the quote" }
         }
         # Get-Content of a config/state/env/secret file without -Encoding: Windows PowerShell 5.1 reads
         # BOM-less UTF-8 (how .env must be written for docker compose) as ANSI and garbles non-ASCII.
@@ -211,6 +222,10 @@ $canaries = @(
     @{ Rule = 'HELP'; Fire = $false; UserFacing = $true; Code = "<#`n.SYNOPSIS`n  x`n#>`nparam(`n  # skip the prompt`n  [switch]`$Force`n)" }
     @{ Rule = 'HELP'; Fire = $false; UserFacing = $true; Code = "<#`n.SYNOPSIS`n  x`n.DESCRIPTION`n  -Force skips the prompt.`n#>`nparam(`n  [switch]`$Force`n)" }
     @{ Rule = 'HELP'; Fire = $false; Code = "<#`n.SYNOPSIS`n  x`n#>`nparam(`n  [switch]`$Force`n)" }
+    @{ Rule = 'NATIVEQUOTE'; Fire = $true; Code = '$l = Invoke-Native -File ''docker'' -Arguments @(''ps'', ''--format'', ''{{.ID}}|{{.Label "com.docker.compose.project"}}'') -Capture' }
+    @{ Rule = 'NATIVEQUOTE'; Fire = $true; Code = '& docker inspect -f ''{{index .Labels "x"}}'' c' }
+    @{ Rule = 'NATIVEQUOTE'; Fire = $false; Code = '$l = Invoke-Native -File ''docker'' -Arguments @(''ps'', ''--format'', ''{{.Label `x`}}'') -Capture' }
+    @{ Rule = 'NATIVEQUOTE'; Fire = $false; Code = 'Write-Host ''say "hi"''' }
     @{ Rule = 'HELP'; Fire = $true; UserFacing = $true; Code = "#Requires -Version 5.1`n<#`n.SYNOPSIS`n  x`n#>`nparam(`n  # y`n  [switch]`$Force`n)" }
     @{ Rule = 'HELP'; Fire = $false; UserFacing = $true; Code = "#Requires -Version 5.1`n`n<#`n.SYNOPSIS`n  x`n#>`nparam(`n  # y`n  [switch]`$Force`n)" }
 )

@@ -26,6 +26,44 @@ function Write-LaiLog {
     Write-Host $line -ForegroundColor $colors[$Level]
 }
 
+function ConvertTo-LaiCmdArg {
+    # Quotes one argument for a Windows command line (scheduled task action, shortcut, Start-Process
+    # string), the way CommandLineToArgvW / powershell.exe read it back: backslashes before a quote
+    # are doubled, so 'D:\' or 'D:\AI\' does not turn the closing quote into a literal one.
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$Value)
+    $sb = New-Object System.Text.StringBuilder
+    [void]$sb.Append('"')
+    $slashes = 0
+    foreach ($ch in $Value.ToCharArray()) {
+        if ($ch -eq [char]'\') { $slashes++; continue }
+        if ($ch -eq [char]'"') { [void]$sb.Append('\', 2 * $slashes + 1); [void]$sb.Append('"') }
+        else { [void]$sb.Append('\', $slashes); [void]$sb.Append($ch) }
+        $slashes = 0
+    }
+    [void]$sb.Append('\', 2 * $slashes)
+    [void]$sb.Append('"')
+    return $sb.ToString()
+}
+
+function ConvertTo-LaiPsQuoted {
+    # A path as a PowerShell single-quoted literal, for commands printed for the user to paste.
+    # PowerShell also ends a single-quoted string at the typographic quotes U+2018-U+201B: doubled too.
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$Value)
+    $t = $Value
+    foreach ($q in @("'", [string][char]0x2018, [string][char]0x2019, [string][char]0x201A, [string][char]0x201B)) { $t = $t.Replace($q, $q + $q) }
+    return "'" + $t + "'"
+}
+
+function Get-LaiScriptCommandLine {
+    # powershell.exe arguments that run one toolkit script with -AIRoot (scheduled tasks, shortcuts).
+    param([Parameter(Mandatory)][string]$ScriptPath, [Parameter(Mandatory)][string]$AIRoot, [string]$Extra = '', [switch]$Hidden)
+    $s = '-NoProfile -ExecutionPolicy Bypass '
+    if ($Hidden) { $s += '-WindowStyle Hidden ' }
+    $s += '-File ' + (ConvertTo-LaiCmdArg $ScriptPath) + ' -AIRoot ' + (ConvertTo-LaiCmdArg $AIRoot)
+    if ($Extra) { $s += ' ' + $Extra }
+    return $s
+}
+
 function ConvertTo-LaiHashtable {
     # PS 5.1 has no ConvertFrom-Json -AsHashtable; this converts PSCustomObject trees recursively.
     param($InputObject)
@@ -952,7 +990,8 @@ function Invoke-LaiWebUIChat {
 function Test-LaiWebUIChat {
     param([string]$BaseUrl = 'http://127.0.0.1:3000', [Parameter(Mandatory)][string]$Token, [Parameter(Mandatory)][string]$Model)
     $answer = Invoke-LaiWebUIChat -BaseUrl $BaseUrl -Token $Token -Model $Model -Prompt 'Respond with exactly: LOCAL AI WORKING'
-    return [pscustomobject]@{ Passed = ($answer -match 'LOCAL AI WORKING'); Answer = $answer.Trim() }
+    # CultureInvariant: on tr-TR, IgnoreCase does not pair I with i ('working' vs 'WORKING').
+    return [pscustomobject]@{ Passed = [regex]::IsMatch($answer, 'LOCAL AI WORKING', 'IgnoreCase, CultureInvariant'); Answer = $answer.Trim() }
 }
 
 function Test-LaiWebUIMemory {
@@ -995,7 +1034,7 @@ function Test-LaiWebUIRag {
         Invoke-LaiApi -Method POST -Uri "$BaseUrl/api/v1/knowledge/$($kb.id)/file/add" -Token $Token -Body @{ file_id = $fileId } | Out-Null
         $answer = Invoke-LaiWebUIChat -BaseUrl $BaseUrl -Token $Token -Model $Model -Files @(@{ type = 'collection'; id = $kb.id }) `
             -Prompt 'According to the supplied manual, what is the calibration code for the Zorblax 9000 widget? Reply with only the code.'
-        return [pscustomobject]@{ Passed = ($answer -match [regex]::Escape($code)); Expected = $code; Answer = $answer.Trim() }
+        return [pscustomobject]@{ Passed = [regex]::IsMatch($answer, [regex]::Escape($code), 'IgnoreCase, CultureInvariant'); Expected = $code; Answer = $answer.Trim() }
     } finally {
         if ($kb) { try { Invoke-LaiApi -Method DELETE -Uri "$BaseUrl/api/v1/knowledge/$($kb.id)/delete" -Token $Token | Out-Null } catch { Write-Verbose 'self-test KB already gone' } }
         if ($fileId) { try { Invoke-LaiApi -Method DELETE -Uri "$BaseUrl/api/v1/files/$fileId" -Token $Token | Out-Null } catch { Write-Verbose 'self-test file already gone' } }

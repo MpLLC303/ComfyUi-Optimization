@@ -115,7 +115,7 @@ if ($CreateShortcut) {
     $shell = New-Object -ComObject WScript.Shell
     $s = $shell.CreateShortcut($lnkPath)
     $s.TargetPath = Join-Path $env:WINDIR 'System32\WindowsPowerShell\v1.0\powershell.exe'
-    $s.Arguments = ('-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "{0}" -AIRoot "{1}"' -f $PSCommandPath, $AIRoot)
+    $s.Arguments = Get-LaiScriptCommandLine -ScriptPath $PSCommandPath -AIRoot $AIRoot -Hidden
     $s.WorkingDirectory = Split-Path -Parent $Path
     if ($Path -like '*.exe') { $s.IconLocation = "$Path,0" }
     $s.Save()

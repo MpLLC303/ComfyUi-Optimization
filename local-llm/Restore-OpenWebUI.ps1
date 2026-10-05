@@ -182,7 +182,7 @@ try {
     # and the installer from starting Open WebUI on it, and says how to finish. Cleared on success.
     $priorHold = Test-Path -LiteralPath $holdPath
     if (-not $priorHold) {
-        $script:recoverCmd = "& '$(Join-Path $PSScriptRoot 'Restore-OpenWebUI.ps1')' -Archive '$((Get-Item -LiteralPath $Archive).FullName)' -SkipSafetyBackup"
+        $script:recoverCmd = "& $(ConvertTo-LaiPsQuoted (Join-Path $PSScriptRoot 'Restore-OpenWebUI.ps1')) -AIRoot $(ConvertTo-LaiPsQuoted $AIRoot) -Archive $(ConvertTo-LaiPsQuoted (Get-Item -LiteralPath $Archive).FullName) -SkipSafetyBackup"
         if ($safety) { $script:holdArchive = $safety.FullName }
         Set-Hold 'a restore was interrupted (or is still running)' $stoppedContainers
     }
@@ -218,7 +218,7 @@ try {
             }
             catch {
                 Write-LaiLog FAIL "Rollback failed too: $($_.Exception.Message)"
-                $script:recoverCmd = "& '$(Join-Path $PSScriptRoot 'Restore-OpenWebUI.ps1')' -Archive '$($safety.FullName)' -SkipSafetyBackup"
+                $script:recoverCmd = "& $(ConvertTo-LaiPsQuoted (Join-Path $PSScriptRoot 'Restore-OpenWebUI.ps1')) -AIRoot $(ConvertTo-LaiPsQuoted $AIRoot) -Archive $(ConvertTo-LaiPsQuoted $safety.FullName) -SkipSafetyBackup"
                 $script:holdArchive = $safety.FullName
                 Write-LaiLog FAIL "Open WebUI is left STOPPED (the health watch will not start it). Recover with: $script:recoverCmd"
                 # Hold the list first, clear it, then record: if writing the hold fails (full disk), the
@@ -231,7 +231,7 @@ try {
             # Outside the rollback's try, so a failed delete is not mistaken for a failed rollback.
             if ($rolledBack -and -not $priorHold) { Clear-Hold '' }
         } else {
-            $script:recoverCmd = "& '$(Join-Path $PSScriptRoot 'Restore-OpenWebUI.ps1')' -Archive '$(Join-Path $backupDir 'open-webui-YYYYMMDD-HHMMSS.tar.gz')' -SkipSafetyBackup  (use a backup from before the problem)"
+            $script:recoverCmd = "& $(ConvertTo-LaiPsQuoted (Join-Path $PSScriptRoot 'Restore-OpenWebUI.ps1')) -AIRoot $(ConvertTo-LaiPsQuoted $AIRoot) -Archive $(ConvertTo-LaiPsQuoted (Join-Path $backupDir 'open-webui-YYYYMMDD-HHMMSS.tar.gz')) -SkipSafetyBackup  (use a backup from before the problem)"
             Write-LaiLog FAIL "No safety backup exists; Open WebUI is left STOPPED so it cannot start on a damaged volume (the health watch will not start it). Recover with: $script:recoverCmd"
             # Hold the list first, clear it, then record: if writing the hold fails (full disk), the
             # 'finally' below must still not start Open WebUI on the damaged volume.

@@ -469,5 +469,77 @@ if ($zipFile) {
     Assert-That ($all -match '\[REDACTED\]') 'redaction markers present'
 }
 
+Write-Host "`n=== diagnostics redaction: Turkish culture, a 2-letter name, a non-ASCII profile folder ===" -ForegroundColor Cyan
+# Under tr-TR, IgnoreCase does not pair I with i; 2-letter names are common (CJK, 'Li'); the profile
+# folder keeps an old (accented) name after an account rename; logs are UTF-8 without BOM, which 5.1
+# would read as ANSI and so never match the accented name.
+$acc = 'Jos' + [char]0x00E9 + '-old'
+$tRoot = Join-Path $Work 'diagroot-tr'
+foreach ($d in 'Secrets', 'Stack', 'Logs') { New-Item -ItemType Directory -Force -Path (Join-Path $tRoot $d) | Out-Null }
+ConvertTo-Json @{ WebUIPort = 39999; OllamaUrl = 'http://127.0.0.1:39997' } | Set-Content -LiteralPath (Join-Path $tRoot 'localai-config.json')
+[System.IO.File]::WriteAllText((Join-Path (Join-Path $tRoot 'Logs') 'install-20990101-000000.log'),
+    ("models in C:\Users\$acc\.ollama`nuser Li signed in`nOPENAI_API_KEY=sk-tr1234567890`nLimited client list stays readable`n"), (New-Object System.Text.UTF8Encoding($false)))
+$saved = @{ U = $env:USERNAME; P = $env:USERPROFILE }
+$env:USERNAME = 'Li'; $env:USERPROFILE = (Join-Path (Join-Path $Work 'Users') $acc)
+$outTr = Join-Path $Work 'diagout-tr'
+$prev = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
+$cmdTr = "[System.Globalization.CultureInfo]::CurrentCulture = 'tr-TR'; & '" + (Join-Path $src 'Get-LocalAIDiagnostics.ps1').Replace("'", "''") + "' -AIRoot '" + $tRoot.Replace("'", "''") + "' -OutDir '" + $outTr.Replace("'", "''") + "'; exit 0"
+& $childExe -NoProfile -ExecutionPolicy Bypass -Command $cmdTr 2>&1 | Out-Null
+$codeTr = $LASTEXITCODE; $ErrorActionPreference = $prev
+$env:USERNAME = $saved.U; $env:USERPROFILE = $saved.P
+$zipTr = Get-ChildItem -LiteralPath $outTr -Filter 'diagnostics-*.zip' -ErrorAction SilentlyContinue | Select-Object -First 1
+Assert-That ($codeTr -eq 0 -and $null -ne $zipTr) "diagnostics under tr-TR writes a zip (exit $codeTr)"
+if ($zipTr) {
+    $xt = Join-Path $Work 'diagx-tr'
+    Expand-Archive -LiteralPath $zipTr.FullName -DestinationPath $xt -Force
+    $allTr = (Get-ChildItem -LiteralPath $xt -Recurse -File | ForEach-Object { [System.IO.File]::ReadAllText($_.FullName) }) -join "`n"
+    Assert-That ($allTr -notmatch 'sk-tr1234567890') 'OPENAI_API_KEY redacted under tr-TR (I/i case rule)'
+    Assert-That (-not $allTr.Contains($acc) -and $allTr -match 'C:\\Users\\<user>\\\.ollama') 'accented profile-folder name redacted from a UTF-8 log'
+    Assert-That ($allTr -notmatch '\bLi\b' -and $allTr -match 'user <user> signed in') '2-letter user name redacted'
+    Assert-That ($allTr -match 'Limited client list stays readable') 'a short name is redacted as a whole word only'
+}
+
+Write-Host "`n=== command-line quoting for tasks, shortcuts and pasted commands ===" -ForegroundColor Cyan
+Assert-That ((ConvertTo-LaiCmdArg 'D:\') -eq '"D:\\"') 'drive root: the trailing backslash is doubled before the closing quote'
+Assert-That ((ConvertTo-LaiCmdArg 'C:\A B\x') -eq '"C:\A B\x"') 'inner backslashes stay single'
+Assert-That ((ConvertTo-LaiCmdArg 'a"b') -eq '"a\"b"') 'an inner quote is escaped'
+$cl = Get-LaiScriptCommandLine -ScriptPath 'C:\AI\Scripts\Watch-LocalAI.ps1' -AIRoot 'D:\' -Hidden
+Assert-That ($cl -eq '-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "C:\AI\Scripts\Watch-LocalAI.ps1" -AIRoot "D:\\"') "task command line for a drive-root install ($cl)"
+$q = [string][char]0x2019
+foreach ($pth in @("C:\Users\O'Brien\AI", ('C:\Mike' + $q + 's Files\AI'), 'C:\plain path\AI')) {
+    $back = & ([scriptblock]::Create('param($x) $x')) (& ([scriptblock]::Create('return ' + (ConvertTo-LaiPsQuoted $pth))))
+    Assert-That ($back -eq $pth) "pasted PowerShell literal round-trips: $pth"
+}
+if ($onWindows) {
+    # Real round trip: exactly what Task Scheduler / a shortcut hands to powershell.exe.
+    $argStub = Join-Path $Work 'argstub.ps1'
+    $argOut = Join-Path $Work 'argstub.json'
+    Set-Content -LiteralPath $argStub -Encoding UTF8 -Value "param([string]`$AIRoot, [int]`$EngineWaitSec) ConvertTo-Json @{ AIRoot = `$AIRoot; Wait = `$EngineWaitSec } | Set-Content -LiteralPath '$argOut' -Encoding UTF8"
+    foreach ($root in @('D:\', 'D:\AI\', "C:\Users\O'Brien\My AI", ('C:\Users\Jos' + [char]0x00E9 + '\AI'))) {
+        if (Test-Path -LiteralPath $argOut) { Remove-Item -LiteralPath $argOut }
+        Start-Process -FilePath 'powershell.exe' -ArgumentList (Get-LaiScriptCommandLine -ScriptPath $argStub -AIRoot $root -Extra '-EngineWaitSec 1200' -Hidden) -Wait -WindowStyle Hidden
+        $gotArg = $null; if (Test-Path -LiteralPath $argOut) { $gotArg = Get-Content -Encoding UTF8 -Raw -LiteralPath $argOut | ConvertFrom-Json }
+        Assert-That ($gotArg -and $gotArg.AIRoot -eq $root -and $gotArg.Wait -eq 1200) "powershell.exe receives -AIRoot '$root' and the next argument intact ($($gotArg.AIRoot))"
+    }
+} else { Skip 'task command-line round trip runs on Windows only' }
+
+Write-Host "`n=== docker template from the installer reaches docker intact (Windows PowerShell 5.1) ===" -ForegroundColor Cyan
+if ($onWindows) {
+    # 5.1 leaves inner double quotes unescaped in native arguments; a docker.cmd stand-in records the
+    # raw command line it got for the installer's own legacy-container template (taken from its source).
+    $instAst2 = [System.Management.Automation.Language.Parser]::ParseFile((Join-Path $src 'Install-LocalAI.ps1'), [ref]$null, [ref]$null)
+    $nativeDef = $instAst2.Find({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Invoke-Native' }, $true)
+    . ([scriptblock]::Create($nativeDef.Extent.Text))
+    $tpl = @($instAst2.FindAll({ param($n) $n -is [System.Management.Automation.Language.StringConstantExpressionAst] -and $n.Value -like '*com.docker.compose.project*' }, $true))[0].Value
+    $shimDir = Join-Path $Work 'dockershim'
+    New-Item -ItemType Directory -Force -Path $shimDir | Out-Null
+    $rawFile = Join-Path $shimDir 'args.txt'
+    Set-Content -LiteralPath (Join-Path $shimDir 'docker.cmd') -Encoding ASCII -Value ("@echo off`r`n>`"$rawFile`" echo %*")
+    $savedPath = $env:Path; $env:Path = "$shimDir;$env:Path"
+    try { Invoke-Native -File 'docker' -Arguments @('ps', '-a', '--format', $tpl) -Capture -AllowFail | Out-Null } finally { $env:Path = $savedPath }
+    $raw = ''; if (Test-Path -LiteralPath $rawFile) { $raw = (Get-Content -LiteralPath $rawFile -Raw).Trim() }
+    Assert-That ($raw.Contains($tpl)) "docker receives the template unchanged ($raw)"
+} else { Skip 'native argument check runs on Windows only' }
+
 if ($failures -eq 0) { Write-Host "`nWINDOWS UNIT TESTS PASSED" -ForegroundColor Green } else { Write-Host "`nWINDOWS UNIT TESTS FAILED ($failures)" -ForegroundColor Red }
 exit $failures

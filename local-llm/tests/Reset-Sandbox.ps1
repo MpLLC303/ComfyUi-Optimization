@@ -76,13 +76,13 @@ if ($real.Count) {
 }
 
 # ---- containers -----------------------------------------------------------------------------------
-$rows = @((Invoke-DockerCli @('ps', '-a', '--format', '{{.Names}}|{{.Image}}|{{.State}}|{{.Label "com.docker.compose.project"}}')).Out | Where-Object { $_ })
+$rows = @((Invoke-DockerCli @('ps', '-a', '--format', '{{.Names}}|{{.Image}}|{{.State}}|{{.Label `com.docker.compose.project`}}')).Out | Where-Object { $_ })
 $names = @($rows | ForEach-Object { ($_ -split '\|')[0] })
 foreach ($row in $rows) {
     $name, $image, $state, $project = $row -split '\|'
     $isTest = ($testProjects -contains $project) -or ($name -match '^open-webui-legacy-') -or
         (($standInNames -contains $name) -and $image -like 'alpine:*') -or
-        ((Invoke-DockerCli @('inspect', '-f', '{{index .Config.Labels "lai-test"}}', $name)).Out -join '') -eq '1'
+        ((Invoke-DockerCli @('inspect', '-f', '{{index .Config.Labels `lai-test`}}', $name)).Out -join '') -eq '1'
     if ($isTest) {
         Invoke-Repair "container $name ($image, $state)" { Assert-Docker (Invoke-DockerCli @('rm', '-f', $name)) "docker rm $name" }
     }
@@ -110,7 +110,7 @@ if ($names -contains 'searxng') {
 }
 
 # ---- volumes and networks ------------------------------------------------------------------------
-foreach ($v in @((Invoke-DockerCli @('volume', 'ls', '--format', '{{.Name}}|{{.Label "com.docker.compose.project"}}')).Out | Where-Object { $_ })) {
+foreach ($v in @((Invoke-DockerCli @('volume', 'ls', '--format', '{{.Name}}|{{.Label `com.docker.compose.project`}}')).Out | Where-Object { $_ })) {
     $name, $project = $v -split '\|'
     # 'open-webui' only when no container uses it (the tests' stand-in volume; the sandbox's Open
     # WebUI keeps its data in a folder). localai-verify-*: the backup deep check's scratch volume.
@@ -120,7 +120,7 @@ foreach ($v in @((Invoke-DockerCli @('volume', 'ls', '--format', '{{.Name}}|{{.L
         Invoke-Repair "volume $name" { Assert-Docker (Invoke-DockerCli @('volume', 'rm', '-f', $name)) "docker volume rm $name" }
     }
 }
-foreach ($n in @((Invoke-DockerCli @('network', 'ls', '--format', '{{.Name}}|{{.Label "com.docker.compose.project"}}')).Out | Where-Object { $_ })) {
+foreach ($n in @((Invoke-DockerCli @('network', 'ls', '--format', '{{.Name}}|{{.Label `com.docker.compose.project`}}')).Out | Where-Object { $_ })) {
     $name, $project = $n -split '\|'
     if ($testProjects -contains $project) {
         Invoke-Repair "network $name" { Assert-Docker (Invoke-DockerCli @('network', 'rm', $name)) "docker network rm $name" }

@@ -159,6 +159,12 @@ if (-not (Test-IsAdmin)) {
 
 #region Paths, state, helpers ---------------------------------------------------------------
 
+# 'D:\AI\' and 'D:\AI' are the same folder; one spelling keeps state, task command lines and
+# comparisons consistent. A bare drive gets its root backslash.
+$AIRoot = $AIRoot.Trim()
+if ($AIRoot -match '^[A-Za-z]:$') { $AIRoot += '\' }
+elseif ($AIRoot.Length -gt 3) { $AIRoot = $AIRoot.TrimEnd([char]'\', [char]'/') }
+
 $P = @{
     Root      = $AIRoot
     Scripts   = Join-Path $AIRoot 'Scripts'
@@ -261,11 +267,20 @@ function Invoke-Native {
     param([Parameter(Mandatory)][string]$File, [string[]]$Arguments = @(), [switch]$Capture, [switch]$AllowFail)
     $prev = $ErrorActionPreference
     $ErrorActionPreference = 'Continue'
+    # docker and ollama write UTF-8; 5.1 decodes captured output with the console code page (437,
+    # 850, 932...), which turns a non-ASCII path like C:\Users\Jose-with-accent into something else.
+    $prevEnc = $null
+    if ($Capture -and (Split-Path -Leaf $File) -match '^(docker|ollama)(\.exe)?$') {
+        try { $prevEnc = [Console]::OutputEncoding; [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false) } catch { $prevEnc = $null }
+    }
     try {
         if ($Capture) { $out = @(& $File @Arguments 2>&1 | ForEach-Object { "$_" }) }
         else { & $File @Arguments | Out-Host; $out = @() }
         $code = $LASTEXITCODE
-    } finally { $ErrorActionPreference = $prev }
+    } finally {
+        $ErrorActionPreference = $prev
+        if ($prevEnc) { try { [Console]::OutputEncoding = $prevEnc } catch { Write-Verbose 'console encoding not restored' } }
+    }
     if ($code -ne 0 -and -not $AllowFail) {
         throw "'$File $($Arguments -join ' ')' failed with exit code $code. $(($out | Select-Object -Last 15) -join "`n")"
     }
@@ -327,6 +342,13 @@ function Protect-Path {
     param([Parameter(Mandatory)][string]$Path, [ValidateSet('Full', 'ReadOnly')][string]$UserAccess = 'Full')
     $r = Set-LaiPrivateAcl -Path $Path -UserSid $CurrentUserSid -UserAccess $UserAccess
     if ($r.ExitCode -ne 0) { Write-LaiLog WARN "Could not restrict permissions on ${Path}: $($r.Text)" }
+}
+
+function Get-DriveOf {
+    # 'D:' for 'D:\Users\x\...'; the system drive when the path has no drive letter.
+    param([Parameter(Mandatory)][string]$Path)
+    try { $q = Split-Path -Qualifier $Path -ErrorAction Stop; if ($q) { return $q } } catch { Write-Verbose "no drive in $Path" }
+    return $env:SystemDrive
 }
 
 function Get-FreeGB {
@@ -588,12 +610,14 @@ Invoke-Stage 'Preflight' {
         $needAll = 10
         foreach ($cm in $catalogAll.Models) { if (-not $cm.Trial -or $trialWanted -contains $cm.Key) { $needAll += [double]$cm.DownloadGB } }
         $hasExisting = (Test-Path -LiteralPath (Join-Path $defaultModels 'manifests'))
-        if (-not $hasExisting -and (Get-FreeGB $env:SystemDrive) -lt ($needAll + 40)) {
-            $best = Get-CimInstance Win32_LogicalDisk -Filter 'DriveType=3' | Where-Object { $_.DeviceID -ne $env:SystemDrive } |
+        # The drive Ollama's default folder is on: the user profile can live on D: (not the system drive).
+        $defaultDrive = Get-DriveOf $defaultModels
+        if (-not $hasExisting -and (Get-FreeGB $defaultModels) -lt ($needAll + 40)) {
+            $best = Get-CimInstance Win32_LogicalDisk -Filter 'DriveType=3' | Where-Object { $_.DeviceID -ne $defaultDrive } |
                 Sort-Object FreeSpace -Descending | Select-Object -First 1  # lai-ok: objects
             if ($best -and ($best.FreeSpace / 1GB) -ge ($needAll + 10)) {
                 $target = Join-Path "$($best.DeviceID)\" 'AI\OllamaModels'
-                Write-LaiLog INFO "System drive is short on space; models go to $target"
+                Write-LaiLog INFO "$defaultDrive is short on space; models go to $target"
             }
         }
     }
@@ -628,7 +652,9 @@ Invoke-Stage 'Preflight' {
     }
     $State.flags['selectedModels'] = $selected
     Write-LaiLog OK "Models: $($selected -join ', ') -> $target ($freeGB GB free)"
-    if ((Get-FreeGB $env:SystemDrive) -lt 15) { Write-LaiLog WARN "Less than 15 GB free on $env:SystemDrive; Docker images and WSL need about 10 GB there." }
+    # Docker Desktop's WSL disk lives under %LOCALAPPDATA% (the profile's drive), not necessarily C:.
+    $dockerDataPath = $env:SystemDrive + '\'; if ($env:LOCALAPPDATA) { $dockerDataPath = $env:LOCALAPPDATA }
+    if ((Get-FreeGB $dockerDataPath) -lt 15) { Write-LaiLog WARN "Less than 15 GB free on $(Get-DriveOf $dockerDataPath); Docker images and WSL need about 10 GB there." }
 
     # Keep a stable copy of the scripts for scheduled tasks and the resume task.
     if ($SourceRoot.TrimEnd('\') -ne $P.Scripts.TrimEnd('\')) {
@@ -931,7 +957,10 @@ Invoke-Stage 'Stack' {
     }
 
     # A container from the guide's manual "docker run" would clash with the compose-managed one.
-    $legacy = Invoke-Native -File 'docker' -Arguments @('ps', '-a', '--filter', 'name=^/open-webui$', '--format', '{{.ID}}|{{.Label "com.docker.compose.project"}}') -Capture -AllowFail
+    # Go raw-string backticks, not double quotes: Windows PowerShell 5.1 strips inner double quotes
+    # from native arguments, and the broken template's error text looked like a legacy container.
+    $legacy = Invoke-Native -File 'docker' -Arguments @('ps', '-a', '--filter', 'name=^/open-webui$', '--format', '{{.ID}}|{{.Label `com.docker.compose.project`}}') -Capture -AllowFail
+    if ($legacy.ExitCode -ne 0) { throw "docker ps failed: $($legacy.Text)" }
     $secretFile = Join-Path $P.Secrets 'openwebui-secret.txt'
     if ($legacy.Text -and $legacy.Text -notmatch '\|localai$') {
         Write-LaiLog WARN 'Found an existing open-webui container from a manual install; migrating its data into the managed stack.'
@@ -958,7 +987,14 @@ Invoke-Stage 'Stack' {
         }
         if ($from -and -not $managedExists) {
             Invoke-Native -File 'docker' -Arguments @('volume', 'create', 'open-webui') -Capture | Out-Null
-            Invoke-Native -File 'docker' -Arguments @('run', '--rm', '-v', $from, '-v', 'open-webui:/to', 'alpine:3.20', 'sh', '-c', 'cp -a /from/. /to/') -Capture | Out-Null
+            # Copy only if the old data really is there: a mis-decoded or vanished bind-mount path makes
+            # 'docker run -v' create an EMPTY folder, and the copy would "succeed" with nothing in it.
+            $copy = Invoke-Native -File 'docker' -Arguments @('run', '--rm', '-v', $from, '-v', 'open-webui:/to', 'alpine:3.20', 'sh', '-c', 'test -f /from/webui.db || exit 3; cp -a /from/. /to/') -Capture -AllowFail
+            if ($copy.ExitCode -eq 3) {
+                Invoke-Native -File 'docker' -Arguments @('volume', 'rm', 'open-webui') -Capture -AllowFail | Out-Null
+                throw "The old Open WebUI data folder ($($from -replace ':/from:ro$', '')) has no webui.db, so nothing was copied and the old container was left as it is. Check that folder (or remove the old container if it held no data), then run the installer again."
+            }
+            if ($copy.ExitCode -ne 0) { throw "Copying the old Open WebUI data failed: $($copy.Text)" }
             Write-LaiLog OK "Copied the old Open WebUI data (from $($from -replace ':/from:ro$', '')) into the open-webui volume"
         } elseif ($from) {
             Write-LaiLog WARN "Both the old data ($from) and an open-webui volume exist; leaving both untouched. See README > Troubleshooting to merge."
@@ -1152,7 +1188,7 @@ Invoke-Stage 'Backup' {
 
     $backupScript = Join-Path $P.Scripts 'Backup-OpenWebUI.ps1'
     # -EngineWaitSec: a missed 03:30 run starts at sign-in, while Docker Desktop may need several minutes.
-    $action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument ('-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "{0}" -AIRoot "{1}" -EngineWaitSec 1200' -f $backupScript, $AIRoot)
+    $action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument (Get-LaiScriptCommandLine -ScriptPath $backupScript -AIRoot $AIRoot -Extra '-EngineWaitSec 1200' -Hidden)
     $trigger = New-ScheduledTaskTrigger -Daily -At $BackupTime
     # Not elevated: docker-users membership, the volume mutex and C:\AI\Backups are all it needs, and
     # an elevated task would run code from C:\AI, which the user controls (see $ElevatedDir).
@@ -1166,7 +1202,7 @@ Invoke-Stage 'Backup' {
     # Health watch every 15 minutes while signed in: restarts a stopped container or Ollama and
     # shows a notification only when something breaks or recovers. Runs non-elevated; conhost
     # --headless (Windows 10 2004+) keeps a console window from flashing every 15 minutes.
-    $watchArgs = '-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "{0}" -AIRoot "{1}"' -f (Join-Path $P.Scripts 'Watch-LocalAI.ps1'), $AIRoot
+    $watchArgs = Get-LaiScriptCommandLine -ScriptPath (Join-Path $P.Scripts 'Watch-LocalAI.ps1') -AIRoot $AIRoot -Hidden
     $conhost = Join-Path $env:WINDIR 'System32\conhost.exe'
     if ([Environment]::OSVersion.Version.Build -ge 19041 -and (Test-Path -LiteralPath $conhost)) {
         $watchAction = New-ScheduledTaskAction -Execute $conhost -Argument ('--headless powershell.exe ' + $watchArgs)
