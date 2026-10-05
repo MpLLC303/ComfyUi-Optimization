@@ -116,7 +116,7 @@ if (-not $NoBackup -and $volumeExists) {
     if ($PSCmdlet.ShouldProcess('Open WebUI volume', 'Final backup')) {
         & (Join-Path $PSScriptRoot 'Backup-OpenWebUI.ps1') -AIRoot $AIRoot -Tag 'pre-uninstall' -NoPrune
         if ($LASTEXITCODE -ne 0) {
-            throw 'The final backup failed, so nothing was removed. Fix the backup or re-run with -NoBackup.'
+            throw "The final backup failed, so nothing was removed. The reason is in $(Join-Path (Join-Path $AIRoot 'Logs') 'backup.log') (most often: Docker Desktop is not running, or the disk is full). Fix that, then run the uninstaller again."
         }
     }
 } elseif ($RemoveData -and $volumeExists -and $NoBackup) {
@@ -197,7 +197,7 @@ if ($ollamaUp) {
 if ($onWindows -and ($ResetOllamaSettings -or $RemoveModels)) {
     $vars = @()
     if ($ResetOllamaSettings) {
-        $vars += 'OLLAMA_FLASH_ATTENTION', 'OLLAMA_KV_CACHE_TYPE', 'OLLAMA_NUM_PARALLEL', 'OLLAMA_GPU_OVERHEAD',
+        $vars += 'OLLAMA_FLASH_ATTENTION', 'OLLAMA_KV_CACHE_TYPE', 'OLLAMA_NUM_PARALLEL', 'OLLAMA_MAX_LOADED_MODELS', 'OLLAMA_GPU_OVERHEAD',
             'OLLAMA_KEEP_ALIVE', 'OLLAMA_NO_CLOUD', 'OLLAMA_IGPU_ENABLE', 'OLLAMA_HOST'
     }
     if ($RemoveModels) { $vars += 'OLLAMA_MODELS' }

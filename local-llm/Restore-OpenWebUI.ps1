@@ -134,6 +134,10 @@ try {
         $Archive = $newest.FullName
     }
     $source = Get-Item -LiteralPath $Archive
+    # Without the engine every archive would look unreadable below: say what is actually wrong.
+    if ((Invoke-Docker -Arguments @('version', '--format', '{{.Server.Version}}') -AllowFail).ExitCode -ne 0) {
+        throw 'Docker Desktop is not running, so the backup could not be opened. Start it (Start menu > Local AI - Start again), wait until it says Engine running, then run the restore again. Nothing was checked or changed.'
+    }
     if (-not (Test-Path -LiteralPath $stagingDir)) { New-Item -ItemType Directory -Force -Path $stagingDir | Out-Null }
     $staged = Join-Path $stagingDir 'restore.tar.gz'
     Copy-Item -LiteralPath $source.FullName -Destination $staged -Force
@@ -161,7 +165,7 @@ try {
         $safety = Get-ChildItem -LiteralPath $backupDir -Filter '*-pre-restore.tar.gz' | Where-Object { $before -notcontains $_.FullName } |
             Sort-Object LastWriteTime -Descending | Select-Object -First 1  # lai-ok: objects
         if ($LASTEXITCODE -ne 0 -or -not $safety -or -not (Test-Archive $safety.FullName)) {
-            throw 'Safety backup failed; nothing was changed. Fix the error above (or use -SkipSafetyBackup).'
+            throw "The safety backup of your current data failed, so nothing was changed. The reason is in $(Join-Path (Join-Path $AIRoot 'Logs') 'backup.log') (most often: the disk is full). Fix that, then run the restore again."
         }
     }
 
@@ -231,7 +235,16 @@ try {
             # Outside the rollback's try, so a failed delete is not mistaken for a failed rollback.
             if ($rolledBack -and -not $priorHold) { Clear-Hold '' }
         } else {
-            $script:recoverCmd = "& $(ConvertTo-LaiPsQuoted (Join-Path $PSScriptRoot 'Restore-OpenWebUI.ps1')) -AIRoot $(ConvertTo-LaiPsQuoted $AIRoot) -Archive $(ConvertTo-LaiPsQuoted (Join-Path $backupDir 'open-webui-YYYYMMDD-HHMMSS.tar.gz')) -SkipSafetyBackup  (use a backup from before the problem)"
+            # A command that works when pasted: the newest other nightly backup (not the one that just
+            # failed, not one dated in the future). Without one, say where to pick a file.
+            $other = Get-ChildItem -LiteralPath $backupDir -Filter 'open-webui-*.tar.gz' -ErrorAction SilentlyContinue |
+                Where-Object { $_.Name -match '^open-webui-\d{8}-\d{6}\.tar\.gz$' -and $_.FullName -ne $source.FullName -and $_.LastWriteTime -le (Get-Date).AddHours(1) } |
+                Sort-Object LastWriteTime -Descending | Select-Object -First 1  # lai-ok: objects
+            if ($other) {
+                $script:recoverCmd = "& $(ConvertTo-LaiPsQuoted (Join-Path $PSScriptRoot 'Restore-OpenWebUI.ps1')) -AIRoot $(ConvertTo-LaiPsQuoted $AIRoot) -Archive $(ConvertTo-LaiPsQuoted $other.FullName) -SkipSafetyBackup"
+            } else {
+                $script:recoverCmd = "no other nightly backup in $backupDir; copy one from your backup mirror there, then run: & $(ConvertTo-LaiPsQuoted (Join-Path $PSScriptRoot 'Restore-OpenWebUI.ps1')) -AIRoot $(ConvertTo-LaiPsQuoted $AIRoot) -Archive <that file> -SkipSafetyBackup"
+            }
             Write-LaiLog FAIL "No safety backup exists; Open WebUI is left STOPPED so it cannot start on a damaged volume (the health watch will not start it). Recover with: $script:recoverCmd"
             # Hold the list first, clear it, then record: if writing the hold fails (full disk), the
             # 'finally' below must still not start Open WebUI on the damaged volume.

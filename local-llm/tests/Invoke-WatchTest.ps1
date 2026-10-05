@@ -131,7 +131,7 @@ services:
     $future = Join-Path $bdir ('open-webui-{0}.tar.gz' -f (Get-Date -Format 'yyyyMMdd-HHmmss'))
     Set-Content -LiteralPath $future -Value 'x'; (Get-Item -LiteralPath $future).LastWriteTime = (Get-Date).AddDays(365)
     Invoke-Watch @('-NoHeal') | Out-Null
-    Assert-That ((& $lastFail) -match 'Backups \(open-webui-[^)]*in the future[^)]*delete it\)') "a backup dated in the future fails the check and says to delete it ($(& $lastFail))"
+    Assert-That ((& $lastFail) -match 'Backups \(open-webui-\S+ is dated \S+, in the future .*: delete it\)') "a backup dated in the future fails the check and says to delete it ($(& $lastFail))"
     # ...also next to a fresh one (clock fixed since): it would otherwise block pruning and restores for a year.
     Set-Content -LiteralPath (Join-Path $bdir ('open-webui-{0}.tar.gz' -f (Get-Date).AddHours(-1).ToString('yyyyMMdd-HHmmss'))) -Value 'x'
     Invoke-Watch @('-NoHeal') | Out-Null

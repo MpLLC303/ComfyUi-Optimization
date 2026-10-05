@@ -78,7 +78,8 @@ $remembered = ''
 if ($config.ContainsKey('ComfyUIPath')) { $remembered = [string]$config['ComfyUIPath'] }
 if (-not $Path) { $Path = Find-ComfyUI -Remembered $remembered }
 if (-not $Path -or -not (Test-Path -LiteralPath $Path)) {
-    throw 'ComfyUI not found. Pass -Path <Comfy Desktop.exe | run_nvidia_gpu.bat | shortcut>; it is remembered for next time.'
+    throw ('ComfyUI was not found in the usual folders. Run this once in PowerShell (the path is remembered, then the shortcut works): ' +
+        '& ' + (ConvertTo-LaiPsQuoted $PSCommandPath) + ' -Path ''<full path to Comfy Desktop.exe or run_nvidia_gpu.bat>''')
 }
 # Remember a full path: the Start-menu shortcut runs from AI\Scripts, where a relative one breaks.
 $Path = (Resolve-Path -LiteralPath $Path).ProviderPath
@@ -97,7 +98,7 @@ try {
         Stop-LaiOllamaModels -BaseUrl $OllamaUrl
     }
 } catch {
-    Write-LaiLog INFO 'Ollama is not running; nothing to unload.'
+    if ($_.Exception.Message -match 'refused|No connection could be made|Unable to connect to the remote server') { Write-LaiLog INFO 'Ollama is not running; nothing to unload.' } else { Write-LaiLog WARN "Could not reach Ollama to unload its models ($($_.Exception.Message)). If Ollama is running and the GPU memory stays full, quit Ollama from its tray icon." }
 }
 Start-Sleep -Seconds 1
 $after = Get-LaiGpuInfo

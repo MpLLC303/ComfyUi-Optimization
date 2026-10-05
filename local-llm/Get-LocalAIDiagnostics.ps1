@@ -155,7 +155,7 @@ $ps = Invoke-Safely { (Invoke-LaiApi -Uri "$ollamaUrl/api/ps" -TimeoutSec 10).mo
 Add-Summary "Loaded now: $(if ($ps) { @($ps) -join '; ' } else { 'nothing' })"
 $ollamaEnv = @()
 foreach ($scope in @('User', 'Machine')) {
-    foreach ($k in @('OLLAMA_FLASH_ATTENTION', 'OLLAMA_KV_CACHE_TYPE', 'OLLAMA_NUM_PARALLEL', 'OLLAMA_GPU_OVERHEAD', 'OLLAMA_KEEP_ALIVE', 'OLLAMA_NO_CLOUD', 'OLLAMA_IGPU_ENABLE', 'OLLAMA_HOST', 'OLLAMA_MODELS', 'OLLAMA_CONTEXT_LENGTH')) {
+    foreach ($k in @('OLLAMA_FLASH_ATTENTION', 'OLLAMA_KV_CACHE_TYPE', 'OLLAMA_NUM_PARALLEL', 'OLLAMA_MAX_LOADED_MODELS', 'OLLAMA_GPU_OVERHEAD', 'OLLAMA_KEEP_ALIVE', 'OLLAMA_NO_CLOUD', 'OLLAMA_IGPU_ENABLE', 'OLLAMA_HOST', 'OLLAMA_MODELS', 'OLLAMA_CONTEXT_LENGTH')) {
         $v = [Environment]::GetEnvironmentVariable($k, $scope)
         if ($v) { $ollamaEnv += "$scope $k=$v" }
     }

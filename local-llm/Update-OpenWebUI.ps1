@@ -153,7 +153,7 @@ try {
     if (-not $SkipBackup) {
         if ($Version) { $tag = "before-$($Version -replace '[^\w\.-]', '')" } else { $tag = "before-searxng-$($SearxngVersion -replace '[^\w\.-]', '')" }
         & (Join-Path $PSScriptRoot 'Backup-OpenWebUI.ps1') -AIRoot $AIRoot -Tag $tag
-        if ($LASTEXITCODE -ne 0) { throw 'Backup failed; not updating. Use -SkipBackup to override.' }
+        if ($LASTEXITCODE -ne 0) { throw "The backup before the update failed, so nothing was changed. The reason is in $(Join-Path (Join-Path $AIRoot 'Logs') 'backup.log') (most often: the disk is full). Fix that, then run the update again." }
         $pre = Get-ChildItem -LiteralPath (Join-Path $AIRoot 'Backups') -Filter "open-webui-*-$tag.tar.gz" -ErrorAction SilentlyContinue |
             Sort-Object LastWriteTime -Descending | Select-Object -First 1  # lai-ok: objects
     }

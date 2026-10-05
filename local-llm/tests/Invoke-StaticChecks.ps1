@@ -41,6 +41,8 @@ $files = Get-ChildItem -Path $Root -Recurse -File -Include *.ps1, *.psm1, *.psd1
 #   DOCPARAM README.md tells the user to run a script with a -Switch that script does not have.
 #   RECURSE  Remove-Item -Recurse in a script that runs as administrator (installer, uninstaller):
 #            Windows PowerShell 5.1 follows junctions in the user-controlled C:\AI. Use Remove-LaiTree.
+#   SETTINGS an OLLAMA_* setting the installer writes that Uninstall -ResetOllamaSettings does not
+#            remove or the diagnostics bundle does not show.
 #   COMPOSELOG a service in stack/docker-compose.yml without 'logging:' (Docker keeps container logs
 #            forever by default; on an always-on PC they grow without limit).
 #   NATIVEQUOTE a literal double quote inside an argument for a native program (docker, wsl, ...):
@@ -190,7 +192,7 @@ function Find-DocParam([string]$Text, [hashtable]$ParamsByScript) {
     $lineNo = 0
     foreach ($line in ($Text -split "`n")) {
         $lineNo++
-        foreach ($m in [regex]::Matches($line, '([A-Za-z][\w-]*)\.(ps1|cmd)((?:[ \t]+[^`|#;\s]+)*)')) {
+        foreach ($m in [regex]::Matches($line, '([A-Za-z][\w-]*)\.(ps1|cmd)((?:[ \t]+(?![\w\\:.-]*\.(?:ps1|cmd)\b)[^`|#;\s]+)*)')) {
             $script = $m.Groups[1].Value + '.ps1'
             if (-not $ParamsByScript.ContainsKey($script)) { continue }
             foreach ($a in [regex]::Matches($m.Groups[3].Value, '(?<=^|\s)-([A-Za-z]\w*)')) {
@@ -287,6 +289,8 @@ $docCanaries = @(
     @{ Fire = $true; Text = '    .\Install-LocalAI.cmd -RenderGuard off -NoSuchSwitch' }
     @{ Fire = $false; Text = 'Run `Update-OpenWebUI.ps1 -Latest` or `Install-LocalAI.cmd -RenderGuard off` (or -Foo outside the span).' }
     @{ Fire = $false; Text = '.\Uninstall-LocalAI.ps1 -WhatIf   # -NotAParam in a comment' }
+    @{ Fire = $false; Text = 'Use Uninstall-LocalAI.ps1 -Force and then Update-OpenWebUI.ps1 -Latest by hand.' }
+    @{ Fire = $true; Text = 'Use Uninstall-LocalAI.ps1 -Force and then Update-OpenWebUI.ps1 -Lates by hand.' }
 )
 $composeCanaries = @(
     @{ Fire = $true; Text = "services:`n  a:`n    image: x`n    logging: *l`n  b:`n    image: y`nvolumes:`n  v:" }
@@ -360,6 +364,40 @@ $runnerText = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'Invoke-AllTests
 $myRules = @([regex]::Matches((Get-Content -LiteralPath $PSCommandPath -Raw -Encoding UTF8), "(?m)^#   ([A-Z0-9]+) ") | ForEach-Object { $_.Groups[1].Value } | Select-Object -Unique)
 foreach ($rule in $myRules) {
     if ($runnerText -notmatch ('VerdictPattern = [^\r\n]*\b' + $rule + '\b')) { $problems++; Write-Host "CANARY   rule $rule is not in Invoke-AllTests.ps1's VerdictPattern" -ForegroundColor Red }
+}
+
+# The same check on the scripts' own messages ('Run Update-OpenWebUI.ps1 -Rollback'): a command a
+# message tells the user to type must exist with those parameters.
+foreach ($f in ($files | Where-Object { $_.Extension -in '.ps1', '.psm1' -and $_.DirectoryName -notlike '*tests*' })) {
+    $tk = $null; $er = $null
+    $ast = [System.Management.Automation.Language.Parser]::ParseFile($f.FullName, [ref]$tk, [ref]$er)
+    $strings = @($ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.StringConstantExpressionAst] -or $n -is [System.Management.Automation.Language.ExpandableStringExpressionAst] }, $true))
+    # Comments too: the help's .EXAMPLE lines are commands users copy.
+    $texts = @($strings | ForEach-Object { [pscustomobject]@{ Text = [string]$_.Value; Line = $_.Extent.StartLineNumber } }) +
+        @($tk | Where-Object { $_.Kind -eq 'Comment' } | ForEach-Object { [pscustomobject]@{ Text = $_.Text; Line = $_.Extent.StartLineNumber } })
+    foreach ($t in $texts) {
+        foreach ($p in (Find-DocParam -Text $t.Text -ParamsByScript $paramsByScript)) {
+            $problems++
+            Write-Host ("{0,-8} {1}:{2} names {3}" -f $p.Rule, $f.Name, ($t.Line + $p.Line - 1), $p.Message) -ForegroundColor Red
+        }
+    }
+}
+
+# Every OLLAMA_* user setting the installer writes is also undone by Uninstall -ResetOllamaSettings
+# and shown by the diagnostics bundle (OLLAMA_MODELS is removed only with -RemoveModels).
+$instFile = Join-Path $Root 'Install-LocalAI.ps1'
+if (Test-Path -LiteralPath $instFile) {
+    $ia = [System.Management.Automation.Language.Parser]::ParseFile($instFile, [ref]$null, [ref]$null)
+    $setHt = $ia.Find({ param($n) $n -is [System.Management.Automation.Language.AssignmentStatementAst] -and $n.Left.Extent.Text -eq '$settings' -and $n.Right.Extent.Text -match 'OLLAMA_' }, $true)
+    $keys = @()
+    if ($setHt) { $keys = @($setHt.Right.FindAll({ param($n) $n -is [System.Management.Automation.Language.HashtableAst] }, $true) | ForEach-Object { $_.KeyValuePairs } | ForEach-Object { $_.Item1.Extent.Text.Trim("'") }) }
+    if ($keys.Count -lt 5) { $problems++; Write-Host "CANARY   rule SETTINGS found only $($keys.Count) OLLAMA_* settings in the installer" -ForegroundColor Red }
+    $unText = Get-Content -LiteralPath (Join-Path $Root 'Uninstall-LocalAI.ps1') -Raw -Encoding UTF8
+    $diText = Get-Content -LiteralPath (Join-Path $Root 'Get-LocalAIDiagnostics.ps1') -Raw -Encoding UTF8
+    foreach ($k in $keys) {
+        if ($k -ne 'OLLAMA_MODELS' -and $unText -notmatch ("'" + $k + "'")) { $problems++; Write-Host "SETTINGS Uninstall-LocalAI.ps1 -ResetOllamaSettings does not remove $k" -ForegroundColor Red }
+        if ($diText -notmatch ("'" + $k + "'")) { $problems++; Write-Host "SETTINGS Get-LocalAIDiagnostics.ps1 does not report $k" -ForegroundColor Red }
+    }
 }
 
 # README.md only: IMPROVEMENTS.md is a backlog and may name switches that do not exist yet.

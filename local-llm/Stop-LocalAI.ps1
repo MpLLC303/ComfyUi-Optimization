@@ -54,7 +54,7 @@ try {
         Stop-LaiOllamaModels -BaseUrl $ollamaUrl
         Write-LaiLog OK "Unloaded $(($loaded | ForEach-Object { $_.name }) -join ', ')"
     } else { Write-LaiLog INFO 'No model loaded' }
-} catch { Write-LaiLog INFO 'Ollama is not running; nothing to unload' }
+} catch { if ($_.Exception.Message -match 'refused|No connection could be made|Unable to connect to the remote server') { Write-LaiLog INFO 'Ollama is not running; nothing to unload.' } else { Write-LaiLog WARN "Could not reach Ollama to unload its models ($($_.Exception.Message)). If Ollama is running and the GPU memory stays full, quit Ollama from its tray icon." } }
 
 # 2. Pause the watch first, so it cannot restart what we stop next.
 & (Join-Path $PSScriptRoot 'Watch-LocalAI.ps1') -AIRoot $AIRoot -PauseMinutes ([Math]::Max(1, $PauseHours * 60)) | Out-Null

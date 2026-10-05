@@ -108,7 +108,7 @@ if (-not $Quick) {
             $load = Invoke-LaiOllamaLoad -BaseUrl $ollamaUrl -Name $m.Alias -KeepAlive '1m'
             $detail = "ctx $($load.Context), $($load.GpuPercent)% GPU, $($load.SizeGiB) GiB"
             if (-not $gpu) { return (Skip "$detail (CPU-only host)") }
-            if ($load.GpuPercent -lt 100) { return (Fail "$detail - spilling to CPU; close GPU apps or re-run the installer with -Retune") }
+            if ($load.GpuPercent -lt 100) { return (Fail "$detail - spilling to CPU; close GPU apps (Start menu > Local AI - Gaming mode frees the GPU from this stack), then run the health check again") }
             if ($tuning.ContainsKey($m.Key) -and [int]$tuning[$m.Key]['Context'] -ne $load.Context) {
                 return (Warn "$detail, but the installer tuned $($tuning[$m.Key]['Context']); re-run the installer")
             }
@@ -116,7 +116,7 @@ if (-not $Quick) {
             $speed = Measure-LaiOllamaSpeed -BaseUrl $ollamaUrl -Name $m.Alias -Tokens 64
             $detail += ", $speed tok/s"
             if ($m.MinTokensPerSec -and $speed -lt $m.MinTokensPerSec) {
-                return (Warn "$detail - below $($m.MinTokensPerSec) tok/s: VRAM is probably spilling to system RAM; close GPU apps or run Release-GPU.ps1")
+                return (Warn "$detail - below $($m.MinTokensPerSec) tok/s: VRAM is probably spilling to system RAM; close GPU-heavy apps (games, ComfyUI) and run the health check again")
             }
             Pass $detail
         }
@@ -181,7 +181,7 @@ if ($NoContainers) {
             $prev = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
             $s = (& docker inspect -f '{{.State.Status}} {{if .State.Health}}{{.State.Health.Status}}{{end}} {{.HostConfig.RestartPolicy.Name}}' $c 2>$null); $code = $LASTEXITCODE
             $ErrorActionPreference = $prev
-            if ($code -ne 0) { return (Fail 'not found - re-run the installer (C:\AI\Scripts\Install-LocalAI.cmd)') }
+            if ($code -ne 0) { return (Fail "not found - re-run the installer: double-click $(Join-Path (Join-Path $AIRoot 'Scripts') 'Install-LocalAI.cmd') and click Yes") }
             if ($s -notmatch '^running') { return (Fail "$s - $startAgain") }
             if ($s -match 'unhealthy') { return (Warn $s) }
             Pass $s
@@ -293,13 +293,13 @@ Add-Check 'Backups' {
     # Age is judged on the nightly archives only, so a tagged one cannot hide a broken nightly task.
     $daily = $all | Where-Object { $_.Name -match '^open-webui-\d{8}-\d{6}\.tar\.gz$' } | Select-Object -First 1
     if ($all.Count -gt 0 -and $all[0].Name -like '*-CORRUPT.tar.gz') {
-        return (Fail "the newest backup $($all[0].Name) failed its database check; the live Open WebUI data may be damaged (restore from $(if ($newest) { $newest.Name } else { 'an older archive' }))")
+        return (Fail "the newest backup $($all[0].Name) failed its database check; the live Open WebUI data may be damaged (restore from $(if ($newest) { $newest.Name } else { 'an older archive' }) with Restore-OpenWebUI.ps1 -Archive, see the README's Maintain section)")
     }
     if (-not $newest) { return (Fail "no archive in $dir") }
-    if (-not $daily) { return (Warn "no nightly archive yet (newest: $($newest.Name)); check the LocalAI-Backup-OpenWebUI task") }
+    if (-not $daily) { return (Warn "no nightly archive yet (newest: $($newest.Name)); the nightly backup task has not run yet; if this stays, run Start menu > Local AI - Update toolkit to set it up again") }
     $age = (Get-Date) - $daily.LastWriteTime
     $detail = '{0} ({1:N1} MB, {2:N0} h old)' -f $daily.Name, ($daily.Length / 1MB), $age.TotalHours
-    if ($onWindows -and -not (Get-ScheduledTask -TaskName 'LocalAI-Backup-OpenWebUI' -ErrorAction SilentlyContinue)) { return (Fail "$detail; daily task missing") }
+    if ($onWindows -and -not (Get-ScheduledTask -TaskName 'LocalAI-Backup-OpenWebUI' -ErrorAction SilentlyContinue)) { return (Fail "$detail; the nightly backup task is missing - run Start menu > Local AI - Update toolkit to set it up again") }
     if ($age.TotalHours -gt 50) { return (Warn "$detail - older than two days") }
     Pass $detail
 }
@@ -318,7 +318,7 @@ Add-Check 'Nothing exposed beyond localhost' {
     if ($onlyOllama -and (Get-NetFirewallRule -DisplayName 'LocalAI - Block Ollama from LAN' -ErrorAction SilentlyContinue)) {
         return (Warn "Ollama listens on all interfaces (Docker fallback) but the LAN block rule is in place: $($bad -join ', ')")
     }
-    Fail "listening beyond loopback: $($bad -join ', ')"
+    Fail "listening beyond loopback: $($bad -join ', ') - reachable from your network; run Start menu > Local AI - Update toolkit to restore the localhost-only settings"
 }
 
 $fails = @($results | Where-Object { $_.Status -eq 'FAIL' }).Count

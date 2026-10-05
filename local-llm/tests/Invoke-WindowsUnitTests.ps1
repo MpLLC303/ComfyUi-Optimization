@@ -208,6 +208,17 @@ foreach ($sc in ($specs | Where-Object { $_.Kind -eq 'lnk' })) {
     [void][System.Management.Automation.Language.Parser]::ParseInput($cmd, [ref]$null, [ref]$errs)
     Assert-That (@($errs).Count -eq 0) "payload of '$($sc.Name)' parses"
 }
+# Run a real payload against a script that fails: the error must be on screen before the window
+# waits for Enter (-NonInteractive so the test never blocks on Read-Host).
+$scRoot = Join-Path $Work 'shortcut-root'
+New-Item -ItemType Directory -Force -Path (Join-Path $scRoot 'Scripts') | Out-Null
+Set-Content -LiteralPath (Join-Path (Join-Path $scRoot 'Scripts') 'Start-LocalAI.ps1') -Value "param([string]`$AIRoot) throw 'stub failure for the shortcut test'"
+$startSpec = @(Get-LaiShortcutSpecs -AIRoot $scRoot) | Where-Object { $_.Name -eq 'Local AI - Start again' }
+$payload = $startSpec.Arguments.Substring($startSpec.Arguments.IndexOf('"') + 1).TrimEnd('"')
+$prev = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
+$scOut = (& $childExe -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command $payload 2>&1 | ForEach-Object { "$_" }) -join "`n"
+$ErrorActionPreference = $prev
+Assert-That ($scOut -match 'FAILED: stub failure for the shortcut test') "a failing script's error is shown in the shortcut window before it waits ($(($scOut -split "`n" | Select-Object -First 2) -join ' | '))"
 if ($onWindows) {
     $shell = New-Object -ComObject WScript.Shell
     $lnkPath = Join-Path $Work 'test.lnk'
@@ -522,6 +533,43 @@ if ($onWindows) {
         Assert-That ($gotArg -and $gotArg.AIRoot -eq $root -and $gotArg.Wait -eq 1200) "powershell.exe receives -AIRoot '$root' and the next argument intact ($($gotArg.AIRoot))"
     }
 } else { Skip 'task command-line round trip runs on Windows only' }
+
+Write-Host "`n=== context search (Find-LaiMaxContext) with a mocked Ollama and nvidia-smi ===" -ForegroundColor Cyan
+# The integration test runs the tuner on a CPU box with -AllowCpu, so the search itself (step-down,
+# headroom, failed loads) never runs there. Mocks inside the module: load results and VRAM readings.
+$mod = Get-Module LocalAI
+& $mod {
+    $script:MockLoads = @(); $script:MockFree = [System.Collections.Queue]::new(); $script:MockTrain = 131072
+    function script:Get-LaiOllamaModelInfo { param($BaseUrl, $Name) $null = $BaseUrl, $Name; [pscustomobject]@{ TrainContext = $script:MockTrain; Capabilities = @() } }
+    function script:Stop-LaiOllamaModels { param($BaseUrl) $null = $BaseUrl }
+    function script:Invoke-LaiOllamaLoad {
+        param($BaseUrl, $Name, $NumCtx, $KeepAlive)
+        $null = $BaseUrl, $KeepAlive
+        $script:MockLoads += $NumCtx
+        if ($NumCtx -eq 65536) { throw 'cudaMalloc failed: out of memory' }
+        [pscustomobject]@{ Name = $Name; Context = $NumCtx; SizeGiB = 20; VramGiB = 20; GpuPercent = 100 }
+    }
+    function script:Get-LaiGpuInfo { $f = 5000; if ($script:MockFree.Count) { $f = $script:MockFree.Dequeue() }; [pscustomobject]@{ FreeMiB = $f; DriverVersion = '1.0' } }
+}
+# 65536 fails to load; at 57344 one reading dips to 600 MiB (another app for a moment), the others are 900+.
+& $mod { foreach ($v in 600, 900, 950) { $script:MockFree.Enqueue($v) } }
+$fit = Find-LaiMaxContext -Name 'm' -Candidates @(32768, 65536, 57344, 65536) -MinFreeMiB 768
+$loads = & $mod { $script:MockLoads }
+Assert-That ($fit.Context -eq 57344 -and $fit.Fits) "a failed load at 65536 steps down instead of failing; one low VRAM reading does not decide (got $($fit.Context), fits=$($fit.Fits))"
+Assert-That ((@($loads) -join ',') -eq '65536,57344') "candidates tried largest first, each once ($(@($loads) -join ','))"
+& $mod { $script:MockLoads = @(); $script:MockTrain = 16384; $script:MockFree.Clear() }
+$fit = Find-LaiMaxContext -Name 'm' -Candidates @(32768, 65536) -MinFreeMiB 768
+Assert-That ($fit.Context -eq 16384 -and (@(& $mod { $script:MockLoads }) -join ',') -eq '16384') 'a model trained on less than every candidate is tried at its own limit'
+Import-Module (Join-Path (Join-Path $src 'lib') 'LocalAI.psm1') -Force
+$mod = Get-Module LocalAI
+& $mod {
+    function script:Get-LaiOllamaLoaded { param($BaseUrl) $null = $BaseUrl; @([pscustomobject]@{ name = (Resolve-LaiModelName 'm'); size = 100 }) }
+    function script:Invoke-LaiApi { param($Method, $Uri, $Body, $TimeoutSec) $null = $Method, $Uri, $Body, $TimeoutSec }
+}
+$apiErr = ''
+try { Invoke-LaiOllamaLoad -Name 'm' -NumCtx 4096 | Out-Null } catch { $apiErr = $_.Exception.Message }
+Assert-That ($apiErr -match 'no size/size_vram') "an Ollama whose /api/ps lacks size_vram is reported, not tuned as 0% GPU ($apiErr)"
+Import-Module (Join-Path (Join-Path $src 'lib') 'LocalAI.psm1') -Force
 
 Write-Host "`n=== Remove-LaiTree never follows a junction / symbolic link ===" -ForegroundColor Cyan
 # The elevated installer and uninstaller delete trees in C:\AI, which the user controls. A link planted

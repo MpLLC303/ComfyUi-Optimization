@@ -207,7 +207,8 @@ foreach ($d in @($P.Root, $P.Logs, $P.Secrets, $P.Backups, $P.Downloads)) {
     if (-not (Test-Path -LiteralPath $d)) { New-Item -ItemType Directory -Force -Path $d | Out-Null }
 }
 $script:TranscriptOn = $false
-try { Start-Transcript -Path (Join-Path $P.Logs ('install-{0}.log' -f (Get-Date -Format 'yyyyMMdd-HHmmss'))) | Out-Null; $script:TranscriptOn = $true } catch { Write-Verbose 'Transcript unavailable' }
+$script:TranscriptPath = Join-Path $P.Logs ('install-{0}.log' -f (Get-Date -Format 'yyyyMMdd-HHmmss'))
+try { Start-Transcript -Path $script:TranscriptPath | Out-Null; $script:TranscriptOn = $true } catch { Write-Verbose 'Transcript unavailable' }
 
 # One installer run or model update at a time (released when this process ends, even if killed).
 try { $script:SetupLock = Enter-LaiSetupLock }
@@ -810,6 +811,7 @@ Invoke-Stage 'Ollama' {
         OLLAMA_FLASH_ATTENTION = '1'
         OLLAMA_KV_CACHE_TYPE   = $KvCacheType
         OLLAMA_NUM_PARALLEL    = '1'                                  # KV cache is allocated per parallel slot
+        OLLAMA_MAX_LOADED_MODELS = '1'                                # each preset is tuned for an otherwise empty card
         OLLAMA_GPU_OVERHEAD    = [string]([int64]$GpuOverheadMiB * 1MB)
         OLLAMA_KEEP_ALIVE      = $KeepAlive
         OLLAMA_NO_CLOUD        = '1'                                  # private: no cloud models/web search
@@ -1102,7 +1104,7 @@ Invoke-Stage 'Stack' {
             if ($copy.ExitCode -ne 0) { throw "Copying the old Open WebUI data failed: $($copy.Text)" }
             Write-LaiLog OK "Copied the old Open WebUI data (from $($from -replace ':/from:ro$', '')) into the open-webui volume"
         } elseif ($from) {
-            Write-LaiLog WARN "Both the old data ($from) and an open-webui volume exist; leaving both untouched. See README > Troubleshooting to merge."
+            Write-LaiLog WARN "Both the old data ($from) and an open-webui volume exist; leaving both untouched: Open WebUI keeps using the open-webui volume, and nothing of the old data is deleted."
         }
         # Keep the old container (stopped, renamed) instead of deleting it.
         # (restart policy off first, or the guide's --restart always would bring it back after a reboot)
@@ -1243,6 +1245,13 @@ Invoke-Stage 'Configure' {
     if ((Resolve-LaiPendingPassword -AIRoot $AIRoot -BaseUrl $WebUIUrl) -eq 'promoted') { $cred = Get-AdminCredential }
     try { $token = Connect-LaiWebUI -BaseUrl $WebUIUrl -Email $cred.email -Password $cred.password }
     catch {
+        # Only a rejected login means "an admin account from before"; a timeout, server error or rate
+        # limit must not turn into a prompt for credentials the user never had (and that blocks an
+        # unattended resume after a reboot).
+        $signInStatus = Get-LaiHttpStatus $_
+        if (@(400, 401, 403) -notcontains $signInStatus -and $_.Exception.Message -notmatch 'not admin') {
+            throw "Open WebUI did not accept the sign-in request ($(Get-LaiHttpErrorText $_)). Wait a minute, then run the installer again."
+        }
         # Existing install whose admin was created by hand: ask once, then store it.
         Write-LaiLog WARN "Could not sign in as $($cred.email). This Open WebUI already has an admin account from before."
         $email = Read-Host 'Existing Open WebUI admin email'
@@ -1418,8 +1427,8 @@ Stop-Install $testExit
 
 } catch {
     Write-LaiLog FAIL $_.Exception.Message
-    if ($_.InvocationInfo) { Write-LaiLog FAIL ("at " + $_.InvocationInfo.PositionMessage.Split("`n")[0]) }
-    Write-LaiLog FAIL "Fix the issue above and run the installer again; re-running is safe and reuses what is done (downloads, tuning). Log: $($P.Logs)"
+    if ($_.InvocationInfo) { Write-LaiLog INFO ("(technical detail for a bug report: " + $_.InvocationInfo.PositionMessage.Split("`n")[0] + ')') }
+    Write-LaiLog FAIL "Fix the issue above and run the installer again (double-click $(Join-Path $P.Scripts 'Install-LocalAI.cmd') and click Yes); re-running is safe and reuses what is done (downloads, tuning). Full log: $($script:TranscriptPath)"
     if ($Resume -and $State -and $State.flags) {
         # The resume task starts the installer at every sign-in. A failure that a reboot does not fix
         # (virtualization off, a broken Docker) must not open an elevated window forever.
@@ -1427,7 +1436,7 @@ Stop-Install $testExit
         $State.flags['resumeFailures'] = $n
         if ($n -ge 2) {
             Unregister-ScheduledTask -TaskName $ResumeTask -Confirm:$false -ErrorAction SilentlyContinue
-            Write-LaiLog WARN "This failed after sign-in twice in a row, so the installer no longer starts by itself. After fixing it, run $(Join-Path $P.Scripts 'Install-LocalAI.ps1') -Resume as Administrator."
+            Write-LaiLog WARN "This failed after sign-in twice in a row, so the installer no longer starts by itself. After fixing it, double-click $(Join-Path $P.Scripts 'Install-LocalAI.cmd') and click Yes."
         } else {
             Write-LaiLog WARN 'The installer tries once more at the next sign-in.'
         }

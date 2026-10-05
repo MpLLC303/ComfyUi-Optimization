@@ -304,17 +304,17 @@ Write-Verbose $line
 
 if ($toNotify.Count -gt 0) {
     # One concrete next step, using the Start-menu shortcuts (typed commands may be blocked by policy).
-    $hint = 'Start menu > Local AI > Health check for details.'
+    $hint = 'Start menu > Local AI - Health check shows details.'
     $heldNow = Get-LaiWebUIHold -AIRoot $AIRoot
     if ($heldNow -and $failed -contains 'Open WebUI') {
         # Start again would refuse; the only fix is the recovery restore (the command is in the details).
-        $hint = 'Open WebUI was kept stopped after a failed restore. Run the recovery command above in PowerShell as Administrator.'
+        $hint = 'Open WebUI is stopped on purpose after a failed restore. The fix is the Recover line in ' + (Join-Path $AIRoot 'open-webui-hold.json') + ': paste it into PowerShell.'
     } elseif ($failed -contains 'Docker' -or $failed -contains 'Open WebUI' -or $failed -contains 'SearXNG' -or $failed -contains 'Render guard' -or $failed -contains 'Ollama') {
-        $hint = 'Try Start menu > Local AI > Start again.'
+        $hint = 'Use Start menu > Local AI - Start again. If that does not help, restart Docker Desktop (whale icon > Restart) and use Start again once more.'
     } elseif ($failed -contains 'Disk space') {
         $hint = 'Free some disk space (old backups in ' + (Join-Path $AIRoot 'Backups') + ', unused models).'
     } elseif ($failed -contains 'Backups') {
-        $hint = 'Run Start menu > Local AI > Diagnostics and check backup.log.'
+        $hint = 'The reason is at the end of ' + (Join-Path (Join-Path $AIRoot 'Logs') 'backup.log') + '.'
     } elseif ($failed -contains 'Backup mirror') {
         $hint = 'Check that the backup mirror drive or NAS share is reachable and has free space.'
     }

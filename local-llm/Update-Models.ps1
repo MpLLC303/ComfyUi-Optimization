@@ -205,6 +205,25 @@ if ($changed.Count -gt 0) {
     Write-LaiLog OK 'All models are current; nothing to re-tune.'
 }
 
+# A new Ollama (this run's -UpdateOllama, or one the tray app installed by itself) can place layers
+# differently: load every other tuned model once and re-tune any that no longer fits fully on the GPU.
+$ollamaNow = ''
+try { $ollamaNow = [string](Get-LaiOllamaVersion -BaseUrl $ollamaUrl) } catch { Write-Verbose 'version unknown' }
+$changedKeys = @($changed | ForEach-Object { $_.Key })
+$toVerify = @($catalog.Models | Where-Object { $changedKeys -notcontains $_.Key -and $state['tuning'].ContainsKey($_.Key) -and
+        $state['tuning'][$_.Key]['OllamaVersion'] -and [string]$state['tuning'][$_.Key]['OllamaVersion'] -ne $ollamaNow })
+if ($ollamaNow -and $toVerify.Count -gt 0) {
+    Write-LaiLog STEP "Ollama is now ${ollamaNow}: checking that $(($toVerify | ForEach-Object { $_.Display }) -join ', ') still fit fully on the GPU"
+    Stop-LaiOllamaModels -BaseUrl $ollamaUrl
+    $gpu = Wait-LaiGpuIdle -MaxUsedMiB $maxBusy -TimeoutSec 600
+    $vfp = ''
+    foreach ($k in $state['tuning'].Keys) { if ($state['tuning'][$k]['Fingerprint']) { $vfp = $state['tuning'][$k]['Fingerprint']; break } }
+    $results = Invoke-LaiModelSetup -BaseUrl $ollamaUrl -Models $toVerify -Candidates $catalog.ContextCandidates -SystemPrompt $system `
+        -Previous $state['tuning'] -Fingerprint $vfp -MinFreeMiB $minFree -AllowCpu:$allowCpu
+    foreach ($k in $results.Keys) { $state['tuning'][$k] = $results[$k] }
+    Save-LaiState -State $state -Path $statePath
+}
+
 if ($failedPulls.Count -gt 0) { Write-LaiLog WARN "Not updated (download failed): $($failedPulls -join ', '). Run Update-Models.ps1 again later." }
 if (-not $SkipTests) {
     & (Join-Path $PSScriptRoot 'Test-LocalAI.ps1') -AIRoot $AIRoot -Quick

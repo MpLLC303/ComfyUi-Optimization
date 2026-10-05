@@ -50,12 +50,12 @@ try {
             Wait-LaiHttp -Uri "$ollamaUrl/api/version" -TimeoutSec 90 | Out-Null
             Write-LaiLog OK 'Ollama started'
         } else {
-            throw "Ollama is not answering at $ollamaUrl. Start it from the Start menu, then re-run."
+            throw "Ollama is not running (no answer at $ollamaUrl). Start Ollama from the Start menu, then use Start menu > Local AI - Start again."
         }
     } else { Write-LaiLog OK 'Ollama is running' }
 
     # 2. Docker engine.
-    if (-not (Get-Command docker -ErrorAction SilentlyContinue)) { throw 'docker CLI not found. Is Docker Desktop installed?' }
+    if (-not (Get-Command docker -ErrorAction SilentlyContinue)) { throw 'Docker Desktop is not installed (the docker command was not found). Run Start menu > Local AI - Update toolkit to install it again.' }
     if (-not (Test-Engine)) {
         if (-not $onWindows) { throw 'Docker engine is not running.' }
         Write-LaiLog INFO 'Starting Docker Desktop (takes a minute or two)'
@@ -87,9 +87,14 @@ try {
         $r = Invoke-Docker @('compose', '--project-directory', $stackDir, '-f', $compose, 'up', '-d')
         if ($r.ExitCode -ne 0) { throw "docker compose up failed: $($r.Text)" }
     } finally { Exit-LaiVolumeLock $lock }
-    Wait-LaiWebUI -BaseUrl "http://127.0.0.1:$webPort" -TimeoutSec $TimeoutSec
+    try { Wait-LaiWebUI -BaseUrl "http://127.0.0.1:$webPort" -TimeoutSec $TimeoutSec }
+    catch { throw "Open WebUI did not answer within $TimeoutSec s. Restart Docker Desktop (whale icon in the taskbar > Restart), wait until it says Engine running, then use Start menu > Local AI - Start again." }
     Write-LaiLog OK "Open WebUI is up on http://localhost:$webPort"
 
+} catch {
+    # Said last and clearly, so a failed start never ends on the 'watch resumed' line below.
+    Write-LaiLog FAIL "Local AI did not start: $($_.Exception.Message)"
+    throw
 } finally {
     # 4. Watch back on.
     & (Join-Path $PSScriptRoot 'Watch-LocalAI.ps1') -AIRoot $AIRoot -Unpause | Out-Null

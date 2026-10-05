@@ -652,6 +652,9 @@ function Invoke-LaiOllamaLoad {
     $resolved = Resolve-LaiModelName $Name
     $entry = Get-LaiOllamaLoaded -BaseUrl $BaseUrl | Where-Object { $_.name -eq $resolved } | Select-Object -First 1
     if (-not $entry) { throw "Model $Name did not appear in /api/ps after loading." }
+    if ($null -eq $entry.size -or $null -eq $entry.size_vram) {
+        throw "This Ollama version's /api/ps reports no size/size_vram for $Name; the tuner needs them (tested with Ollama 0.35.1)."
+    }
     $size = [int64]$entry.size
     $vram = [int64]$entry.size_vram
     $pct = 0
@@ -683,13 +686,28 @@ function Find-LaiMaxContext {
     $list = @($Candidates | Where-Object { $limit -le 0 -or $_ -le $limit } | Sort-Object -Descending -Unique)
     if ($list.Count -eq 0) { $list = @($limit) }
 
-    Stop-LaiOllamaModels -BaseUrl $BaseUrl
     $result = $null
     foreach ($ctx in $list) {
-        $load = Invoke-LaiOllamaLoad -BaseUrl $BaseUrl -Name $Name -NumCtx $ctx -KeepAlive '2m'
-        $gpu = Get-LaiGpuInfo
+        # Each size from an empty card: VRAM freed by the previous size may show up late on Windows.
+        Stop-LaiOllamaModels -BaseUrl $BaseUrl
+        try { $load = Invoke-LaiOllamaLoad -BaseUrl $BaseUrl -Name $Name -NumCtx $ctx -KeepAlive '2m' }
+        catch {
+            # E.g. 'cudaMalloc failed: out of memory' when Ollama under-estimates: try the next size
+            # instead of failing the whole install.
+            Write-LaiLog WARN ("  ctx {0,6}: load failed ({1}); trying a smaller context" -f $ctx, (Get-LaiHttpErrorText $_))
+            $result = [pscustomobject]@{ Name = $Name; TrainContext = $info.TrainContext; Context = $ctx; GpuPercent = 0; SizeGiB = 0; FreeMiB = -1; Fits = $false }
+            continue
+        }
+        # Median of three readings: one other program grabbing VRAM for a moment must not decide the
+        # context that is then kept until the next -Retune.
+        $reads = @()
+        for ($i = 0; $i -lt 3; $i++) {
+            $g = Get-LaiGpuInfo
+            if ($g) { $reads += [int]$g.FreeMiB }
+            if ($i -lt 2) { Start-Sleep -Milliseconds 700 }
+        }
         $free = -1
-        if ($gpu) { $free = $gpu.FreeMiB }
+        if ($reads.Count) { $free = @($reads | Sort-Object)[[int][Math]::Floor($reads.Count / 2)] }
         $fits = ($load.GpuPercent -ge 100) -or $AllowCpu
         $roomy = ($free -lt 0) -or ($free -ge $MinFreeMiB)
         Write-LaiLog INFO ("  ctx {0,6}: {1,3}% GPU, model+cache {2} GiB, VRAM free {3} MiB" -f $ctx, $load.GpuPercent, $load.SizeGiB, $free)
@@ -1152,11 +1170,18 @@ function Invoke-LaiModelSetup {
         # Results from before Digest/OllamaVersion were recorded still count (no forced re-tune).
         $sameModel = $prev -and (-not $prev['Digest'] -or $prev['Digest'] -eq $digest)
         $sameOllama = $prev -and $prev['OllamaVersion'] -and $prev['OllamaVersion'] -eq $ollamaVer
+        # The candidate list counts too (an edited ContextCandidates must take effect); results from
+        # before it was recorded still count.
+        $candKey = (@($Candidates | Sort-Object -Descending -Unique) -join ',')
+        $sameCandidates = $prev -and (-not $prev['Candidates'] -or [string]$prev['Candidates'] -eq $candKey)
         $reuse = (-not $Retune) -and $prev -and ($prev['Source'] -eq $m.Source) -and ($prev['Fingerprint'] -eq $Fingerprint) -and
-            ($prev['MaxContext'] -eq $m.MaxContext) -and $sameModel -and (Test-LaiOllamaModel -BaseUrl $BaseUrl -Name $m.Alias)
+            ($prev['MaxContext'] -eq $m.MaxContext) -and $sameModel -and $sameCandidates -and (Test-LaiOllamaModel -BaseUrl $BaseUrl -Name $m.Alias)
+        # A result that was slow or not fully on the GPU when measured is checked again, not trusted forever.
+        $wasGood = $prev -and $prev['TokensPerSec'] -and $null -ne $prev['GpuPercent'] -and
+            ($AllowCpu -or ([int]$prev['GpuPercent'] -ge 100 -and [double]$prev['TokensPerSec'] -ge [double]$m.MinTokensPerSec))
         # Skipping the load also needs the same Ollama: a new version can place layers differently.
         # (Results without a recorded version take the verify path once, which records it.)
-        if ($reuse -and $sameOllama -and $prev['TokensPerSec'] -and $null -ne $prev['GpuPercent']) {
+        if ($reuse -and $sameOllama -and $wasGood) {
             # Nothing that decides the fit changed: refresh the alias (system prompt, parameters) and
             # keep the measured numbers. The acceptance test at the end measures speed again.
             $ctx = [int]$prev['Context']
@@ -1195,10 +1220,14 @@ function Invoke-LaiModelSetup {
         if ($load.GpuPercent -lt 100 -or $speed -lt $m.MinTokensPerSec) { $level = 'WARN' }
         if ($AllowCpu) { $level = 'OK' }
         Write-LaiLog $level ("  {0}: ctx {1} (trained {2}), {3}% GPU, {4} GiB, {5} tok/s" -f $m.Alias, $load.Context, $info.TrainContext, $load.GpuPercent, $load.SizeGiB, $speed)
+        # The context the alias was built with, if /api/ps does not report one (older/newer Ollama).
+        $finalCtx = [int]$load.Context
+        if ($finalCtx -le 0) { $finalCtx = [int]$ctx }
         $results[$m.Key] = @{
             Source       = $m.Source
             Alias        = $m.Alias
-            Context      = $load.Context
+            Context      = $finalCtx
+            Candidates   = $candKey
             TrainContext = $info.TrainContext
             MaxContext   = $m.MaxContext
             GpuPercent   = $load.GpuPercent
@@ -1424,7 +1453,9 @@ function Get-LaiShortcutSpecs {
         $path = $scripts + '\' + $i.Script
         if ($i.Env) { $call = "`$env:$($i.Env) = $(& $q $AIRoot.TrimEnd('\')); & $(& $q $path)" }   # bootstrap reads the root from the environment
         else { $call = "& $(& $q $path) -AIRoot $(& $q $AIRoot)$($i.Extra)" }
-        $cmd = "try { $call } finally { Write-Host ''; Read-Host 'Done - press Enter to close' }"
+        # 'catch' prints the error BEFORE the window waits: with only try/finally PowerShell shows the
+        # error after the user has pressed Enter, i.e. as the window closes, so it was never read.
+        $cmd = "try { $call } catch { Write-Host ''; Write-Host ('FAILED: ' + `$_.Exception.Message) -ForegroundColor Red; Write-Host 'For help: Start menu > Local AI - Diagnostics (redacted zip).' -ForegroundColor Yellow } finally { Write-Host ''; Read-Host 'Done - press Enter to close' }"
         $specs += [pscustomobject]@{
             Name      = $i.Name
             Kind      = 'lnk'
