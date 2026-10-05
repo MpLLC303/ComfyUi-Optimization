@@ -197,6 +197,15 @@ Add-Check 'Open WebUI reachable' {
 }
 
 $token = $null
+Add-Check 'Open WebUI version' {
+    if (-not $script:webUp) { return (Skip 'Open WebUI not reachable') }
+    $ver = [string](Invoke-LaiApi -Uri "$webUrl/api/version" -TimeoutSec 15).version
+    switch (Get-LaiWebUICompat -Version $ver) {
+        'tested' { Pass "$ver (the version this toolkit was tested with)" }
+        'newer' { Warn "$ver is newer than the tested 0.11.4; if a check below fails, Update-OpenWebUI.ps1 -Rollback goes back" }
+        default { Warn "$ver (tested with 0.11.4)" }
+    }
+}
 Add-Check 'Open WebUI admin login' {
     if (-not $script:webUp) { return (Skip 'Open WebUI not reachable') }
     $credFile = Join-Path (Join-Path $AIRoot 'Secrets') 'openwebui-admin.json'
@@ -240,6 +249,8 @@ if ($script:token) {
         if ($urls -notcontains $expected) {
             return (Warn "Open WebUI uses $via instead of $expected (e.g. after restoring an older backup); it works, but re-run Install-LocalAI.ps1 to put it back")
         }
+        # Open WebUI answers {"version": false} when its Ollama API is switched off: not a working link.
+        if (-not ([string]$v.version -match '^\d')) { return (Fail "Open WebUI reports no Ollama version through $via ($($v.version)): its Ollama connection is switched off or not working - re-run the installer") }
         if ($expected -like '*render-guard*') { Pass "$expected (render guard), Ollama $($v.version)" } else { Pass "$expected (direct), Ollama $($v.version)" }
     }
     Add-Check 'Signup disabled, memories enabled' {

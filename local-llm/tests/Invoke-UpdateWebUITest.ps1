@@ -127,6 +127,14 @@ try {
     $m = @(Get-ChildItem -LiteralPath $mirrorDir -Filter 'open-webui-*.tar.gz' | Sort-Object LastWriteTime -Descending)  # lai-ok: objects
     Assert-That ($m.Count -eq 3 -and $m[0].Name -notlike 'open-webui-2020*' -and $m[0].Length -gt 100) "mirror: new archive plus the 2 newest old ones, 2 oldest pruned ($($m.Count) left)"
     Assert-That (@(Get-ChildItem -LiteralPath $mirrorDir -Filter 'incomplete-*').Count -eq 0) 'mirror: no partial copies left'
+    $bsPath = Join-Path $aiRoot 'backup-state.json'
+    Assert-That ([string](Read-LaiState -Path $bsPath)['mirrorTarget'] -eq $mirrorDir -and (Read-LaiState -Path $bsPath)['mirrorOkAt']) 'the backup records which mirror got the copy and when (the watch checks it)'
+    # A mirror that cannot be written: the backup still succeeds, and the reason is recorded.
+    $notADir = Join-Path $Work 'mirror-is-a-file'; Set-Content -LiteralPath $notADir -Value 'x'
+    $prevPref = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
+    & pwsh -NoProfile -File (Join-Path $src 'Backup-OpenWebUI.ps1') -AIRoot $aiRoot -RetentionDays 1 -SkipDeepVerify -NoPrune -Mirror (Join-Path $notADir 'sub') 2>&1 | Out-Null
+    $mcode = $LASTEXITCODE; $ErrorActionPreference = $prevPref
+    Assert-That ($mcode -eq 0 -and (Read-LaiState -Path $bsPath)['mirrorError']) "a failed mirror copy does not fail the backup but is recorded (exit $mcode)"
 
     Write-Host "`n=== 3b. a failed backup leaves no archive that looks fresh ===" -ForegroundColor Cyan
     $bdir = Join-Path $aiRoot 'Backups'
@@ -223,6 +231,25 @@ try {
     Assert-That ($r.Code -ne 0 -and $r.Text -match 'Rollback complete' -and -not (Test-Path -LiteralPath $holdFile)) "failed swap, good rollback: no hold left behind (exit $($r.Code))"
     Assert-That ((Invoke-DockerText @('inspect', '-f', '{{.State.Status}} {{.HostConfig.RestartPolicy.Name}}', 'open-webui')) -eq 'running always') 'and Open WebUI runs again as before'
 
+    Write-Host "`n=== 5d. no safety backup: a recovery command that works; Docker down said as such ===" -ForegroundColor Cyan
+    $bdir5 = Join-Path $aiRoot 'Backups'
+    $future5 = Join-Path $bdir5 ('open-webui-{0}.tar.gz' -f (Get-Date).AddDays(400).ToString('yyyyMMdd-HHmmss'))
+    Copy-Item -LiteralPath $good.FullName -Destination $future5; (Get-Item -LiteralPath $future5).LastWriteTime = (Get-Date).AddDays(400)
+    $env:LOCALAI_TEST_FAIL_SWAP = '1'
+    $r = & $runScript 'Restore-OpenWebUI.ps1' @('-Archive', $good.FullName, '-Force', '-SkipSafetyBackup')
+    $env:LOCALAI_TEST_FAIL_SWAP = ''
+    $h5 = Read-LaiState -Path $holdFile
+    $rec5 = [string]$h5['Recover']
+    Assert-That ($r.Code -ne 0 -and $rec5 -match '-Archive ' -and $rec5 -notmatch 'YYYYMMDD' -and $rec5 -notmatch [regex]::Escape($good.Name) -and $rec5 -notmatch [regex]::Escape((Split-Path -Leaf $future5))) "the recovery command names another real nightly backup ($rec5)"
+    $prevPref = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
+    & pwsh -NoProfile -Command ($rec5 + ' -Force') 2>&1 | Out-Null
+    $c5 = $LASTEXITCODE; $ErrorActionPreference = $prevPref
+    Assert-That ($c5 -eq 0 -and -not (Test-Path -LiteralPath $holdFile)) "pasted as printed, it restores and clears the hold (exit $c5)"
+    Remove-Item -LiteralPath $future5 -Force
+    $savedDockerHost = $env:DOCKER_HOST; $env:DOCKER_HOST = 'unix:///nonexistent/lai-docker.sock'
+    try { $r = & $runScript 'Restore-OpenWebUI.ps1' @('-Archive', $good.FullName, '-Force') } finally { $env:DOCKER_HOST = $savedDockerHost }
+    Assert-That ($r.Code -ne 0 -and $r.Text -match 'Docker Desktop is not running' -and $r.Text -notmatch 'not a valid Open WebUI backup') 'with Docker down the restore says so (it used to call a good backup invalid)'
+
     Write-Host "`n=== 6. admin password rotation (real Open WebUI) ===" -ForegroundColor Cyan
     $credPath = Join-Path (Join-Path $aiRoot 'Secrets') 'openwebui-admin.json'
     $r = & $runScript 'Set-OpenWebUIPassword.ps1' @('-NewPassword', 'Rotated-Password-456', '-Quiet')
@@ -262,10 +289,15 @@ try {
     Assert-That ($b.Code -ne 0 -and $bad.Count -eq 1 -and $b.Text -match 'failed the SQLite check') "a damaged database is caught and kept as -CORRUPT (exit $($b.Code))"
     Assert-That (@(Get-ChildItem -LiteralPath (Join-Path $aiRoot 'Backups') -Filter '*-deeptest.tar.gz').Count -eq 1) 'only the good archive keeps a normal name'
     # Corrupt archives pile up night after night: two are kept for inspection, older ones go.
+    # An uninstall's final backup is kept even when quarantined.
+    Set-Content -LiteralPath (Join-Path (Join-Path $aiRoot 'Backups') 'open-webui-20190101-000000-pre-uninstall-CORRUPT.tar.gz') -Value 'x'
+    (Get-Item -LiteralPath (Join-Path (Join-Path $aiRoot 'Backups') 'open-webui-20190101-000000-pre-uninstall-CORRUPT.tar.gz')).LastWriteTime = (Get-Date).AddDays(-60)
     foreach ($i in 1..3) { Set-Content -LiteralPath (Join-Path (Join-Path $aiRoot 'Backups') ("open-webui-2020010$i-000000-old-CORRUPT.tar.gz")) -Value 'x'; (Get-Item -LiteralPath (Join-Path (Join-Path $aiRoot 'Backups') ("open-webui-2020010$i-000000-old-CORRUPT.tar.gz"))).LastWriteTime = (Get-Date).AddDays(-30 + $i) }
     Start-Sleep -Seconds 1
     $b = & $runScript 'Backup-OpenWebUI.ps1' @('-Volume', 'lai-deep-test', '-Container', 'lai-no-such-container', '-Tag', 'deeptest', '-NoPrune', '-VerifyImage', $verifyImage)
     $corNow = @(Get-ChildItem -LiteralPath (Join-Path $aiRoot 'Backups') -Filter '*-CORRUPT.tar.gz' | ForEach-Object { $_.Name })
+    Assert-That (Test-Path -LiteralPath (Join-Path (Join-Path $aiRoot 'Backups') 'open-webui-20190101-000000-pre-uninstall-CORRUPT.tar.gz')) "an uninstall's quarantined final backup is never deleted by the cap"
+    $corNow = @($corNow | Where-Object { $_ -notlike '*-pre-uninstall-CORRUPT*' })
     Assert-That ($b.Code -ne 0 -and $corNow.Count -eq 2 -and $corNow -contains 'open-webui-20200101-000000-old-CORRUPT.tar.gz') "two quarantined archives are kept: the oldest (closest to the last good state) and the newest ($($corNow -join ', '))"
     # An empty webui.db (0 bytes: integrity_check says ok, but there are no tables) is not a backup.
     Invoke-DockerText @('volume', 'create', 'lai-ok-test') | Out-Null
@@ -280,6 +312,15 @@ try {
     $b = & $runScript 'Backup-OpenWebUI.ps1' @('-Volume', 'lai-ok-test', '-Container', 'lai-no-such-container', '-Tag', 'nocheck', '-NoPrune', '-VerifyImage', 'alpine:3.20')
     Assert-That ($b.Code -eq 0 -and $b.Text -match 'Deep check could not run' -and @(Get-ChildItem -LiteralPath (Join-Path $aiRoot 'Backups') -Filter '*-nocheck.tar.gz').Count -eq 1 -and @(Get-ChildItem -LiteralPath (Join-Path $aiRoot 'Backups') -Filter '*-nocheck-CORRUPT.tar.gz').Count -eq 0) "a deep check that cannot run is a warning, not a CORRUPT archive (exit $($b.Code))"
     Assert-That ((Invoke-DockerText @('volume', 'ls', '-q', '--filter', 'name=localai-verify-')) -eq '') 'scratch volumes left by a killed deep check are swept'
+    # The backup counts nights whose check could not run (the watch fails after 3) and resets on a good one.
+    $bsPath = Join-Path $aiRoot 'backup-state.json'
+    $bs1 = Read-LaiState -Path $bsPath
+    $b = & $runScript 'Backup-OpenWebUI.ps1' @('-Volume', 'lai-ok-test', '-Container', 'lai-no-such-container', '-Tag', 'nocheck', '-NoPrune', '-VerifyImage', 'alpine:3.20')
+    $bs2 = Read-LaiState -Path $bsPath
+    Assert-That ($bs1['deepCheck'] -eq 'could-not-run' -and [int]$bs2['deepCheckSkips'] -eq [int]$bs1['deepCheckSkips'] + 1) "nights without a database check are counted ($($bs1['deepCheckSkips']) -> $($bs2['deepCheckSkips']))"
+    $b = & $runScript 'Backup-OpenWebUI.ps1' @('-Volume', 'lai-ok-test', '-Container', 'lai-no-such-container', '-Tag', 'nocheck', '-NoPrune', '-VerifyImage', $verifyImage)
+    $bs3 = Read-LaiState -Path $bsPath
+    Assert-That ($bs3['deepCheck'] -eq 'ok' -and [int]$bs3['deepCheckSkips'] -eq 0) 'and the count resets after a check that ran'
     Invoke-DockerText @('volume', 'rm', 'lai-ok-test') | Out-Null
     Invoke-DockerText @('volume', 'rm', 'lai-deep-test') | Out-Null
 } finally {

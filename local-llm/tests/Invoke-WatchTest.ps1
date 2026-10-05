@@ -172,6 +172,16 @@ services:
     Assert-That (@((Read-LaiState -Path $statePath)['pendingRecovered']) -contains 'Backups') 'a recovery toast that failed is kept for the next run'
     Invoke-Watch @('-NoHeal') | Out-Null
     Assert-That ((Get-WatchLog) -match 'NOTIFY Local AI: [^\n]*(recovered Backups|Working again: Backups)' -and -not (Read-LaiState -Path $statePath).ContainsKey('pendingRecovered')) 'and is sent on the next run'
+    # A 'problem detected' toast that fails is not marked as delivered: the next run tries again.
+    Get-ChildItem -LiteralPath $bdir -File | Remove-Item -Force
+    Save-LaiState -State @{ failed = @('Backups'); notified = @() } -Path $statePath
+    $env:LOCALAI_TEST_TOAST_FAIL = '1'
+    try { Invoke-Watch @('-NoHeal') | Out-Null } finally { $env:LOCALAI_TEST_TOAST_FAIL = '' }
+    Assert-That (@((Read-LaiState -Path $statePath)['notified']) -notcontains 'Backups') 'a problem toast that failed is not counted as delivered'
+    $before = @((Get-WatchLog) -split "`n" | Where-Object { $_ -match 'NOTIFY Local AI: problem detected' }).Count
+    Invoke-Watch @('-NoHeal') | Out-Null
+    $after = @((Get-WatchLog) -split "`n" | Where-Object { $_ -match 'NOTIFY Local AI: problem detected' }).Count
+    Assert-That ($after -eq $before + 1 -and @((Read-LaiState -Path $statePath)['notified']) -contains 'Backups') 'and is sent on the next run'
     # (d) Disk hysteresis: 'low' clears only with 2 GB to spare above the limit.
     $freeGB = [Math]::Floor([System.IO.DriveInfo]::new([System.IO.Path]::GetPathRoot($aiRoot)).AvailableFreeSpace / 1GB)
     $limit = [int]$freeGB - 1

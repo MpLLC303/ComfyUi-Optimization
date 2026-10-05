@@ -86,6 +86,21 @@ try {
     Assert-That ($r.Text -match 'Re-tuned') 'changed model was re-tuned'
     Assert-That (-not (Test-LaiOllamaModel -BaseUrl $OllamaUrl -Name "$tag-prevnew")) 'temporary reference cleaned up'
 
+    Write-Host "`n=== 2b. a new Ollama re-checks the tuned models ===" -ForegroundColor Cyan
+    # Ollama was updated (by -UpdateOllama, or the tray app): placement may differ, so the tuned
+    # models are loaded once even though none of them changed.
+    $stPath = Join-Path $aiRoot 'install-state.json'
+    $st2 = Read-LaiState -Path $stPath
+    $ctxBefore = $st2['tuning']['main']['Context']
+    $st2['tuning']['main']['OllamaVersion'] = '0.0.1'
+    Save-LaiState -State $st2 -Path $stPath
+    $r = Invoke-Update @() $variant
+    $st3 = Read-LaiState -Path $stPath
+    Assert-That ($r.Code -eq 0 -and $r.Text -match 'Ollama is now' -and [string]$st3['tuning']['main']['OllamaVersion'] -eq (Get-LaiOllamaVersion -BaseUrl $OllamaUrl)) "after an Ollama version change the model is checked again (exit $($r.Code))"
+    Assert-That ($st3['tuning']['main']['Context'] -eq $ctxBefore) 'and keeps its context when it still fits'
+    $r = Invoke-Update @() $variant
+    Assert-That ($r.Text -notmatch 'Ollama is now') 'nothing to re-check on the next run'
+
     Write-Host "`n=== 3. -Rollback main ===" -ForegroundColor Cyan
     $r = Invoke-Update @('-Rollback', 'main') ''
     Assert-That ($r.Code -eq 0) "rollback exits 0 (got $($r.Code))"

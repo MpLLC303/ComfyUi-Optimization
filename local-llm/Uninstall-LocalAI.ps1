@@ -225,6 +225,8 @@ if ($desktop) {
 # The administrators-only copy the resume task runs (see Install-LocalAI.ps1, $ElevatedDir).
 if ($env:ProgramFiles) {
     $elevated = Join-Path $env:ProgramFiles 'LocalAI'
+    $dlDir = Join-Path $env:ProgramFiles 'LocalAI-Downloads'
+    if (Test-Path -LiteralPath $dlDir) { Invoke-Step $dlDir { Remove-LaiTree -Path $dlDir; Write-LaiLog OK "Deleted $dlDir" } }
     if (Test-Path -LiteralPath $elevated) { Invoke-Step $elevated { Remove-LaiTree -Path $elevated; Write-LaiLog OK "Deleted $elevated" } }
 }
 if ($env:ProgramData) {

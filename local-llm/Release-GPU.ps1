@@ -18,9 +18,9 @@ $ErrorActionPreference = 'Stop'
 Import-Module (Join-Path (Join-Path $PSScriptRoot 'lib') 'LocalAI.psm1') -Force
 
 $before = Get-LaiGpuInfo
-$loaded = $null; $whyNot = ''
-try { $loaded = @(Get-LaiOllamaLoaded -BaseUrl $OllamaUrl) } catch { $whyNot = $_.Exception.Message }
-if ($null -eq $loaded -and $whyNot -match 'refused|No connection could be made|Unable to connect to the remote server') {
+$loaded = $null; $whyNot = ''; $refused = $false
+try { $loaded = @(Get-LaiOllamaLoaded -BaseUrl $OllamaUrl) } catch { $whyNot = $_.Exception.Message; $refused = Test-LaiConnectionRefused $_ }
+if ($null -eq $loaded -and $refused) {
     Write-LaiLog OK 'Ollama is not running, so no model holds VRAM.'
 } elseif ($null -eq $loaded) {
     # Not answering is usually 'not running', but a busy Ollama (loading a model) can time out too.

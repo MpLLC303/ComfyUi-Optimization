@@ -332,6 +332,7 @@ function global:Get-ScheduledTask {
 function global:Set-ScheduledTask { param($TaskName, $Principal) $global:TaskPrincipals[$TaskName] = [string]$Principal.Args; Record "Set-ScheduledTask $TaskName" }
 $global:Tasks['LocalAI-Backup-OpenWebUI'] = '-File "C:\AI\Scripts\Backup-OpenWebUI.ps1" -AIRoot "C:\AI"'; $global:TaskPrincipals['LocalAI-Backup-OpenWebUI'] = '-UserId x -LogonType Interactive -RunLevel Highest'
 $global:Tasks['LocalAI-Install-Resume'] = '-File "C:\AI\Scripts\Install-LocalAI.ps1"'; $global:TaskPrincipals['LocalAI-Install-Resume'] = '-UserId x -LogonType Interactive -RunLevel Highest'
+$global:Tasks['LocalAI-Watch'] = '-File "C:\AI\Scripts\Watch-LocalAI.ps1"'; $global:TaskPrincipals['LocalAI-Watch'] = '-UserId x -LogonType Interactive -RunLevel Highest'
 # Exactly what the first bootstrap unpacked: Installer\ComfyUi-Optimization-<ref>\local-llm\...
 $oldCopy = Join-Path $aiRoot 'Installer/ComfyUi-Optimization-main/local-llm'
 New-Item -ItemType Directory -Force -Path (Join-Path $oldCopy 'lib') | Out-Null
@@ -344,6 +345,7 @@ $env:LOCALAI_TEST_FAIL_STAGE = ''
 Assert-That ($c6 -ne 0) "the run stops at the first stage (exit $c6)"
 Assert-That ([string]$global:TaskPrincipals['LocalAI-Backup-OpenWebUI'] -match 'Limited' -and [string]$global:TaskPrincipals['LocalAI-Backup-OpenWebUI'] -notmatch 'Highest') 'an elevated backup task from an early version is made non-elevated before anything can fail'
 Assert-That (-not $global:Tasks.ContainsKey('LocalAI-Install-Resume')) "an elevated after-reboot task from an early version is removed"
+Assert-That ([string]$global:TaskPrincipals['LocalAI-Watch'] -match 'Limited') 'an elevated health-watch task is made non-elevated too'
 $p6 = (Read-LaiState -Path $statePath).flags['params']
 Assert-That ($p6 -and [int]$p6['BackupRetentionDays'] -eq 90 -and [string]$p6['BackupMirror'] -eq (Join-Path $Work 'nas-mirror') -and [string]$p6['KeepAlive'] -eq '30m') 'retention, mirror and keep-alive carried over from the old config (no pruning of 15-90-day-old backups)'
 Assert-That ($p6 -and [int]$p6['GpuOverheadMiB'] -eq 600 -and [string]$p6['BackupTime'] -eq '02:15') 'VRAM overhead from the tuning fingerprint (no needless re-tune) and backup time from the old task'
@@ -355,6 +357,13 @@ $env:LOCALAI_TEST_FAIL_STAGE = 'Preflight'
 $env:LOCALAI_TEST_FAIL_STAGE = ''
 Assert-That (Test-Path -LiteralPath (Join-Path $aiRoot 'Installer/my-notes.txt')) "a user's own folder named Installer is left alone"
 Remove-Item -LiteralPath (Join-Path $aiRoot 'Installer') -Recurse -Force
+# A second key file that DIFFERS from the managed one is not a duplicate: deleting it could lose a key.
+Set-Content -LiteralPath (Join-Path $aiRoot 'openwebui-secret.txt') -Value 'some-other-key' -NoNewline
+$env:LOCALAI_TEST_FAIL_STAGE = 'Preflight'
+& (Join-Path $aiRoot 'Scripts/Install-LocalAI.ps1') -AIRoot $aiRoot -SkipTests
+$env:LOCALAI_TEST_FAIL_STAGE = ''
+Assert-That ((Test-Path -LiteralPath (Join-Path $aiRoot 'openwebui-secret.txt')) -and (Test-Path -LiteralPath (Join-Path $aiRoot 'Secrets/openwebui-secret.txt'))) 'a different key file outside Secrets is kept'
+Remove-Item -LiteralPath (Join-Path $aiRoot 'openwebui-secret.txt') -Force
 Assert-That (-not (Test-Path -LiteralPath (Join-Path $aiRoot 'openwebui-secret.txt')) -and (Test-Path -LiteralPath (Join-Path $aiRoot 'Secrets/openwebui-secret.txt'))) 'the second copy of the secret key outside Secrets is removed'
 Remove-Item -Path 'function:Get-ScheduledTask', 'function:Set-ScheduledTask' -ErrorAction SilentlyContinue
 Assert-That (-not (Get-Command Get-ScheduledTask -ErrorAction SilentlyContinue)) 'task mocks removed for the next phase'
@@ -383,9 +392,33 @@ $log6b = (Get-ChildItem -LiteralPath (Join-Path $ai2 'Logs') -Filter 'install-*.
 $st6b = Read-LaiState -Path (Join-Path $ai2 'install-state.json')
 Assert-That ($c6b -ne 0 -and $log6b -match 'already installed with its stack in /elsewhere/AI/Stack' -and -not ($st6b['stages'] -and $st6b['stages'].Count)) "refuses and names the existing install's folder (exit $c6b)"
 
+Write-Host "`n=== PHASE 6c: a manual install whose data folder holds no webui.db ===" -ForegroundColor Cyan
+# A mis-decoded or emptied data path: copying it would start the managed stack on an empty volume.
+& /usr/bin/docker rm -f open-webui 2>$null | Out-Null
+& /usr/bin/docker volume rm open-webui owui-empty 2>$null | Out-Null
+& /usr/bin/docker volume create owui-empty | Out-Null
+& /usr/bin/docker run --rm -v owui-empty:/data alpine:3.20 sh -c 'echo x > /data/marker.txt' | Out-Null
+& /usr/bin/docker create --name open-webui --label lai-test=1 -v owui-empty:/app/backend/data alpine:3.20 sleep 3600 | Out-Null
+$legacyBefore = @(& /usr/bin/docker ps -a --filter 'name=^/open-webui-legacy-' --format '{{.Names}}')
+$env:LOCALAI_TEST_FAIL_STAGE = 'Configure'
+& (Join-Path $aiRoot 'Scripts/Install-LocalAI.ps1') -AIRoot $aiRoot -SkipTests
+$c6c = $LASTEXITCODE
+$env:LOCALAI_TEST_FAIL_STAGE = ''
+$log6c = Get-Content -Raw -LiteralPath (Get-ChildItem (Join-Path $aiRoot 'Logs') -Filter 'install-*.log' | Sort-Object LastWriteTime | Select-Object -Last 1).FullName  # lai-ok: objects
+$legacyAfter = @(& /usr/bin/docker ps -a --filter 'name=^/open-webui-legacy-' --format '{{.Names}}')
+$prevEap = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
+& /usr/bin/docker volume inspect open-webui 2>&1 | Out-Null; $managedVol = ($LASTEXITCODE -eq 0)
+& /usr/bin/docker container inspect open-webui 2>&1 | Out-Null; $oldKept = ($LASTEXITCODE -eq 0)
+$ErrorActionPreference = $prevEap
+Assert-That ($c6c -ne 0 -and $log6c -match 'has no webui\.db') "stops and says the old data folder has no webui.db (exit $c6c)"
+Assert-That (-not $managedVol -and $oldKept -and $legacyAfter.Count -eq $legacyBefore.Count) 'no empty managed volume left, the old container untouched (not renamed)'
+& /usr/bin/docker rm -f open-webui 2>$null | Out-Null
+& /usr/bin/docker volume rm owui-empty 2>$null | Out-Null
+
 } finally {
     $env:LOCALAI_TEST_FAIL_STAGE = ''
     & /usr/bin/docker rm -f open-webui lai-test-elsewhere 2>$null | Out-Null
+    & /usr/bin/docker volume rm owui-empty 2>$null | Out-Null
     & /usr/bin/docker ps -aq --filter 'name=^/open-webui-legacy-' | ForEach-Object { & /usr/bin/docker rm -f $_ | Out-Null }
     & /usr/bin/docker volume rm open-webui owui-old 2>$null | Out-Null
     # The installer pointed the shared Open WebUI at the guard on :11435; point it back at Ollama.

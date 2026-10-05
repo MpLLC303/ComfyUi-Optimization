@@ -98,7 +98,7 @@ try {
         Stop-LaiOllamaModels -BaseUrl $OllamaUrl
     }
 } catch {
-    if ($_.Exception.Message -match 'refused|No connection could be made|Unable to connect to the remote server') { Write-LaiLog INFO 'Ollama is not running; nothing to unload.' } else { Write-LaiLog WARN "Could not reach Ollama to unload its models ($($_.Exception.Message)). If Ollama is running and the GPU memory stays full, quit Ollama from its tray icon." }
+    if (Test-LaiConnectionRefused $_) { Write-LaiLog INFO 'Ollama is not running; nothing to unload.' } else { Write-LaiLog WARN "Could not reach Ollama to unload its models ($($_.Exception.Message)). If Ollama is running and the GPU memory stays full, quit Ollama from its tray icon." }
 }
 Start-Sleep -Seconds 1
 $after = Get-LaiGpuInfo

@@ -429,10 +429,10 @@ function Install-App {
     # 'O=Dockerize LLC' does not.
     if ([string]$sig.SignerCertificate.Subject -notmatch ('(^|,\s*)(CN|O)="?' + [regex]::Escape($Publisher) + '\b')) { throw "$FileName is signed by '$($sig.SignerCertificate.Subject)', not $Publisher; refusing to run it." }
     Write-LaiLog INFO "Running $FileName (signed by $($sig.SignerCertificate.Subject.Split(',')[0]))"
-    $proc = Start-Process -FilePath $dest -ArgumentList $InstallerArgs -Wait -PassThru
+    try { $proc = Start-Process -FilePath $dest -ArgumentList $InstallerArgs -Wait -PassThru }
+    finally { Remove-Item -LiteralPath $dest -Force -ErrorAction SilentlyContinue }   # also after a failure
     if ($proc.ExitCode -ne 0 -and $proc.ExitCode -ne 3010) { throw "$FileName exited with code $($proc.ExitCode)" }
     if ($proc.ExitCode -eq 3010) { $State.flags['rebootPending'] = $true }
-    Remove-Item -LiteralPath $dest -Force -ErrorAction SilentlyContinue
     if (-not (& $IsInstalled)) { throw "$FileName finished but the product is still not detected." }
 }
 
@@ -1228,6 +1228,10 @@ $WebUIUrl = "http://127.0.0.1:$($script:WebUIPortEffective)"
 
 #region 8. Configure Open WebUI (guide Parts 10-18) -----------------------------------------
 Invoke-Stage 'Configure' {
+    try {
+        $webVer = [string](Invoke-LaiApi -Uri "$WebUIUrl/api/version" -TimeoutSec 15).version
+        if ((Get-LaiWebUICompat -Version $webVer) -eq 'newer') { Write-LaiLog WARN "Open WebUI $webVer is newer than the tested 0.11.4; its settings are applied as usual, but report any step that fails." }
+    } catch { Write-Verbose 'Open WebUI version unknown' }
     $cred = Get-AdminCredential
     $token = $null
     if ((Invoke-LaiApi -Uri "$WebUIUrl/api/config").onboarding -eq $true) {

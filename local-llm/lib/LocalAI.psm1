@@ -324,6 +324,10 @@ function Invoke-LaiApi {
     if ($bytes.Length -eq 0) { return $null }
     $text = [System.Text.Encoding]::UTF8.GetString($bytes)
     if ($text.Length -gt 0 -and $text[0] -eq [char]0xFEFF) { $text = $text.Substring(1) }
+    # Open WebUI serves its web app for any unknown path with status 200: a moved or removed API
+    # endpoint answers with an HTML page. Treating that as data hides the change (or reads a setting
+    # as 'off'), so say what happened instead.
+    if ($text -match '^\s*<(!doctype|html)') { throw "$Uri returned a web page instead of data: this API is not available in this Open WebUI version." }
     try { return (ConvertFrom-Json -InputObject $text -ErrorAction Stop) } catch { return $text }
 }
 
@@ -335,6 +339,20 @@ function Get-LaiHttpStatus {
         if ($null -eq $resp) { return 0 }
         return [int]$resp.StatusCode
     } catch { return 0 }
+}
+
+function Test-LaiConnectionRefused {
+    # True when nothing listens at the address (the service is not running), from the exception
+    # TYPES, not their text: the message is translated on non-English Windows.
+    param($ErrorRecord)
+    $e = $ErrorRecord
+    if ($e -is [System.Management.Automation.ErrorRecord]) { $e = $e.Exception }
+    while ($e) {
+        if ($e -is [System.Net.Sockets.SocketException] -and $e.SocketErrorCode -eq [System.Net.Sockets.SocketError]::ConnectionRefused) { return $true }
+        if ($e -is [System.Net.WebException] -and $e.Status -eq [System.Net.WebExceptionStatus]::ConnectFailure) { return $true }
+        $e = $e.InnerException
+    }
+    return $false
 }
 
 function Get-LaiHttpErrorText {
@@ -827,6 +845,7 @@ function Connect-LaiWebUI {
             Start-Sleep -Seconds $wait
         }
     }
+    if (-not $r -or -not $r.token -or -not $r.role) { throw "Open WebUI's sign-in answer has an unexpected shape (no token/role); this Open WebUI version may not be supported yet." }
     if ($r.role -ne 'admin') { throw "Signed in as '$Email' but role is '$($r.role)', not admin." }
     return [string]$r.token
 }
@@ -860,7 +879,14 @@ function Merge-LaiPresetForm {
     foreach ($k in $Managed['params'].Keys) { $params[$k] = $Managed['params'][$k] }
     $meta = @{}
     if ($old.ContainsKey('meta') -and $old['meta'] -is [hashtable]) { $meta = $old['meta'] }
-    foreach ($k in $Managed['meta'].Keys) { $meta[$k] = $Managed['meta'][$k] }
+    foreach ($k in $Managed['meta'].Keys) {
+        # capabilities / builtinTools: set the switches the installer manages, keep every other one.
+        # Replacing the whole set erased the user's own choices (Open WebUI treats a missing tool
+        # category as ON, so a calendar or notes tool the user had turned off came back on).
+        if ($Managed['meta'][$k] -is [hashtable] -and $meta.ContainsKey($k) -and $meta[$k] -is [hashtable]) {
+            foreach ($leaf in $Managed['meta'][$k].Keys) { $meta[$k][$leaf] = $Managed['meta'][$k][$leaf] }
+        } else { $meta[$k] = $Managed['meta'][$k] }
+    }
     $access = $Managed['access_grants']
     if ($old.ContainsKey('access_grants') -and $null -ne $old['access_grants']) { $access = @($old['access_grants']) }
     return @{
@@ -891,10 +917,10 @@ function Hide-LaiWebUIModel {
         if (-not $form.ContainsKey('meta') -or $null -eq $form['meta']) { $form['meta'] = @{} }
         if ($form['meta']['hidden'] -eq $true) { return 'already hidden' }
         $form['meta']['hidden'] = $true
-        $update = @{
-            id = $Id; name = $form['name']; base_model_id = $form['base_model_id']
-            meta = $form['meta']; params = $form['params']; is_active = $form['is_active']
-        }
+        # The whole model as the server returned it (it ignores fields it does not know): a fixed key
+        # list would reset everything else, such as who may use the model.
+        $update = $form
+        $update['id'] = $Id
         if ($null -eq $update['params']) { $update['params'] = @{} }
         Invoke-LaiApi -Method POST -Uri "$BaseUrl/api/v1/models/model/update" -Body $update -Token $Token | Out-Null
         return 'hidden'
@@ -939,6 +965,12 @@ function Set-LaiWebUIOllamaUrl {
     # left alone. Returns $true when something changed.
     param([string]$BaseUrl = 'http://127.0.0.1:3000', [Parameter(Mandatory)][string]$Token, [Parameter(Mandatory)][string]$OllamaUrl)
     $cfg = ConvertTo-LaiHashtable (Invoke-LaiApi -Uri "$BaseUrl/ollama/config" -Token $Token)
+    # A newer Open WebUI that renamed the list must not be read as 'no connections' and overwritten
+    # with ours alone (that would delete every connection the user added).
+    if (-not ($cfg -is [hashtable]) -or -not $cfg.ContainsKey('OLLAMA_BASE_URLS')) {
+        Write-LaiLog WARN "Open WebUI's Ollama settings have an unexpected shape (no OLLAMA_BASE_URLS); not changing them. Set the connection in Admin Settings > Connections if chats fail."
+        return $false
+    }
     $managed = @('http://host.docker.internal:11434', 'http://render-guard:11434', 'http://localhost:11434', 'http://127.0.0.1:11434')
     $urls = @()
     if ($cfg.ContainsKey('OLLAMA_BASE_URLS') -and $cfg['OLLAMA_BASE_URLS']) { $urls = @($cfg['OLLAMA_BASE_URLS']) }
@@ -954,9 +986,26 @@ function Set-LaiWebUIOllamaUrl {
     if (-not $changed) { return $false }
     $apiConfigs = @{}
     if ($cfg.ContainsKey('OLLAMA_API_CONFIGS') -and $cfg['OLLAMA_API_CONFIGS']) { $apiConfigs = $cfg['OLLAMA_API_CONFIGS'] }
-    $body = @{ ENABLE_OLLAMA_API = $enabled; OLLAMA_BASE_URLS = [object[]]$new; OLLAMA_API_CONFIGS = $apiConfigs }
+    # The server's own object with only the two managed keys changed: any setting a newer version
+    # adds is sent back as it was.
+    $body = $cfg
+    $body['ENABLE_OLLAMA_API'] = $enabled; $body['OLLAMA_BASE_URLS'] = [object[]]$new; $body['OLLAMA_API_CONFIGS'] = $apiConfigs
     Invoke-LaiApi -Method POST -Uri "$BaseUrl/ollama/config/update" -Body $body -Token $Token | Out-Null
     return $true
+}
+
+function Get-LaiWebUICompat {
+    # Compares an Open WebUI version ('v0.12.1', '0.11.4-dev') with the one this toolkit was tested
+    # against. Returns 'tested', 'newer', 'older' or 'unknown'. Newer versions usually work, but API
+    # changes are possible: callers warn instead of assuming.
+    param([string]$Version, [string]$Tested = '0.11.4')
+    $m = [regex]::Match([string]$Version, '(\d+)\.(\d+)\.(\d+)')
+    if (-not $m.Success) { return 'unknown' }
+    $v = [version]('{0}.{1}.{2}' -f $m.Groups[1].Value, $m.Groups[2].Value, $m.Groups[3].Value)
+    $t = [version]$Tested
+    if ($v -gt $t) { return 'newer' }
+    if ($v -lt $t) { return 'older' }
+    return 'tested'
 }
 
 function Get-LaiWebUIKnowledge {
@@ -964,6 +1013,8 @@ function Get-LaiWebUIKnowledge {
     $all = @()
     for ($page = 1; $page -le 50; $page++) {
         $r = Invoke-LaiApi -Uri "$BaseUrl/api/v1/knowledge/?page=$page" -Token $Token
+        # Without 'items' every run would find no collections and create them all again.
+        if (-not $r -or -not ($r.PSObject.Properties.Name -contains 'items')) { throw "Open WebUI's knowledge list has an unexpected shape (no 'items'); not creating collections to avoid duplicates." }
         $items = @($r.items)
         $all += $items
         if ($items.Count -eq 0 -or $all.Count -ge [int]$r.total) { break }
@@ -1260,7 +1311,12 @@ function Set-LaiWebUIModelsConfig {
     )
     $cfg = ConvertTo-LaiHashtable (Invoke-LaiApi -Uri "$BaseUrl/api/v1/configs/models" -Token $Token)
     $cfg['DEFAULT_MODELS'] = $DefaultModel
-    if ($Order.Count -gt 0) { $cfg['MODEL_ORDER_LIST'] = @($Order) }
+    if ($Order.Count -gt 0) {
+        # The presets first, then the order the user gave every other model (kept, not replaced).
+        $rest = @()
+        if ($cfg.ContainsKey('MODEL_ORDER_LIST') -and $cfg['MODEL_ORDER_LIST']) { $rest = @($cfg['MODEL_ORDER_LIST'] | Where-Object { $Order -notcontains $_ }) }
+        $cfg['MODEL_ORDER_LIST'] = @(@($Order) + $rest)
+    }
     return Invoke-LaiApi -Method POST -Uri "$BaseUrl/api/v1/configs/models" -Body $cfg -Token $Token
 }
 

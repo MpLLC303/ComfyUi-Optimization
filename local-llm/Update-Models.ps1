@@ -97,6 +97,16 @@ function Hide-InWebUI([string]$Id) {
     } catch { Write-Verbose "could not hide $Id in Open WebUI: $($_.Exception.Message)" }
 }
 
+function Get-CurrentFingerprint($Gpu) {
+    # The tuning fingerprint (driver, KV cache, VRAM settings) as stored, with today's driver: the
+    # next installer run must not see a 'driver change' for models tuned here.
+    $fp = ''
+    foreach ($k in $state['tuning'].Keys) { if ($state['tuning'][$k]['Fingerprint']) { $fp = [string]$state['tuning'][$k]['Fingerprint']; break } }
+    if (-not $fp -and $Gpu) { return "driver=$($Gpu.DriverVersion)" }
+    if ($Gpu) { $fp = $fp -replace '(^|;)driver=[^;]*', ('$1driver=' + $Gpu.DriverVersion) }
+    return $fp
+}
+
 function Get-PrevName([string]$Source) {
     $full = Resolve-LaiModelName $Source
     return "$full-prev"
@@ -190,12 +200,7 @@ if ($Rollback.Count -gt 0) {
 if ($changed.Count -gt 0) {
     Stop-LaiOllamaModels -BaseUrl $ollamaUrl
     $gpu = Wait-LaiGpuIdle -MaxUsedMiB $maxBusy -TimeoutSec 600
-    $fingerprint = ''
-    foreach ($k in $state['tuning'].Keys) { if ($state['tuning'][$k]['Fingerprint']) { $fingerprint = $state['tuning'][$k]['Fingerprint']; break } }
-    if (-not $fingerprint -and $gpu) { $fingerprint = "driver=$($gpu.DriverVersion)" }
-    # Today's driver, not the one stored with the old tuning: otherwise the next installer run sees a
-    # 'driver change' and measures these freshly tuned models all over again.
-    elseif ($gpu) { $fingerprint = $fingerprint -replace '(^|;)driver=[^;]*', ('$1driver=' + $gpu.DriverVersion) }
+    $fingerprint = Get-CurrentFingerprint $gpu
     $results = Invoke-LaiModelSetup -BaseUrl $ollamaUrl -Models $changed -Candidates $catalog.ContextCandidates -SystemPrompt $system `
         -Fingerprint $fingerprint -MinFreeMiB $minFree -Retune -AllowCpu:$allowCpu
     foreach ($k in $results.Keys) { $state['tuning'][$k] = $results[$k] }
@@ -216,8 +221,9 @@ if ($ollamaNow -and $toVerify.Count -gt 0) {
     Write-LaiLog STEP "Ollama is now ${ollamaNow}: checking that $(($toVerify | ForEach-Object { $_.Display }) -join ', ') still fit fully on the GPU"
     Stop-LaiOllamaModels -BaseUrl $ollamaUrl
     $gpu = Wait-LaiGpuIdle -MaxUsedMiB $maxBusy -TimeoutSec 600
-    $vfp = ''
-    foreach ($k in $state['tuning'].Keys) { if ($state['tuning'][$k]['Fingerprint']) { $vfp = $state['tuning'][$k]['Fingerprint']; break } }
+    # Today's driver too: after a driver update the stored fingerprint no longer matches, so those
+    # models are measured again instead of keeping a result recorded under the old driver.
+    $vfp = Get-CurrentFingerprint $gpu
     $results = Invoke-LaiModelSetup -BaseUrl $ollamaUrl -Models $toVerify -Candidates $catalog.ContextCandidates -SystemPrompt $system `
         -Previous $state['tuning'] -Fingerprint $vfp -MinFreeMiB $minFree -AllowCpu:$allowCpu
     foreach ($k in $results.Keys) { $state['tuning'][$k] = $results[$k] }

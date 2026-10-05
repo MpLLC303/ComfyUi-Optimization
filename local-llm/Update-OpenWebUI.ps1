@@ -132,6 +132,9 @@ if ($Latest) {
     $Version = (Invoke-RestMethod -Uri 'https://api.github.com/repos/open-webui/open-webui/releases/latest' -UseBasicParsing).tag_name
     Write-UpdateLog INFO "Latest Open WebUI release: $Version"
 }
+if ($Version -and (Get-LaiWebUICompat -Version $Version) -eq 'newer') {
+    Write-UpdateLog WARN "Open WebUI $Version is newer than the version this toolkit was tested with (0.11.4). It usually works; if the health check after the update fails, Update-OpenWebUI.ps1 -Rollback goes back."
+}
 
 $lines = @(Get-Content -Encoding UTF8 -LiteralPath $envPath)
 $current = ($lines | Where-Object { $_ -like 'OPEN_WEBUI_VERSION=*' } | Select-Object -First 1) -replace '^OPEN_WEBUI_VERSION=', ''

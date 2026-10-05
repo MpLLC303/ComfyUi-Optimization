@@ -494,9 +494,10 @@ $saved = @{ U = $env:USERNAME; P = $env:USERPROFILE }
 $env:USERNAME = 'Li'; $env:USERPROFILE = (Join-Path (Join-Path $Work 'Users') $acc)
 $outTr = Join-Path $Work 'diagout-tr'
 $prev = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
-$cmdTr = "[System.Globalization.CultureInfo]::CurrentCulture = 'tr-TR'; & '" + (Join-Path $src 'Get-LocalAIDiagnostics.ps1').Replace("'", "''") + "' -AIRoot '" + $tRoot.Replace("'", "''") + "' -OutDir '" + $outTr.Replace("'", "''") + "'; exit 0"
-& $childExe -NoProfile -ExecutionPolicy Bypass -Command $cmdTr 2>&1 | Out-Null
+$cmdTr = "[System.Globalization.CultureInfo]::CurrentCulture = 'tr-TR'; Write-Output ('CULTURE=' + [System.Globalization.CultureInfo]::CurrentCulture.Name); & '" + (Join-Path $src 'Get-LocalAIDiagnostics.ps1').Replace("'", "''") + "' -AIRoot '" + $tRoot.Replace("'", "''") + "' -OutDir '" + $outTr.Replace("'", "''") + "'; exit 0"
+$outTrText = (& $childExe -NoProfile -ExecutionPolicy Bypass -Command $cmdTr 2>&1 | ForEach-Object { "$_" }) -join "`n"
 $codeTr = $LASTEXITCODE; $ErrorActionPreference = $prev
+Assert-That ($outTrText -match 'CULTURE=tr-TR') 'setup: the diagnostics child really ran under tr-TR'
 $env:USERNAME = $saved.U; $env:USERPROFILE = $saved.P
 $zipTr = Get-ChildItem -LiteralPath $outTr -Filter 'diagnostics-*.zip' -ErrorAction SilentlyContinue | Select-Object -First 1
 Assert-That ($codeTr -eq 0 -and $null -ne $zipTr) "diagnostics under tr-TR writes a zip (exit $codeTr)"
@@ -571,6 +572,93 @@ try { Invoke-LaiOllamaLoad -Name 'm' -NumCtx 4096 | Out-Null } catch { $apiErr =
 Assert-That ($apiErr -match 'no size/size_vram') "an Ollama whose /api/ps lacks size_vram is reported, not tuned as 0% GPU ($apiErr)"
 Import-Module (Join-Path (Join-Path $src 'lib') 'LocalAI.psm1') -Force
 
+Write-Host "`n=== tuning reuse rules (Invoke-LaiModelSetup) with a mocked Ollama ===" -ForegroundColor Cyan
+$mod = Get-Module LocalAI
+& $mod {
+    function script:Get-LaiOllamaVersion { param($BaseUrl) $null = $BaseUrl; '0.35.1' }
+    function script:Get-LaiOllamaModelInfo { param($BaseUrl, $Name) $null = $BaseUrl, $Name; [pscustomobject]@{ TrainContext = 32768; Capabilities = @('tools') } }
+    function script:Get-LaiOllamaDigest { param($BaseUrl, $Name) $null = $BaseUrl, $Name; 'digest1' }
+    function script:Test-LaiOllamaModel { param($BaseUrl, $Name) $null = $BaseUrl, $Name; $true }
+    function script:Set-LaiOllamaDerivedModel { param($BaseUrl, $Name, $From, $NumCtx, $Parameters, $System) $null = $BaseUrl, $Name, $From, $NumCtx, $Parameters, $System }
+    function script:Stop-LaiOllamaModels { param($BaseUrl) $null = $BaseUrl }
+    function script:Invoke-LaiOllamaLoad { param($BaseUrl, $Name, $NumCtx, $KeepAlive) $null = $BaseUrl, $NumCtx, $KeepAlive; [pscustomobject]@{ Name = $Name; Context = 8192; SizeGiB = 2; VramGiB = 2; GpuPercent = 100 } }
+    function script:Measure-LaiOllamaSpeed { param($BaseUrl, $Name) $null = $BaseUrl, $Name; 55.5 }
+    function script:Find-LaiMaxContext { param($BaseUrl, $Name, $Candidates, $MaxContext, $MinFreeMiB, [switch]$AllowCpu) $null = $BaseUrl, $Candidates, $MaxContext, $MinFreeMiB, $AllowCpu; [pscustomobject]@{ Name = $Name; Context = 8192; Fits = $true } }
+}
+$mm = @(@{ Key = 'main'; Display = 'Main'; Source = 'src:1'; Alias = 'localai-main'; MaxContext = 0; MinTokensPerSec = 40; Parameters = @{} })
+$good = @{ Source = 'src:1'; Fingerprint = 'fp'; MaxContext = 0; Digest = 'digest1'; OllamaVersion = '0.35.1'; TokensPerSec = 50; GpuPercent = 100; Context = 8192; Candidates = '8192' }
+$runSetup = { param($Prev) (Invoke-LaiModelSetup -Models $mm -Candidates @(8192) -SystemPrompt 'x' -Previous @{ main = $Prev } -Fingerprint 'fp')['main'] }
+Assert-That ((& $runSetup $good.Clone())['Reused']) 'a good earlier result is reused without loading'
+$slow = $good.Clone(); $slow['TokensPerSec'] = 10
+Assert-That (-not (& $runSetup $slow)['Reused']) 'a result below the minimum speed is measured again, not reused forever'
+$spill = $good.Clone(); $spill['GpuPercent'] = 93
+Assert-That (-not (& $runSetup $spill)['Reused']) 'a result that was partly on the CPU is measured again'
+$cand = $good.Clone(); $cand['Candidates'] = '4096'
+Assert-That (-not (& $runSetup $cand)['Reused']) 'an edited candidate list takes effect'
+$old = $good.Clone(); $old.Remove('Candidates')
+Assert-That ((& $runSetup $old)['Reused']) 'a result from before candidates were recorded is still reused (no forced re-tune)'
+& $mod { function script:Invoke-LaiApi { param($Method, $Uri, $Body, $Token, $TimeoutSec) $null = $Method, $Uri, $Body, $Token, $TimeoutSec; [pscustomobject]@{ filenames = @('', $null) } } }
+Assert-That ((Test-LaiWebUIWebSearch -Token 't').Status -eq 'no-results') 'an empty web-search result is no-results, not ok'
+Import-Module (Join-Path (Join-Path $src 'lib') 'LocalAI.psm1') -Force
+
+Write-Host "`n=== Open WebUI: user settings survive re-runs; a newer Open WebUI is handled safely ===" -ForegroundColor Cyan
+# A preset the user changed: a tool category the installer does not manage turned off, an extra
+# capability, an unknown key. A re-run must change only what the installer manages.
+$entry = @{ Preset = 'local-main'; Alias = 'localai-main'; Display = 'Local Main'; Description = 'd'; Vision = $false; Think = $null; Trial = $false }
+$managedForm = New-LaiPresetForm -Entry $entry -NativeTools $true -SystemPrompt 'sys'
+$existingPreset = [pscustomobject]@{ id = 'local-main'; name = 'Local Main'; base_model_id = 'localai-main:latest'; params = [pscustomobject]@{ temperature = 0.3 }
+    meta = [pscustomobject]@{ builtinTools = [pscustomobject]@{ calendar = $false; web_search = $false; code_interpreter = $true }
+        capabilities = [pscustomobject]@{ usage = $true; code_interpreter = $true }; myOwnKey = 'kept' } }
+$merged = Merge-LaiPresetForm -Managed $managedForm -Existing $existingPreset
+Assert-That ($merged.meta.builtinTools['calendar'] -eq $false -and $merged.meta.capabilities['usage'] -eq $true -and $merged.meta['myOwnKey'] -eq 'kept') 'a tool category the user turned off, an extra capability and an unknown key are kept'
+Assert-That ($merged.meta.builtinTools['code_interpreter'] -eq $false -and $merged.meta.capabilities['code_interpreter'] -eq $false -and $merged.meta.builtinTools['web_search'] -eq $true) 'what the installer manages is still enforced (no code execution)'
+Assert-That ($merged.params['temperature'] -eq 0.3 -and $merged.params['system'] -eq 'sys') 'user parameters kept, system prompt refreshed'
+Assert-That ((Get-LaiWebUICompat -Version 'v0.11.4') -eq 'tested' -and (Get-LaiWebUICompat -Version 'v0.12.0') -eq 'newer' -and (Get-LaiWebUICompat -Version '0.11.4-dev') -eq 'tested' -and (Get-LaiWebUICompat -Version 'main') -eq 'unknown') 'Open WebUI versions are compared numerically'
+$mod = Get-Module LocalAI
+& $mod {
+    $script:Posts = 0
+    function script:Invoke-LaiApi { param($Method, $Uri, $Body, $Token, $TimeoutSec) $null = $Uri, $Body, $Token, $TimeoutSec; if ($Method -eq 'POST') { $script:Posts++ }; [pscustomobject]@{ OLLAMA_URLS = @('http://user-added:11434') } }
+}
+$chg = Set-LaiWebUIOllamaUrl -Token 't' -OllamaUrl 'http://render-guard:11434'
+Assert-That (-not $chg -and (& $mod { $script:Posts }) -eq 0) "a renamed connection list is left alone, not overwritten with ours alone (the user's connections would be deleted)"
+Import-Module (Join-Path (Join-Path $src 'lib') 'LocalAI.psm1') -Force
+# A moved endpoint: Open WebUI answers any unknown path with its web page (status 200).
+$htmlPort = Get-Random -Minimum 41000 -Maximum 49000
+$hl = New-Object System.Net.HttpListener
+$hl.Prefixes.Add("http://127.0.0.1:$htmlPort/")
+$hl.Start()
+$hAsync = $hl.BeginGetContext($null, $null)
+$hClient = Join-Path $Work 'html-client.ps1'; $hOut = Join-Path $Work 'html-out.txt'
+Set-Content -LiteralPath $hClient -Value (("Import-Module '{0}' -Force`n" -f (Join-Path (Join-Path $src 'lib') 'LocalAI.psm1')) +
+    ("`$m = try {{ Invoke-LaiApi -Uri 'http://127.0.0.1:{0}/api/v1/auths/admin/config' -TimeoutSec 20 | Out-Null; 'NO ERROR' }} catch {{ `$_.Exception.Message }}`n`$m | Set-Content -LiteralPath '{1}'" -f $htmlPort, $hOut))
+$hsp = @{ FilePath = $childExe; ArgumentList = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $hClient); PassThru = $true }
+if ($onWindows) { $hsp['WindowStyle'] = 'Hidden' }
+$hProc = Start-Process @hsp
+if ($hAsync.AsyncWaitHandle.WaitOne(30000)) {
+    $hctx = $hl.EndGetContext($hAsync)
+    $page = [System.Text.Encoding]::UTF8.GetBytes('<!doctype html><html><body>Open WebUI</body></html>')
+    $hctx.Response.ContentType = 'text/html'
+    $hctx.Response.OutputStream.Write($page, 0, $page.Length)
+    $hctx.Response.Close()
+}
+[void]$hProc.WaitForExit(30000)
+$hl.Stop()
+$hText = ''; if (Test-Path -LiteralPath $hOut) { $hText = Get-Content -LiteralPath $hOut -Raw }
+Assert-That ($hText -match 'returned a web page instead of data') "an API path answered with Open WebUI's web page is an error, not data ($hText)"
+
+Write-Host "`n=== watch dates are read the same in every culture ===" -ForegroundColor Cyan
+# PowerShell 7's ConvertFrom-Json already returns dates; 5.1 leaves strings, so this path is 5.1's.
+$wAst = [System.Management.Automation.Language.Parser]::ParseFile((Join-Path $src 'Watch-LocalAI.ps1'), [ref]$null, [ref]$null)
+. ([scriptblock]::Create($wAst.Find({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'ConvertTo-WatchDate' }, $true).Extent.Text))
+$savedCulture = [System.Globalization.CultureInfo]::CurrentCulture
+foreach ($c in 'de-DE', 'tr-TR', 'ja-JP') {
+    [System.Globalization.CultureInfo]::CurrentCulture = $c
+    $d = ConvertTo-WatchDate '2026-10-05T13:45:00'
+    Assert-That ($d -and $d.Month -eq 10 -and $d.Day -eq 5 -and $d.Hour -eq 13) "an ISO date from the state file reads the same under $c"
+}
+[System.Globalization.CultureInfo]::CurrentCulture = $savedCulture
+Assert-That ($null -eq (ConvertTo-WatchDate 'not a date') -and $null -eq (ConvertTo-WatchDate '')) 'a damaged value reads as no date (no crash)'
+
 Write-Host "`n=== Remove-LaiTree never follows a junction / symbolic link ===" -ForegroundColor Cyan
 # The elevated installer and uninstaller delete trees in C:\AI, which the user controls. A link planted
 # there must be removed as a link: what it points at (here a 'victim' folder outside) stays.
@@ -590,9 +678,16 @@ if ($onWindows) {
     $linkMade = Test-Path -LiteralPath (Join-Path $tree 'a/dirlink/important.txt')
 }
 Assert-That $linkMade 'setup: a link inside the tree reaches the victim folder'
+Set-Content -LiteralPath (Join-Path $tree 'a/readonly.txt') -Value 'ro'
+(Get-Item -LiteralPath (Join-Path $tree 'a/readonly.txt')).Attributes = 'ReadOnly'
 Remove-LaiTree -Path $tree
-Assert-That (-not (Test-Path -LiteralPath $tree)) 'the tree is gone'
+Assert-That (-not (Test-Path -LiteralPath $tree)) 'the tree is gone (a read-only file in it included)'
 Assert-That ((Test-Path -LiteralPath (Join-Path $victim 'important.txt')) -and (Get-Content -LiteralPath (Join-Path $victim 'important.txt')) -eq 'keep') 'what the link pointed at is untouched'
+# The path itself a link (a whole folder in C:\AI swapped for one): only the link goes.
+$rootLink = Join-Path $Work 'root-link'
+if ($onWindows) { $prev = $ErrorActionPreference; $ErrorActionPreference = 'Continue'; & cmd.exe /c mklink /J $rootLink $victim 2>&1 | Out-Null; $ErrorActionPreference = $prev } else { & ln -s $victim $rootLink }
+Remove-LaiTree -Path $rootLink
+Assert-That (-not (Test-Path -LiteralPath $rootLink) -and (Test-Path -LiteralPath (Join-Path $victim 'important.txt'))) 'a link given as the folder to delete: the link goes, its target stays'
 
 Write-Host "`n=== permission changes and installer folders refuse links ===" -ForegroundColor Cyan
 $lroot = Join-Path $Work 'linkroot'; $outside = Join-Path $Work 'outside-target'
@@ -613,7 +708,8 @@ if ($onWindows) {
     $instAst2 = [System.Management.Automation.Language.Parser]::ParseFile((Join-Path $src 'Install-LocalAI.ps1'), [ref]$null, [ref]$null)
     $nativeDef = $instAst2.Find({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Invoke-Native' }, $true)
     . ([scriptblock]::Create($nativeDef.Extent.Text))
-    $tpl = @($instAst2.FindAll({ param($n) $n -is [System.Management.Automation.Language.StringConstantExpressionAst] -and $n.Value -like '*com.docker.compose.project*' }, $true))[0].Value
+    $tpl = @($instAst2.FindAll({ param($n) $n -is [System.Management.Automation.Language.StringConstantExpressionAst] -and $n.Value -like '{{.ID}}|{{.Label*' }, $true))[0].Value
+    Assert-That ($tpl -match '\{\{\.Label') "setup: the installer's legacy-container template was found ($tpl)"
     $shimDir = Join-Path $Work 'dockershim'
     New-Item -ItemType Directory -Force -Path $shimDir | Out-Null
     $rawFile = Join-Path $shimDir 'args.txt'
@@ -623,6 +719,21 @@ if ($onWindows) {
     $raw = ''; if (Test-Path -LiteralPath $rawFile) { $raw = (Get-Content -LiteralPath $rawFile -Raw).Trim() }
     Assert-That ($raw.Contains($tpl)) "docker receives the template unchanged ($raw)"
 } else { Skip 'native argument check runs on Windows only' }
+
+Write-Host "`n=== docker output with a non-ASCII path is decoded as UTF-8 (Windows PowerShell 5.1) ===" -ForegroundColor Cyan
+if ($onWindows) {
+    # docker writes UTF-8; 5.1 decodes captured output with the console code page unless told otherwise.
+    $utfDir = Join-Path $Work 'docker-utf8'
+    New-Item -ItemType Directory -Force -Path $utfDir | Out-Null
+    $jose = 'C:\Users\Jos' + [char]0x00E9 + '\owui'
+    [System.IO.File]::WriteAllText((Join-Path $utfDir 'out.txt'), "bind||$jose|/app/backend/data`r`n", (New-Object System.Text.UTF8Encoding($false)))
+    Set-Content -LiteralPath (Join-Path $utfDir 'docker.cmd') -Encoding ASCII -Value ("@echo off`r`ntype `"" + (Join-Path $utfDir 'out.txt') + "`"")
+    $encBefore = [Console]::OutputEncoding.CodePage
+    $savedPath = $env:Path; $env:Path = "$utfDir;$env:Path"
+    try { $res = Invoke-Native -File 'docker' -Arguments @('inspect') -Capture -AllowFail } finally { $env:Path = $savedPath }
+    Assert-That ($res.Text -match [regex]::Escape($jose)) "a path with an accent comes back intact ($($res.Text))"
+    Assert-That ([Console]::OutputEncoding.CodePage -eq $encBefore) 'the console encoding is restored afterwards'
+} else { Skip 'console code pages exist on Windows only' }
 
 if ($failures -eq 0) { Write-Host "`nWINDOWS UNIT TESTS PASSED" -ForegroundColor Green } else { Write-Host "`nWINDOWS UNIT TESTS FAILED ($failures)" -ForegroundColor Red }
 exit $failures
