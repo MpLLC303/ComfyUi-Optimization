@@ -94,6 +94,7 @@ $archive = Join-Path $backupDir $name
 # Written under a name no reader matches (open-webui-*.tar.gz) and renamed only once verified, so a
 # crash, reboot or full disk mid-archive never leaves a truncated file that counts as a fresh backup.
 $workName = "incomplete-$name"
+$backupStatePath = Join-Path $AIRoot 'backup-state.json'
 $work = Join-Path $backupDir $workName
 $stopped = $false
 $verifiedOk = $false
@@ -125,6 +126,10 @@ try {
     }
     # Leftovers of an interrupted earlier run (we hold the volume lock, so none is in progress).
     Get-ChildItem -LiteralPath $backupDir -Filter 'incomplete-open-webui-*' -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
+    # Scratch volumes of a deep check that was killed (task time limit, power cut) hold a copy of webui.db.
+    foreach ($v in @((Invoke-Docker -Arguments @('volume', 'ls', '-q', '--filter', 'name=localai-verify-') -AllowFail).Text -split "`n" | Where-Object { $_ -match '^localai-verify-\d{14}$' })) {
+        Invoke-Docker -Arguments @('volume', 'rm', '-f', $v) -AllowFail | Out-Null
+    }
     try {
         Invoke-Docker -Arguments @('run', '--rm', '-v', "${Volume}:/data:ro", '-v', "${backupDir}:/backup", $HelperImage,
             'tar', 'czf', "/backup/$workName", '-C', '/data', '.') | Out-Null
@@ -168,14 +173,27 @@ try {
             $run = Invoke-Docker -Arguments @('run', '--rm', '--entrypoint', 'python3', '-v', "${scratch}:/d", $VerifyImage, '-c', $py) -AllowFail
             $out = $run.Text.Trim()
             $parts = ($out -split '\s+')
-            if ($run.ExitCode -ne 0 -or $parts[0] -ne 'ok') {
+            # Corrupt only when SQLite itself says so: integrity_check printed something other than 'ok',
+            # or the file is not a readable database. A check that could not run (docker error, out of
+            # memory, an image without python3, a renamed table in a newer Open WebUI) says nothing about
+            # the data, and quarantining every nightly archive for it would stop pruning and fill the disk.
+            $sqliteSaysBad = ($run.ExitCode -eq 0 -and $parts[0] -ne 'ok') -or ($out -match 'DatabaseError|malformed|not a database|file is encrypted')
+            if ($sqliteSaysBad) {
                 # Keep it for inspection, but tagged so it never counts as one of the three protected daily backups.
                 $bad = $archive -replace '\.tar\.gz$', '-CORRUPT.tar.gz'
                 Move-Item -LiteralPath $work -Destination $bad -Force
+                # Two quarantined archives are enough to investigate; more just fill the disk night after night.
+                Get-ChildItem -LiteralPath $backupDir -Filter 'open-webui-*-CORRUPT.tar.gz' | Sort-Object LastWriteTime -Descending | Select-Object -Skip 2 |  # lai-ok: objects
+                    ForEach-Object { Remove-Item -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue }
                 $reason = ($out -split "`n" | Select-Object -Last 1)
                 throw "Archive ${name}: webui.db failed the SQLite check ($reason). Kept as $(Split-Path -Leaf $bad). Your live data may be damaged: do not delete older backups."
             }
-            $verified = "; database OK ($($parts[1]) users, $($parts[2]) chats)"
+            if ($run.ExitCode -ne 0 -or $parts.Count -lt 3) {
+                Write-BackupLog WARN "Deep check could not run (exit $($run.ExitCode): $(($out -split "`n" | Select-Object -Last 1))); the archive is kept as a normal backup."
+                $verified = '; deep check could not run'
+            } else {
+                $verified = "; database OK ($($parts[1]) users, $($parts[2]) chats)"
+            }
         } finally {
             Invoke-Docker -Arguments @('volume', 'rm', '-f', $scratch) -AllowFail | Out-Null
         }
@@ -229,11 +247,16 @@ try {
             Copy-Item -LiteralPath $archive -Destination $mirrorTmp -Force -ErrorAction Stop
             Move-Item -LiteralPath $mirrorTmp -Destination (Join-Path $Mirror $name) -Force -ErrorAction Stop
             Write-BackupLog OK "Mirrored to $Mirror"
+            # The health watch reads this: a mirror that stops working must not go unnoticed for months.
+            $bs = Read-LaiState -Path $backupStatePath; $bs['mirrorOkAt'] = (Get-Date).ToString('s'); $bs['mirrorTarget'] = $Mirror; $bs.Remove('mirrorError')
+            Save-LaiState -State $bs -Path $backupStatePath
             Get-ChildItem -LiteralPath $Mirror -Filter 'incomplete-open-webui-*' -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
             if (-not $NoPrune) { & $prune $Mirror }
         } catch {
             # The local archive is complete and verified; an offline NAS must not fail the backup.
             Write-BackupLog WARN "Mirror copy to $Mirror failed: $($_.Exception.Message)"
+            try { $bs = Read-LaiState -Path $backupStatePath; $bs['mirrorError'] = $_.Exception.Message; $bs['mirrorErrorAt'] = (Get-Date).ToString('s'); Save-LaiState -State $bs -Path $backupStatePath }
+            catch { Write-BackupLog WARN "Could not record the mirror failure: $($_.Exception.Message)" }
         }
     }
 } catch {

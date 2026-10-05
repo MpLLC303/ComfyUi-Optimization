@@ -60,7 +60,7 @@ function Write-Missing([string]$What) {
 
 # Compose projects and volumes only the tests create; container names the tests give alpine stand-ins.
 $testProjects = @('lai-update-test', 'lai-uninstall-test', 'lai-stopstart-test')
-$testVolumes = @('owui-old', 'lai-deep-test', 'lai-empty-test')
+$testVolumes = @('owui-old', 'lai-deep-test', 'lai-empty-test', 'lai-ok-test')
 $standInNames = @('open-webui', 'render-guard', 'lai-stopstart-probe')
 
 if ((Invoke-DockerCli @('info', '--format', '{{.ServerVersion}}')).Code -ne 0) {
@@ -107,6 +107,11 @@ if ($names -contains 'searxng') {
     }
 } elseif ($names -notcontains 'searxng-uninstall-test-keep') {
     Write-Missing 'the sandbox searxng container'
+}
+
+# A stand-in 'older image' tag from the update test.
+if (@((Invoke-DockerCli @('images', '-q', 'alpine:lai-old-test')).Out | Where-Object { $_ }).Count) {
+    Invoke-Repair 'image tag alpine:lai-old-test' { Assert-Docker (Invoke-DockerCli @('rmi', 'alpine:lai-old-test')) 'docker rmi' }
 }
 
 # ---- volumes and networks ------------------------------------------------------------------------

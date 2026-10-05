@@ -193,6 +193,9 @@ if ($changed.Count -gt 0) {
     $fingerprint = ''
     foreach ($k in $state['tuning'].Keys) { if ($state['tuning'][$k]['Fingerprint']) { $fingerprint = $state['tuning'][$k]['Fingerprint']; break } }
     if (-not $fingerprint -and $gpu) { $fingerprint = "driver=$($gpu.DriverVersion)" }
+    # Today's driver, not the one stored with the old tuning: otherwise the next installer run sees a
+    # 'driver change' and measures these freshly tuned models all over again.
+    elseif ($gpu) { $fingerprint = $fingerprint -replace '(^|;)driver=[^;]*', ('$1driver=' + $gpu.DriverVersion) }
     $results = Invoke-LaiModelSetup -BaseUrl $ollamaUrl -Models $changed -Candidates $catalog.ContextCandidates -SystemPrompt $system `
         -Fingerprint $fingerprint -MinFreeMiB $minFree -Retune -AllowCpu:$allowCpu
     foreach ($k in $results.Keys) { $state['tuning'][$k] = $results[$k] }

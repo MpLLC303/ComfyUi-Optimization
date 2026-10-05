@@ -109,6 +109,49 @@ services:
         }
         if (-not $holder.HasExited) { $holder.WaitForExit(15000) | Out-Null }
     }
+
+    Write-Host "`n=== 5. long-term: reminders, clock skew, backup mirror, disk hysteresis ===" -ForegroundColor Cyan
+    $cfgFile = Join-Path $aiRoot 'localai-config.json'
+    $statePath = Join-Path $aiRoot 'watch-state.json'
+    $bdir = Join-Path $aiRoot 'Backups'
+    $lastFail = { @((Get-WatchLog) -split "`n" | Where-Object { $_ -match ' (FAIL|OK)( |$)' -and $_ -notmatch ' NOTIFY' })[-1] }
+    $notifyCount = { @((Get-WatchLog) -split "`n" | Where-Object { $_ -match ' NOTIFY' }).Count }
+    Get-ChildItem -LiteralPath $bdir -File | Remove-Item -Force
+    # (a) A problem reported 25 h ago and still there is announced again; an hour later it is not.
+    Save-LaiState -State @{ failed = @('Backups'); notified = @('Backups'); notifiedAt = (Get-Date).AddHours(-25).ToString('s') } -Path $statePath
+    $n0 = & $notifyCount
+    Invoke-Watch @('-NoHeal') | Out-Null
+    $n1 = & $notifyCount
+    Assert-That ($n1 -eq $n0 + 1 -and (Get-WatchLog) -match 'NOTIFY Local AI: still not working: Not working: [^\n]*Backups') 'a problem that lasts is announced again after 24 h (not once a year)'
+    $remindCount = { @((Get-WatchLog) -split "`n" | Where-Object { $_ -match 'NOTIFY Local AI: still not working' }).Count }
+    $r1 = & $remindCount
+    Invoke-Watch @('-NoHeal') | Out-Null
+    Assert-That ((& $remindCount) -eq $r1) 'but not again on the next run'
+    # (b) An archive dated a year ahead must not look fresh.
+    $future = Join-Path $bdir ('open-webui-{0}.tar.gz' -f (Get-Date -Format 'yyyyMMdd-HHmmss'))
+    Set-Content -LiteralPath $future -Value 'x'; (Get-Item -LiteralPath $future).LastWriteTime = (Get-Date).AddDays(365)
+    Invoke-Watch @('-NoHeal') | Out-Null
+    Assert-That ((& $lastFail) -match 'Backups \(newest backup is dated [^)]*in the future') "a backup dated in the future fails the check ($(& $lastFail))"
+    Remove-Item -LiteralPath $future -Force
+    # (c) A configured mirror that did not get the newest backup.
+    Set-Content -LiteralPath (Join-Path $bdir ('open-webui-{0}.tar.gz' -f (Get-Date -Format 'yyyyMMdd-HHmmss'))) -Value 'x'
+    $c5 = Read-LaiState -Path $cfgFile; $c5['BackupMirror'] = '\\nas\gone'; Save-LaiState -State $c5 -Path $cfgFile
+    Save-LaiState -State @{ mirrorError = 'The network path was not found' } -Path (Join-Path $aiRoot 'backup-state.json')
+    Invoke-Watch @('-NoHeal') | Out-Null
+    Assert-That ((& $lastFail) -match 'Backup mirror \(newest backup not copied to [^)]*network path was not found\)' -and (& $lastFail) -notmatch 'Backups \(') "a mirror that stopped is a failed check with its reason ($(& $lastFail))"
+    Save-LaiState -State @{ mirrorOkAt = (Get-Date).ToString('s') } -Path (Join-Path $aiRoot 'backup-state.json')
+    Invoke-Watch @('-NoHeal') | Out-Null
+    Assert-That ((& $lastFail) -notmatch 'Backup mirror') 'and passes once the newest backup was mirrored'
+    # (d) Disk hysteresis: 'low' clears only with 2 GB to spare above the limit.
+    $freeGB = [Math]::Floor([System.IO.DriveInfo]::new([System.IO.Path]::GetPathRoot($aiRoot)).AvailableFreeSpace / 1GB)
+    $limit = [int]$freeGB - 1
+    Save-LaiState -State @{ failed = @() } -Path $statePath
+    Invoke-Watch @('-NoHeal', '-MinFreeGB', "$limit") | Out-Null
+    Assert-That ((& $lastFail) -notmatch 'Disk space') "free space 1 GB above the limit passes when it was fine before ($freeGB GB free, limit $limit)"
+    Save-LaiState -State @{ failed = @('Disk space') } -Path $statePath
+    Invoke-Watch @('-NoHeal', '-MinFreeGB', "$limit") | Out-Null
+    Assert-That ((& $lastFail) -match 'Disk space') 'but after a low-space failure it needs 2 GB more before it counts as fixed (no toast flapping)'
+    $c5 = Read-LaiState -Path $cfgFile; $c5.Remove('BackupMirror'); Save-LaiState -State $c5 -Path $cfgFile
 } finally {
     if ($holder -and -not $holder.HasExited) { $holder.Kill() }
     $tc = Join-Path (Join-Path $aiRoot 'Stack') 'docker-compose.yml'

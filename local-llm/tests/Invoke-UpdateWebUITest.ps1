@@ -65,11 +65,15 @@ if (-not $env:LOCALAI_TEST_CATALOG) { $env:LOCALAI_TEST_CATALOG = Join-Path $PSS
 
 try {
     Write-Host "`n=== 1. update 3.19 -> 3.20 ===" -ForegroundColor Cyan
+    # An image from an even older update (a second tag of the same image: no download needed).
+    Invoke-DockerText @('tag', 'alpine:3.20', 'alpine:lai-old-test') | Out-Null
     $r = Invoke-Update @('-Version', '3.20')
     $cfg = Read-LaiState -Path (Join-Path $aiRoot 'localai-config.json')
     Assert-That ((Get-Image) -eq 'alpine:3.20') 'new image running'
     Assert-That ($cfg['PreviousOpenWebUIVersion'] -eq '3.19' -and (Test-Path -LiteralPath ([string]$cfg['RollbackArchive']))) 'rollback point recorded'
     Assert-That ($r.Text -match 'Rollback') 'prints how to roll back'
+    $tagsNow = @(Invoke-DockerText @('images', '--format', '{{.Repository}}:{{.Tag}}', 'alpine') -split "`n")
+    Assert-That ($tagsNow -notcontains 'alpine:lai-old-test' -and $tagsNow -contains 'alpine:3.20' -and $tagsNow -contains 'alpine:3.19') "after a good update, older images go; the running one and the rollback one stay ($($tagsNow -join ', '))"
     $rollbackArchive = [string]$cfg['RollbackArchive']
 
     Write-Host "`n=== 2. failed pull changes nothing ===" -ForegroundColor Cyan
@@ -257,6 +261,19 @@ try {
     $bad = @(Get-ChildItem -LiteralPath (Join-Path $aiRoot 'Backups') -Filter '*-deeptest-CORRUPT.tar.gz')
     Assert-That ($b.Code -ne 0 -and $bad.Count -eq 1 -and $b.Text -match 'failed the SQLite check') "a damaged database is caught and kept as -CORRUPT (exit $($b.Code))"
     Assert-That (@(Get-ChildItem -LiteralPath (Join-Path $aiRoot 'Backups') -Filter '*-deeptest.tar.gz').Count -eq 1) 'only the good archive keeps a normal name'
+    # Corrupt archives pile up night after night: two are kept for inspection, older ones go.
+    foreach ($i in 1..3) { Set-Content -LiteralPath (Join-Path (Join-Path $aiRoot 'Backups') ("open-webui-2020010$i-000000-old-CORRUPT.tar.gz")) -Value 'x'; (Get-Item -LiteralPath (Join-Path (Join-Path $aiRoot 'Backups') ("open-webui-2020010$i-000000-old-CORRUPT.tar.gz"))).LastWriteTime = (Get-Date).AddDays(-30 + $i) }
+    Start-Sleep -Seconds 1
+    $b = & $runScript 'Backup-OpenWebUI.ps1' @('-Volume', 'lai-deep-test', '-Container', 'lai-no-such-container', '-Tag', 'deeptest', '-NoPrune', '-VerifyImage', $verifyImage)
+    Assert-That ($b.Code -ne 0 -and @(Get-ChildItem -LiteralPath (Join-Path $aiRoot 'Backups') -Filter '*-CORRUPT.tar.gz').Count -eq 2) 'at most two quarantined (-CORRUPT) archives are kept'
+    # A deep check that cannot run at all (here: an image without python3) says nothing about the data.
+    Invoke-DockerText @('volume', 'create', 'localai-verify-20200101000000') | Out-Null
+    Invoke-DockerText @('volume', 'create', 'lai-ok-test') | Out-Null
+    Invoke-DockerText @('run', '--rm', '-v', 'lai-ok-test:/d', '-v', "${dbDir}:/src:ro", 'alpine:3.20', 'cp', '/src/webui.db', '/d/webui.db') | Out-Null
+    $b = & $runScript 'Backup-OpenWebUI.ps1' @('-Volume', 'lai-ok-test', '-Container', 'lai-no-such-container', '-Tag', 'nocheck', '-NoPrune', '-VerifyImage', 'alpine:3.20')
+    Assert-That ($b.Code -eq 0 -and $b.Text -match 'Deep check could not run' -and @(Get-ChildItem -LiteralPath (Join-Path $aiRoot 'Backups') -Filter '*-nocheck.tar.gz').Count -eq 1 -and @(Get-ChildItem -LiteralPath (Join-Path $aiRoot 'Backups') -Filter '*-nocheck-CORRUPT.tar.gz').Count -eq 0) "a deep check that cannot run is a warning, not a CORRUPT archive (exit $($b.Code))"
+    Assert-That ((Invoke-DockerText @('volume', 'ls', '-q', '--filter', 'name=localai-verify-')) -eq '') 'scratch volumes left by a killed deep check are swept'
+    Invoke-DockerText @('volume', 'rm', 'lai-ok-test') | Out-Null
     Invoke-DockerText @('volume', 'rm', 'lai-deep-test') | Out-Null
 } finally {
     # Never leave the shared sandbox Open WebUI with a changed admin password.

@@ -65,6 +65,13 @@ function Invoke-Docker {
     try { & docker @Arguments; $code = $LASTEXITCODE } finally { $ErrorActionPreference = $prev }
     if ($code -ne 0) { throw "docker $($Arguments -join ' ') failed with exit code $code" }
 }
+function Get-DockerResult {
+    # Captured output and exit code; never throws (for optional steps such as removing old images).
+    param([string[]]$Arguments)
+    $prev = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
+    try { $out = @(& docker @Arguments 2>&1 | ForEach-Object { "$_" }); $code = $LASTEXITCODE } finally { $ErrorActionPreference = $prev }
+    return [pscustomobject]@{ ExitCode = $code; Text = ($out -join "`n") }
+}
 
 $config = Read-LaiState -Path $configPath
 $port = 3000; if ($config.ContainsKey('WebUIPort')) { $port = [int]$config['WebUIPort'] }
@@ -195,4 +202,19 @@ Write-UpdateLog OK "Open WebUI $running is up on http://localhost:$port (was $cu
 if ($pre -and $Version) { Write-UpdateLog INFO "If this version misbehaves: Update-OpenWebUI.ps1 -Rollback (back to $current with the data from $($pre.Name))" }
 
 & (Join-Path $PSScriptRoot 'Test-LocalAI.ps1') -AIRoot $AIRoot -Quick
-exit $LASTEXITCODE
+$testExit = $LASTEXITCODE
+if ($testExit -eq 0 -and $Version) {
+    # Each Open WebUI image is several GB and Docker's disk image never shrinks by itself: keep the
+    # running version and the one -Rollback goes back to, remove the older ones. An image still in
+    # use by any container is refused by 'docker rmi' and simply stays.
+    $img = (Get-DockerResult -Arguments @('inspect', '-f', '{{.Config.Image}}', 'open-webui')).Text.Trim()
+    $repo = $img -replace ':[^:/]+$', ''
+    if ($repo -and $repo -ne $img) {
+        $keep = @("${repo}:$Version", "${repo}:$current")
+        $tags = @((Get-DockerResult -Arguments @('images', '--format', '{{.Repository}}:{{.Tag}}', $repo)).Text -split "`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ -and $_ -notlike '*:<none>' })
+        foreach ($t in @($tags | Where-Object { $keep -notcontains $_ })) {
+            if ((Get-DockerResult -Arguments @('rmi', $t)).ExitCode -eq 0) { Write-UpdateLog INFO "Removed the old image $t" }
+        }
+    }
+}
+exit $testExit

@@ -10,10 +10,19 @@
 
 name: localai
 
+# Container logs are capped (Docker keeps them forever by default; the render guard alone can log
+# thousands of lines a day while Ollama is down). 3 x 10 MB per container.
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
 services:
   open-webui:
     image: ghcr.io/open-webui/open-webui:${OPEN_WEBUI_VERSION:-v0.11.4}
     container_name: open-webui
+    logging: *logging
     restart: always
     ports:
       - "127.0.0.1:${WEBUI_PORT:-3000}:8080"
@@ -64,6 +73,7 @@ services:
   render-guard:
     image: searxng/searxng:${SEARXNG_VERSION:-2026.10.2-19ffbcd30}
     container_name: render-guard
+    logging: *logging
     restart: always
     entrypoint: ["python3", "-u", "/guard/render_guard.py"]
     user: "65534:65534"
@@ -89,6 +99,7 @@ services:
   searxng:
     image: searxng/searxng:${SEARXNG_VERSION:-2026.10.2-19ffbcd30}
     container_name: searxng
+    logging: *logging
     restart: always
     ports:
       # Optional: lets you use http://localhost:8888 as a private search engine in your browser.

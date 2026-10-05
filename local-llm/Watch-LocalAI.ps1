@@ -50,6 +50,20 @@ $statePath = Join-Path $AIRoot 'watch-state.json'
 $onWindows = ($env:OS -eq 'Windows_NT')
 $notify = $onWindows -and -not $NoNotify
 $healAllowed = -not $NoHeal
+# A problem that persists is announced again after this many hours (a single toast is easy to miss:
+# Focus Assist during a game, a busy morning), until it is fixed.
+$remindHours = 24
+
+function Write-WatchLog([string]$Text) {
+    # A full disk must not end the watch before it can tell anyone (the toast needs no disk space).
+    try { Add-Content -LiteralPath $logFile -Value $Text -ErrorAction Stop } catch { Write-Verbose "watch.log not writable: $($_.Exception.Message)" }
+}
+function ConvertTo-WatchDate($Value) {
+    # PowerShell 7's ConvertFrom-Json already turns ISO strings into dates; 5.1 leaves strings.
+    if ($null -eq $Value -or "$Value" -eq '') { return $null }
+    if ($Value -is [datetime]) { return $Value }
+    try { return [datetime]::Parse([string]$Value, [Globalization.CultureInfo]::InvariantCulture) } catch { return $null }
+}
 
 function Test-DockerEngine {
     if (-not (Get-Command docker -ErrorAction SilentlyContinue)) { return $null }
@@ -97,9 +111,11 @@ function Start-Container {
 }
 
 function Send-Notification {
+    # Returns $true when the message went out (or notifications are off and the log is the channel),
+    # $false when the toast failed: the caller then tries again on the next run.
     param([string]$Title, [string]$Text)
-    Add-Content -LiteralPath $logFile -Value ('{0} NOTIFY {1}: {2}' -f (Get-Date -Format 's'), $Title, $Text)
-    if (-not $notify) { return }
+    if (-not $notify) { Write-WatchLog ('{0} NOTIFY {1}: {2}' -f (Get-Date -Format 's'), $Title, $Text); return $true }
+    $shown = $false
     try {
         [void][Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime]
         $xml = [Windows.UI.Notifications.ToastNotificationManager]::GetTemplateContent([Windows.UI.Notifications.ToastTemplateType]::ToastText02)
@@ -108,9 +124,12 @@ function Send-Notification {
         [void]$nodes.Item(1).AppendChild($xml.CreateTextNode($Text))
         $appId = '{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\WindowsPowerShell\v1.0\powershell.exe'
         [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier($appId).Show([Windows.UI.Notifications.ToastNotification]::new($xml))
+        $shown = $true
     } catch {
         Write-Verbose "toast failed: $($_.Exception.Message)"
     }
+    Write-WatchLog ('{0} NOTIFY{1} {2}: {3}' -f (Get-Date -Format 's'), $(if ($shown) { '' } else { ' (toast failed)' }), $Title, $Text)
+    return $shown
 }
 
 # ---- pause ----------------------------------------------------------------------------------
@@ -124,7 +143,7 @@ if ($PauseMinutes -gt 0 -or $Unpause) {
         $msg = "watch paused until $($st['pausedUntil'])"
     }
     Save-LaiState -State $st -Path $statePath
-    Add-Content -LiteralPath $logFile -Value ('{0} {1}' -f (Get-Date -Format 's'), $msg)
+    Write-WatchLog ('{0} {1}' -f (Get-Date -Format 's'), $msg)
     Write-LaiLog OK $msg
     exit 0
 }
@@ -133,9 +152,8 @@ function Test-WatchPaused {
     $st = Read-LaiState -Path $statePath
     if (-not ($st.ContainsKey('pausedUntil') -and $st['pausedUntil'])) { return $false }
     # PowerShell 7's ConvertFrom-Json already turns ISO strings into dates; 5.1 leaves strings.
-    $until = $st['pausedUntil']
-    if ($until -isnot [datetime]) { $until = [datetime]::Parse([string]$until, [Globalization.CultureInfo]::InvariantCulture) }
-    return ((Get-Date) -lt $until)
+    $until = ConvertTo-WatchDate $st['pausedUntil']
+    return ($until -and (Get-Date) -lt $until)
 }
 function Test-CanHeal { return ($healAllowed -and -not (Test-WatchPaused)) }
 if (Test-WatchPaused) { Write-Verbose 'paused'; exit 0 }
@@ -203,33 +221,63 @@ $all = @(Get-ChildItem -LiteralPath $backupDir -Filter 'open-webui-*.tar.gz' -Er
 # hide a nightly task that stopped working.
 $daily = @($all | Where-Object { $_.Name -match '^open-webui-\d{8}-\d{6}\.tar\.gz$' })
 $results['Backups'] = ($all.Count -gt 0) -and ($all[0].Name -notlike '*-CORRUPT.tar.gz') -and ($daily.Count -gt 0) -and (((Get-Date) - $daily[0].LastWriteTime).TotalHours -le 50)
+# An archive dated in the future (written while the clock was wrong) would look fresh for months
+# while the nightly task is dead, and would always count as one of the three protected newest.
+if ($daily.Count -gt 0 -and $daily[0].LastWriteTime -gt (Get-Date).AddHours(1)) {
+    $results['Backups'] = $false
+    $details['Backups'] = "newest backup is dated $($daily[0].LastWriteTime.ToString('s')), in the future: check the PC's clock"
+}
+# The second copy (NAS, other drive): a mirror that stopped working is otherwise only a line in backup.log.
+$mirrorTarget = ''
+if ($config.ContainsKey('BackupMirror') -and $config['BackupMirror']) { $mirrorTarget = [string]$config['BackupMirror'] }
+if ($mirrorTarget -and $daily.Count -gt 0) {
+    $bstate = Read-LaiState -Path (Join-Path $AIRoot 'backup-state.json')
+    $okAt = ConvertTo-WatchDate $bstate['mirrorOkAt']
+    # The newest nightly archive must have been mirrored (within its own run).
+    $results['Backup mirror'] = [bool]($okAt -and $okAt -ge $daily[0].LastWriteTime.AddHours(-2))
+    if (-not $results['Backup mirror']) {
+        $why = 'newest backup not copied to ' + $mirrorTarget
+        if ($bstate['mirrorError']) { $why += ': ' + [string]$bstate['mirrorError'] }
+        $details['Backup mirror'] = $why
+    }
+}
 
 $modelDir = ''
 if ($config.ContainsKey('ModelDir') -and $config['ModelDir']) { $modelDir = [string]$config['ModelDir'] }
 elseif ($env:USERPROFILE) { $modelDir = Join-Path $env:USERPROFILE '.ollama' }
 $dockerData = ''
 if ($onWindows -and $env:LOCALAPPDATA) { $dockerData = Join-Path $env:LOCALAPPDATA 'Docker' }
-$diskProblem = Get-FreeSpaceProblem -Paths @($AIRoot, $modelDir, $dockerData) -MinGB $MinFreeGB
+# Hysteresis: once low, the drive counts as fixed only with 2 GB more than the limit, so free space
+# hovering around the limit (pagefile, temp files) does not toast 'problem'/'back to normal' all day.
+$previous = Read-LaiState -Path $statePath
+$diskLimit = $MinFreeGB
+if ($previous.ContainsKey('failed') -and @($previous['failed']) -contains 'Disk space') { $diskLimit = $MinFreeGB + 2 }
+$diskProblem = Get-FreeSpaceProblem -Paths @($AIRoot, $modelDir, $dockerData) -MinGB $diskLimit
 $results['Disk space'] = (-not $diskProblem)
 if ($diskProblem) { $details['Disk space'] = $diskProblem }
 
 # ---- report ---------------------------------------------------------------------------------
 # Two strikes before a notification: right after sign-in Docker Desktop needs a minute or two, and
-# one failed check would otherwise toast every morning. A failure is reported once, when it has
-# been seen on two consecutive runs; "back to normal" follows only for failures that were reported.
+# one failed check would otherwise toast every morning. A failure is reported when it has been seen
+# on two consecutive runs, and again every $remindHours h while it lasts; "back to normal" follows
+# only for failures that were reported.
 $failed = @($results.Keys | Where-Object { -not $results[$_] })
-$previous = Read-LaiState -Path $statePath
 $prevFailed = @(); $prevNotified = @()
 if ($previous.ContainsKey('failed') -and $previous['failed']) { $prevFailed = @($previous['failed']) }
 if ($previous.ContainsKey('notified') -and $previous['notified']) { $prevNotified = @($previous['notified']) }
+$lastToast = ConvertTo-WatchDate $previous['notifiedAt']
 $toNotify = @($failed | Where-Object { ($prevFailed -contains $_) -and ($prevNotified -notcontains $_) })
+$stillReported = @($failed | Where-Object { $prevNotified -contains $_ })
+$reminder = ($toNotify.Count -eq 0 -and $stillReported.Count -gt 0 -and (-not $lastToast -or ((Get-Date) - $lastToast).TotalHours -ge $remindHours))
+if ($reminder) { $toNotify = $stillReported }
 $notified = @($failed | Where-Object { ($prevNotified -contains $_) -or ($toNotify -contains $_) })
 $recovered = @($prevNotified | Where-Object { $failed -notcontains $_ })
+$notifiedAt = $previous['notifiedAt']
 
 $failedText = @($failed | ForEach-Object { if ($details.ContainsKey($_)) { '{0} ({1})' -f $_, $details[$_] } else { $_ } }) -join ', '
 $line = '{0} {1}{2}' -f (Get-Date -Format 's'), $(if ($failed.Count) { 'FAIL ' + $failedText } else { 'OK' }), $(if ($healed.Count) { ' (restarted: ' + ($healed -join ', ') + ')' } else { '' })
 if ($maintenance) { $line += ' (Open WebUI stopped for a backup/restore/update; left alone)' }
-Add-Content -LiteralPath $logFile -Value $line
+Write-WatchLog $line
 Write-Verbose $line
 
 if ($toNotify.Count -gt 0) {
@@ -245,19 +293,27 @@ if ($toNotify.Count -gt 0) {
         $hint = 'Free some disk space (old backups in ' + (Join-Path $AIRoot 'Backups') + ', unused models).'
     } elseif ($failed -contains 'Backups') {
         $hint = 'Run Start menu > Local AI > Diagnostics and check backup.log.'
+    } elseif ($failed -contains 'Backup mirror') {
+        $hint = 'Check that the backup mirror drive or NAS share is reachable and has free space.'
     }
-    Send-Notification 'Local AI: problem detected' ("Not working: {0}. {1}" -f $failedText, $hint)
+    $title = 'Local AI: problem detected'; if ($reminder) { $title = 'Local AI: still not working' }
+    if (Send-Notification $title ("Not working: {0}. {1}" -f $failedText, $hint)) { $notifiedAt = (Get-Date).ToString('s') }
+    else {
+        # Not shown: keep them unreported so the next run tries again.
+        $notified = @($notified | Where-Object { $toNotify -notcontains $_ -or $stillReported -contains $_ })
+    }
 } elseif ($recovered.Count -gt 0 -or ($healed.Count -gt 0 -and $failed.Count -eq 0)) {
     $parts = @()
     if ($healed.Count -gt 0) { $parts += 'restarted ' + ($healed -join ', ') }
     $other = @($recovered | Where-Object { $healed -notcontains $_ })
     if ($other.Count -gt 0) { $parts += 'recovered ' + ($other -join ', ') }
-    if ($failed.Count -eq 0) { Send-Notification 'Local AI: back to normal' (($parts -join '; ') + '.') }
-    else { Send-Notification 'Local AI: partly recovered' ((($parts -join '; ') + '. Still not working: ' + $failedText + '.')) }
+    if ($failed.Count -eq 0) { [void](Send-Notification 'Local AI: back to normal' (($parts -join '; ') + '.')) }
+    else { [void](Send-Notification 'Local AI: partly recovered' ((($parts -join '; ') + '. Still not working: ' + $failedText + '.'))) }
 }
 
 # Merge into the current file so a pause set while this run was busy survives.
 $final = Read-LaiState -Path $statePath
 $final['failed'] = $failed; $final['notified'] = $notified; $final['checked'] = (Get-Date).ToString('s')
+if ($notified.Count -and $notifiedAt) { $final['notifiedAt'] = [string]$notifiedAt } else { $final.Remove('notifiedAt') }
 Save-LaiState -State $final -Path $statePath
 exit $failed.Count

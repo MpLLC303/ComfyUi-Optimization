@@ -39,6 +39,8 @@ $files = Get-ChildItem -Path $Root -Recurse -File -Include *.ps1, *.psm1, *.psd1
 #   HELP     a user-facing script (toolkit root) with a parameter its help never mentions: no
 #            .PARAMETER entry, no comment right above it, no -Name in the help text.
 #   DOCPARAM README.md tells the user to run a script with a -Switch that script does not have.
+#   COMPOSELOG a service in stack/docker-compose.yml without 'logging:' (Docker keeps container logs
+#            forever by default; on an always-on PC they grow without limit).
 #   NATIVEQUOTE a literal double quote inside an argument for a native program (docker, wsl, ...):
 #            Windows PowerShell 5.1 does not escape it, so the program receives it stripped.
 function Find-Pitfall([System.Management.Automation.Language.Ast]$Ast, [string[]]$Lines, [string]$FileName = '', [switch]$UserFacing) {
@@ -193,6 +195,21 @@ function Find-DocParam([string]$Text, [hashtable]$ParamsByScript) {
     return , $found
 }
 
+function Find-ComposeLogGap([string]$Text) {
+    # Service names under 'services:' whose block has no 'logging:' key.
+    $missing = @(); $inServices = $false; $svc = $null; $hasLog = $false
+    foreach ($l in (($Text -split "`n") + @('end:'))) {
+        if ($l -match '^\S') {
+            if ($svc -and -not $hasLog) { $missing += $svc }
+            $svc = $null; $inServices = ($l -match '^services:\s*$'); continue
+        }
+        if (-not $inServices) { continue }
+        if ($l -match '^  ([A-Za-z0-9_-]+):\s*$') { if ($svc -and -not $hasLog) { $missing += $svc }; $svc = $Matches[1]; $hasLog = $false }
+        elseif ($l -match '^    logging:') { $hasLog = $true }
+    }
+    return , $missing
+}
+
 # ---- canaries: every rule must fire on its bad snippet and stay quiet on the fixed one ---------
 $canaries = @(
     @{ Rule = 'PS51'; Fire = $true; Code = '$h | Measure-Object -Property Size -Sum' }
@@ -247,6 +264,14 @@ $docCanaries = @(
     @{ Fire = $false; Text = 'Run `Update-OpenWebUI.ps1 -Latest` or `Install-LocalAI.cmd -RenderGuard off` (or -Foo outside the span).' }
     @{ Fire = $false; Text = '.\Uninstall-LocalAI.ps1 -WhatIf   # -NotAParam in a comment' }
 )
+foreach ($k in @(
+        @{ Fire = $true; Text = "services:`n  a:`n    image: x`n    logging: *l`n  b:`n    image: y`nvolumes:`n  v:" }
+        @{ Fire = $false; Text = "services:`n  a:`n    image: x`n    logging: *l`nvolumes:`n  v:" })) {
+    if (((Find-ComposeLogGap $k.Text).Count -gt 0) -ne $k.Fire) {
+        $canaryFail++; $problems++
+        Write-Host ("CANARY   rule COMPOSELOG {0}" -f $(if ($k.Fire) { 'did not fire' } else { 'fired wrongly' })) -ForegroundColor Red
+    }
+}
 foreach ($k in $docCanaries) {
     $hit = (Find-DocParam -Text $k.Text -ParamsByScript @{ 'Update-OpenWebUI.ps1' = @('Latest'); 'Install-LocalAI.ps1' = @('RenderGuard'); 'Uninstall-LocalAI.ps1' = @('Force') }).Count -gt 0
     if ($hit -ne $k.Fire) {
@@ -264,7 +289,7 @@ foreach ($k in $canaries) {
         Write-Host ("CANARY   rule {0} {1} on: {2}" -f $k.Rule, $(if ($k.Fire) { 'did not fire' } else { 'fired wrongly' }), $k.Code) -ForegroundColor Red
     }
 }
-Write-Host ("Pitfall-rule canaries: {0}/{1} OK" -f ($canaries.Count + $docCanaries.Count - $canaryFail), ($canaries.Count + $docCanaries.Count)) -ForegroundColor $(if ($canaryFail) { 'Red' } else { 'Green' })
+Write-Host ("Pitfall-rule canaries: {0}/{1} OK" -f ($canaries.Count + $docCanaries.Count + 2 - $canaryFail), ($canaries.Count + $docCanaries.Count + 2)) -ForegroundColor $(if ($canaryFail) { 'Red' } else { 'Green' })
 
 foreach ($f in $files) {
     $tokens = $null; $errs = $null
@@ -294,6 +319,20 @@ foreach ($f in ($files | Where-Object { $_.DirectoryName -eq $Root -and $_.Exten
     $ast = [System.Management.Automation.Language.Parser]::ParseFile($f.FullName, [ref]$tokens, [ref]$errs)
     $paramsByScript[$f.Name] = @(if ($ast.ParamBlock) { $ast.ParamBlock.Parameters | ForEach-Object { $_.Name.VariablePath.UserPath } })
 }
+$composeFile = Join-Path (Join-Path $Root 'stack') 'docker-compose.yml'
+if (Test-Path -LiteralPath $composeFile) {
+    foreach ($svc in (Find-ComposeLogGap (Get-Content -LiteralPath $composeFile -Raw -Encoding UTF8))) {
+        $problems++; Write-Host "COMPOSELOG docker-compose.yml: service '$svc' has no logging limits (add 'logging: *logging')" -ForegroundColor Red
+    }
+}
+
+# Every rule prefix this script prints must be one the test runner counts as a failure.
+$runnerText = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'Invoke-AllTests.ps1') -Raw -Encoding UTF8
+$myRules = @([regex]::Matches((Get-Content -LiteralPath $PSCommandPath -Raw -Encoding UTF8), "(?m)^#   ([A-Z0-9]+) ") | ForEach-Object { $_.Groups[1].Value } | Select-Object -Unique)
+foreach ($rule in $myRules) {
+    if ($runnerText -notmatch ('VerdictPattern = [^\r\n]*\b' + $rule + '\b')) { $problems++; Write-Host "CANARY   rule $rule is not in Invoke-AllTests.ps1's VerdictPattern" -ForegroundColor Red }
+}
+
 # README.md only: IMPROVEMENTS.md is a backlog and may name switches that do not exist yet.
 foreach ($doc in @(Get-ChildItem -LiteralPath $Root -Filter 'README.md' -File)) {
     foreach ($p in (Find-DocParam -Text (Get-Content -LiteralPath $doc.FullName -Raw -Encoding UTF8) -ParamsByScript $paramsByScript)) {
