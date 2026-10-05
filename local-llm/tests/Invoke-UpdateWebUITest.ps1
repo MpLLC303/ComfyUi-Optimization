@@ -105,6 +105,8 @@ try {
     Assert-That (Test-Path -LiteralPath $rollbackArchive) '60-day-old rollback archive survives pruning'
     Assert-That (Test-Path -LiteralPath (Join-Path $bdir 'open-webui-20200101-000000-pre-uninstall.tar.gz')) '60-day-old pre-uninstall archive survives pruning'
     Assert-That (-not (Test-Path -LiteralPath (Join-Path $bdir 'open-webui-20200101-000000-pre-restore.tar.gz'))) '60-day-old ordinary tagged archive is pruned'
+    # The stand-in is not a real archive: later steps pick archives from this folder.
+    Invoke-DockerText @('run', '--rm', '-v', "${bdir}:/b", 'alpine:3.20', 'rm', '-f', '/b/open-webui-20200101-000000-pre-uninstall.tar.gz') | Out-Null
 
     Write-Host "`n=== 3a. mirror: copied whole, and pruned like the local folder ===" -ForegroundColor Cyan
     $mirrorDir = Join-Path $Work 'nas'
@@ -149,7 +151,9 @@ try {
     Assert-That ((Get-Content -LiteralPath (Join-Path (Join-Path $aiRoot 'Logs') 'update.log') -Raw) -match 'Rolled back') 'update.log has the history'
 
     Write-Host "`n=== 5. a failed restore keeps Open WebUI down until a good restore ===" -ForegroundColor Cyan
-    $good = Get-ChildItem -LiteralPath (Join-Path $aiRoot 'Backups') -Filter 'open-webui-*.tar.gz' | Where-Object { $_.Name -notlike '*CORRUPT*' } | Select-Object -First 1
+    # The newest real archive (a stand-in or a corrupt one would make every restore below fail early).
+    $good = Get-ChildItem -LiteralPath (Join-Path $aiRoot 'Backups') -Filter 'open-webui-*.tar.gz' | Where-Object { $_.Name -notlike '*CORRUPT*' -and $_.Length -gt 1KB } |
+        Sort-Object LastWriteTime -Descending | Select-Object -First 1  # lai-ok: objects
     $holdFile = Join-Path $aiRoot 'open-webui-hold.json'
     $runScript = {
         param([string]$Name, [string[]]$Arguments)
