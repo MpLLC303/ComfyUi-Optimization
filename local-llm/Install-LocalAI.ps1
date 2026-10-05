@@ -164,6 +164,12 @@ if (-not (Test-IsAdmin)) {
 $AIRoot = $AIRoot.Trim()
 if ($AIRoot -match '^[A-Za-z]:$') { $AIRoot += '\' }
 elseif ($AIRoot.Length -gt 3) { $AIRoot = $AIRoot.TrimEnd([char]'\', [char]'/') }
+# The Start-menu shortcuts carry the folder three times in a 1024-character limit, and Docker bind
+# paths and model files deep inside it run into the 260-character path limit.
+if ($AIRoot.Length -gt 100) {
+    Write-Host "The install folder '$AIRoot' is $($AIRoot.Length) characters long; choose one of at most 100 (for example D:\AI) and run again. Nothing was changed." -ForegroundColor Red
+    exit 1
+}
 
 $P = @{
     Root      = $AIRoot
@@ -1293,8 +1299,10 @@ Invoke-Stage 'Configure' {
         }
     }
 
-    Invoke-LaiWebUISetup -BaseUrl $WebUIUrl -Token $token -Models $Catalog.Models -ModelResults $State.tuning `
-        -SystemPrompt $SystemPrompt -DefaultPreset $Catalog.DefaultPreset -Collections $KnowledgeCollections
+    # Optional settings that did not take come back as warnings instead of stopping the install
+    # before the Backup stage; they are repeated in the report and at the end.
+    $State.flags['configureWarnings'] = @(Invoke-LaiWebUISetup -BaseUrl $WebUIUrl -Token $token -Models $Catalog.Models -ModelResults $State.tuning `
+        -SystemPrompt $SystemPrompt -DefaultPreset $Catalog.DefaultPreset -Collections $KnowledgeCollections)
 }
 #endregion
 
@@ -1412,6 +1420,9 @@ $report = @(
     'Context = largest value that kept the model 100% in VRAM with headroom, capped at the trained/configured maximum.'
     'Start ComfyUI with Start-ComfyUI.ps1 (or Start menu > Local AI); chats during a render run on the CPU (render guard). For Forge or games run Release-GPU.ps1 or Stop-LocalAI.ps1.'
 )
+$attention = @()
+if ($State.flags.ContainsKey('configureWarnings')) { $attention = @($State.flags['configureWarnings'] | Where-Object { $_ }) }
+if ($attention.Count -gt 0) { $report += @('', '## Settings that need attention', '') + @($attention | ForEach-Object { "- $_" }) }
 Set-Content -LiteralPath $P.Report -Value $report -Encoding UTF8
 Write-Host ''
 Write-LaiLog OK "Report: $($P.Report)"
@@ -1424,6 +1435,7 @@ Write-Host ''
 Write-Host "Open WebUI:  http://localhost:$($script:WebUIPortEffective)" -ForegroundColor Green
 Write-Host "Login:       $($cred.email)" -ForegroundColor Green
 Write-Host "Password:    $($cred.password)   (also in $($P.Secrets)\openwebui-admin.json)" -ForegroundColor Green
+foreach ($a in $attention) { Write-Host "Needs attention: $a" -ForegroundColor Yellow }
 Write-Host 'Open a NEW terminal to use the ollama command (windows opened before the install do not see the PATH change).' -ForegroundColor Gray
 Start-AsUser "http://localhost:$($script:WebUIPortEffective)"
 Stop-Install $testExit

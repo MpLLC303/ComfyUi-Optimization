@@ -1294,6 +1294,34 @@ function Invoke-LaiModelSetup {
     return $results
 }
 
+function Compare-LaiConfig {
+    <#
+    .SYNOPSIS
+        Lists the settings in $Expected that $Actual (what the API reads back) does not hold, one
+        'KEY: wanted X, got Y' line each; nested hashtables are compared key by key ('web.KEY').
+        Open WebUI answers a settings POST with 200 even when a newer version ignores a field, so
+        a write is only trusted once it reads back.
+    #>
+    param([Parameter(Mandatory)][hashtable]$Expected, [AllowNull()]$Actual, [string]$Prefix = '')
+    $inv = [Globalization.CultureInfo]::InvariantCulture
+    $a = ConvertTo-LaiHashtable $Actual
+    $out = @()
+    foreach ($k in @($Expected.Keys | Sort-Object)) {
+        $name = $Prefix + $k
+        $want = $Expected[$k]
+        if (-not ($a -is [hashtable]) -or -not $a.ContainsKey($k)) { $out += "${name}: not returned"; continue }
+        $got = $a[$k]
+        if ($want -is [hashtable]) { $out += @(Compare-LaiConfig -Expected $want -Actual $got -Prefix "$name."); continue }
+        $w = if ($null -eq $want) { '' } else { [Convert]::ToString($want, $inv) }
+        $g = if ($null -eq $got) { '' } else { [Convert]::ToString($got, $inv) }
+        if (-not [string]::Equals($w, $g, [StringComparison]::OrdinalIgnoreCase)) {
+            $shown = if ($null -eq $got) { 'nothing' } else { $g }
+            $out += "${name}: wanted $w, got $shown"
+        }
+    }
+    return $out
+}
+
 function Set-LaiWebUIAdminConfig {
     # GET -> merge -> POST, so settings this script does not manage are left untouched.
     param([string]$BaseUrl = 'http://127.0.0.1:3000', [Parameter(Mandatory)][string]$Token, [Parameter(Mandatory)][hashtable]$Changes)
@@ -1369,10 +1397,23 @@ function Invoke-LaiWebUISetup {
         [string[]]$Collections = @(),
         [string]$SearxngQueryUrl = 'http://searxng:8080/search?q=<query>'
     )
+    # Returns the optional steps that did not take, one line each (empty when all did). Signing up,
+    # the presets and the model list are essential and throw; the RAG/web-search settings and the
+    # knowledge collections are not: a failure there must not stop the install before the Backup
+    # stage schedules the nightly backups, and a re-run retries them.
+    $warnings = New-Object System.Collections.Generic.List[string]
     Write-LaiLog STEP 'Open WebUI: admin settings (signup off, memories on, community sharing off)'
-    Set-LaiWebUIAdminConfig -BaseUrl $BaseUrl -Token $Token -Changes @{
-        ENABLE_SIGNUP = $false; ENABLE_MEMORIES = $true; ENABLE_MEMORY_SYSTEM_CONTEXT = $true; ENABLE_COMMUNITY_SHARING = $false
-    } | Out-Null
+    $adminWanted = @{ ENABLE_SIGNUP = $false; ENABLE_MEMORIES = $true; ENABLE_MEMORY_SYSTEM_CONTEXT = $true; ENABLE_COMMUNITY_SHARING = $false }
+    Set-LaiWebUIAdminConfig -BaseUrl $BaseUrl -Token $Token -Changes $adminWanted | Out-Null
+    $adminBad = @(Compare-LaiConfig -Expected $adminWanted -Actual (Invoke-LaiApi -Uri "$BaseUrl/api/v1/auths/admin/config" -Token $Token))
+    if (@($adminBad | Where-Object { $_ -like 'ENABLE_SIGNUP:*' }).Count -gt 0) {
+        # Anyone who can reach the page could make an account: never carry on with that.
+        throw "Open WebUI did not keep 'sign-up off' ($($adminBad -join '; ')). Turn it off in Admin Panel > Settings > General, then run the installer again."
+    }
+    foreach ($b in $adminBad) {
+        $warnings.Add("Admin setting not kept ($b); set it in Admin Panel > Settings")
+        Write-LaiLog WARN "Open WebUI did not keep an admin setting: $b"
+    }
 
     Write-LaiLog STEP 'Open WebUI: waiting for the tuned Ollama models to be listed'
     $wanted = @($Models | ForEach-Object { "$($_.Alias):latest" })
@@ -1408,7 +1449,7 @@ function Invoke-LaiWebUISetup {
     Write-LaiLog OK "Raw models hidden; default model '$default'; selector order: $($order -join ', ')"
 
     Write-LaiLog STEP 'Open WebUI: documents (RAG) and web search settings'
-    Set-LaiWebUIRetrievalConfig -BaseUrl $BaseUrl -Token $Token -Settings @{
+    $ragWanted = @{
         TEXT_SPLITTER                        = 'token'
         ENABLE_MARKDOWN_HEADER_TEXT_SPLITTER = $true
         CHUNK_SIZE                           = 2000
@@ -1420,14 +1461,32 @@ function Invoke-LaiWebUISetup {
             SEARXNG_QUERY_URL       = $SearxngQueryUrl
             WEB_SEARCH_RESULT_COUNT = 5
         }
-    } | Out-Null
-    $rc = Get-LaiWebUIRetrievalConfig -BaseUrl $BaseUrl -Token $Token
-    Write-LaiLog OK ("RAG: splitter={0}, chunk={1}/{2}, top_k={3}; web search={4} via {5}" -f $rc.TEXT_SPLITTER, $rc.CHUNK_SIZE, $rc.CHUNK_OVERLAP, $rc.TOP_K, $rc.web.ENABLE_WEB_SEARCH, $rc.web.WEB_SEARCH_ENGINE)
+    }
+    try {
+        Set-LaiWebUIRetrievalConfig -BaseUrl $BaseUrl -Token $Token -Settings $ragWanted | Out-Null
+        $rc = Get-LaiWebUIRetrievalConfig -BaseUrl $BaseUrl -Token $Token
+        $ragBad = @(Compare-LaiConfig -Expected $ragWanted -Actual $rc)
+        if ($ragBad.Count -gt 0) {
+            $warnings.Add("Documents/web search settings not kept: $($ragBad -join '; '). Set them in Admin Panel > Settings > Documents and Web Search")
+            Write-LaiLog WARN "Open WebUI did not keep these documents/web search settings: $($ragBad -join '; ')"
+        } else {
+            Write-LaiLog OK ("RAG: splitter={0}, chunk={1}/{2}, top_k={3}; web search={4} via {5}" -f $rc.TEXT_SPLITTER, $rc.CHUNK_SIZE, $rc.CHUNK_OVERLAP, $rc.TOP_K, $rc.web.ENABLE_WEB_SEARCH, $rc.web.WEB_SEARCH_ENGINE)
+        }
+    } catch {
+        $warnings.Add("Documents/web search settings failed ($($_.Exception.Message)); run the installer again, or set them in Admin Panel > Settings > Documents and Web Search")
+        Write-LaiLog WARN "Documents/web search settings failed: $($_.Exception.Message)"
+    }
 
     foreach ($c in $Collections) {
-        $k = Add-LaiWebUIKnowledge -BaseUrl $BaseUrl -Token $Token -Name $c -Description "Knowledge collection: $c"
-        Write-LaiLog OK "Knowledge collection '$c' $($k.Action)"
+        try {
+            $k = Add-LaiWebUIKnowledge -BaseUrl $BaseUrl -Token $Token -Name $c -Description "Knowledge collection: $c"
+            Write-LaiLog OK "Knowledge collection '$c' $($k.Action)"
+        } catch {
+            $warnings.Add("Knowledge collection '$c' was not created ($($_.Exception.Message)); add it in Workspace > Knowledge")
+            Write-LaiLog WARN "Knowledge collection '$c' was not created: $($_.Exception.Message)"
+        }
     }
+    return $warnings.ToArray()
 }
 
 #endregion
@@ -1495,12 +1554,13 @@ function Get-LaiShortcutSpecs {
     param([Parameter(Mandatory)][string]$AIRoot, [int]$WebUIPort = 3000)
     # Plain string building (Windows paths), so this also works when tested on Linux.
     $scripts = $AIRoot.TrimEnd('\') + '\Scripts'
-    $q = { param($s) "'" + $s.Replace("'", "''") + "'" }
+    # ConvertTo-LaiPsQuoted, not a plain '' doubling: a typographic apostrophe in the path also ends the string.
+    $q = { param($s) ConvertTo-LaiPsQuoted $s }
     $items = @(
-        @{ Name = 'Local AI - Gaming mode (free GPU)'; Script = 'Stop-LocalAI.ps1'; Extra = '' }
-        @{ Name = 'Local AI - Start again'; Script = 'Start-LocalAI.ps1'; Extra = '' }
-        @{ Name = 'Local AI - Health check'; Script = 'Test-LocalAI.ps1'; Extra = ' -Quick' }
-        @{ Name = 'ComfyUI (free GPU first)'; Script = 'Start-ComfyUI.ps1'; Extra = '' }
+        @{ Name = 'Local AI - Gaming mode (free GPU)'; Script = 'Stop-LocalAI.ps1'; Extra = ''; Log = $true }
+        @{ Name = 'Local AI - Start again'; Script = 'Start-LocalAI.ps1'; Extra = ''; Log = $true }
+        @{ Name = 'Local AI - Health check'; Script = 'Test-LocalAI.ps1'; Extra = ' -Quick'; Log = $true }
+        @{ Name = 'ComfyUI (free GPU first)'; Script = 'Start-ComfyUI.ps1'; Extra = ''; Log = $true }
         @{ Name = 'Local AI - Diagnostics (redacted zip)'; Script = 'Get-LocalAIDiagnostics.ps1'; Extra = ' -RunTests' }
         @{ Name = 'Local AI - Update toolkit'; Script = 'Get-LocalAI.ps1'; Extra = ''; Env = 'LOCALAI_ROOT' }
     )
@@ -1511,7 +1571,16 @@ function Get-LaiShortcutSpecs {
         else { $call = "& $(& $q $path) -AIRoot $(& $q $AIRoot)$($i.Extra)" }
         # 'catch' prints the error BEFORE the window waits: with only try/finally PowerShell shows the
         # error after the user has pressed Enter, i.e. as the window closes, so it was never read.
-        $cmd = "try { $call } catch { Write-Host ''; Write-Host ('FAILED: ' + `$_.Exception.Message) -ForegroundColor Red; Write-Host 'For help: Start menu > Local AI - Diagnostics (redacted zip).' -ForegroundColor Yellow } finally { Write-Host ''; Read-Host 'Done - press Enter to close' }"
+        # The window's text is gone once it closes, so the last run of each is kept in Logs\shortcut-*.log
+        # for the diagnostics zip. Not for Update toolkit: an installer running in the same window
+        # prints the admin password at the end.
+        $logOn = ''; $logOff = ''
+        if ($i.Log) {
+            $logPath = $AIRoot.TrimEnd('\') + '\Logs\shortcut-' + $i.Script.Replace('.ps1', '') + '.log'
+            $logOn = "try { Start-Transcript -LiteralPath $(& $q $logPath) -Force | Out-Null } catch { Write-Host 'This run is not logged.' }; "
+            $logOff = 'try { Stop-Transcript | Out-Null } catch { $null = $_ }; '
+        }
+        $cmd = "${logOn}try { $call } catch { Write-Host ''; Write-Host ('FAILED: ' + `$_.Exception.Message) -ForegroundColor Red; Write-Host 'For help: Start menu > Local AI - Diagnostics (redacted zip).' -ForegroundColor Yellow } finally { Write-Host ''; ${logOff}Read-Host 'Done - press Enter to close' }"
         $specs += [pscustomobject]@{
             Name      = $i.Name
             Kind      = 'lnk'

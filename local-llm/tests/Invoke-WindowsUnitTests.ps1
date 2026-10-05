@@ -198,7 +198,7 @@ Assert-That ($free -eq 'FREE') "and as free after release (got '$free')"
 
 # ---- shortcuts -----------------------------------------------------------------------------------
 Write-Host "`n=== Start-menu shortcuts ===" -ForegroundColor Cyan
-$specs = @(Get-LaiShortcutSpecs -AIRoot "C:\It's AI" -WebUIPort 3001)
+$specs = @(Get-LaiShortcutSpecs -AIRoot ("C:\It's Dad" + [char]0x2019 + 's AI') -WebUIPort 3001)
 Assert-That ($specs.Count -eq 7) "seven shortcut specs (got $($specs.Count))"
 $upd = $specs | Where-Object { $_.Name -like '*Update toolkit*' }
 Assert-That ($upd -and $upd.Arguments -match 'LOCALAI_ROOT' -and $upd.Arguments -notmatch '-AIRoot') 'Update toolkit passes the AI root via LOCALAI_ROOT'
@@ -219,6 +219,19 @@ $prev = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
 $scOut = (& $childExe -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command $payload 2>&1 | ForEach-Object { "$_" }) -join "`n"
 $ErrorActionPreference = $prev
 Assert-That ($scOut -match 'FAILED: stub failure for the shortcut test') "a failing script's error is shown in the shortcut window before it waits ($(($scOut -split "`n" | Select-Object -First 2) -join ' | '))"
+# The window's text is lost when it closes: the run is kept in Logs\shortcut-<script>.log (Logs is
+# created by the installer; created here as it would be).
+New-Item -ItemType Directory -Force -Path (Join-Path $scRoot 'Logs') | Out-Null
+$prev = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
+$null = & $childExe -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command $payload 2>&1
+$ErrorActionPreference = $prev
+$scLog = Join-Path (Join-Path $scRoot 'Logs') 'shortcut-Start-LocalAI.log'
+Assert-That ((Test-Path -LiteralPath $scLog) -and ((Get-Content -Raw -LiteralPath $scLog) -match 'FAILED: stub failure')) 'the shortcut run, failure included, is kept in Logs\shortcut-Start-LocalAI.log'
+$updPayload = ($specs | Where-Object { $_.Name -like '*Update toolkit*' }).Arguments
+Assert-That ($updPayload -notmatch 'Start-Transcript') 'Update toolkit is not logged (an installer in that window prints the admin password)'
+$longSpecs = @(Get-LaiShortcutSpecs -AIRoot ('D:\' + ('x' * 120) + '\AI'))
+$maxLen = ($longSpecs | Where-Object { $_.Kind -eq 'lnk' } | ForEach-Object { $_.Arguments.Length } | Measure-Object -Maximum).Maximum
+Assert-That ($maxLen -lt 1024) "every shortcut's arguments fit the 1024-char .lnk limit with a 125-char AI root ($maxLen)"
 if ($onWindows) {
     $shell = New-Object -ComObject WScript.Shell
     $lnkPath = Join-Path $Work 'test.lnk'
@@ -462,6 +475,7 @@ $key = ([guid]::NewGuid().ToString('N') + [guid]::NewGuid().ToString('N'))
 ConvertTo-Json @{ email = 'someone@example.org'; password = $pw } | Set-Content -LiteralPath (Join-Path (Join-Path $dRoot 'Secrets') 'openwebui-admin.json')
 Set-Content -LiteralPath (Join-Path (Join-Path $dRoot 'Stack') '.env') -Value @("WEBUI_SECRET_KEY=$key", 'OPEN_WEBUI_VERSION=v0.11.4')
 Set-Content -LiteralPath (Join-Path (Join-Path $dRoot 'Logs') 'install-20990101-000000.log') -Value @("Admin password: $pw", "secret $key", 'login someone@example.org', 'shared by other.person@family.example', "Machine: $env:COMPUTERNAME-TESTHOST", 'Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.abcdefghijklmnop')
+Set-Content -LiteralPath (Join-Path (Join-Path $dRoot 'Logs') 'shortcut-Start-LocalAI.log') -Value @('FAILED: shortcut marker 7731', "signed in as someone@example.org with $pw")
 ConvertTo-Json @{ WebUIPort = 39999; OllamaUrl = 'http://127.0.0.1:39997' } | Set-Content -LiteralPath (Join-Path $dRoot 'localai-config.json')
 $outDir = Join-Path $Work 'diagout'
 $r = Invoke-Child 'Get-LocalAIDiagnostics.ps1' @('-AIRoot', $dRoot, '-OutDir', $outDir)
@@ -478,6 +492,7 @@ if ($zipFile) {
     Assert-That ($all -notmatch 'other\.person@family') 'any other e-mail address redacted'
     if ($env:COMPUTERNAME) { Assert-That ($all -notmatch [regex]::Escape($env:COMPUTERNAME)) 'computer name redacted' }
     Assert-That ($all -match '\[REDACTED\]') 'redaction markers present'
+    Assert-That ((Test-Path -LiteralPath (Join-Path $x 'shortcut-Start-LocalAI.log')) -and ($all -match 'shortcut marker 7731')) 'the last Start-menu shortcut run is in the bundle (redacted with the rest)'
 }
 
 Write-Host "`n=== diagnostics redaction: Turkish culture, a 2-letter name, a non-ASCII profile folder ===" -ForegroundColor Cyan
@@ -600,6 +615,59 @@ Assert-That ((& $runSetup $old)['Reused']) 'a result from before candidates were
 & $mod { function script:Invoke-LaiApi { param($Method, $Uri, $Body, $Token, $TimeoutSec) $null = $Method, $Uri, $Body, $Token, $TimeoutSec; [pscustomobject]@{ filenames = @('', $null) } } }
 Assert-That ((Test-LaiWebUIWebSearch -Token 't').Status -eq 'no-results') 'an empty web-search result is no-results, not ok'
 Import-Module (Join-Path (Join-Path $src 'lib') 'LocalAI.psm1') -Force
+
+Write-Host "`n=== Open WebUI setup: settings are read back; optional steps only warn ===" -ForegroundColor Cyan
+$cmp = @(Compare-LaiConfig -Expected @{ A = $true; N = 2000; S = 'searxng'; web = @{ U = 'http://x/?q=<query>'; C = 5 } } `
+    -Actual ([pscustomobject]@{ A = $true; N = [long]2000; S = 'searxng'; web = [pscustomobject]@{ U = 'http://x/?q=<query>'; C = 5 } }))
+Assert-That ($cmp.Count -eq 0) "identical settings compare equal across JSON types (bool, Int64, nested) ($($cmp -join '; '))"
+$cmp = @(Compare-LaiConfig -Expected @{ A = $false; N = 2000; web = @{ C = 5; Z = 1 } } -Actual ([pscustomobject]@{ A = $true; web = [pscustomobject]@{ C = $null } }))
+Assert-That (($cmp -join '|') -eq 'A: wanted False, got True|N: not returned|web.C: wanted 5, got nothing|web.Z: not returned') "differences are listed by key, nested ones as web.KEY ($($cmp -join '|'))"
+$savedCulture = [System.Threading.Thread]::CurrentThread.CurrentCulture
+try {
+    [System.Threading.Thread]::CurrentThread.CurrentCulture = [Globalization.CultureInfo]::GetCultureInfo('de-DE')
+    $cmp = @(Compare-LaiConfig -Expected @{ R = 0.5 } -Actual ([pscustomobject]@{ R = [double]0.5 }))
+} finally { [System.Threading.Thread]::CurrentThread.CurrentCulture = $savedCulture }
+Assert-That ($cmp.Count -eq 0) 'a decimal compares equal under a comma-decimal culture'
+$mod = Get-Module LocalAI
+& $mod {
+    $script:FakeAdmin = @{ ENABLE_SIGNUP = $true; ENABLE_MEMORIES = $false; ENABLE_MEMORY_SYSTEM_CONTEXT = $false; ENABLE_COMMUNITY_SHARING = $true; OTHER = 'kept' }
+    $script:DropSignup = $false; $script:OldTopK = $null; $script:RagThrows = $false; $script:Rag = @{}; $script:Kbs = @()
+    function script:Invoke-LaiApi { param($Method, $Uri, $Body, $Token, $TimeoutSec) $null = $Token, $TimeoutSec
+        if ($Uri -notlike '*/api/v1/auths/admin/config') { throw "unexpected call $Uri" }
+        if ($Method -eq 'POST') { foreach ($k in @($Body.Keys)) { if (-not ($script:DropSignup -and $k -eq 'ENABLE_SIGNUP')) { $script:FakeAdmin[$k] = $Body[$k] } } }
+        return [pscustomobject]$script:FakeAdmin }
+    function script:Get-LaiWebUIModelIds { param($BaseUrl, $Token) $null = $BaseUrl, $Token; @('localai-main:latest', 'qwen3:1.7b') }
+    function script:Get-LaiWebUIModel { param($BaseUrl, $Token, $Id) $null = $BaseUrl, $Token, $Id; $null }
+    function script:Set-LaiWebUIModel { param($BaseUrl, $Token, $Model) $null = $BaseUrl, $Token, $Model; 'created' }
+    function script:Hide-LaiWebUIModel { param($BaseUrl, $Token, $Id) $null = $BaseUrl, $Token, $Id }
+    function script:Set-LaiWebUIModelsConfig { param($BaseUrl, $Token, $DefaultModel, $Order) $null = $BaseUrl, $Token, $DefaultModel, $Order }
+    function script:Set-LaiWebUIRetrievalConfig { param($BaseUrl, $Token, $Settings) $null = $BaseUrl, $Token
+        if ($script:RagThrows) { throw 'HTTP 500 Internal Server Error' }
+        $script:Rag = ConvertTo-LaiHashtable $Settings
+        if ($null -ne $script:OldTopK) { $script:Rag['TOP_K'] = $script:OldTopK } }
+    function script:Get-LaiWebUIRetrievalConfig { param($BaseUrl, $Token) $null = $BaseUrl, $Token; [pscustomobject]$script:Rag }
+    function script:Add-LaiWebUIKnowledge { param($BaseUrl, $Token, $Name, $Description) $null = $BaseUrl, $Token, $Description
+        if ($Name -eq 'Rejected') { throw 'HTTP 400 Bad Request' }
+        $script:Kbs += $Name; [pscustomobject]@{ Action = 'created' } }
+}
+$setupArgs = @{ Token = 't'; SystemPrompt = 'sys'; DefaultPreset = 'local-main'; ModelResults = @{ main = @{ Tools = $true } }; Collections = @('Rejected', 'Notes')
+    Models = @(@{ Key = 'main'; Preset = 'local-main'; Alias = 'localai-main'; Source = 'qwen3:1.7b'; Display = 'Local Main'; Description = 'd'; Order = 1; Vision = $false; Think = $null; Trial = $false }) }
+$w = @(Invoke-LaiWebUISetup @setupArgs)
+Assert-That ((& $mod { $script:FakeAdmin['ENABLE_SIGNUP'] }) -eq $false -and (& $mod { $script:FakeAdmin['OTHER'] }) -eq 'kept') 'sign-up is turned off and unmanaged admin settings are kept'
+Assert-That ($w.Count -eq 1 -and $w[0] -like "Knowledge collection 'Rejected'*") "a rejected knowledge collection is one warning, not a failed install ($($w -join ' | '))"
+Assert-That ((@(& $mod { $script:Kbs }) -join ',') -eq 'Notes') 'the collections after a rejected one are still created'
+& $mod { $script:OldTopK = 3; $script:Kbs = @() }
+$w = @(Invoke-LaiWebUISetup @setupArgs)
+Assert-That (@($w | Where-Object { $_ -like '*TOP_K: wanted 5, got 3*' }).Count -eq 1) "a RAG setting the server did not keep is reported by name ($($w -join ' | '))"
+& $mod { $script:OldTopK = $null; $script:RagThrows = $true }
+$w = @(Invoke-LaiWebUISetup @setupArgs)
+Assert-That (@($w | Where-Object { $_ -like 'Documents/web search settings failed (HTTP 500*' }).Count -eq 1) 'a failing RAG update is a warning, and the setup carries on'
+& $mod { $script:RagThrows = $false; $script:DropSignup = $true; $script:FakeAdmin['ENABLE_SIGNUP'] = $true }
+$threw = $null
+try { Invoke-LaiWebUISetup @setupArgs | Out-Null } catch { $threw = $_.Exception.Message }
+Assert-That ($threw -like "*did not keep 'sign-up off'*ENABLE_SIGNUP: wanted False, got True*") "sign-up left on stops the install, it is never just a warning ($threw)"
+Import-Module (Join-Path (Join-Path $src 'lib') 'LocalAI.psm1') -Force
+$mod = Get-Module LocalAI
 
 Write-Host "`n=== Open WebUI: user settings survive re-runs; a newer Open WebUI is handled safely ===" -ForegroundColor Cyan
 # A preset the user changed: a tool category the installer does not manage turned off, an extra

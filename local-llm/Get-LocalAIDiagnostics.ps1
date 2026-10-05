@@ -186,6 +186,8 @@ Save-Part 'watch.log' (Get-Tail (Join-Path $logs 'watch.log') 150)
 Save-Part 'backup.log' (Get-Tail (Join-Path $logs 'backup.log') 150)
 $inst = Get-ChildItem -LiteralPath $logs -Filter 'install-*.log' -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 1  # lai-ok: objects
 if ($inst) { Save-Part 'install-latest.log' (Get-Tail $inst.FullName 500) }
+# The last run of each Start-menu shortcut (its window's text is gone once closed).
+foreach ($sl in @(Get-ChildItem -LiteralPath $logs -Filter 'shortcut-*.log' -ErrorAction SilentlyContinue)) { Save-Part $sl.Name (Get-Tail $sl.FullName 200) }
 $lastWatch = (Get-Tail (Join-Path $logs 'watch.log') 1)
 Add-Summary "Health watch, last line: $lastWatch"
 $backups = @(Get-ChildItem -LiteralPath (Join-Path $AIRoot 'Backups') -Filter 'open-webui-*.tar.gz' -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending)  # lai-ok: objects

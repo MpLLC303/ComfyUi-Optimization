@@ -195,6 +195,8 @@ $envFile = Get-Content -Encoding UTF8 (Join-Path $aiRoot 'Stack/.env')
 Assert-That ($code2 -eq 0) "phase 2 completes (exit $code2)"
 foreach ($s in 'Preflight', 'Ollama', 'Models', 'Tuning', 'WSL', 'Docker', 'Stack', 'Configure', 'Backup') { Assert-That ($null -ne $state.stages.$s) "stage $s recorded" }
 Assert-That (-not $global:Tasks.ContainsKey('LocalAI-Install-Resume')) 'resume task removed at the end'
+Assert-That ($state.flags.PSObject.Properties['configureWarnings'] -and @($state.flags.configureWarnings).Count -eq 0) "Configure read every setting back from the real Open WebUI: no warnings ($(@($state.flags.configureWarnings) -join ' | '))"
+Assert-That (-not (Select-String -LiteralPath (Join-Path $aiRoot 'install-report.md') -Pattern 'need attention' -Quiet)) 'a clean install report has no attention section'
 $sel = @($state.flags.selectedModels)
 Assert-That ($sel -contains 'trial-ok') 'trial model that works was added (passed through the reboot/resume)'
 Assert-That ($sel -notcontains 'trial-missing') 'trial model with a missing tag was skipped, not fatal'
@@ -379,6 +381,11 @@ New-Item -ItemType Directory -Force -Path $elsewhere | Out-Null
 $c6a = $LASTEXITCODE
 Assert-That ($c6a -ne 0 -and @(Get-ChildItem -LiteralPath $elsewhere).Count -eq 0) "refuses before writing anything through it (exit $c6a)"
 Remove-Item -LiteralPath $logsDir -Force; Rename-Item -LiteralPath (Join-Path $aiRoot 'Logs-real') -NewName 'Logs'
+# A folder path too long for the shortcuts (1024-character arguments) is refused before anything is made.
+$longRoot = Join-Path $Work ('deep-' + ('x' * 100))
+$longOut = (& (Join-Path $aiRoot 'Scripts/Install-LocalAI.ps1') -AIRoot $longRoot -SkipTests 6>&1 | ForEach-Object { "$_" }) -join ' '
+$c6l = $LASTEXITCODE
+Assert-That ($c6l -eq 1 -and -not (Test-Path -LiteralPath $longRoot) -and $longOut -match 'at most 100') "a $($longRoot.Length)-character install folder is refused with a clear message, nothing created (exit $c6l)"
 
 Write-Host "`n=== PHASE 6b: an old 'Update toolkit' shortcut pointing at the wrong folder ===" -ForegroundColor Cyan
 # Older shortcuts ignored -AIRoot and ran against C:\AI. With an install running elsewhere, a fresh

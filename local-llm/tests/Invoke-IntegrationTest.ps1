@@ -65,8 +65,11 @@ $token = Connect-LaiWebUI -BaseUrl $WebUIUrl -Email $Email -Password $Password
 $oc = ConvertTo-LaiHashtable (Invoke-LaiApi -Uri "$WebUIUrl/ollama/config" -Token $token)
 $ocCfgs = @{}; if ($oc.ContainsKey('OLLAMA_API_CONFIGS') -and $oc['OLLAMA_API_CONFIGS']) { $ocCfgs = $oc['OLLAMA_API_CONFIGS'] }
 Invoke-LaiApi -Method POST -Uri "$WebUIUrl/ollama/config/update" -Token $token -Body @{ ENABLE_OLLAMA_API = $true; OLLAMA_BASE_URLS = [object[]]@($OllamaUrl); OLLAMA_API_CONFIGS = $ocCfgs } | Out-Null
-Invoke-LaiWebUISetup -BaseUrl $WebUIUrl -Token $token -Models $catalog.Models -ModelResults $results -SystemPrompt $system `
-    -DefaultPreset $catalog.DefaultPreset -Collections @('PC & Electronics', 'General References') -SearxngQueryUrl $SearxngQueryUrl
+$setupWarn = @(Invoke-LaiWebUISetup -BaseUrl $WebUIUrl -Token $token -Models $catalog.Models -ModelResults $results -SystemPrompt $system `
+    -DefaultPreset $catalog.DefaultPreset -Collections @('PC & Electronics', 'General References') -SearxngQueryUrl $SearxngQueryUrl)
+# Every setting written must read back from the real server (a mismatch here means the comparison
+# or a payload is wrong, and real installs would print false 'needs attention' lines).
+if ($setupWarn.Count -ne 0) { Write-LaiLog FAIL "the first configuration pass reported settings that did not take: $($setupWarn -join ' | ')"; $failures++ } else { Write-LaiLog OK 'every admin, documents and web search setting read back as written' }
 # A user edit to a preset (attached knowledge, an extra parameter) must survive a re-run.
 $p0 = ConvertTo-LaiHashtable (Get-LaiWebUIModel -BaseUrl $WebUIUrl -Token $token -Id $catalog.DefaultPreset)
 $p0['meta']['knowledge'] = @(@{ id = 'user-kb'; name = 'User collection'; type = 'collection' })
@@ -75,8 +78,9 @@ Invoke-LaiApi -Method POST -Uri "$WebUIUrl/api/v1/models/model/update" -Token $t
     id = $p0['id']; name = $p0['name']; base_model_id = $p0['base_model_id']; meta = $p0['meta']; params = $p0['params']; is_active = $true
 } | Out-Null
 # Idempotency: the whole configuration pass must succeed a second time unchanged.
-Invoke-LaiWebUISetup -BaseUrl $WebUIUrl -Token $token -Models $catalog.Models -ModelResults $results -SystemPrompt $system `
-    -DefaultPreset $catalog.DefaultPreset -Collections @('PC & Electronics', 'General References') -SearxngQueryUrl $SearxngQueryUrl
+$setupWarn = @(Invoke-LaiWebUISetup -BaseUrl $WebUIUrl -Token $token -Models $catalog.Models -ModelResults $results -SystemPrompt $system `
+    -DefaultPreset $catalog.DefaultPreset -Collections @('PC & Electronics', 'General References') -SearxngQueryUrl $SearxngQueryUrl)
+if ($setupWarn.Count -ne 0) { Write-LaiLog FAIL "the second configuration pass reported warnings: $($setupWarn -join ' | ')"; $failures++ }
 
 $p1 = Get-LaiWebUIModel -BaseUrl $WebUIUrl -Token $token -Id $catalog.DefaultPreset
 if (@($p1.meta.knowledge).Count -ne 1 -or $p1.meta.knowledge[0].id -ne 'user-kb' -or [double]$p1.params.temperature -ne 0.33) {
