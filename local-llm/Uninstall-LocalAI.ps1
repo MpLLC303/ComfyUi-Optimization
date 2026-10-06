@@ -144,7 +144,7 @@ if ($dockerUp) {
         # Also catch containers whose compose file is gone or that were renamed by hand.
         foreach ($c in @('open-webui', 'searxng', 'render-guard', 'deep-research')) {
             if ((Invoke-Docker @('container', 'inspect', $c)).ExitCode -eq 0) {
-                $r = Invoke-Docker @('rm', '-f', $c)
+                $r = Invoke-Docker @('rm', '-f', '-v', $c)   # -v: anonymous volumes only; named data volumes stay
                 if ($r.ExitCode -ne 0) { throw "docker rm $c failed: $($r.Text)" }
             }
         }

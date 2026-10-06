@@ -217,15 +217,17 @@ if ($haveLdr) {
         $ldrPw = New-LaiPassword
         Register-LaiResearchUser -BaseUrl $ldrUrl -Account 'localai' -Password $ldrPw
         $dup = ''; try { Register-LaiResearchUser -BaseUrl $ldrUrl -Account 'localai' -Password $ldrPw } catch { $dup = $_.Exception.Message }
-        $bad = ''; try { Connect-LaiResearch -BaseUrl $ldrUrl -Account 'localai' -Password 'Not-The-Password-1' | Out-Null } catch { $bad = $_.Exception.Message }
+        $bad = ''; $badKind = ''
+        try { Connect-LaiResearch -BaseUrl $ldrUrl -Account 'localai' -Password 'Not-The-Password-1' | Out-Null } catch { $bad = $_.Exception.Message; $badKind = [string]$_.Exception.Data['LaiKind'] }
         $rs = Connect-LaiResearch -BaseUrl $ldrUrl -Account 'localai' -Password $ldrPw
-        $mOk = Test-LaiResearchModel -Session $rs -Model (@($catalog.Models)[0].Alias)
-        $mNo = Test-LaiResearchModel -Session $rs -Model 'no-such-model:1b'
         $rs.Client.Dispose()
+        # From inside the container (where the configured address means something): the real Ollama, then nothing.
+        $reachOk = Test-LaiResearchOllama -OllamaUrl $OllamaUrl -Container 'lai-ldr-integration'
+        $reachNo = Test-LaiResearchOllama -OllamaUrl 'http://127.0.0.1:9' -Container 'lai-ldr-integration'
         if ($dup -notmatch "did not create the account 'localai'") { Write-LaiLog FAIL "a second sign-up with the same name was not reported as refused ($dup)"; $failures++ }
-        elseif ($bad -notmatch 'refused the sign-in') { Write-LaiLog FAIL "a wrong password was not reported as a refused sign-in ($bad)"; $failures++ }
-        elseif (-not $mOk.Available -or $mNo.Available) { Write-LaiLog FAIL "model check: alias available=$($mOk.Available) ($($mOk.Message)), bogus available=$($mNo.Available)"; $failures++ }
-        else { Write-LaiLog OK 'deep research: account made, duplicate and wrong password refused with reasons, signed in, sees the tuned alias (and not a missing model)' }
+        elseif ($bad -notmatch 'refused the sign-in' -or $badKind -ne 'bad-password') { Write-LaiLog FAIL "a wrong password was not reported as a refused sign-in of kind bad-password (${badKind}: $bad)"; $failures++ }
+        elseif (-not $reachOk.Ok -or $reachNo.Ok -or $reachNo.Message -notmatch '127\.0\.0\.1:9 not reachable from the lai-ldr-integration container') { Write-LaiLog FAIL "reach check: Ollama ok=$($reachOk.Ok) ($($reachOk.Message)); closed port ok=$($reachNo.Ok) ($($reachNo.Message))"; $failures++ }
+        else { Write-LaiLog OK 'deep research: account made, duplicate and wrong password refused (kind bad-password), signed in, the container reaches Ollama and reports an address it cannot reach' }
     } catch {
         Write-LaiLog FAIL "deep research against the real Local Deep Research: $($_.Exception.Message)"; $failures++
     } finally {

@@ -558,7 +558,7 @@ Assert-That ($c7e -ne 0 -and $log7e -match 'A container named searxng from anoth
 Assert-That ($ow7e -eq 'running|always' -and @(& /usr/bin/docker ps -a --filter 'name=^/open-webui-legacy-' --format '{{.Names}}').Count -eq $legacy7e) "the existing Open WebUI keeps running under its name, restart=always ($ow7e)"
 & /usr/bin/docker rm -f searxng open-webui 2>$null | Out-Null
 
-Write-Host "`n=== PHASE 8: -DeepResearch (Local Deep Research), then -DeepResearch:`$false ===" -ForegroundColor Cyan
+Write-Host "`n=== PHASE 8: -DeepResearch (Local Deep Research), then -NoDeepResearch ===" -ForegroundColor Cyan
 # compose is mocked: a real Local Deep Research container stands in for the one compose would start
 # (same image, the installer's port), on the host network so it reaches the sandbox's real Ollama.
 $ldrImage = 'localdeepresearch/local-deep-research:1.10.7'
@@ -579,6 +579,8 @@ if ((& /usr/bin/docker image inspect $ldrImage 2>$null) -and $LASTEXITCODE -eq 0
     $cfg8 = Read-LaiState -Path (Join-Path $aiRoot 'localai-config.json')
     $mainCtx = [int]$st8['tuning']['main']['Context']
     Assert-That ($c8 -eq 0 -and @($st8['flags']['configureWarnings']).Count -eq 0) "the install with -DeepResearch completes without warnings (exit $c8; $(@($st8['flags']['configureWarnings']) -join ' | '))"
+    $thinks8 = @((Get-LaiOllamaModelInfo -BaseUrl 'http://127.0.0.1:11434' -Name 'localai-main').Capabilities) -contains 'thinking'
+    Assert-That ($env8 -contains ('DEEP_RESEARCH_THINKING=' + ([string]$thinks8).ToLowerInvariant()) -and $env8 -contains ('DEEP_RESEARCH_OLLAMA_URL=' + [string]$cfg8['WebUIOllamaUrl'])) "thinking follows the model's Ollama capabilities ($thinks8) and the Ollama address is Open WebUI's ($($cfg8['WebUIOllamaUrl']))"
     Assert-That ($env8 -contains 'COMPOSE_PROFILES=research' -and $env8 -contains 'DEEP_RESEARCH_MODEL=localai-main:latest' -and $env8 -contains "DEEP_RESEARCH_CONTEXT=$mainCtx" -and $env8 -contains 'DEEP_RESEARCH_PORT=5055') "Stack\.env turns the service on with Local Main at its tuned context ($mainCtx), port 5055"
     Assert-That ($env8 -contains 'DEEP_RESEARCH_ALLOW_REGISTRATIONS=false' -and @($global:Calls[$before8..($global:Calls.Count - 1)] | Where-Object { $_ -like 'docker compose*up -d deep-research*' }).Count -ge 1) 'after the account is made, sign-up is turned off and the service recreated with that'
     $rcFile = Join-Path $aiRoot 'Secrets/deep-research.json'
@@ -593,12 +595,13 @@ if ((& /usr/bin/docker image inspect $ldrImage 2>$null) -and $LASTEXITCODE -eq 0
     $rc8b = Get-Content -Raw -Encoding UTF8 -LiteralPath $rcFile | ConvertFrom-Json
     Assert-That ($LASTEXITCODE -eq 0 -and $rc8b.password -eq $rc8.password -and @((Read-LaiState -Path (Join-Path $aiRoot 'install-state.json'))['flags']['configureWarnings']).Count -eq 0) 're-run without the switch keeps deep research on and reuses the account'
     & /usr/bin/docker volume create localai-deep-research 2>$null | Out-Null
-    & (Join-Path $aiRoot 'Scripts/Install-LocalAI.ps1') -AIRoot $aiRoot -SkipTests -DeepResearch:$false
+    & (Join-Path $aiRoot 'Scripts/Install-LocalAI.ps1') -AIRoot $aiRoot -SkipTests -NoDeepResearch
     $env8c = @(Get-Content -Encoding UTF8 (Join-Path $aiRoot 'Stack/.env'))
     $gone = -not ((& /usr/bin/docker container inspect deep-research 2>$null) -and $LASTEXITCODE -eq 0)
     $volKept = [bool](& /usr/bin/docker volume inspect localai-deep-research 2>$null) -and $LASTEXITCODE -eq 0
-    Assert-That ($env8c -contains 'COMPOSE_PROFILES=' -and $gone -and $volKept -and [int](Read-LaiState -Path (Join-Path $aiRoot 'localai-config.json'))['DeepResearchPort'] -eq 0) '-DeepResearch:$false turns the profile off and removes the container, the data volume stays'
+    Assert-That ($env8c -contains 'COMPOSE_PROFILES=' -and $gone -and $volKept -and [int](Read-LaiState -Path (Join-Path $aiRoot 'localai-config.json'))['DeepResearchPort'] -eq 0) '-NoDeepResearch turns the profile off and removes the container, the data volume stays'
     Assert-That (@(Get-ChildItem -Path (Join-Path $Work 'ProgramData') -Recurse -Filter 'Local AI - Deep Research.url' -ErrorAction SilentlyContinue).Count -eq 0) 'and its Start-menu shortcut is removed'
+    Assert-That ((Read-LaiState -Path (Join-Path $aiRoot 'install-state.json'))['flags']['params']['DeepResearch'] -eq $false) 'the off switch is remembered (a later plain re-run does not bring it back)'
     & /usr/bin/docker rm -f deep-research 2>$null | Out-Null
     & /usr/bin/docker volume rm localai-deep-research 2>$null | Out-Null
 } else { Write-Host "  SKIP        $ldrImage is not on this machine (docker pull it to run this phase)" -ForegroundColor DarkGray }

@@ -1753,17 +1753,24 @@ function Get-LaiDeepResearchEnv {
         so docker compose never starts it. On: it uses the preset's tuned context, because a num_ctx
         that differs from the alias makes Ollama reload the model (and fit it differently) on every call.
     #>
-    param([bool]$Enabled, [string]$Model = 'localai-main:latest', [int]$Context = 32768, [int]$Port = 5055, [bool]$AllowRegistrations = $true)
-    # With its tag: its model list and checks compare names exactly with Ollama's ('x:latest').
+    # -Thinking: only for a model whose Ollama capabilities include 'thinking'. Local Deep Research
+    # asks for thinking by default, and Ollama answers any other model with 400 'does not support
+    # thinking', so every research run with an Instruct model would fail.
+    param([bool]$Enabled, [string]$Model = 'localai-main:latest', [int]$Context = 32768, [int]$Port = 5055, [bool]$AllowRegistrations = $true,
+        [bool]$Thinking = $false, [string]$OllamaUrl = 'http://render-guard:11434')
+    # With its tag: its model list compares names exactly with Ollama's ('x:latest').
     if ($Model -notmatch ':[^/]+$') { $Model += ':latest' }
     $profiles = ''; if ($Enabled) { $profiles = 'research' }
     $allow = 'false'; if ($AllowRegistrations) { $allow = 'true' }
+    $think = 'false'; if ($Thinking) { $think = 'true' }
     return @{
         COMPOSE_PROFILES                  = $profiles
         DEEP_RESEARCH_PORT                = [string]$Port
         DEEP_RESEARCH_MODEL               = $Model
         DEEP_RESEARCH_CONTEXT             = [string]$Context
         DEEP_RESEARCH_ALLOW_REGISTRATIONS = $allow
+        DEEP_RESEARCH_THINKING            = $think
+        DEEP_RESEARCH_OLLAMA_URL          = $OllamaUrl
     }
 }
 
@@ -1853,34 +1860,67 @@ function Connect-LaiResearch {
     param([Parameter(Mandatory)][string]$BaseUrl, [Parameter(Mandatory)][string]$Account, [Parameter(Mandatory)][string]$Password, [int]$TimeoutSec = 30)
     $s = New-LaiResearchSession -BaseUrl $BaseUrl -TimeoutSec $TimeoutSec
     $t = Get-LaiResearchCsrf $s
-    $r = Invoke-LaiResearchRequest -Session $s -Method POST -Path '/auth/login' -Form @{ username = $Account; password = $Password; csrf_token = $t }
-    if ($r.Status -eq 429) {
+    # The reason travels in Exception.Data['LaiKind'] (bad-password, locked, refused), so a caller
+    # never mistakes a lock-out or an outage for a wrong password (and, say, makes a new account).
+    $fail = {
+        param($Kind, $Message)
         $s.Client.Dispose()
-        # 5 sign-ins per 15 minutes: say so, a 'wrong password' guess would send the user the wrong way.
-        throw 'Local Deep Research refused the sign-in: too many sign-ins in the last 15 minutes. Wait 15 minutes and try again.'
+        $ex = New-Object System.Exception($Message)
+        $ex.Data['LaiKind'] = $Kind
+        throw $ex
     }
+    $r = Invoke-LaiResearchRequest -Session $s -Method POST -Path '/auth/login' -Form @{ username = $Account; password = $Password; csrf_token = $t }
+    if ($r.Status -eq 429) { & $fail 'locked' 'Local Deep Research refused the sign-in: too many sign-in attempts. Wait 15 minutes and try again.' }
     $chk = Invoke-LaiResearchRequest -Session $s -Path '/auth/check'
     if ($chk.Status -ne 200) {
         $why = Get-LaiResearchFormError $r.Body
-        $s.Client.Dispose()
-        if ($why) { throw "Local Deep Research refused the sign-in for '$Account' ($why)." }
-        throw "Local Deep Research refused the sign-in for '$Account' (HTTP $($r.Status))."
+        if ($why -match '(?i)locked|too many') { & $fail 'locked' "Local Deep Research refused the sign-in for '$Account' ($why). Wait 15 minutes and try again." }
+        if ($why -match '(?i)invalid username or password') { & $fail 'bad-password' "Local Deep Research refused the sign-in for '$Account' ($why)." }
+        if (-not $why) { $why = "HTTP $($r.Status)" }
+        & $fail 'refused' "Local Deep Research refused the sign-in for '$Account' ($why)."
     }
     return $s
 }
 
-function Test-LaiResearchModel {
-    # Whether Local Deep Research reaches Ollama and finds its model: Available plus its message.
-    # The model is passed: this endpoint does not fall back to LDR_LLM_MODEL (only research runs do).
-    # Its check compares the name exactly with Ollama's list, which always has the tag ('x:latest').
-    param([Parameter(Mandatory)]$Session, [Parameter(Mandatory)][string]$Model)
-    if ($Model -notmatch ':[^/]+$') { $Model += ':latest' }
-    $path = '/research/api/check/ollama_model?model=' + [uri]::EscapeDataString($Model)
-    $r = Invoke-LaiResearchRequest -Session $Session -Path $path
-    $o = $null; try { $o = ConvertFrom-Json -InputObject $r.Body } catch { $o = $null }
-    if ($r.Status -ne 200 -or -not $o) { return [pscustomobject]@{ Available = $false; Message = "HTTP $($r.Status)" } }
-    $msg = ''; if ($o.PSObject.Properties['message']) { $msg = [string]$o.message }
-    return [pscustomobject]@{ Available = [bool]$o.available; Message = $msg }
+function Test-LaiResearchOllama {
+    # Whether the research container reaches Ollama at the URL it is configured with (from inside
+    # the container, the only place that address means anything). Local Deep Research's own model
+    # check cannot tell: it ignores the configured URL and always asks localhost:11434.
+    param([Parameter(Mandatory)][string]$OllamaUrl, [string]$Container = 'deep-research', [int]$TimeoutSec = 30)
+    $py = "import sys,urllib.request as u;u.urlopen(sys.argv[1].rstrip('/')+'/api/tags',timeout=10).read();print('OK')"
+    $r = Invoke-LaiTimedNative -File 'docker' -Arguments @('exec', $Container, 'python3', '-c', $py, $OllamaUrl) -TimeoutSec $TimeoutSec
+    if ($r.ExitCode -eq 0 -and [string]$r.Out -match 'OK') { return [pscustomobject]@{ Ok = $true; Message = $OllamaUrl } }
+    $why = ([string]$r.Text -split "`n" | Where-Object { $_ -match '\S' } | Select-Object -Last 1)
+    if ($r.TimedOut) { $why = "no answer within $TimeoutSec s" }
+    return [pscustomobject]@{ Ok = $false; Message = "$OllamaUrl not reachable from the $Container container ($([string]$why).Trim())" }
+}
+
+function Update-LaiDeepResearchContext {
+    <#
+    .SYNOPSIS
+        After a re-tune (Update-Models.ps1): the research agent must ask for the alias's new context,
+        or Ollama reloads the model every time research and chats take turns (and a context larger
+        than the new one may no longer fit on the GPU). Rewrites DEEP_RESEARCH_CONTEXT in Stack\.env
+        and recreates the container. Returns a line for the log, or '' when nothing changed.
+    #>
+    param([Parameter(Mandatory)][string]$AIRoot, [Parameter(Mandatory)][hashtable]$Tuning, [Parameter(Mandatory)][object[]]$Models)
+    $stack = Join-Path $AIRoot 'Stack'
+    $envPath = Join-Path $stack '.env'
+    if (-not (Test-Path -LiteralPath $envPath)) { return '' }
+    $lines = @(Get-Content -Encoding UTF8 -LiteralPath $envPath)
+    $get = { param($n) $v = ''; foreach ($l in $lines) { if ($l -like "$n=*") { $v = $l.Substring($n.Length + 1) } }; $v }
+    if ((& $get 'COMPOSE_PROFILES') -notmatch '(^|,)research(,|$)') { return '' }
+    $alias = (& $get 'DEEP_RESEARCH_MODEL') -replace ':latest$', ''
+    $m = @($Models | Where-Object { $_.Alias -eq $alias }) | Select-Object -First 1
+    if (-not $m -or -not $Tuning.ContainsKey($m.Key) -or -not $Tuning[$m.Key]['Context']) { return '' }
+    $want = [int]$Tuning[$m.Key]['Context']
+    $have = 0; [void][int]::TryParse((& $get 'DEEP_RESEARCH_CONTEXT'), [ref]$have)
+    if ($want -eq $have) { return '' }
+    $out = foreach ($l in $lines) { if ($l -like 'DEEP_RESEARCH_CONTEXT=*') { "DEEP_RESEARCH_CONTEXT=$want" } else { $l } }
+    [System.IO.File]::WriteAllLines($envPath, [string[]]$out, (New-Object System.Text.UTF8Encoding($false)))
+    $r = Invoke-LaiTimedNative -File 'docker' -Arguments @('compose', '--project-directory', $stack, '-f', (Join-Path $stack 'docker-compose.yml'), 'up', '-d', 'deep-research') -TimeoutSec 300
+    if ($r.ExitCode -ne 0) { return "Deep research context set to $want tokens in Stack\.env (was $have), but restarting it failed: $(([string]$r.Text).Trim()). Run Start menu > Local AI > Start again." }
+    return "Deep research now uses $want tokens of context (was $have), the same as $alias"
 }
 
 function Invoke-LaiResearchQuick {
@@ -1896,7 +1936,7 @@ function Invoke-LaiResearchQuick {
         $err = ''; if ($o -and $o.PSObject.Properties['error']) { $err = [string]$o.error }
         throw "Local Deep Research research run failed (HTTP $($r.Status)$(if ($err) { ': ' + $err }))."
     }
-    return [pscustomobject]@{ Summary = [string]$o.summary; Sources = @($o.sources | Where-Object { $_ }).Count; Findings = @($o.findings).Count }
+    return [pscustomobject]@{ Summary = [string]$o.summary; Sources = @($o.sources | Where-Object { $_ }).Count; Findings = @($o.findings | Where-Object { $_ }).Count }
 }
 
 #endregion

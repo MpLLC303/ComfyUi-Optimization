@@ -225,7 +225,7 @@ Add-Check 'SearXNG search' {
 if ($researchPort -gt 0) {
     # One sign-in for both checks: Local Deep Research allows 5 per 15 minutes.
     $script:research = $null
-    Add-Check 'Deep research signs in and sees its model' {
+    Add-Check 'Deep research signs in and reaches its model' {
         if (-not $script:engineUp) { return (Skip 'Docker engine down') }
         $rUrl = "http://127.0.0.1:$researchPort"
         try { Wait-LaiHttp -Uri "$rUrl/api/v1/health" -TimeoutSec 30 | Out-Null }
@@ -233,14 +233,20 @@ if ($researchPort -gt 0) {
         $rCredFile = Join-Path (Join-Path $AIRoot 'Secrets') 'deep-research.json'
         if (-not (Test-Path -LiteralPath $rCredFile)) { return (Fail "missing $rCredFile - run the installer again (it creates the account)") }
         $rc = Get-Content -Encoding UTF8 -Raw -LiteralPath $rCredFile | ConvertFrom-Json
-        $rModel = 'localai-main'
+        $rModel = 'localai-main:latest'; $rOllama = 'http://render-guard:11434'
         $envFile = Join-Path (Join-Path $AIRoot 'Stack') '.env'
-        if (Test-Path -LiteralPath $envFile) { foreach ($l in (Get-Content -Encoding UTF8 -LiteralPath $envFile)) { if ($l -like 'DEEP_RESEARCH_MODEL=*') { $rModel = $l.Substring(20) } } }
+        if (Test-Path -LiteralPath $envFile) {
+            foreach ($l in (Get-Content -Encoding UTF8 -LiteralPath $envFile)) {
+                if ($l -like 'DEEP_RESEARCH_MODEL=*') { $rModel = $l.Substring(20) }
+                if ($l -like 'DEEP_RESEARCH_OLLAMA_URL=*') { $rOllama = $l.Substring(25) }
+            }
+        }
         try { $script:research = Connect-LaiResearch -BaseUrl $rUrl -Account $rc.username -Password $rc.password -TimeoutSec 900 }
         catch { return (Fail "$($_.Exception.Message) (account in $rCredFile)") }
-        $m = Test-LaiResearchModel -Session $script:research -Model $rModel
-        if (-not $m.Available) { return (Fail "signed in, but it cannot use $rModel ($($m.Message)) - is Ollama running?") }
-        Pass "http://localhost:$researchPort, model $rModel"
+        if (-not (Test-LaiOllamaModel -BaseUrl $ollamaUrl -Name $rModel)) { return (Fail "signed in, but its model $rModel is not in Ollama - run the installer again") }
+        $reach = Test-LaiResearchOllama -OllamaUrl $rOllama
+        if (-not $reach.Ok) { return (Fail "signed in, but $($reach.Message) - $startAgain") }
+        Pass "http://localhost:$researchPort, model $rModel via $rOllama"
     }
     if (-not $Quick) {
         Add-Check 'Deep research answers a question' {

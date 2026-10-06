@@ -73,9 +73,12 @@ param(
     # Optional research agent at http://localhost:<DeepResearchPort> (Local Deep Research, about 1 GB
     # to download): it plans searches, reads the pages through the private SearXNG and writes a
     # report with sources, using Local Main, or the Tongyi DeepResearch model when you also pass
-    # -TrialModels trial-research. Free: no search API or key. -DeepResearch:$false removes the
-    # container again (its saved research stays in the localai-deep-research volume).
+    # -TrialModels trial-research. Free: no search API or key. Remembered by later runs.
     [switch]$DeepResearch,
+    # Remove the research agent again (its saved research stays in the localai-deep-research volume).
+    # A switch of its own: -DeepResearch:$false does not get through Install-LocalAI.cmd on Windows
+    # PowerShell 5.1 (powershell -File passes '$false' as text, which a switch refuses).
+    [switch]$NoDeepResearch,
     # Its loopback port (a busy port is replaced by the next free one).
     [int]$DeepResearchPort = 5055,
     # Empty Open WebUI knowledge collections to create (existing ones are kept).
@@ -288,6 +291,7 @@ foreach ($name in $RememberedParams) {
         Write-Verbose "Using $name from the previous run"
     }
 }
+if ($NoDeepResearch) { $DeepResearch = $false; $savedParams['DeepResearch'] = $false }
 
 function Save-State { Save-LaiState -State $State -Path $P.State }
 
@@ -632,55 +636,62 @@ function Get-StackEnvValue([string]$Name) {
 
 function Invoke-DeepResearchSetup {
     # The research agent has no use without an account (one encrypted database per account, made only
-    # through its sign-up form): create it once, keep the password in Secrets, then turn sign-up off.
+    # through its sign-up form): create it once, keep the password in Secrets, and keep sign-up off.
     # Returns warnings (an optional part: it must not stop the install before the backup is scheduled).
     $url = "http://127.0.0.1:$($script:ResearchPortEffective)"
     $credFile = Join-Path $P.Secrets 'deep-research.json'
     $model = (Get-ResearchModel).Alias
+    $ollamaForIt = $script:WebUIOllamaUrl; if (-not $ollamaForIt) { $ollamaForIt = 'http://render-guard:11434' }
+    $restartIt = {
+        Invoke-ComposeUp -Arguments @('up', '-d', 'deep-research')
+        Wait-LaiHttp -Uri "$url/api/v1/health" -TimeoutSec 300 | Out-Null
+    }
     $session = $null
     try {
+        # The same Ollama address as Open WebUI (the render guard, or Ollama directly when the guard is not in the path).
+        if ((Get-StackEnvValue 'DEEP_RESEARCH_OLLAMA_URL') -ne $ollamaForIt) { Write-StackEnv -Values @{ DEEP_RESEARCH_OLLAMA_URL = $ollamaForIt }; & $restartIt }
         Wait-LaiHttp -Uri "$url/api/v1/health" -TimeoutSec 300 | Out-Null
         $cred = $null
         if (Test-Path -LiteralPath $credFile) { $cred = Get-Content -Encoding UTF8 -Raw -LiteralPath $credFile | ConvertFrom-Json }
-        $loginError = ''
+        $startOver = "To start over instead (this deletes its saved research): docker rm -f deep-research, then docker volume rm localai-deep-research, then run the installer again."
         if ($cred) {
             try { $session = Connect-LaiResearch -BaseUrl $url -Account $cred.username -Password $cred.password }
-            catch { $loginError = $_.Exception.Message }
-        }
-        if (-not $session) {
-            if ($loginError -match 'too many sign-ins') { throw $loginError }
-            # First run, or its data volume was deleted since: sign-up has to be on to make the account.
-            if ((Get-StackEnvValue 'DEEP_RESEARCH_ALLOW_REGISTRATIONS') -ne 'true') {
-                Write-StackEnv -Values @{ DEEP_RESEARCH_ALLOW_REGISTRATIONS = 'true' }
-                Invoke-ComposeUp -Arguments @('up', '-d', 'deep-research')
-                Wait-LaiHttp -Uri "$url/api/v1/health" -TimeoutSec 300 | Out-Null
+            catch {
+                # Only a refused password is about the account; a lock-out or an outage is not (and must
+                # never lead to advice that deletes the research).
+                if ($_.Exception.Data['LaiKind'] -ne 'bad-password') { throw }
+                throw "the password in $credFile is no longer accepted for '$($cred.username)'. Sign in at http://localhost:$($script:ResearchPortEffective) with the password you set. $startOver"
             }
+        } else {
+            # First run (or Secrets was replaced): sign-up has to be on to make the account.
+            if ((Get-StackEnvValue 'DEEP_RESEARCH_ALLOW_REGISTRATIONS') -ne 'true') { Write-StackEnv -Values @{ DEEP_RESEARCH_ALLOW_REGISTRATIONS = 'true' }; & $restartIt }
             $new = [pscustomobject]@{ username = 'localai'; password = (New-LaiPassword); url = "http://localhost:$($script:ResearchPortEffective)" }
             try { Register-LaiResearchUser -BaseUrl $url -Account $new.username -Password $new.password }
-            catch {
-                if ($cred) { throw "the stored password for '$($cred.username)' no longer works ($loginError), and a new account could not be made ($($_.Exception.Message)). Sign in at http://localhost:$($script:ResearchPortEffective) with the password you know, or delete its data with: docker volume rm localai-deep-research (after: docker rm -f deep-research), then run the installer again" }
-                throw
-            }
+            catch { throw "$($_.Exception.Message) An account 'localai' may already exist from an earlier install, with a password that is not in $credFile. $startOver" }
             ConvertTo-Json -InputObject $new | Set-Content -LiteralPath $credFile -Encoding UTF8
             Protect-Path -Path $credFile
             $session = Connect-LaiResearch -BaseUrl $url -Account $new.username -Password $new.password
             Write-LaiLog OK "Deep research account 'localai' created (password in $credFile)"
         }
-        $m = Test-LaiResearchModel -Session $session -Model $model
         $warn = @()
-        if (-not $m.Available) { $warn += "Deep research cannot use its model $model ($($m.Message)); check that Ollama is running, then run the installer again" }
-        if ((Get-StackEnvValue 'DEEP_RESEARCH_ALLOW_REGISTRATIONS') -ne 'false') {
-            Write-StackEnv -Values @{ DEEP_RESEARCH_ALLOW_REGISTRATIONS = 'false' }
-            Invoke-ComposeUp -Arguments @('up', '-d', 'deep-research')
-            Wait-LaiHttp -Uri "$url/api/v1/health" -TimeoutSec 300 | Out-Null
-        }
+        if (-not (Test-LaiOllamaModel -BaseUrl $OllamaUrl -Name $model)) { $warn += "Deep research's model $model is not in Ollama; run the installer again" }
+        $reach = Test-LaiResearchOllama -OllamaUrl $ollamaForIt
+        if (-not $reach.Ok) { $warn += "Deep research cannot reach Ollama: $($reach.Message); check that Ollama and the render guard are running (Start menu > Local AI > Start again)" }
+        foreach ($w in $warn) { Write-LaiLog WARN $w }
         Write-LaiLog OK "Deep research at http://localhost:$($script:ResearchPortEffective) (model $model; sign in as localai, password in $credFile)"
         return $warn
     } catch {
         $why = $_.Exception.Message -replace '\s+', ' '
         Write-LaiLog WARN "Deep research is not ready: $why"
         return @("Deep research is not ready ($why); run the installer again")
-    } finally { if ($session) { $session.Client.Dispose() } }
+    } finally {
+        if ($session) { $session.Client.Dispose() }
+        # Sign-up never stays on, also after a failure (a re-run would otherwise keep it open).
+        if ((Get-StackEnvValue 'DEEP_RESEARCH_ALLOW_REGISTRATIONS') -ne 'false') {
+            Write-StackEnv -Values @{ DEEP_RESEARCH_ALLOW_REGISTRATIONS = 'false' }
+            try { & $restartIt } catch { Write-LaiLog WARN "Could not restart deep research with sign-up off: $($_.Exception.Message)" }
+        }
+    }
 }
 
 #endregion
@@ -1400,7 +1411,14 @@ Invoke-Stage 'Stack' {
     $rm = Get-ResearchModel
     # Sign-up stays as it is (the account step below turns it off); a first start has it on.
     $allowNow = (Get-StackEnvValue 'DEEP_RESEARCH_ALLOW_REGISTRATIONS') -ne 'false'
-    $researchEnv = Get-LaiDeepResearchEnv -Enabled ([bool]$DeepResearch) -Model $rm.Alias -Context $rm.Context -Port $script:ResearchPortEffective -AllowRegistrations $allowNow
+    $think = $false
+    if ($DeepResearch) {
+        try { $think = @((Get-LaiOllamaModelInfo -BaseUrl $OllamaUrl -Name $rm.Alias).Capabilities) -contains 'thinking' } catch { Write-LaiLog WARN "Could not read $($rm.Alias)'s capabilities ($($_.Exception.Message)); deep research runs without thinking" }
+    }
+    # The address Open WebUI used last time (the guard's probe below may change it; the account step follows it).
+    $researchOllama = 'http://render-guard:11434'
+    if (Get-StackEnvValue 'DEEP_RESEARCH_OLLAMA_URL') { $researchOllama = Get-StackEnvValue 'DEEP_RESEARCH_OLLAMA_URL' }
+    $researchEnv = Get-LaiDeepResearchEnv -Enabled ([bool]$DeepResearch) -Model $rm.Alias -Context $rm.Context -Port $script:ResearchPortEffective -AllowRegistrations $allowNow -Thinking $think -OllamaUrl $researchOllama
     foreach ($k in $researchEnv.Keys) { $envValues[$k] = $researchEnv[$k] }
     Write-StackEnv -Values $envValues
     if (-not $DeepResearch) {
@@ -1408,7 +1426,8 @@ Invoke-Stage 'Stack' {
         # research history stays in its volume for a later -DeepResearch.
         $dr = Invoke-Native -File 'docker' -Arguments @('container', 'inspect', 'deep-research') -Capture -AllowFail
         if ($dr.ExitCode -eq 0) {
-            Invoke-Native -File 'docker' -Arguments @('rm', '-f', 'deep-research') -Capture -AllowFail | Out-Null
+            # -v: also its anonymous volume (the image declares one); the named data volume stays.
+            Invoke-Native -File 'docker' -Arguments @('rm', '-f', '-v', 'deep-research') -Capture -AllowFail | Out-Null
             Write-LaiLog INFO 'Deep research turned off: container removed (its data volume localai-deep-research is kept)'
         }
     }

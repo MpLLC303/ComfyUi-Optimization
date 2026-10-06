@@ -183,8 +183,12 @@ services:
     $after = @((Get-WatchLog) -split "`n" | Where-Object { $_ -match 'NOTIFY Local AI: problem detected' }).Count
     Assert-That ($after -eq $before + 1 -and @((Read-LaiState -Path $statePath)['notified']) -contains 'Backups') 'and is sent on the next run'
     # (d) Disk hysteresis: 'low' clears only with 2 GB to spare above the limit.
-    $freeGB = [Math]::Floor([System.IO.DriveInfo]::new([System.IO.Path]::GetPathRoot($aiRoot)).AvailableFreeSpace / 1GB)
-    $limit = [int]$freeGB - 1
+    # The free space sits near the middle of [limit, limit + 2) (at least 0.5 GB from either edge):
+    # with limit = floor(free) - 1 it could be a few MB under limit + 2, and a file written or deleted
+    # during the run flipped the result.
+    $freeExact = [System.IO.DriveInfo]::new([System.IO.Path]::GetPathRoot($aiRoot)).AvailableFreeSpace / 1GB
+    $freeGB = [Math]::Round($freeExact, 1)
+    $limit = [int][Math]::Round($freeExact - 1)
     Save-LaiState -State @{ failed = @() } -Path $statePath
     Invoke-Watch @('-NoHeal', '-MinFreeGB', "$limit") | Out-Null
     Assert-That ((& $lastFail) -notmatch 'Disk space') "free space 1 GB above the limit passes when it was fine before ($freeGB GB free, limit $limit)"

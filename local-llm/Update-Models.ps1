@@ -254,6 +254,13 @@ if ($ollamaNow -and $toVerify.Count -gt 0) {
     foreach ($m in $toVerify) { Invoke-ModelSetup -Model $m -SetupArgs @{ Previous = $state['tuning']; Fingerprint = $vfp } | Out-Null }
 }
 
+# The research agent (Install-LocalAI.ps1 -DeepResearch) asks Ollama for a context of its own: keep
+# it equal to its model's tuned context, or every switch between chats and research reloads the model.
+try {
+    $drLine = Update-LaiDeepResearchContext -AIRoot $AIRoot -Tuning $state['tuning'] -Models @($catalog.Models)
+    if ($drLine) { Write-LaiLog OK $drLine }
+} catch { Write-LaiLog WARN "Could not update the deep research context: $($_.Exception.Message)" }
+
 if ($failedPulls.Count -gt 0) {
     Write-LaiLog WARN "Not updated (download failed): $($failedPulls -join ', ')."
     if ($offline) { Write-LaiLog INFO 'Run Update-Models.ps1 again when the PC is online.' }
