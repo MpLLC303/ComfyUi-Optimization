@@ -169,6 +169,31 @@ try {
     Assert-That (-not (Test-Path (Join-Path $aiRoot 'Stack')) -and -not (Test-Path (Join-Path $aiRoot 'Secrets')) -and -not (Test-Path (Join-Path $aiRoot 'localai-config.json')) -and -not (Test-Path (Join-Path $aiRoot 'localai-config.json.bak'))) 'stack, secrets and config (with its .bak) deleted'
     Assert-That (@(Get-ChildItem (Join-Path $aiRoot 'Backups') -Filter '*-pre-uninstall.tar.gz').Count -eq 1) 'Backups folder kept with the final backup'
 
+    Write-Host "`n=== 3b. deep research data: in the final backup, deleted only once saved ===" -ForegroundColor Cyan
+    $rv = 'localai-deep-research'
+    if (Test-Volume $rv) { Write-Host "  (skipped: this machine has a real $rv volume)" -ForegroundColor Yellow }
+    else {
+        try {
+            New-Stack
+            Invoke-DockerQuiet -DockerArgs @('volume', 'create', $rv) | Out-Null
+            Invoke-DockerQuiet -DockerArgs @('run', '--rm', '-v', "${rv}:/d", 'alpine:3.20', 'sh', '-c', 'mkdir /d/encrypted_databases; echo x > /d/encrypted_databases/u.db') | Out-Null
+            $code = Invoke-Uninstall @('-Force', '-RemoveData')
+            Assert-That ($code -eq 0 -and -not (Test-Volume $rv) -and @(Get-ChildItem (Join-Path $aiRoot 'Backups') -Filter 'deep-research-*-pre-uninstall.tar.gz').Count -eq 1) "deep research is in the final backup, then its volume is deleted (exit $code)"
+            # Not Local Deep Research's data, so it cannot be saved: the final backup fails, nothing is removed.
+            New-Stack
+            Invoke-DockerQuiet -DockerArgs @('volume', 'create', $rv) | Out-Null
+            $code = Invoke-Uninstall @('-Force', '-RemoveData')
+            Assert-That ($code -ne 0 -and (Test-Volume 'open-webui') -and (Test-Volume $rv)) "a deep research volume that could not be saved stops the uninstall, nothing removed (exit $code)"
+            # No Open WebUI volume, so no final backup runs at all: the research volume is kept.
+            New-Stack
+            foreach ($c in 'open-webui', 'render-guard') { Invoke-DockerQuiet -DockerArgs @('rm', '-f', $c) | Out-Null }
+            Invoke-DockerQuiet -DockerArgs @('volume', 'rm', 'open-webui') | Out-Null
+            Invoke-DockerQuiet -DockerArgs @('run', '--rm', '-v', "${rv}:/d", 'alpine:3.20', 'sh', '-c', 'mkdir -p /d/encrypted_databases') | Out-Null
+            $code = Invoke-Uninstall @('-Force', '-RemoveData')
+            Assert-That ((Test-Volume $rv)) "without a final backup the deep research volume is kept (exit $code)"
+        } finally { Invoke-DockerQuiet -DockerArgs @('volume', 'rm', '-f', $rv) | Out-Null }
+    }
+
     Write-Host "`n=== 4. failing backup aborts ===" -ForegroundColor Cyan
     New-Stack -NoDb
     $code = Invoke-Uninstall @('-Force', '-RemoveData')

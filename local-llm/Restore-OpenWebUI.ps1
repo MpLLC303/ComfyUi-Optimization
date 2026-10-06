@@ -134,9 +134,14 @@ if ($DeepResearch) {
         if ((Read-Host 'Type YES to restore') -cne 'YES') { Write-LaiLog INFO 'Nothing changed.'; exit 1 }
     }
     $rSwap = $swapScript.Replace('test -f /data/.restore-staging/webui.db', 'test -d /data/.restore-staging/encrypted_databases')
+    # Putting the earlier data back: whatever it held (it may have been a fresh, empty install).
+    $rBack = $swapScript.Replace('test -f /data/.restore-staging/webui.db', 'true')
+    if ($rSwap -eq $swapScript -or $rBack -eq $swapScript) { throw 'Internal error: the swap script changed; nothing was done.' }
     $wasRunning = $false
+    $policy = ''
     $rSafety = $null
     $rTouched = $false
+    $keepStopped = $false
     $code = 0
     try {
         $lock = Enter-LaiVolumeLock
@@ -148,30 +153,53 @@ if ($DeepResearch) {
         Copy-Item -LiteralPath $source.FullName -Destination $staged -Force
         $list = Invoke-Docker -Arguments @('run', '--rm', '-v', "${staged}:/restore.tar.gz:ro", $img, 'tar', 'tzf', '/restore.tar.gz') -AllowFail
         if ($list.ExitCode -ne 0 -or $list.Text -notmatch '(?m)^(\./)?encrypted_databases/?\s*$') { throw "$($source.Name) is not a deep research backup (unreadable, or no encrypted_databases folder). Nothing was changed." }
-        # Stopped first, so the safety copy is consistent and nothing writes during the swap.
-        $wasRunning = (Invoke-Docker -Arguments @('inspect', '-f', '{{.State.Running}}', $ResearchContainer) -AllowFail).Text.Trim() -eq 'true'
-        if ($wasRunning) { Invoke-Docker -Arguments @('stop', '-t', '30', $ResearchContainer) | Out-Null }
+        # Stopped first, so the safety copy is consistent and nothing writes during the swap; its
+        # restart policy is off meanwhile, so a Docker Desktop restart cannot start it mid-swap (the
+        # health watch leaves it alone while this holds the volume lock).
+        $insp = Invoke-Docker -Arguments @('inspect', '-f', '{{.State.Running}}|{{.HostConfig.RestartPolicy.Name}}', $ResearchContainer) -AllowFail
+        if ($insp.ExitCode -eq 0) {
+            $wasRunning = ($insp.Text.Trim() -split '\|')[0] -eq 'true'
+            $policy = ($insp.Text.Trim() -split '\|')[1]
+            if ($policy -and $policy -ne 'no') { Invoke-Docker -Arguments @('update', '--restart', 'no', $ResearchContainer) | Out-Null }
+            if ($wasRunning) { Invoke-Docker -Arguments @('stop', '-t', '30', $ResearchContainer) | Out-Null }
+        }
         if ((Invoke-Docker -Arguments @('volume', 'inspect', $ResearchVolume) -AllowFail).ExitCode -ne 0) {
             Invoke-Docker -Arguments @('volume', 'create', $ResearchVolume) | Out-Null
         } elseif (-not $SkipSafetyBackup) {
+            # Written under a temporary name and checked before it counts as the safety copy.
             $rSafety = Join-Path $backupDir ('deep-research-{0}-pre-restore.tar.gz' -f (Get-Date -Format 'yyyyMMdd-HHmmss'))
-            Invoke-Docker -Arguments @('run', '--rm', '-v', "${ResearchVolume}:/data:ro", '-v', "${backupDir}:/backup", $img, 'tar', 'czf', "/backup/$(Split-Path -Leaf $rSafety)", '-C', '/data', '.') | Out-Null
+            $tmp = 'incomplete-' + (Split-Path -Leaf $rSafety)
+            Invoke-Docker -Arguments @('run', '--rm', '-v', "${ResearchVolume}:/data:ro", '-v', "${backupDir}:/backup", $img, 'tar', 'czf', "/backup/$tmp", '-C', '/data', '.') | Out-Null
+            Invoke-Docker -Arguments @('run', '--rm', '-v', "${backupDir}:/backup:ro", $img, 'tar', 'tzf', "/backup/$tmp") | Out-Null
+            Move-Item -LiteralPath (Join-Path $backupDir $tmp) -Destination $rSafety -Force -ErrorAction Stop
             Write-LaiLog OK "Current deep research data saved as $rSafety"
         }
         $rTouched = $true
         Invoke-Docker -Arguments @('run', '--rm', '-v', "${ResearchVolume}:/data", '-v', "${staged}:/restore.tar.gz:ro", $img, 'sh', '-c', $rSwap) | Out-Null
+        if ($env:LOCALAI_TEST_FAIL_RESEARCH_SWAP) { throw 'Test hook: deep research swap failed' }
         Write-LaiLog OK "Deep research data restored from $($source.Name)"
     } catch {
         $code = 1
         Write-LaiLog FAIL $_.Exception.Message
-        if ($rTouched -and $rSafety -and (Test-Path -LiteralPath $rSafety)) {
-            try {
-                Invoke-Docker -Arguments @('run', '--rm', '-v', "${ResearchVolume}:/data", '-v', "${rSafety}:/restore.tar.gz:ro", $img, 'sh', '-c', $rSwap) | Out-Null
-                Write-LaiLog OK 'The data from before the restore was put back.'
-            } catch { Write-LaiLog FAIL "Putting the earlier data back failed too ($($_.Exception.Message)); it is in ${rSafety}: run this again with -Archive '$rSafety' -DeepResearch." }
+        Get-ChildItem -LiteralPath $backupDir -Filter 'incomplete-deep-research-*' -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
+        if ($rTouched) {
+            if ($rSafety -and (Test-Path -LiteralPath $rSafety)) {
+                try {
+                    Invoke-Docker -Arguments @('run', '--rm', '-v', "${ResearchVolume}:/data", '-v', "${rSafety}:/restore.tar.gz:ro", $img, 'sh', '-c', $rBack) | Out-Null
+                    Write-LaiLog OK 'The data from before the restore was put back.'
+                } catch {
+                    $keepStopped = $true
+                    Write-LaiLog FAIL "Putting the earlier data back failed too ($($_.Exception.Message)). Deep research is kept stopped; the earlier data is in ${rSafety}: run this again with -DeepResearch -Archive '$rSafety'."
+                }
+            } else {
+                # No safety copy (-SkipSafetyBackup, or a new volume): the volume may be half written.
+                $keepStopped = $true
+                Write-LaiLog FAIL "Deep research is kept stopped (its data may be incomplete): run this again with -DeepResearch -Archive '$($source.FullName)'."
+            }
         }
     } finally {
-        if ($wasRunning) {
+        if ($policy -and $policy -ne 'no' -and -not $keepStopped) { Invoke-Docker -Arguments @('update', '--restart', $policy, $ResearchContainer) -AllowFail | Out-Null }
+        if ($wasRunning -and -not $keepStopped) {
             if ((Invoke-Docker -Arguments @('start', $ResearchContainer) -AllowFail).ExitCode -ne 0) { Write-LaiLog WARN 'Deep research did not start again: Start menu > Local AI > Start again.' }
         }
         Remove-Item -LiteralPath (Join-Path $stagingDir 'restore-deep-research.tar.gz') -Force -ErrorAction SilentlyContinue

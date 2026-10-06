@@ -71,7 +71,34 @@ try {
     Assert-That ($lastLine -match 'left alone' -and $lastLine -notmatch 'failed restore') "a restore still running is not reported as failed ($lastLine)"
     Assert-That ((Get-State 'open-webui') -eq 'created') 'Open WebUI is not started mid-backup/restore'
     Assert-That ((Get-WatchLog) -match 'left alone') 'watch.log says it was left alone on purpose'
-    if ($holder -and -not $holder.HasExited) { $holder.Kill() }
+
+    Write-Host "`n=== 3b. deep research paused by a backup: left alone under the lock, woken after ===" -ForegroundColor Cyan
+    # A stand-in answering on its health URL, under deep research's container name: Python's http.server
+    # from the SearXNG image the sandbox already has (alpine's busybox has no httpd).
+    Invoke-DockerText @('rm', '-f', 'deep-research') | Out-Null
+    $pyImage = Invoke-DockerText @('inspect', '-f', '{{.Config.Image}}', 'searxng')
+    Invoke-DockerText @('run', '-d', '--name', 'deep-research', '--label', 'lai-test=1', '--network', 'host', '--entrypoint', 'sh', $pyImage, '-c',
+        'mkdir -p /tmp/www/api/v1 && echo ok > /tmp/www/api/v1/health && exec python3 -m http.server 5061 --bind 127.0.0.1 --directory /tmp/www') | Out-Null
+    $cfgPath = Join-Path $aiRoot 'localai-config.json'
+    $cfg = Read-LaiState -Path $cfgPath; $cfg['DeepResearchPort'] = 5061; Save-LaiState -State $cfg -Path $cfgPath
+    try {
+        $deadline = (Get-Date).AddSeconds(20)
+        $up = $false
+        while (-not $up -and (Get-Date) -lt $deadline) { try { Wait-LaiHttp -Uri 'http://127.0.0.1:5061/api/v1/health' -TimeoutSec 2 | Out-Null; $up = $true } catch { Start-Sleep -Milliseconds 300 } }
+        Assert-That $up "setup: the stand-in answers on its health URL ($pyImage)"
+        Invoke-DockerText @('pause', 'deep-research') | Out-Null
+        Invoke-Watch | Out-Null
+        Assert-That ((Get-State 'deep-research') -eq 'paused') 'deep research paused while a backup holds the volume lock is left alone'
+        if ($holder -and -not $holder.HasExited) { $holder.Kill() }
+        $deadline = (Get-Date).AddSeconds(30)
+        while ((Test-LaiVolumeLockBusy) -and (Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 300 }
+        Invoke-DockerText @('rm', '-f', 'open-webui') | Out-Null   # the stand-in from 3. would be started and waited for
+        Invoke-Watch | Out-Null
+        Assert-That ((Get-State 'deep-research') -eq 'running' -and (Get-WatchLog) -match 'restarted: [^)]*Deep research') 'a deep research container left paused (a backup killed mid-copy) is woken once the lock is free'
+    } finally {
+        Invoke-DockerText @('rm', '-f', 'deep-research') | Out-Null
+        $cfg = Read-LaiState -Path $cfgPath; $cfg.Remove('DeepResearchPort'); Save-LaiState -State $cfg -Path $cfgPath
+    }
 
     Write-Host "`n=== 4. gaming mode Stop/Start wait for a running backup instead of racing it ===" -ForegroundColor Cyan
     # A throwaway compose project, so the sandbox's real containers are not touched.
@@ -273,6 +300,7 @@ services:
     $tc = Join-Path (Join-Path $aiRoot 'Stack') 'docker-compose.yml'
     if (Test-Path -LiteralPath $tc) { Invoke-DockerText @('compose', '--project-directory', (Join-Path $aiRoot 'Stack'), '-f', $tc, 'down') | Out-Null }
     Invoke-DockerText @('rm', '-f', 'open-webui') | Out-Null
+    Invoke-DockerText @('rm', '-f', 'deep-research') | Out-Null
     if ((Get-State 'searxng') -ne 'running') { Invoke-DockerText @('start', 'searxng') | Out-Null }
 }
 

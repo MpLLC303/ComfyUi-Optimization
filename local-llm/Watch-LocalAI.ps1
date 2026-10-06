@@ -193,9 +193,9 @@ if ($engine -eq 'down' -or $engine -eq 'hung') {
     foreach ($c in $watched) {
         $ok = Test-Url $c.Url
         $hold = $null; if ($c.Name -eq 'open-webui') { $hold = Get-LaiWebUIHold -AIRoot $AIRoot }
-        if (-not $ok -and $c.Name -eq 'open-webui' -and (Test-LaiVolumeLockBusy)) {
-            # A backup, restore or update is running and stopped it on purpose (checked before the
-            # hold: a restore in progress has written its hold already, but has not failed).
+        if (-not $ok -and @('open-webui', 'deep-research') -contains $c.Name -and (Test-LaiVolumeLockBusy)) {
+            # A backup, restore or update is running and stopped (or paused) it on purpose (checked
+            # before the hold: a restore in progress has written its hold already, but has not failed).
             $ok = $true
             $maintenance = $true
         } elseif (-not $ok -and $hold) {
@@ -203,7 +203,12 @@ if ($engine -eq 'down' -or $engine -eq 'hung') {
             $details[$c.Key] = "kept stopped after a failed restore - $($hold['Recover'])"
         } elseif (-not $ok -and (Test-CanHeal)) {
             $state = Get-ContainerState $c.Name
-            if ($state -eq 'exited' -or $state -eq 'created') {
+            if ($state -eq 'paused') {
+                # Only a backup pauses deep research, under the volume lock (free now): one killed
+                # mid-copy left it frozen, and 'docker start' does not wake a paused container.
+                Invoke-LaiTimedNative -File 'docker' -Arguments @('unpause', $c.Name) -TimeoutSec (2 * $dockerLimit) | Out-Null
+                try { Wait-LaiHttp -Uri $c.Url -TimeoutSec 180 | Out-Null; $ok = $true; $healed += $c.Key } catch { Write-Verbose "$($c.Key) did not come back" }
+            } elseif ($state -eq 'exited' -or $state -eq 'created') {
                 Start-Container $c.Name
                 try { Wait-LaiHttp -Uri $c.Url -TimeoutSec 180 | Out-Null; $ok = $true; $healed += $c.Key } catch { Write-Verbose "$($c.Key) did not come back" }
             }

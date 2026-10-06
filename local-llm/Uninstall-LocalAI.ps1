@@ -114,6 +114,7 @@ if (-not $Force -and -not $WhatIfPreference) {
 }
 
 # ---- 1. final backup ----------------------------------------------------------------------------
+$researchBefore = @(Get-ChildItem -LiteralPath (Join-Path $AIRoot 'Backups') -Filter 'deep-research-*-pre-uninstall.tar.gz' -ErrorAction SilentlyContinue | ForEach-Object { $_.Name })
 if (-not $NoBackup -and $volumeExists) {
     if ($PSCmdlet.ShouldProcess('Open WebUI volume', 'Final backup')) {
         & (Join-Path $PSScriptRoot 'Backup-OpenWebUI.ps1') -AIRoot $AIRoot -Tag 'pre-uninstall' -NoPrune
@@ -158,7 +159,13 @@ if ($dockerUp) {
         }
     }
     # The optional research agent's saved research (Install-LocalAI.ps1 -DeepResearch).
-    if ($RemoveData -and (Invoke-Docker @('volume', 'inspect', 'localai-deep-research')).ExitCode -eq 0) {
+    # Deleted only once this run's final backup holds it (the final backup fails when it could not save
+    # it); with no Open WebUI volume there was no final backup run at all, so it is kept.
+    $researchSaved = @(Get-ChildItem -LiteralPath (Join-Path $AIRoot 'Backups') -Filter 'deep-research-*-pre-uninstall.tar.gz' -ErrorAction SilentlyContinue | Where-Object { $researchBefore -notcontains $_.Name }).Count -gt 0
+    $researchVolume = $RemoveData -and (Invoke-Docker @('volume', 'inspect', 'localai-deep-research')).ExitCode -eq 0
+    if ($researchVolume -and -not $NoBackup -and -not $researchSaved) {
+        Write-LaiLog WARN "Kept the deep research data volume (localai-deep-research): no final backup of it was made in this run (see Logs\backup.log). To delete it anyway, run the uninstaller again with -RemoveData -NoBackup."
+    } elseif ($researchVolume) {
         Invoke-Step 'deep research volume' {
             $r = Invoke-Docker @('volume', 'rm', 'localai-deep-research')
             if ($r.ExitCode -ne 0) { throw $r.Text }

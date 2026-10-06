@@ -462,7 +462,8 @@ exec 'REALDOCKER' "$@"
         Invoke-DockerText @('rm', '-f', 'lai-research-ct') | Out-Null
         foreach ($v in 'lai-research-test', 'lai-research-bad') { Invoke-DockerText @('volume', 'rm', '-f', $v) | Out-Null; Invoke-DockerText @('volume', 'create', $v) | Out-Null }
         Invoke-DockerText @('run', '--rm', '-v', 'lai-research-test:/d', 'alpine:3.20', 'sh', '-c', 'mkdir /d/encrypted_databases; echo v1 > /d/encrypted_databases/u.db; echo k > /d/.secret_key') | Out-Null
-        Invoke-DockerText @('run', '-d', '--name', 'lai-research-ct', '--label', 'lai-test=1', '-v', 'lai-research-test:/data', 'alpine:3.20', 'sleep', '3600') | Out-Null
+        Invoke-DockerText @('run', '-d', '--name', 'lai-research-ct', '--label', 'lai-test=1', '--restart', 'always', '-v', 'lai-research-test:/data', 'alpine:3.20', 'sleep', '3600') | Out-Null
+        $started0 = Invoke-DockerText @('inspect', '-f', '{{.State.StartedAt}}', 'lai-research-ct')
         # Old daily research archives (dated 30 days back): beyond the newest three they go; a
         # pre-uninstall one never does.
         foreach ($i in 1..4) {
@@ -478,12 +479,24 @@ exec 'REALDOCKER' "$@"
         $status = Invoke-DockerText @('inspect', '-f', '{{.State.Status}}', 'lai-research-ct')
         $listing = if ($made.Count -eq 1) { Invoke-DockerText @('run', '--rm', '-v', "${bk}:/b:ro", 'alpine:3.20', 'tar', 'tzf', "/b/$($made[0].Name)") } else { '' }
         Assert-That ($b.Code -eq 0 -and $made.Count -eq 1 -and $made[0].Name -match '^deep-research-\d{8}-\d{6}\.tar\.gz$' -and $listing -match 'encrypted_databases/u\.db') "a daily run archives deep research next to Open WebUI (exit $($b.Code), made $($made.Name -join ','))"
-        Assert-That ($status -eq 'running') "the research container runs on afterwards: paused, never stopped (status $status)"
+        $started1 = Invoke-DockerText @('inspect', '-f', '{{.State.StartedAt}}', 'lai-research-ct')
+        Assert-That ($status -eq 'running' -and $started1 -eq $started0 -and $b.Text -notmatch 'left paused') "the research container runs on afterwards: paused, never stopped or restarted (status $status, started $started0 -> $started1)"
         $left = @(Get-ChildItem -LiteralPath $bk -Filter 'deep-research-2026010*-030000.tar.gz' | ForEach-Object { $_.Name })
         Assert-That ($left.Count -eq 2 -and (Test-Path -LiteralPath $pu)) "old research archives beyond the newest three are pruned, the pre-uninstall one kept (left: $($left -join ', '))"
         Assert-That ($made.Count -eq 1 -and (Test-Path -LiteralPath (Join-Path $rMirror $made[0].Name))) 'the research archive is mirrored too'
         $bs = Read-LaiState -Path (Join-Path $aiRoot 'backup-state.json')
         Assert-That ($bs['researchOkAt'] -and -not $bs['researchError']) 'backup-state records the research backup'
+        # A container an earlier, killed run left paused is woken (docker start would not).
+        Invoke-DockerText @('pause', 'lai-research-ct') | Out-Null
+        $b = & $runScript 'Backup-OpenWebUI.ps1' ($rArgs + @('-NoMirror'))
+        Assert-That ($b.Code -eq 0 -and $b.Text -match 'left paused' -and (Invoke-DockerText @('inspect', '-f', '{{.State.Status}}', 'lai-research-ct')) -eq 'running') "a research container left paused is woken by the next backup (exit $($b.Code))"
+        Assert-That (@((Invoke-DockerText @('volume', 'ls', '-q', '--filter', 'name=localai-research-copy-')) -split "`n" | Where-Object { $_ }).Count -eq 0) 'no scratch copy volume is left behind'
+        # An uninstall's final backup holds deep research too, and fails when it could not save it
+        # (the uninstaller then deletes nothing).
+        $b = & $runScript 'Backup-OpenWebUI.ps1' ($rArgs + @('-Tag', 'pre-uninstall', '-NoPrune', '-NoMirror'))
+        Assert-That ($b.Code -eq 0 -and @(Get-ChildItem -LiteralPath $bk -Filter 'deep-research-*-pre-uninstall.tar.gz' | Where-Object { $_.FullName -ne $pu }).Count -eq 1) "an uninstall's final backup includes deep research (exit $($b.Code))"
+        $b = & $runScript 'Backup-OpenWebUI.ps1' @('-Volume', 'lai-ok-test', '-Container', 'lai-no-such-container', '-SkipDeepVerify', '-Tag', 'pre-uninstall', '-NoPrune', '-NoMirror', '-ResearchVolume', 'lai-research-bad', '-ResearchContainer', 'lai-no-such-container')
+        Assert-That ($b.Code -ne 0 -and $b.Text -match 'must not delete it') "an uninstall's final backup fails when deep research could not be saved (exit $($b.Code))"
         # Tagged runs (a restore's safety copy, before an update) leave deep research alone.
         $n = @(Get-ChildItem -LiteralPath $bk -Filter 'deep-research-*.tar.gz').Count
         $b = & $runScript 'Backup-OpenWebUI.ps1' ($rArgs + @('-Tag', 'before-x', '-NoPrune', '-NoMirror'))
@@ -500,12 +513,25 @@ exec 'REALDOCKER' "$@"
         $sList = if ($safetyR) { Invoke-DockerText @('run', '--rm', '-v', "${bk}:/b:ro", 'alpine:3.20', 'sh', '-c', "tar xzOf /b/$($safetyR.Name) ./encrypted_databases/u.db") } else { '' }
         Assert-That ($r.Code -eq 0 -and (& $rData) -eq 'v1' -and $sList -eq 'v2') "restore -DeepResearch puts the archive back and keeps the replaced data (exit $($r.Code), now $(& $rData), safety $sList)"
         Assert-That ((Invoke-DockerText @('inspect', '-f', '{{.State.Status}}', 'lai-research-ct')) -eq 'running') 'the research container runs again after the restore'
+        Assert-That ((Invoke-DockerText @('inspect', '-f', '{{.HostConfig.RestartPolicy.Name}}', 'lai-research-ct')) -eq 'always') 'its restart policy is back after the restore (off during it)'
+        # The swap fails after the old data was replaced: the safety copy goes back.
+        Invoke-DockerText @('run', '--rm', '-v', 'lai-research-test:/d', 'alpine:3.20', 'sh', '-c', 'echo v3 > /d/encrypted_databases/u.db') | Out-Null
+        $env:LOCALAI_TEST_FAIL_RESEARCH_SWAP = '1'
+        try { $r = & $runScript 'Restore-OpenWebUI.ps1' ($rr + @('-Archive', $made[0].FullName)) } finally { $env:LOCALAI_TEST_FAIL_RESEARCH_SWAP = '' }
+        Assert-That ($r.Code -ne 0 -and $r.Text -match 'put back' -and (& $rData) -eq 'v3' -and (Invoke-DockerText @('inspect', '-f', '{{.State.Status}}', 'lai-research-ct')) -eq 'running') "a failed swap puts the earlier data back and starts deep research again (exit $($r.Code), data $(& $rData))"
+        # Without a safety copy there is nothing to go back to: deep research is kept stopped.
+        $env:LOCALAI_TEST_FAIL_RESEARCH_SWAP = '1'
+        try { $r = & $runScript 'Restore-OpenWebUI.ps1' ($rr + @('-Archive', $made[0].FullName, '-SkipSafetyBackup')) } finally { $env:LOCALAI_TEST_FAIL_RESEARCH_SWAP = '' }
+        Assert-That ($r.Code -ne 0 -and $r.Text -match 'kept stopped' -and (Invoke-DockerText @('inspect', '-f', '{{.State.Status}}', 'lai-research-ct')) -eq 'exited') "with no safety copy a failed swap keeps deep research stopped and says how to finish (exit $($r.Code))"
+        Invoke-DockerText @('update', '--restart', 'always', 'lai-research-ct') | Out-Null
+        Invoke-DockerText @('start', 'lai-research-ct') | Out-Null
         # An Open WebUI archive is refused before anything changes.
         $r = & $runScript 'Restore-OpenWebUI.ps1' ($rr + @('-Archive', $good.FullName))
         Assert-That ($r.Code -ne 0 -and $r.Text -match 'not a deep research backup' -and (& $rData) -eq 'v1') "an Open WebUI archive is refused, nothing changed (exit $($r.Code))"
         # With no -Archive: the newest daily (or pre-uninstall) research archive.
+        $expect = Get-ChildItem -LiteralPath $bk -Filter 'deep-research-*.tar.gz' | Where-Object { $_.Name -match '^deep-research-\d{8}-\d{6}(-pre-uninstall)?\.tar\.gz$' } | Sort-Object LastWriteTime -Descending | Select-Object -First 1  # lai-ok: objects
         $r = & $runScript 'Restore-OpenWebUI.ps1' $rr
-        Assert-That ($r.Code -eq 0 -and $r.Text -match [regex]::Escape($made[0].Name)) "without -Archive the newest research archive is used (exit $($r.Code))"
+        Assert-That ($r.Code -eq 0 -and $expect -and $expect.Name -match 'pre-uninstall' -and $r.Text -match [regex]::Escape($expect.Name)) "without -Archive the newest research archive (daily or an uninstall's) is used: $($expect.Name) (exit $($r.Code))"
     } finally {
         Invoke-DockerText @('rm', '-f', 'lai-research-ct') | Out-Null
         foreach ($v in 'lai-research-test', 'lai-research-bad') { Invoke-DockerText @('volume', 'rm', '-f', $v) | Out-Null }

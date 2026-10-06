@@ -187,29 +187,50 @@ if ($WaitForChatsSec -gt 0 -and -not $NoStop) {
 function Save-ResearchArchive {
     param([string]$RVolume, [string]$RContainer)
     # Local Deep Research's accounts, history and reports, in a small archive next to Open WebUI's.
-    # Paused rather than stopped while tar runs (a second or two): a research run in progress carries
-    # on afterwards, and the copy is what a power cut at that instant would leave, which SQLite (its
-    # SQLCipher databases) recovers from by design. A failure is a warning: Open WebUI's archive above
-    # is complete, and the next run tries again; Test-LocalAI reports a lasting failure.
+    # Paused rather than stopped, and only while its data is copied to a scratch volume inside Docker
+    # (no compression, no Windows folder: about a second): a research run in progress carries on
+    # afterwards. The copy is what a power cut at that instant would leave, which SQLite (its
+    # SQLCipher databases) recovers from by design. A failure is a warning on a nightly run (Open
+    # WebUI's archive above is complete, the next run tries again, Test-LocalAI reports it) and fails
+    # an uninstall's final backup, so the uninstaller never deletes research data it could not save.
     $rName = 'deep-research-{0}{1}.tar.gz' -f (Get-Date -Format 'yyyyMMdd-HHmmss'), $suffix
     $rWork = Join-Path $backupDir "incomplete-$rName"
-    $paused = $false
+    $scratch = 'localai-research-copy-' + (Get-Date -Format 'yyyyMMddHHmmss')
     try {
         Get-ChildItem -LiteralPath $backupDir -Filter 'incomplete-deep-research-*' -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
+        foreach ($v in @((Invoke-Docker -Arguments @('volume', 'ls', '-q', '--filter', 'name=localai-research-copy-') -AllowFail).Text -split "`n" | Where-Object { $_ -match '^localai-research-copy-\d{14}$' })) {
+            Invoke-Docker -Arguments @('volume', 'rm', '-f', $v) -AllowFail | Out-Null
+        }
         $state = (Invoke-Docker -Arguments @('inspect', '-f', '{{.State.Status}}', $RContainer) -AllowFail).Text.Trim()
+        if ($state -eq 'paused') {
+            # Left paused by an earlier run that was killed mid-copy (nothing else here pauses it).
+            Invoke-Docker -Arguments @('unpause', $RContainer) | Out-Null
+            Write-BackupLog WARN "Deep research was left paused by an interrupted earlier backup; woke it."
+            $state = 'running'
+        }
+        Invoke-Docker -Arguments @('volume', 'create', $scratch) | Out-Null
+        $paused = $false
         if ($state -eq 'running' -and -not $NoStop) { Invoke-Docker -Arguments @('pause', $RContainer) | Out-Null; $paused = $true }
         try {
-            Invoke-Docker -Arguments @('run', '--rm', '-v', ($RVolume + ':/data:ro'), '-v', "${backupDir}:/backup", $HelperImage,
-                'tar', 'czf', "/backup/incomplete-$rName", '-C', '/data', '.') | Out-Null
+            Invoke-Docker -Arguments @('run', '--rm', '-v', ($RVolume + ':/data:ro'), '-v', ($scratch + ':/copy'), $HelperImage, 'cp', '-a', '/data/.', '/copy/') | Out-Null
+        } catch {
+            throw
         } finally {
             if ($paused -and (Invoke-Docker -Arguments @('unpause', $RContainer) -AllowFail).ExitCode -ne 0) {
-                Write-BackupLog FAIL "Deep research is still paused; Start menu > Local AI > Start again (or 'docker unpause $RContainer') wakes it."
+                # Reported as a failed research backup (Test-LocalAI shows it); the next run wakes it.
+                throw "deep research could not be woken after the copy ('docker unpause $RContainer' does it; the next backup tries too)"
             }
         }
+        Invoke-Docker -Arguments @('run', '--rm', '-v', ($scratch + ':/data:ro'), '-v', "${backupDir}:/backup", $HelperImage,
+            'tar', 'czf', "/backup/incomplete-$rName", '-C', '/data', '.') | Out-Null
         $list = (Invoke-Docker -Arguments @('run', '--rm', '-v', "${backupDir}:/backup:ro", $HelperImage, 'tar', 'tzf', "/backup/incomplete-$rName")).Text
         if ($list -notmatch '(?m)^(\./)?encrypted_databases/?\s*$') { throw "$rName has no encrypted_databases folder (the volume is not Local Deep Research's data)" }
         $rArchive = Join-Path $backupDir $rName
-        Move-Item -LiteralPath $rWork -Destination $rArchive -Force -ErrorAction Stop
+        for ($i = 1; $i -le 5; $i++) {
+            # Antivirus or a sync client can hold a just-written file for a moment.
+            try { Move-Item -LiteralPath $rWork -Destination $rArchive -Force -ErrorAction Stop; break }
+            catch { if ($i -eq 5) { throw }; Start-Sleep -Seconds (2 * $i) }
+        }
         $rSize = (Get-Item -LiteralPath $rArchive).Length
         $note = ''
         if ($Mirror -and -not $NoMirror) {
@@ -239,9 +260,16 @@ function Save-ResearchArchive {
         catch { Write-BackupLog WARN "Could not record the deep research backup: $($_.Exception.Message)" }
     } catch {
         Remove-Item -LiteralPath $rWork -Force -ErrorAction SilentlyContinue
-        Write-BackupLog WARN "Deep research backup failed: $($_.Exception.Message). Open WebUI's backup is not affected; the next run tries again."
+        if ($Tag -eq 'pre-uninstall') {
+            Write-BackupLog FAIL "Deep research backup failed: $($_.Exception.Message). Its data is not saved, so the uninstall must not delete it."
+            $script:exitCode = 1
+        } else {
+            Write-BackupLog WARN "Deep research backup failed: $($_.Exception.Message). Open WebUI's backup is not affected; the next run tries again."
+        }
         try { $bs = Read-LaiState -Path $backupStatePath; $bs['researchError'] = $_.Exception.Message; $bs['researchErrorAt'] = (Get-Date).ToString('s'); Save-LaiState -State $bs -Path $backupStatePath }
         catch { Write-BackupLog WARN "Could not record the failure: $($_.Exception.Message)" }
+    } finally {
+        Invoke-Docker -Arguments @('volume', 'rm', '-f', $scratch) -AllowFail | Out-Null
     }
 }
 
