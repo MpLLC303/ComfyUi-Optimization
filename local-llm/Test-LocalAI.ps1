@@ -377,7 +377,16 @@ if ($script:token) {
         # address depends on the install.
         $changed = @(Compare-LaiConfig -Expected (Get-LaiRagWanted) -Actual $rc | Where-Object { $_ -notlike 'web.SEARXNG_QUERY_URL:*' })
         if ($changed.Count -gt 0) { return (Warn "$d; changed from the installer's values: $($changed -join '; ') - re-run the installer to restore them") }
-        Pass "$d, images scaled to $($rc.FILE_IMAGE_COMPRESSION_WIDTH) px, fetched pages cut at $($rc.web.WEB_FETCH_MAX_CONTENT_LENGTH) characters"
+        # The embedder: Open WebUI's stock one reads only ~256 tokens of each chunk.
+        $emb = $null; try { $emb = Invoke-LaiApi -Uri "$webUrl/api/v1/retrieval/embedding" -Token $token } catch { Write-Verbose 'embedding config unreadable' }
+        $embNote = ''
+        if ($emb) {
+            if ([string]$emb.RAG_EMBEDDING_ENGINE -eq '' -and [string]$emb.RAG_EMBEDDING_MODEL -eq 'sentence-transformers/all-MiniLM-L6-v2') {
+                return (Warn "$d; document search still uses Open WebUI's stock embedding model (reads ~256 tokens of each chunk) - re-run the installer (it downloads a better one)")
+            }
+            $embNote = "; embedding $(([string]$emb.RAG_EMBEDDING_ENGINE + ' ' + [string]$emb.RAG_EMBEDDING_MODEL).Trim())$(if ($rc.RAG_RERANKING_MODEL) { ', reranker ' + $rc.RAG_RERANKING_MODEL })"
+        }
+        Pass "$d$embNote, images scaled to $($rc.FILE_IMAGE_COMPRESSION_WIDTH) px, fetched pages cut at $($rc.web.WEB_FETCH_MAX_CONTENT_LENGTH) characters"
     }
 
     if (-not $Quick) {

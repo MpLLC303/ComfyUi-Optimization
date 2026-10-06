@@ -433,7 +433,12 @@ exec 'REALDOCKER' "$@"
     Invoke-DockerText @('volume', 'create', 'localai-verify-20200101000000') | Out-Null
     Invoke-DockerText @('volume', 'create', 'lai-ok-test') | Out-Null
     Invoke-DockerText @('run', '--rm', '-v', 'lai-ok-test:/d', '-v', "${dbDir}:/src:ro", 'alpine:3.20', 'cp', '/src/webui.db', '/d/webui.db') | Out-Null
+    # Downloaded document-search and speech models in the volume: left out of the archive.
+    Invoke-DockerText @('run', '--rm', '-v', 'lai-ok-test:/d', 'alpine:3.20', 'sh', '-c', 'mkdir -p /d/cache/embedding/models/BAAI /d/cache/whisper/models /d/uploads && echo m > /d/cache/embedding/models/BAAI/weights && echo w > /d/cache/whisper/models/small && echo u > /d/uploads/notes.pdf') | Out-Null
     $b = & $runScript 'Backup-OpenWebUI.ps1' @('-Volume', 'lai-ok-test', '-Container', 'lai-no-such-container', '-Tag', 'nocheck', '-NoPrune', '-VerifyImage', 'alpine:3.20')
+    $nc = Get-ChildItem -LiteralPath (Join-Path $aiRoot 'Backups') -Filter '*-nocheck.tar.gz' | Select-Object -First 1
+    $ncList = if ($nc) { Invoke-DockerText @('run', '--rm', '-v', "$($nc.DirectoryName):/b:ro", 'alpine:3.20', 'tar', 'tzf', "/b/$($nc.Name)") } else { '' }
+    Assert-That ($ncList -match 'uploads/notes\.pdf' -and $ncList -notmatch 'cache/embedding/models/BAAI' -and $ncList -notmatch 'cache/whisper/models/small') 'the archive keeps uploads but not the downloaded models (re-fetched after a restore)'
     Assert-That ($b.Code -eq 0 -and $b.Text -match 'Deep check could not run' -and @(Get-ChildItem -LiteralPath (Join-Path $aiRoot 'Backups') -Filter '*-nocheck.tar.gz').Count -eq 1 -and @(Get-ChildItem -LiteralPath (Join-Path $aiRoot 'Backups') -Filter '*-nocheck-CORRUPT.tar.gz').Count -eq 0) "a deep check that cannot run is a warning, not a CORRUPT archive (exit $($b.Code))"
     Assert-That ((Invoke-DockerText @('volume', 'ls', '-q', '--filter', 'name=localai-verify-')) -eq '') 'scratch volumes left by a killed deep check are swept'
     # The backup counts nights whose check could not run (the watch fails after 3) and resets on a good one.

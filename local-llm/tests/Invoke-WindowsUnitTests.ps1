@@ -895,6 +895,8 @@ $mod = Get-Module LocalAI
     function script:Add-LaiWebUIKnowledge { param($BaseUrl, $Token, $Name, $Description) $null = $BaseUrl, $Token, $Description
         if ($Name -eq 'Rejected') { throw 'HTTP 400 Bad Request' }
         $script:Kbs += $Name; [pscustomobject]@{ Action = 'created' } }
+    # Document search models: tested on their own (below); here an owner's setup, nothing changed.
+    function script:Set-LaiWebUIEmbedding { param($BaseUrl, $Token) $null = $BaseUrl, $Token; [pscustomobject]@{ Result = 'owner'; Detail = 'ollama test'; Warnings = @() } }
 }
 $setupArgs = @{ Token = 't'; SystemPrompt = 'sys'; DefaultPreset = 'local-main'; ModelResults = @{ main = @{ Tools = $true } }; Collections = @('Rejected', 'Notes')
     Models = @(@{ Key = 'main'; Preset = 'local-main'; Alias = 'localai-main'; Source = 'qwen3:1.7b'; Display = 'Local Main'; Description = 'd'; Order = 1; Vision = $false; Think = $null; Trial = $false }) }
@@ -904,7 +906,7 @@ Assert-That ($w.Count -eq 1 -and $w[0] -like "Knowledge collection 'Rejected'*")
 Assert-That ((@(& $mod { $script:Kbs }) -join ',') -eq 'Notes') 'the collections after a rejected one are still created'
 & $mod { $script:OldTopK = 3; $script:Kbs = @() }
 $w = @(Invoke-LaiWebUISetup @setupArgs)
-Assert-That (@($w | Where-Object { $_ -like '*TOP_K: wanted 5, got 3*' }).Count -eq 1) "a RAG setting the server did not keep is reported by name ($($w -join ' | '))"
+Assert-That (@($w | Where-Object { $_ -like '*TOP_K: wanted 10, got 3*' }).Count -eq 1) "a RAG setting the server did not keep is reported by name ($($w -join ' | '))"
 # Context budget: full-size images re-sent every turn overflow Local Vision's 32K after ~7 photos, and
 # one uncapped fetched page fills Fast/Vision so Ollama silently drops the user's question.
 & $mod { $script:OldTopK = $null; $script:NullKey = 'FILE_IMAGE_COMPRESSION_WIDTH' }
@@ -965,6 +967,48 @@ $mod = Get-Module LocalAI
 $chg = Set-LaiWebUIOllamaUrl -Token 't' -OllamaUrl 'http://render-guard:11434'
 Assert-That (-not $chg -and (& $mod { $script:Posts }) -eq 0) "a renamed connection list is left alone, not overwritten with ours alone (the user's connections would be deleted)"
 Import-Module (Join-Path (Join-Path $src 'lib') 'LocalAI.psm1') -Force
+
+Write-Host "`n=== document search: embedder and reranker, the owner's own setup left alone ===" -ForegroundColor Cyan
+# A fake Open WebUI: $script:Emb is its embedding config, $script:Rc its retrieval config; posts are logged.
+$runEmb = {
+    param([hashtable]$Emb, [hashtable]$Rc, [string]$FailOn = '')
+    $mod = Get-Module LocalAI
+    & $mod {
+        param($e, $r, $f)
+        $script:Emb = $e; $script:Rc = $r; $script:FailOn = $f; $script:Posted = @()
+        function script:Invoke-LaiApi {
+            param($Method, $Uri, $Body, $Token, $TimeoutSec)
+            $null = $Token, $TimeoutSec
+            if ($Method -eq 'POST') {
+                $script:Posted += ($Uri -replace '^.*/api/v1/', '')
+                if ($script:FailOn -and $Uri -like "*$script:FailOn*") { throw 'download failed (test)' }
+                if ($Uri -like '*/retrieval/embedding/update') { $script:Emb['RAG_EMBEDDING_ENGINE'] = $Body.RAG_EMBEDDING_ENGINE; $script:Emb['RAG_EMBEDDING_MODEL'] = $Body.RAG_EMBEDDING_MODEL }
+                if ($Uri -like '*/retrieval/config/update') { foreach ($k in $Body.Keys) { $script:Rc[$k] = $Body[$k] } }
+                return $true
+            }
+            if ($Uri -like '*/retrieval/embedding') { return [pscustomobject]$script:Emb }
+            if ($Uri -like '*/retrieval/config') { return [pscustomobject]$script:Rc }
+            return $null
+        }
+    } $Emb $Rc $FailOn
+    $res = Set-LaiWebUIEmbedding -Token 't'
+    return [pscustomobject]@{ Result = $res.Result; Warnings = @($res.Warnings); Posted = @(& $mod { $script:Posted }); Emb = (& $mod { $script:Emb }); Rc = (& $mod { $script:Rc }) }
+}
+$e1 = & $runEmb @{ RAG_EMBEDDING_ENGINE = ''; RAG_EMBEDDING_MODEL = 'sentence-transformers/all-MiniLM-L6-v2' } @{ RAG_RERANKING_MODEL = ''; ENABLE_RAG_HYBRID_SEARCH = $true }
+Assert-That ($e1.Result -eq 'changed' -and $e1.Emb['RAG_EMBEDDING_MODEL'] -eq 'BAAI/bge-m3' -and $e1.Posted -contains 'knowledge/reindex' -and $e1.Rc['RAG_RERANKING_MODEL'] -eq 'BAAI/bge-reranker-v2-m3' -and $e1.Warnings.Count -eq 0) "Open WebUI's stock embedder is replaced, the collections re-indexed, the reranker set ($($e1.Posted -join ', '))"
+$e2 = & $runEmb @{ RAG_EMBEDDING_ENGINE = 'ollama'; RAG_EMBEDDING_MODEL = 'nomic-embed-text:latest' } @{ RAG_RERANKING_MODEL = ''; ENABLE_RAG_HYBRID_SEARCH = $true }
+Assert-That ($e2.Result -eq 'owner' -and $e2.Posted.Count -eq 0) 'an embedding engine the owner chose is left alone (nothing posted)'
+$e3 = & $runEmb @{ RAG_EMBEDDING_ENGINE = ''; RAG_EMBEDDING_MODEL = 'intfloat/e5-large-v2' } @{ RAG_RERANKING_MODEL = ''; ENABLE_RAG_HYBRID_SEARCH = $true }
+Assert-That ($e3.Result -eq 'owner' -and $e3.Posted.Count -eq 0) "another embedding model the owner picked is left alone"
+$e4 = & $runEmb @{ RAG_EMBEDDING_ENGINE = ''; RAG_EMBEDDING_MODEL = 'BAAI/bge-m3' } @{ RAG_RERANKING_MODEL = 'my/reranker'; ENABLE_RAG_HYBRID_SEARCH = $true }
+Assert-That ($e4.Result -eq 'unchanged' -and $e4.Posted.Count -eq 0 -and $e4.Rc['RAG_RERANKING_MODEL'] -eq 'my/reranker') 'already set up: nothing is downloaded again, and a reranker the owner chose stays'
+$e5 = & $runEmb @{ RAG_EMBEDDING_ENGINE = ''; RAG_EMBEDDING_MODEL = 'sentence-transformers/all-MiniLM-L6-v2' } @{ RAG_RERANKING_MODEL = ''; ENABLE_RAG_HYBRID_SEARCH = $true } 'embedding/update'
+Assert-That ($e5.Result -eq 'unchanged' -and $e5.Warnings.Count -eq 1 -and $e5.Warnings[0] -match 'keeps its old embedding model' -and $e5.Posted -notcontains 'knowledge/reindex') 'a failed download keeps the old model, warns, and does not re-index'
+$e6 = & $runEmb @{ RAG_EMBEDDING_ENGINE = ''; RAG_EMBEDDING_MODEL = 'BAAI/bge-m3' } @{ RAG_RERANKING_MODEL = ''; ENABLE_RAG_HYBRID_SEARCH = $true } 'retrieval/config/update'
+Assert-That ($e6.Warnings.Count -eq 1 -and $e6.Warnings[0] -match 'without its reranker') 'a reranker that cannot be set up is a warning'
+Import-Module (Join-Path (Join-Path $src 'lib') 'LocalAI.psm1') -Force
+$rw = Get-LaiRagWanted
+Assert-That ($rw.CHUNK_SIZE -eq 1000 -and $rw.ENABLE_RAG_HYBRID_SEARCH -eq $true -and $rw.TOP_K -gt $rw.TOP_K_RERANKER) 'document search: whole 1,000-token chunks, hybrid search, more candidates than results'
 
 Write-Host "`n=== presets: Think and image generation stay the user's; context overrides, vision and images are checked ===" -ForegroundColor Cyan
 # Open WebUI 0.11.4 re-applies a preset's think over the per-chat Chat Controls switch, so the preset is

@@ -52,9 +52,9 @@ services:
       ENABLE_MEMORIES: "true"
       RAG_TEXT_SPLITTER: token
       ENABLE_MARKDOWN_HEADER_TEXT_SPLITTER: "true"
-      CHUNK_SIZE: "2000"
-      CHUNK_OVERLAP: "200"
-      RAG_TOP_K: "5"
+      CHUNK_SIZE: "1000"
+      CHUNK_OVERLAP: "100"
+      RAG_TOP_K: "10"
       ENABLE_WEB_SEARCH: "true"
       WEB_SEARCH_ENGINE: searxng
       SEARXNG_QUERY_URL: http://searxng:8080/search?q=<query>

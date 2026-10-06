@@ -1342,7 +1342,7 @@ function Set-LaiWebUIRetrievalConfig {
     # object is NOT: the server assigns every web field it defines, so a partial 'web' would null
     # out the rest (e.g. SEARXNG_LANGUAGE=None crashes every SearXNG search with AttributeError).
     # So 'web' is always sent as current-config + changes, with known defaults repaired.
-    param([string]$BaseUrl = 'http://127.0.0.1:3000', [Parameter(Mandatory)][string]$Token, [Parameter(Mandatory)][hashtable]$Settings)
+    param([string]$BaseUrl = 'http://127.0.0.1:3000', [Parameter(Mandatory)][string]$Token, [Parameter(Mandatory)][hashtable]$Settings, [int]$TimeoutSec = 120)
     $body = @{}
     foreach ($k in $Settings.Keys) { $body[$k] = $Settings[$k] }
     if ($body.ContainsKey('web')) {
@@ -1356,7 +1356,69 @@ function Set-LaiWebUIRetrievalConfig {
         foreach ($k in $body['web'].Keys) { $web[$k] = $body['web'][$k] }
         $body['web'] = $web
     }
-    return Invoke-LaiApi -Method POST -Uri "$BaseUrl/api/v1/retrieval/config/update" -Body $body -Token $Token -TimeoutSec 120
+    return Invoke-LaiApi -Method POST -Uri "$BaseUrl/api/v1/retrieval/config/update" -Body $body -Token $Token -TimeoutSec $TimeoutSec
+}
+
+# Document search runs these inside the Open WebUI container, on the CPU (an Ollama embedder would
+# push the chat model out of VRAM on every question: OLLAMA_MAX_LOADED_MODELS=1). Open WebUI's own
+# default, all-MiniLM-L6-v2, reads only the first ~256 tokens of a chunk; bge-m3 reads 8,192.
+$script:LaiEmbeddingModel = 'BAAI/bge-m3'
+$script:LaiRerankingModel = 'BAAI/bge-reranker-v2-m3'
+$script:LaiStockEmbeddingModel = 'sentence-transformers/all-MiniLM-L6-v2'
+
+function Set-LaiWebUIEmbedding {
+    <#
+    .SYNOPSIS
+        Puts document search on a long-context embedding model and a reranker (both downloaded by
+        Open WebUI once, roughly 7 GB together, and run on the CPU), then re-indexes the knowledge
+        collections, whose vectors from the old model cannot be compared with the new one. Leaves
+        alone an embedding setup the owner chose (another engine or model) and a reranker they set.
+        Returns Result ('changed', 'unchanged', 'owner') and Warnings (a failure keeps the old model).
+    #>
+    param([string]$BaseUrl = 'http://127.0.0.1:3000', [Parameter(Mandatory)][string]$Token, [int]$TimeoutSec = 1800)
+    $warn = @()
+    $cur = Invoke-LaiApi -Uri "$BaseUrl/api/v1/retrieval/embedding" -Token $Token
+    $engine = [string]$cur.RAG_EMBEDDING_ENGINE; $model = [string]$cur.RAG_EMBEDDING_MODEL
+    if ($engine -ne '' -or ($model -and @($script:LaiStockEmbeddingModel, $script:LaiEmbeddingModel) -notcontains $model)) {
+        return [pscustomobject]@{ Result = 'owner'; Detail = (("$engine $model").Trim()); Warnings = @() }
+    }
+    $result = 'unchanged'
+    if ($model -ne $script:LaiEmbeddingModel) {
+        Write-LaiLog STEP "Document search: embedding model $($script:LaiEmbeddingModel) (a one-time download of a few GB; runs on the CPU)"
+        try {
+            Invoke-LaiApi -Method POST -Uri "$BaseUrl/api/v1/retrieval/embedding/update" -Token $Token -TimeoutSec $TimeoutSec `
+                -Body @{ RAG_EMBEDDING_ENGINE = ''; RAG_EMBEDDING_MODEL = $script:LaiEmbeddingModel } | Out-Null
+            $now = [string](Invoke-LaiApi -Uri "$BaseUrl/api/v1/retrieval/embedding" -Token $Token).RAG_EMBEDDING_MODEL
+            if ($now -ne $script:LaiEmbeddingModel) { throw "Open WebUI kept $now" }
+        } catch {
+            $why = (Get-LaiHttpErrorText $_) -replace '\s+', ' '
+            if (-not $why) { $why = $_.Exception.Message }
+            $warn += "Document search keeps its old embedding model: switching to $($script:LaiEmbeddingModel) failed ($why). Run the installer again when the internet connection is fine"
+            return [pscustomobject]@{ Result = 'unchanged'; Detail = $model; Warnings = $warn }
+        }
+        $result = 'changed'
+        Write-LaiLog OK "Document search uses $($script:LaiEmbeddingModel); re-indexing the knowledge collections with it (minutes per few hundred pages)"
+        try { Invoke-LaiApi -Method POST -Uri "$BaseUrl/api/v1/knowledge/reindex" -Token $Token -TimeoutSec 7200 | Out-Null; Write-LaiLog OK 'Knowledge collections re-indexed' }
+        catch { $warn += "The knowledge collections still hold the old model's index ($((Get-LaiHttpErrorText $_) -replace '\s+', ' ')): Admin Panel > Settings > Documents > Reindex Knowledge Base Vectors" }
+    }
+    # The reranker re-scores the candidates of hybrid search (keywords + meaning) and keeps the best.
+    # Open WebUI switches hybrid search off by itself if the reranker cannot load: checked below.
+    try {
+        $rc = Get-LaiWebUIRetrievalConfig -BaseUrl $BaseUrl -Token $Token
+        $rr = [string]$rc.RAG_RERANKING_MODEL
+        if (-not $rr) {
+            Write-LaiLog STEP "Document search: reranker $($script:LaiRerankingModel) (a one-time download of a few GB; runs on the CPU)"
+            Set-LaiWebUIRetrievalConfig -BaseUrl $BaseUrl -Token $Token -Settings @{ ENABLE_RAG_HYBRID_SEARCH = $true; RAG_RERANKING_MODEL = $script:LaiRerankingModel } -TimeoutSec $TimeoutSec | Out-Null
+            $rc = Get-LaiWebUIRetrievalConfig -BaseUrl $BaseUrl -Token $Token
+            if ([string]$rc.RAG_RERANKING_MODEL -ne $script:LaiRerankingModel -or -not $rc.ENABLE_RAG_HYBRID_SEARCH) { throw 'Open WebUI could not load it and turned hybrid search off' }
+            if ($result -eq 'unchanged') { $result = 'changed' }
+        }
+    } catch {
+        $why = (Get-LaiHttpErrorText $_) -replace '\s+', ' '
+        if (-not $why) { $why = $_.Exception.Message }
+        $warn += "Document search runs without its reranker ($why); run the installer again to retry"
+    }
+    return [pscustomobject]@{ Result = $result; Detail = $script:LaiEmbeddingModel; Warnings = $warn }
 }
 
 function Set-LaiWebUIOllamaUrl {
@@ -2489,9 +2551,13 @@ function Get-LaiRagWanted {
     return @{
         TEXT_SPLITTER                        = 'token'
         ENABLE_MARKDOWN_HEADER_TEXT_SPLITTER = $true
-        CHUNK_SIZE                           = 2000
-        CHUNK_OVERLAP                        = 200
-        TOP_K                                = 5
+        # 1,000-token chunks (whole ones fit the embedder), 10 candidates from keywords + meaning,
+        # the best 5 kept (re-scored by the reranker when it is set, else by similarity).
+        CHUNK_SIZE                           = 1000
+        CHUNK_OVERLAP                        = 100
+        TOP_K                                = 10
+        ENABLE_RAG_HYBRID_SEARCH             = $true
+        TOP_K_RERANKER                       = 5
         # The browser scales an attached image to fit 1920x1920 before sending it. Every image in a
         # chat is sent again with each message, and a full-size photo costs up to 4,096 of Local
         # Vision's 32K tokens (llama.cpp's Qwen-VL cap): unscaled, a chat with about seven photos no
@@ -2601,6 +2667,16 @@ function Invoke-LaiWebUISetup {
         $why = $_.Exception.Message -replace '\s+', ' '
         $warnings.Add("Documents/web search settings failed ($why); run the installer again, or set them in Admin Panel > Settings > Documents and Web Search")
         Write-LaiLog WARN "Documents/web search settings failed: $why"
+    }
+    try {
+        $emb = Set-LaiWebUIEmbedding -BaseUrl $BaseUrl -Token $Token
+        if ($emb.Result -eq 'owner') { Write-LaiLog INFO "Document search keeps the embedding setup you chose ($($emb.Detail))" }
+        elseif ($emb.Result -eq 'unchanged' -and -not $emb.Warnings.Count) { Write-LaiLog OK "Document search: $($emb.Detail) with a reranker" }
+        foreach ($w in @($emb.Warnings)) { $warnings.Add($w); Write-LaiLog WARN $w }
+    } catch {
+        $why = $_.Exception.Message -replace '\s+', ' '
+        $warnings.Add("Document search models were not checked ($why); run the installer again")
+        Write-LaiLog WARN "Document search models were not checked: $why"
     }
 
     foreach ($c in $Collections) {

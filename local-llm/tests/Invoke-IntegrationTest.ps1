@@ -67,17 +67,17 @@ $ocCfgs = @{}; if ($oc.ContainsKey('OLLAMA_API_CONFIGS') -and $oc['OLLAMA_API_CO
 Invoke-LaiApi -Method POST -Uri "$WebUIUrl/ollama/config/update" -Token $token -Body @{ ENABLE_OLLAMA_API = $true; OLLAMA_BASE_URLS = [object[]]@($OllamaUrl); OLLAMA_API_CONFIGS = $ocCfgs } | Out-Null
 # Start from values other than the wanted ones (the server's own defaults already equal most of
 # them, so an ignored write would otherwise still read back 'right').
-Set-LaiWebUIRetrievalConfig -BaseUrl $WebUIUrl -Token $token -Settings @{ TOP_K = 3; CHUNK_SIZE = 1000; CHUNK_OVERLAP = 100; FILE_IMAGE_COMPRESSION_WIDTH = 640; FILE_IMAGE_COMPRESSION_HEIGHT = 480
+Set-LaiWebUIRetrievalConfig -BaseUrl $WebUIUrl -Token $token -Settings @{ TOP_K = 3; CHUNK_SIZE = 1500; CHUNK_OVERLAP = 150; ENABLE_RAG_HYBRID_SEARCH = $false; FILE_IMAGE_COMPRESSION_WIDTH = 640; FILE_IMAGE_COMPRESSION_HEIGHT = 480
     web = @{ WEB_SEARCH_RESULT_COUNT = 3; WEB_FETCH_MAX_CONTENT_LENGTH = 1000 } } | Out-Null
 Set-LaiWebUIAdminConfig -BaseUrl $WebUIUrl -Token $token -Changes @{ ENABLE_MEMORY_SYSTEM_CONTEXT = $false } | Out-Null
 $pre = Get-LaiWebUIRetrievalConfig -BaseUrl $WebUIUrl -Token $token
-if ($pre.TOP_K -ne 3 -or $pre.CHUNK_SIZE -ne 1000 -or $pre.web.WEB_SEARCH_RESULT_COUNT -ne 3) { Write-LaiLog FAIL "could not move the settings away from the wanted values first (top_k=$($pre.TOP_K) chunk=$($pre.CHUNK_SIZE))"; $failures++ }
+if ($pre.TOP_K -ne 3 -or $pre.CHUNK_SIZE -ne 1500 -or $pre.ENABLE_RAG_HYBRID_SEARCH -ne $false -or $pre.web.WEB_SEARCH_RESULT_COUNT -ne 3) { Write-LaiLog FAIL "could not move the settings away from the wanted values first (top_k=$($pre.TOP_K) chunk=$($pre.CHUNK_SIZE))"; $failures++ }
 if ([int]$pre.FILE_IMAGE_COMPRESSION_WIDTH -ne 640 -or [int]$pre.web.WEB_FETCH_MAX_CONTENT_LENGTH -ne 1000) { Write-LaiLog FAIL "could not move the image scaling / fetch cap away first (width=$($pre.FILE_IMAGE_COMPRESSION_WIDTH) fetch=$($pre.web.WEB_FETCH_MAX_CONTENT_LENGTH))"; $failures++ }
 $setupWarn = @(Invoke-LaiWebUISetup -BaseUrl $WebUIUrl -Token $token -Models $catalog.Models -ModelResults $results -SystemPrompt $system `
     -DefaultPreset $catalog.DefaultPreset -Collections @('PC & Electronics', 'General References') -SearxngQueryUrl $SearxngQueryUrl)
 $post = Get-LaiWebUIRetrievalConfig -BaseUrl $WebUIUrl -Token $token
 $postAdmin = Invoke-LaiApi -Uri "$WebUIUrl/api/v1/auths/admin/config" -Token $token
-if ($post.TOP_K -ne 5 -or $post.CHUNK_SIZE -ne 2000 -or $post.CHUNK_OVERLAP -ne 200 -or $post.web.WEB_SEARCH_RESULT_COUNT -ne 5 -or $postAdmin.ENABLE_MEMORY_SYSTEM_CONTEXT -ne $true) { Write-LaiLog FAIL 'the configuration pass did not change the moved settings back'; $failures++ }
+if ($post.TOP_K -ne 10 -or $post.CHUNK_SIZE -ne 1000 -or $post.CHUNK_OVERLAP -ne 100 -or $post.ENABLE_RAG_HYBRID_SEARCH -ne $true -or $post.web.WEB_SEARCH_RESULT_COUNT -ne 5 -or $postAdmin.ENABLE_MEMORY_SYSTEM_CONTEXT -ne $true) { Write-LaiLog FAIL 'the configuration pass did not change the moved settings back'; $failures++ }
 # Context budget (Local Vision 32K, Fast 40K): image scaling and the fetched-page cap, read back from the real server.
 $ragWant = Get-LaiRagWanted
 if ([int]$post.FILE_IMAGE_COMPRESSION_WIDTH -ne $ragWant.FILE_IMAGE_COMPRESSION_WIDTH -or [int]$post.FILE_IMAGE_COMPRESSION_HEIGHT -ne $ragWant.FILE_IMAGE_COMPRESSION_HEIGHT -or [int]$post.web.WEB_FETCH_MAX_CONTENT_LENGTH -ne $ragWant.web.WEB_FETCH_MAX_CONTENT_LENGTH) {
@@ -130,7 +130,7 @@ $left = @(Get-LaiContextOverride -BaseUrl $WebUIUrl -Token $token -PresetIds @($
 if ($left.Count -ne 0) { Write-LaiLog FAIL "context override still reported after clearing it: $($left -join ' | ')"; $failures++ }
 
 $rc = Get-LaiWebUIRetrievalConfig -BaseUrl $WebUIUrl -Token $token
-if ($rc.web.SEARXNG_LANGUAGE -ne 'all' -or $rc.web.WEB_LOADER_CONCURRENT_REQUESTS -ne 10 -or $rc.TEXT_SPLITTER -ne 'token' -or $rc.TOP_K -ne 5) {
+if ($rc.web.SEARXNG_LANGUAGE -ne 'all' -or $rc.web.WEB_LOADER_CONCURRENT_REQUESTS -ne 10 -or $rc.TEXT_SPLITTER -ne 'token' -or $rc.TOP_K -ne 10) {
     Write-LaiLog FAIL "retrieval config clobbered: language=$($rc.web.SEARXNG_LANGUAGE) loader=$($rc.web.WEB_LOADER_CONCURRENT_REQUESTS) splitter=$($rc.TEXT_SPLITTER) top_k=$($rc.TOP_K)"
     $failures++
 }

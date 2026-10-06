@@ -3,7 +3,8 @@
 <#
 .SYNOPSIS
     Consistent backup of the Open WebUI data volume (users, chats, memories, presets, settings,
-    uploaded documents and their vector index).
+    uploaded documents and their vector index). The models Open WebUI downloads for document search
+    and speech are left out: it fetches them again by itself after a restore.
 
 .DESCRIPTION
     Stops the open-webui container while the archive is written (seconds to a few minutes; a
@@ -295,8 +296,10 @@ try {
         Invoke-Docker -Arguments @('volume', 'rm', '-f', $v) -AllowFail | Out-Null
     }
     try {
+        # Without the models Open WebUI downloads for document search and speech (several GB, fetched
+        # again by itself after a restore): every nightly archive would otherwise carry them.
         Invoke-Docker -Arguments @('run', '--rm', '-v', "${Volume}:/data:ro", '-v', "${backupDir}:/backup", $HelperImage,
-            'tar', 'czf', "/backup/$workName", '-C', '/data', '.') | Out-Null
+            'tar', 'czf', "/backup/$workName", '--exclude=./cache/embedding/models', '--exclude=./cache/whisper/models', '-C', '/data', '.') | Out-Null
     } finally {
         if ($stopped) { Invoke-Docker -Arguments @('start', $Container) | Out-Null }
     }
