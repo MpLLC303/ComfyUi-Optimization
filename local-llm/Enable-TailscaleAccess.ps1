@@ -86,9 +86,25 @@ if ($status.BackendState -ne 'Running') {
 }
 $dns = ([string]$status.Self.DNSName).TrimEnd('.')
 
+function Set-WebUIExtraOrigin([string]$Value) {
+    # Open WebUI accepts API calls (and live chat streaming) only from the origins it is told about
+    # (CORS_ALLOW_ORIGIN in the compose file): the phone's https://<pc>.<tailnet>.ts.net is added
+    # here and removed with -Disable. Open WebUI is then recreated to pick it up (about 20 s).
+    $envPath = Join-Path (Join-Path $AIRoot 'Stack') '.env'
+    if (-not (Test-Path -LiteralPath $envPath)) { Write-LaiLog WARN "No $envPath; re-run the installer, then this script."; return }
+    $lines = @(Get-Content -LiteralPath $envPath -Encoding UTF8 | Where-Object { $_ -notlike 'WEBUI_EXTRA_ORIGINS=*' })
+    if ($Value) { $lines += "WEBUI_EXTRA_ORIGINS=$Value" }
+    [System.IO.File]::WriteAllLines($envPath, [string[]]$lines, (New-Object System.Text.UTF8Encoding($false)))
+    $stackDir = Join-Path $AIRoot 'Stack'
+    try { $r = Invoke-LaiTimedNative -File 'docker' -Arguments @('compose', '--project-directory', $stackDir, '-f', (Join-Path $stackDir 'docker-compose.yml'), 'up', '-d', 'open-webui') -TimeoutSec 300 }
+    catch { $r = [pscustomobject]@{ ExitCode = -1; Text = $_.Exception.Message } }
+    if ($r.ExitCode -ne 0) { Write-LaiLog WARN "Open WebUI could not be restarted with the new address list ($($r.Text)); Start menu > Local AI > Start again does it." }
+}
+
 if ($Disable) {
     $r = Invoke-Tailscale @('serve', '--https=443', 'off')
     if ($r.ExitCode -ne 0 -and $r.Text -notmatch 'does not exist') { throw "Could not remove the mapping: $($r.Text)" }
+    Set-WebUIExtraOrigin ''
     Write-LaiLog OK "Tailscale access to Open WebUI removed (https://$dns no longer served)."
     exit 0
 }
@@ -122,6 +138,7 @@ if ($cfg -and $cfg.PSObject.Properties.Name -contains 'Web' -and $cfg.Web) {
     }
 }
 if (-not $ok) { throw "tailscale serve did not record a mapping to $target. Output: $($r.Text)" }
+Set-WebUIExtraOrigin ";https://$dns"
 
 Write-LaiLog OK "Open WebUI is available to your tailnet at https://$dns/ (HTTPS, not public, survives reboots)."
 Write-LaiLog INFO 'Install Tailscale on the phone, sign in to the same tailnet, open that URL and add it to the home screen.'

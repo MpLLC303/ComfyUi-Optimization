@@ -68,6 +68,19 @@ scheduled tasks run without administrator rights, and removes the old `C:\AI\Ins
 - **ComfyUI and games:** they matter only when something has to be measured (a new model, a driver
   update, `-Retune`). Then the installer waits up to 10 minutes for other GPU apps to let go.
 - **NVIDIA driver updates:** after one, the models are re-tuned automatically, which takes longer.
+- **What runs:** the window shows the toolkit version and the exact commit before Windows asks for
+  administrator rights, and that commit is what gets installed (a re-run after a failure, or the
+  resume after a restart, installs the same code). An older toolkit refuses to run over a newer
+  install (`-AllowDowngrade` if you really mean to go back).
+- **A backup comes first:** before the update changes anything, the chats are backed up once
+  (`C:\AI\Backups\open-webui-<time>-before-toolkit-<version>.tar.gz`; `Restore-OpenWebUI.ps1 -Archive
+  <that file>` goes back to it).
+- **Options with the one-liner:** set them first, e.g. `$env:LOCALAI_ARGS = '-OfficialModels none'`, then
+  paste the command. Plain options only (no quotes).
+- **The first update that brings the official models** (about 42 GB) says so and waits 20 seconds, so you
+  can close the window and run it again with `-OfficialModels none`. Windows will not go to sleep while
+  the installer runs. If the stored Open WebUI admin login no longer works, it asks for it at the start,
+  not after the downloads.
 - **Open WebUI:** it restarts briefly for the backup step.
 - **Your settings:** on the presets the installer refreshes only what it manages (base model,
   system prompt, tool mode, capabilities). Your additions (attached knowledge, tools, access, extra
@@ -158,7 +171,8 @@ prompt processing before the first token appears. Both are normal.
    A value there wins over the tuned alias; the installer report and `Test-LocalAI.ps1` warn about the first three.
 5. **Image versions are pinned** (Open WebUI v0.11.4, SearXNG 2026.10.2) instead of `:main`. A moving tag
    can migrate your database on an unplanned restart. `Update-OpenWebUI.ps1 -Latest` updates deliberately, with a backup first.
-6. **SearXNG is set up from day one.** It needs no API key and keeps searches private, so there's no provider to choose
+6. **SearXNG is set up from day one.** It needs no API key and no account, and builds no profile of you (the search sites still see your IP
+   address and the query), so there's no provider to choose
    and nothing to sign up for. It's bound to localhost only.
 7. **Backups are consistent and versioned.** The guide's command tars a live SQLite database and
    overwrites one file. The script stops the container while the archive is written (seconds to a few minutes), keeps timestamped archives

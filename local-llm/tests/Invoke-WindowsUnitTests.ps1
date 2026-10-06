@@ -398,6 +398,14 @@ if ($onWindows) {
     & chmod +x (Join-Path $shimDir 'tailscale')
 }
 $tsLog = Join-Path $shimDir 'calls.txt'
+# A fake docker too: the script recreates Open WebUI with the phone's address allowed.
+$dockerLog = Join-Path $shimDir 'docker-calls.txt'
+$dockerPs = Join-Path $shimDir 'docker-shim.ps1'
+Set-Content -LiteralPath $dockerPs -Encoding UTF8 -Value ('Add-Content -LiteralPath ''{0}'' -Value ($args -join '' ''); exit 0' -f $dockerLog)
+if ($onWindows) { Set-Content -LiteralPath (Join-Path $shimDir 'docker.cmd') -Value ('@"{0}" -NoProfile -ExecutionPolicy Bypass -File "{1}" %*' -f $childExe, $dockerPs) }
+else { Set-Content -LiteralPath (Join-Path $shimDir 'docker') -Value ("#!/bin/sh`nexec pwsh -NoProfile -File '{0}' `"`$@`"" -f $dockerPs); & chmod +x (Join-Path $shimDir 'docker') }
+New-Item -ItemType Directory -Force -Path (Join-Path $aiRoot 'Stack') | Out-Null
+Set-Content -LiteralPath (Join-Path (Join-Path $aiRoot 'Stack') '.env') -Encoding UTF8 -Value @('WEBUI_PORT=3999', 'KEEP_ME=1')
 $savedPath = $env:Path; $savedPATH = $env:PATH
 $env:Path = $shimDir + [System.IO.Path]::PathSeparator + $savedPath
 if (-not $onWindows) { $env:PATH = $env:Path }
@@ -414,6 +422,9 @@ try {
     }
     $r = & $runTs 'ok' @()
     Assert-That ($r.Code -eq 0 -and $r.Text -match 'available to your tailnet at https://pc\.tail\.ts\.net/') "serve applied and verified -> success (exit $($r.Code))"
+    $envTs = @(Get-Content -LiteralPath (Join-Path (Join-Path $aiRoot 'Stack') '.env') -Encoding UTF8)
+    $dCalls = @(); if (Test-Path -LiteralPath $dockerLog) { $dCalls = @(Get-Content -LiteralPath $dockerLog) }
+    Assert-That ($envTs -contains 'WEBUI_EXTRA_ORIGINS=;https://pc.tail.ts.net' -and $envTs -contains 'KEEP_ME=1' -and @($dCalls | Where-Object { $_ -match 'compose .*up -d open-webui$' }).Count -eq 1) "the phone's address is allowed to call Open WebUI, which is recreated ($($dCalls -join ' | '))"
     $r = & $runTs 'needslogin' @()
     Assert-That ($r.Code -ne 0 -and $r.Text -match 'NeedsLogin' -and -not ($r.Calls -match '^serve')) 'not signed in: clear error, nothing served'
     $r = & $runTs 'nohttps' @()
@@ -422,12 +433,17 @@ try {
     Assert-That ($r.Code -ne 0 -and $r.Text -match 'did not record a mapping') 'serve exits 0 but records nothing: not reported as success'
     $r = & $runTs 'ok' @('-Disable')
     Assert-That ($r.Code -eq 0 -and $r.Text -match 'removed') '-Disable with nothing mapped is fine (idempotent)'
+    $envTs = @(Get-Content -LiteralPath (Join-Path (Join-Path $aiRoot 'Stack') '.env') -Encoding UTF8)
+    Assert-That (@($envTs | Where-Object { $_ -like 'WEBUI_EXTRA_ORIGINS=*' }).Count -eq 0 -and $envTs -contains 'KEEP_ME=1') '-Disable takes the phone address off the allowed list'
     $r = & $runTs 'hang' @()
     Assert-That ($r.Code -ne 0 -and $r.Text -match 'did not answer within 8 s' -and $r.Seconds -lt 40) ("a hung tailscale CLI times out instead of hanging ({0:N0} s)" -f $r.Seconds)
 } finally {
     $env:Path = $savedPath; if (-not $onWindows) { $env:PATH = $savedPATH }
     $env:LAI_TS_SCENARIO = ''; $env:LOCALAI_TS_TIMEOUT = ''
 }
+
+$composeText = Get-Content -LiteralPath (Join-Path (Join-Path $src 'stack') 'docker-compose.yml') -Raw -Encoding UTF8
+Assert-That ($composeText -match 'CORS_ALLOW_ORIGIN: "http://localhost:\$\{WEBUI_PORT:-3000\};http://127\.0\.0\.1:\$\{WEBUI_PORT:-3000\}\$\{WEBUI_EXTRA_ORIGINS:-\}"') 'Open WebUI accepts API calls with your login only from its own pages (no CORS wildcard)'
 
 Write-Host "`n=== resume command: real round trip through Windows PowerShell 5.1 ===" -ForegroundColor Cyan
 if ($onWindows) {
@@ -1195,6 +1211,9 @@ if ($onWindows) {
     Assert-That ([Console]::OutputEncoding.CodePage -eq $encBefore) 'the console encoding is restored afterwards'
 } else { Skip 'console code pages exist on Windows only' }
 
+# Keep-awake for long installs: takes on Windows (Windows CI), a no-op elsewhere.
+if ($env:OS -eq 'Windows_NT') { Assert-That (Enable-LaiKeepAwake) 'Windows does not sleep while the installer runs (SetThreadExecutionState took)' }
+else { Assert-That (-not (Enable-LaiKeepAwake)) 'keep-awake is a no-op off Windows' }
 Write-Host "`n=== other hardware: GPU size, several GPUs, no NVIDIA GPU, RAM ===" -ForegroundColor Cyan
 Import-Module (Join-Path (Join-Path $src 'lib') 'LocalAI.psm1') -Force
 # The owner's card must keep passing: every model of the real catalog fits a 24 GB RTX 3090.

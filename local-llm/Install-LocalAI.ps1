@@ -46,6 +46,8 @@ param(
     # presets. 'all', a list of keys, or 'none' (hides them again). Omitted on a re-run = keep the
     # choice made before; one that failed to set up is not retried until named here or -Retune.
     [string[]]$OfficialModels = @(),
+    # Run this toolkit even if an older version than the one installed (see README: Maintain).
+    [switch]$AllowDowngrade,
     # Loopback ports (never exposed to the LAN). A busy port is replaced by the next free one.
     [int]$WebUIPort = 3000,
     # SearXNG's loopback port (Open WebUI's web search).
@@ -115,7 +117,11 @@ $ProgressPreference = 'SilentlyContinue'
 $SourceRoot = $PSScriptRoot
 $ToolkitVersion = 'unknown'
 $versionFile = Join-Path $SourceRoot 'VERSION'
-if (Test-Path -LiteralPath $versionFile) { $ToolkitVersion = (Get-Content -LiteralPath $versionFile -Raw).Trim() }
+if (Test-Path -LiteralPath $versionFile) { $ToolkitVersion = (Get-Content -LiteralPath $versionFile -Raw -Encoding UTF8).Trim() }
+# The exact commit, written by Get-LocalAI.ps1 (absent in a ZIP downloaded by hand).
+$ToolkitCommit = ''
+$commitFile = Join-Path $SourceRoot 'COMMIT'
+if (Test-Path -LiteralPath $commitFile) { $ToolkitCommit = (Get-Content -LiteralPath $commitFile -Raw -Encoding UTF8).Trim() }
 Import-Module (Join-Path $SourceRoot 'lib\LocalAI.psm1') -Force
 
 #region Elevation ---------------------------------------------------------------------------
@@ -205,6 +211,7 @@ $DockerExe = Find-LaiDockerDesktopExe -OrDefault
 $DockerBin = Join-Path (Split-Path -Parent $DockerExe) 'resources\bin'
 $ResumeTask = 'LocalAI-Install-Resume'
 $ToolkitItems = @('Install-LocalAI.ps1', 'Install-LocalAI.cmd', 'Test-LocalAI.ps1', 'Backup-OpenWebUI.ps1', 'Update-OpenWebUI.ps1', 'Release-GPU.ps1', 'Set-OpenWebUIPassword.ps1', 'Restore-OpenWebUI.ps1', 'Update-Models.ps1', 'Start-ComfyUI.ps1', 'Enable-TailscaleAccess.ps1', 'Watch-LocalAI.ps1', 'Uninstall-LocalAI.ps1', 'Stop-LocalAI.ps1', 'Start-LocalAI.ps1', 'Get-LocalAIDiagnostics.ps1', 'Get-LocalAI.ps1', 'Sync-LocalAISkills.ps1', 'VERSION', 'README.md', 'lib', 'config', 'stack', 'skills')
+if ($ToolkitCommit) { $ToolkitItems += 'COMMIT' }
 # After a reboot the resume task (not elevated) starts this copy, which asks for admin rights with a
 # UAC prompt. The prompt names powershell.exe, not the script, so the script it runs must be one
 # only Administrators can change: not C:\AI\Scripts (the user has full control of C:\AI and can
@@ -820,7 +827,17 @@ if (-not $PSBoundParameters.ContainsKey('RenderGuard') -and @('cpu', 'off') -con
     $RenderGuard = $PrevStackEnv['RENDER_GUARD_MODE']
 }
 
-Write-LaiLog STEP "Local AI installer $ToolkitVersion - log: $($P.Logs)"
+Write-LaiLog STEP "Local AI installer $ToolkitVersion$(if ($ToolkitCommit) { ' (commit ' + $ToolkitCommit.Substring(0, [Math]::Min(7, $ToolkitCommit.Length)) + ')' }) - log: $($P.Logs)"
+# An older toolkit over a newer install: its scripts would not know the newer settings (an older
+# installer removes the render guard Open WebUI now talks to, and makes the backup task elevated
+# again). -AllowDowngrade when that is really wanted (README: Maintain).
+$installedVersion = [string](Read-LaiState -Path $P.Config)['ToolkitVersion']
+if ($installedVersion -match '^\d{4}\.\d{2}\.\d{2}$' -and $ToolkitVersion -match '^\d{4}\.\d{2}\.\d{2}$' -and [string]::CompareOrdinal($ToolkitVersion, $installedVersion) -lt 0 -and -not $AllowDowngrade) {
+    Write-LaiLog FAIL "This is toolkit $ToolkitVersion, older than the installed $installedVersion. Nothing was changed. Use the newest one (Start menu > Local AI > Update toolkit), or pass -AllowDowngrade if you really mean to go back."
+    exit 1
+}
+# A run downloads for hours: Windows must not sleep meanwhile (the screen may still turn off).
+if (Enable-LaiKeepAwake) { Write-LaiLog INFO 'Windows will not go to sleep while the installer runs' }
 if (-not $Resume -and $SourceRoot.TrimEnd('\') -eq $P.Scripts.TrimEnd('\')) {
     Write-LaiLog WARN (('This is the installed copy in {0}; it re-applies the toolkit you already have. To get the newest ' +
         'version use Start menu > Local AI > Update toolkit, or the one-line command in the README.') -f $P.Scripts)
@@ -903,6 +920,32 @@ Invoke-Stage 'Preflight' {
     Write-LaiLog INFO "$osName $($cv.DisplayVersion) (build $build.$($cv.UBR))"
     if ($build -lt 19045) { throw 'Windows 10 22H2 (build 19045) or newer is required by Ollama and Docker Desktop. Run Windows Update, then re-run.' }
 
+    # An existing install: check the stored Open WebUI admin login now, so a password changed in
+    # Open WebUI is asked for here, not after hours of downloads (when the window may be unattended).
+    $credFileNow = Join-Path $P.Secrets 'openwebui-admin.json'
+    if ($script:PrevSelected.Count -and (Test-Path -LiteralPath $credFileNow)) {
+        $cfgNow = Read-LaiState -Path $P.Config
+        $portNow = 3000; if ($cfgNow['WebUIPort']) { $portNow = [int]$cfgNow['WebUIPort'] }
+        $urlNow = "http://127.0.0.1:$portNow"
+        $upNow = $false; try { Invoke-LaiApi -Uri "$urlNow/health" -TimeoutSec 5 | Out-Null; $upNow = $true } catch { Write-Verbose 'Open WebUI not up yet' }
+        if ($upNow) {
+            $credNow = Get-AdminCredential
+            try { Connect-LaiWebUI -BaseUrl $urlNow -Email $credNow.email -Password $credNow.password | Out-Null; Write-LaiLog OK 'Open WebUI admin sign-in checked' }
+            catch {
+                if (@(400, 401, 403) -contains (Get-LaiHttpStatus $_)) {
+                    Write-LaiLog WARN "The stored Open WebUI admin login ($($credNow.email)) no longer works (changed in Open WebUI?). Enter the current one now, before the downloads:"
+                    $email = Read-Host 'Open WebUI admin email'
+                    $sec = Read-Host 'Password' -AsSecureString
+                    $plain = [Runtime.InteropServices.Marshal]::PtrToStringAuto([Runtime.InteropServices.Marshal]::SecureStringToBSTR($sec))
+                    Connect-LaiWebUI -BaseUrl $urlNow -Email $email -Password $plain | Out-Null
+                    ConvertTo-Json -InputObject @{ email = $email; password = $plain; url = "http://localhost:$portNow" } | Set-Content -LiteralPath $credFileNow -Encoding UTF8
+                    Protect-Path -Path $credFileNow
+                    Write-LaiLog OK 'Saved the new Open WebUI admin login'
+                } else { Write-Verbose "sign-in check skipped: $($_.Exception.Message)" }
+            }
+        }
+    }
+
     $gpu = Get-LaiGpuInfo
     if (-not $gpu) {
         # Say what this PC has: an AMD/Intel GPU or an ARM CPU is not a broken NVIDIA driver.
@@ -963,6 +1006,13 @@ Invoke-Stage 'Preflight' {
         if ($officialWanted -contains 'all') { $officialWanted = $officialKeys }
     } else {
         $officialWanted = $officialKeys
+        if ($script:PrevSelected.Count) {
+            # An update of an install from before the official models: say what is coming and how to
+            # skip it before the downloads start (the choice is then remembered).
+            $offGB = 0; foreach ($om in @($catalogAll.Models | Where-Object { $_.Official })) { $offGB += [double]$om.DownloadGB }
+            Write-LaiLog WARN ("This update adds the official models (Official Main, Deep and Fast): about {0} GB to download next to the uncensored ones, which stay. Not wanted? Close this window now and run it again with -OfficialModels none (one-line update: first `$env:LOCALAI_ARGS = '-OfficialModels none'). Continuing in 20 seconds." -f [Math]::Round($offGB))
+            if (-not $env:LOCALAI_TEST_CATALOG) { Start-Sleep -Seconds 20 }
+        }
     }
     if ($Retune) { $State.flags['officialFailed'] = @{} }
     $ollamaNow = ''; try { $ollamaNow = [string](Get-LaiOllamaVersion -BaseUrl $OllamaUrl) } catch { Write-Verbose 'Ollama version unknown' }
@@ -1088,8 +1138,17 @@ Invoke-Stage 'Preflight' {
     # them): backups hold every chat, logs the install transcript. The scripts that the backup and
     # resume tasks run as administrator are read-only even for the user. Skipped when the AI root is
     # a drive root (not ours to lock down).
-    if ([System.IO.Path]::GetPathRoot($P.Root).TrimEnd('\', '/') -ne $P.Root.TrimEnd('\', '/')) {
+    # A folder there that is not the toolkit's (ComfyUI kept in C:\AI, a shared folder) keeps its own
+    # permissions: then only the toolkit's folders and files are locked down, one by one.
+    $ours = @('Scripts', 'Stack', 'Secrets', 'Backups', 'Logs', 'Workspace', 'Downloads', 'Skills', 'OllamaModels')
+    $foreign = @(Get-ChildItem -LiteralPath $P.Root -Directory -Force -ErrorAction SilentlyContinue | Where-Object { $ours -notcontains $_.Name } | ForEach-Object { $_.Name })
+    if ([System.IO.Path]::GetPathRoot($P.Root).TrimEnd('\', '/') -ne $P.Root.TrimEnd('\', '/') -and $foreign.Count -eq 0) {
         Protect-Path -Path $P.Root
+        if (Test-Path -LiteralPath $P.Scripts) { Protect-Path -Path $P.Scripts -UserAccess ReadOnly }
+    } elseif ($foreign.Count) {
+        Write-LaiLog INFO "$($P.Root) also holds $($foreign -join ', '): their permissions are left alone; the toolkit's own folders and files are locked down one by one"
+        foreach ($d in @('Stack', 'Backups', 'Logs', 'Workspace', 'Downloads', 'Skills')) { $dp = Join-Path $P.Root $d; if (Test-Path -LiteralPath $dp) { Protect-Path -Path $dp } }
+        foreach ($f in @(Get-ChildItem -LiteralPath $P.Root -File -Force -ErrorAction SilentlyContinue)) { Protect-Path -Path $f.FullName }
         if (Test-Path -LiteralPath $P.Scripts) { Protect-Path -Path $P.Scripts -UserAccess ReadOnly }
     }
     Protect-Path -Path $P.Secrets
@@ -1470,6 +1529,21 @@ Invoke-Stage 'Stack' {
         throw ("A container named {0} from another setup is in the way: this stack's own containers need the names searxng and render-guard. No container was changed. Keep it under another name with 'docker rename {1} {1}-old' (stop it first if it uses port {2} or {3}), or remove it if you no longer need it, then run the installer again." -f ($clash -join ', '), $first, $script:WebUIPortEffective, $script:SearxngPortEffective)
     }
 
+    # Before this update changes containers, presets and settings: a backup of the chats as they are,
+    # once per toolkit version (the newest nightly one may be days old). Tagged, so it never counts as
+    # a nightly backup; pruned by age like the other tagged ones. A failure is a warning: the nightly
+    # backups are still there.
+    $preTag = 'before-toolkit-' + ($ToolkitVersion -replace '[^0-9A-Za-z.-]', '')
+    if ($script:PrevSelected.Count -and [string]$State.flags['preUpdateBackup'] -ne $preTag -and
+        (Invoke-Native -File 'docker' -Arguments @('volume', 'inspect', 'open-webui') -Capture -AllowFail).ExitCode -eq 0) {
+        Write-LaiLog STEP 'Backing up the chats before the update changes anything'
+        # Its own process: in this one it would import the module again and reset this run's log.
+        $psHost = (Get-Process -Id $PID).Path
+        & $psHost -NoProfile -ExecutionPolicy Bypass -File (Join-Path $SourceRoot 'Backup-OpenWebUI.ps1') -AIRoot $AIRoot -Tag $preTag -NoMirror -SkipDeepVerify | ForEach-Object { Write-Host "  $_" }
+        if ($LASTEXITCODE -eq 0) { $State.flags['preUpdateBackup'] = $preTag; Save-State; Write-LaiLog OK "Backup taken: $($P.Backups)\open-webui-<time>-$preTag.tar.gz (Restore-OpenWebUI.ps1 -Archive <that file> goes back to it)" }
+        else { Write-LaiLog WARN "The backup before the update did not work (see Logs\backup.log); the nightly backups in $($P.Backups) are still there" }
+    }
+
     # A container from the guide's manual "docker run" would clash with the compose-managed one.
     # Go raw-string backticks, not double quotes: Windows PowerShell 5.1 strips inner double quotes
     # from native arguments, and the broken template's error text looked like a legacy container.
@@ -1781,11 +1855,11 @@ Invoke-Stage 'Backup' {
         ModelDir = $State.flags['modelDir']; SelectedModels = @($State.flags['selectedModels'])
         BackupRetentionDays = $BackupRetentionDays; BackupMirror = $BackupMirror; KeepAlive = $KeepAlive
         MinFreeVramMiB = $MinFreeVramMiB; MaxBusyVramMiB = $MaxBusyVramMiB; RenderGuard = $RenderGuard
-        WebUIOllamaUrl = $script:WebUIOllamaUrl; ToolkitVersion = $ToolkitVersion
+        WebUIOllamaUrl = $script:WebUIOllamaUrl; ToolkitVersion = $ToolkitVersion; ToolkitCommit = $ToolkitCommit
         DeepResearchPort = $(if ($DeepResearch) { $script:ResearchPortEffective } else { 0 })
     }
     foreach ($k in $managed.Keys) { $config[$k] = $managed[$k] }
-    ConvertTo-Json -InputObject $config -Depth 5 | Set-Content -LiteralPath $P.Config -Encoding UTF8
+    Save-LaiState -State $config -Path $P.Config
 
     $backupScript = Join-Path $P.Scripts 'Backup-OpenWebUI.ps1'
     # -EngineWaitSec: a missed 03:30 run starts at sign-in, while Docker Desktop may need several minutes.

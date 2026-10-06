@@ -299,6 +299,20 @@ function Get-LaiReparsePath {
     return $null
 }
 
+function Enable-LaiKeepAwake {
+    # Keeps Windows from sleeping while this process runs (an install downloads for hours; a sleep
+    # mid-download fails the pull). The display may still turn off. Ends with the process. Returns
+    # whether it took ($false off Windows or if the call is not available).
+    if ($env:OS -ne 'Windows_NT') { return $false }
+    try {
+        if (-not ('LaiPower' -as [type])) {
+            Add-Type -Namespace '' -Name 'LaiPower' -MemberDefinition '[System.Runtime.InteropServices.DllImport("kernel32.dll")] public static extern uint SetThreadExecutionState(uint esFlags);'
+        }
+        # ES_CONTINUOUS | ES_SYSTEM_REQUIRED
+        return ([LaiPower]::SetThreadExecutionState([uint32]2147483649) -ne 0)
+    } catch { return $false }
+}
+
 function Set-LaiPrivateAcl {
     <#
     .SYNOPSIS

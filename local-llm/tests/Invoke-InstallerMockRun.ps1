@@ -260,6 +260,8 @@ Assert-That ($tp -and -not $tp.meta.hidden) 'trial preset created in Open WebUI 
 Assert-That ($sel -contains 'official-ok' -and $sel -notcontains 'official-missing') "official models are installed by default; one whose tag cannot be pulled is skipped, not fatal ($($sel -join ', '))"
 $allLogs = (Get-ChildItem (Join-Path $aiRoot 'Logs') -Filter 'install-*.log' | ForEach-Object { Get-Content -Raw $_.FullName }) -join "`n"
 Assert-That ($allLogs -match 'Official model Official: missing tag \(testorg/official-does-not-exist:1b\) skipped: .*The uncensored presets are unaffected') 'the official skip came from the Models stage and says the uncensored presets are unaffected'
+Assert-That ($allLogs -match 'This update adds the official models .* -OfficialModels none') 'an existing install that never chose is told about the official models and how to skip them before the downloads'
+Assert-That ($allLogs -match 'Open WebUI admin sign-in checked') 'an existing install checks the stored admin login before the downloads'
 Assert-That ($state.flags.officialFailed.PSObject.Properties['official-missing'] -and [string]$state.flags.officialFailed.'official-missing'.Source -eq 'testorg/official-does-not-exist:1b') 'the failed official model is recorded, so later runs do not download and load it again'
 $op = Get-TestPreset 'official-standin'
 $mcfg = Invoke-LaiApi -Uri 'http://127.0.0.1:3000/api/v1/configs/models' -Token $tok2
@@ -423,6 +425,19 @@ $mcfgF = Invoke-LaiApi -Uri 'http://127.0.0.1:3000/api/v1/configs/models' -Token
 $opF = Get-TestPreset 'official-standin'
 Assert-That ($c4f -eq 0 -and [string]$mcfgF.DEFAULT_MODELS -eq 'local-fast') "a default model the owner picked is kept by an update (default '$($mcfgF.DEFAULT_MODELS)', exit $c4f)"
 Assert-That ($opF -and $opF.meta.hidden -eq $true) 'a selected preset the owner hid stays hidden'
+Write-Host "`n=== PHASE 4g: an older toolkit over a newer install; a folder in AI that is not ours ===" -ForegroundColor Cyan
+$cfgPathG = Join-Path $aiRoot 'localai-config.json'
+$cfgG = Read-LaiState -Path $cfgPathG; $cfgG['ToolkitVersion'] = '2099.01.01'; Save-LaiState -State $cfgG -Path $cfgPathG
+$foreignDir = Join-Path $aiRoot 'ComfyUI'; New-Item -ItemType Directory -Force -Path $foreignDir | Out-Null
+& (Join-Path $aiRoot 'Scripts/Install-LocalAI.ps1') -AIRoot $aiRoot -SkipTests -TrialModels none
+$c4g = $LASTEXITCODE
+$log4g = Get-Content -Raw (Get-ChildItem (Join-Path $aiRoot 'Logs') -Filter 'install-*.log' | Sort-Object LastWriteTime | Select-Object -Last 1).FullName  # lai-ok: objects
+Assert-That ($c4g -eq 1 -and $log4g -match 'older than the installed 2099\.01\.01\. Nothing was changed') "an older toolkit refuses to run over a newer install (exit $c4g)"
+& (Join-Path $aiRoot 'Scripts/Install-LocalAI.ps1') -AIRoot $aiRoot -SkipTests -TrialModels none -AllowDowngrade
+$c4h = $LASTEXITCODE
+$log4h = Get-Content -Raw (Get-ChildItem (Join-Path $aiRoot 'Logs') -Filter 'install-*.log' | Sort-Object LastWriteTime | Select-Object -Last 1).FullName  # lai-ok: objects
+Assert-That ($c4h -eq 0 -and $log4h -match 'also holds ComfyUI: their permissions are left alone') "-AllowDowngrade runs it; a folder in AI that is not the toolkit's keeps its permissions (exit $c4h)"
+Remove-Item -LiteralPath $foreignDir -Recurse -Force
 # Back to the toolkit's own default for the later phases.
 Set-LaiWebUIModelsConfig -BaseUrl 'http://127.0.0.1:3000' -Token $tokF -DefaultModel 'official-standin' | Out-Null
 Show-LaiWebUIModel -BaseUrl 'http://127.0.0.1:3000' -Token $tokF -Id 'official-standin' | Out-Null
@@ -652,6 +667,9 @@ if ((& /usr/bin/docker image inspect $ldrImage 2>$null) -and $LASTEXITCODE -eq 0
     $before8 = @($global:Calls).Count
     & (Join-Path $aiRoot 'Scripts/Install-LocalAI.ps1') -AIRoot $aiRoot -SkipTests -TrialModels none -DeepResearch
     $c8 = $LASTEXITCODE
+    # Before the update changed anything, the chats were backed up once for this toolkit version.
+    $pre8 = @(Get-ChildItem -LiteralPath (Join-Path $aiRoot 'Backups') -Filter 'open-webui-*-before-toolkit-*.tar.gz' -ErrorAction SilentlyContinue)
+    Assert-That ($pre8.Count -eq 1 -and [string](Read-LaiState -Path (Join-Path $aiRoot 'install-state.json'))['flags']['preUpdateBackup'] -like 'before-toolkit-*') "an update of an existing install backs the chats up first, once per toolkit version ($($pre8.Count) archive(s))"
     $env8 = @(Get-Content -Encoding UTF8 (Join-Path $aiRoot 'Stack/.env'))
     $st8 = Read-LaiState -Path (Join-Path $aiRoot 'install-state.json')
     $cfg8 = Read-LaiState -Path (Join-Path $aiRoot 'localai-config.json')

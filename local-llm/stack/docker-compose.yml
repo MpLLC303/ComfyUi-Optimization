@@ -35,6 +35,10 @@ services:
     environment:
       WEBUI_SECRET_KEY: ${WEBUI_SECRET_KEY:?WEBUI_SECRET_KEY is missing from .env}
       WEBUI_URL: http://localhost:${WEBUI_PORT:-3000}
+      # Only Open WebUI's own pages may call its API with your login (its default, "*", lets any page
+      # served from localhost - a ComfyUI custom node, Deep Research's report page - do it). Phone
+      # access adds its https://<pc>.<tailnet>.ts.net origin here (Enable-TailscaleAccess.ps1).
+      CORS_ALLOW_ORIGIN: "http://localhost:${WEBUI_PORT:-3000};http://127.0.0.1:${WEBUI_PORT:-3000}${WEBUI_EXTRA_ORIGINS:-}"
       # Headless admin creation. Only used while the database has zero users; it also
       # disables open signup. The installer blanks the password in .env after first login.
       WEBUI_ADMIN_EMAIL: ${WEBUI_ADMIN_EMAIL:-}
