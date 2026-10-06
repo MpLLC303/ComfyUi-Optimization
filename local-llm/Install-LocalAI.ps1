@@ -1538,7 +1538,7 @@ Invoke-Stage 'Stack' {
         (Invoke-Native -File 'docker' -Arguments @('volume', 'inspect', 'open-webui') -Capture -AllowFail).ExitCode -eq 0) {
         Write-LaiLog STEP 'Backing up the chats before the update changes anything'
         # Its own process: in this one it would import the module again and reset this run's log.
-        $psHost = (Get-Process -Id $PID).Path
+        $psHost = [System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
         & $psHost -NoProfile -ExecutionPolicy Bypass -File (Join-Path $SourceRoot 'Backup-OpenWebUI.ps1') -AIRoot $AIRoot -Tag $preTag -NoMirror -SkipDeepVerify | ForEach-Object { Write-Host "  $_" }
         if ($LASTEXITCODE -eq 0) { $State.flags['preUpdateBackup'] = $preTag; Save-State; Write-LaiLog OK "Backup taken: $($P.Backups)\open-webui-<time>-$preTag.tar.gz (Restore-OpenWebUI.ps1 -Archive <that file> goes back to it)" }
         else { Write-LaiLog WARN "The backup before the update did not work (see Logs\backup.log); the nightly backups in $($P.Backups) are still there" }
