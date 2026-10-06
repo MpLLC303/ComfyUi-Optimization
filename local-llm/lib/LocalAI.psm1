@@ -1280,6 +1280,21 @@ function Set-LaiWebUIModel {
     return 'created'
 }
 
+function Show-LaiWebUIModel {
+    # Undoes Hide-LaiWebUIModel on an existing model; everything else on it is kept.
+    param([string]$BaseUrl = 'http://127.0.0.1:3000', [Parameter(Mandatory)][string]$Token, [Parameter(Mandatory)][string]$Id)
+    $existing = Get-LaiWebUIModel -BaseUrl $BaseUrl -Token $Token -Id $Id
+    if (-not $existing) { return 'missing' }
+    $form = ConvertTo-LaiHashtable $existing
+    if (-not $form.ContainsKey('meta') -or $null -eq $form['meta']) { $form['meta'] = @{} }
+    if ($form['meta']['hidden'] -ne $true) { return 'already shown' }
+    $form['meta']['hidden'] = $false
+    $form['id'] = $Id
+    if ($null -eq $form['params']) { $form['params'] = @{} }
+    Invoke-LaiApi -Method POST -Uri "$BaseUrl/api/v1/models/model/update" -Body $form -Token $Token | Out-Null
+    return 'shown'
+}
+
 function Hide-LaiWebUIModel {
     # Hides a raw/base model from the chat selector without touching any per-model settings
     # the user already saved for it (same thing the Admin > Models "hide" toggle does).
@@ -2425,18 +2440,23 @@ function New-LaiPresetForm {
             image_generation = $false; code_interpreter = $false; terminal = $false
             citations = $true; status_updates = $true; memory = $true; builtin_tools = $true
         }
+        # chats off: with it the model can search and read every past chat, and a web page or document
+        # it reads could tell it to put what it finds into a URL it fetches (fetch_url reaches any
+        # public site, without asking). Re-runs keep it off.
         builtinTools      = @{
-            memory = $true; web_search = $true; knowledge = $true; chats = $true; time = $true
+            memory = $true; web_search = $true; knowledge = $true; chats = $false; time = $true
             image_generation = $false; code_interpreter = $false
         }
         tags              = @(@{ name = 'local' })
     }
-    # A trial or official release that is selected again must be shown again (the installer hid it
-    # when it was dropped); the measured presets keep whatever the user chose.
-    if ($Entry.Trial -or $Entry.Official) { $meta['hidden'] = $false }
+    # No 'hidden' here: a preset the owner hid stays hidden. The installer shows a trial or official
+    # preset again only when it hid it itself (Show-LaiWebUIModel).
     # Native tool calling lets the model decide when to search. In legacy (prompt-based) mode a
     # default-on web search would run a search before every single message, so leave it off there.
-    if ($NativeTools) { $meta['defaultFeatureIds'] = @('web_search') }
+    # The uncensored presets search only when you switch Search on for the chat: they have no refusal
+    # training, so they are the ones a planted instruction in a page most easily steers.
+    if ($NativeTools -and $Entry.Official) { $meta['defaultFeatureIds'] = @('web_search') }
+    else { $meta['defaultFeatureIds'] = @() }
     return @{
         id            = $Entry.Preset
         base_model_id = "$($Entry.Alias):latest"
@@ -2487,6 +2507,8 @@ function Invoke-LaiWebUISetup {
         [Parameter(Mandatory)][hashtable]$ModelResults,
         [Parameter(Mandatory)][string]$SystemPrompt,
         [Parameter(Mandatory)][string]$DefaultPreset,
+        # The default is a model the owner picked (kept even if it is not one of these presets).
+        [switch]$DefaultIsOwners,
         [string[]]$Collections = @(),
         [string]$SearxngQueryUrl = 'http://searxng:8080/search?q=<query>'
     )
@@ -2545,7 +2567,7 @@ function Invoke-LaiWebUISetup {
     }
     $order = @($Models | Sort-Object { $_.Order } | ForEach-Object { $_.Preset })
     $default = $DefaultPreset
-    if (-not ($Models | Where-Object { $_.Preset -eq $default })) { $default = $order[0] }
+    if (-not $DefaultIsOwners -and -not ($Models | Where-Object { $_.Preset -eq $default })) { $default = $order[0] }
     Set-LaiWebUIModelsConfig -BaseUrl $BaseUrl -Token $Token -DefaultModel $default -Order $order | Out-Null
     Write-LaiLog OK "Raw models hidden; default model '$default'; selector order: $($order -join ', ')"
 

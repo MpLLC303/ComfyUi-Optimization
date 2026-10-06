@@ -196,6 +196,14 @@ function Find-Pitfall([System.Management.Automation.Language.Ast]$Ast, [string[]
                 & $add 'ENCODING' $c 'Select-String on a file without -Encoding UTF8: Windows PowerShell 5.1 reads BOM-less UTF-8 as ANSI'
             }
         }
+        # Writing a file: 5.1's Add-Content/Set-Content default to the ANSI code page (Out-File to
+        # UTF-16), while every reader here uses UTF-8, so a non-ASCII path or name in a log came back
+        # garbled and could slip past the diagnostics redaction.
+        # Toolkit scripts only: the test harness writes its own scratch files and runs on pwsh.
+        if (@('Add-Content', 'ac', 'Set-Content', 'sc', 'Out-File') -contains $name -and $FileName -notmatch '^(Invoke-|Reset-Sandbox)' -and -not (& $marker $c 'encoding')) {
+            $hasEnc = @($c.CommandElements | Where-Object { $_ -is [System.Management.Automation.Language.CommandParameterAst] -and 'encoding'.StartsWith($_.ParameterName.ToLower()) -and $_.ParameterName.Length -ge 3 }).Count -gt 0
+            if (-not $hasEnc) { & $add 'ENCODING' $c "$name without -Encoding: Windows PowerShell 5.1 writes the ANSI code page (Out-File: UTF-16), the readers expect UTF-8" }
+        }
         # A string or (...) argument followed by a bare -f or + : meant as an operator, bound as an
         # argument. Only Verb-Noun commands: native tools (docker -f file) take -f legitimately.
         $els = $c.CommandElements
@@ -440,6 +448,9 @@ $canaries = @(
     @{ Rule = 'ENCODING'; Fire = $true; Code = 'if (Select-String -Path $report -Pattern ''need attention'' -Quiet) { 1 }' }
     @{ Rule = 'ENCODING'; Fire = $false; Code = '$l = Select-String -LiteralPath $log -Pattern ''x'' -Encoding UTF8 | Select-Object -Last 1' }
     @{ Rule = 'ENCODING'; Fire = $false; Code = '$l = Get-Content -LiteralPath $log -Encoding UTF8 | Select-String -Pattern ''x''' }
+    @{ Rule = 'ENCODING'; Fire = $true; Code = 'Add-Content -LiteralPath $logFile -Value $line' }
+    @{ Rule = 'ENCODING'; Fire = $true; Code = '$x | Out-File -FilePath $p' }
+    @{ Rule = 'ENCODING'; Fire = $false; Code = 'Add-Content -LiteralPath $logFile -Value $line -Encoding UTF8' }
     @{ Rule = 'MATCHES'; Fire = $true; Code = 'if ($l -match ''^(\w+)=(.*)$'' -and $Matches[1] -match ''KEY'') { Add-Secret $Matches[2] }' }
     @{ Rule = 'MATCHES'; Fire = $true; Code = 'if ($a -match ''x(\d)'' -and $b -match ''y'' -and $Matches[1]) { 1 }' }
     @{ Rule = 'MATCHES'; Fire = $false; Code = 'if ($l -match ''^(\w+)=(.*)$'') { $k = $Matches[1]; if ($k -match ''KEY'') { 1 } }' }

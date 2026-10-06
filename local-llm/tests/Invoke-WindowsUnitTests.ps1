@@ -917,13 +917,20 @@ Write-Host "`n=== Open WebUI: user settings survive re-runs; a newer Open WebUI 
 # capability, an unknown key. A re-run must change only what the installer manages.
 $entry = @{ Preset = 'local-main'; Alias = 'localai-main'; Display = 'Local Main'; Description = 'd'; Vision = $false; Think = $null; Trial = $false }
 $managedForm = New-LaiPresetForm -Entry $entry -NativeTools $true -SystemPrompt 'sys'
-# Selected again after -OfficialModels none / -TrialModels none hid them: shown again. A measured
-# preset keeps the user's own hidden choice (no 'hidden' key in the managed form).
+# Prompt injection: no preset may read past chats (a page could have them sent out in a fetched URL),
+# and only the official presets search the web on their own.
+$offForm = New-LaiPresetForm -Entry @{ Preset = 'official-main'; Alias = 'localai-official-main'; Display = 'Official Main'; Description = 'd'; Vision = $true; Think = $null; Official = $true } -NativeTools $true -SystemPrompt 'sys'
+Assert-That ($managedForm.meta.builtinTools['chats'] -eq $false -and $offForm.meta.builtinTools['chats'] -eq $false) 'no preset gets the past-chat tools'
+Assert-That (@($managedForm.meta['defaultFeatureIds']).Count -eq 0 -and @($offForm.meta['defaultFeatureIds']) -contains 'web_search') 'uncensored presets search only when asked; official ones by default'
+$mergedOld = Merge-LaiPresetForm -Managed $managedForm -Existing ([pscustomobject]@{ id = 'local-main'; meta = [pscustomobject]@{ defaultFeatureIds = @('web_search'); builtinTools = [pscustomobject]@{ chats = $true } }; params = [pscustomobject]@{} })
+Assert-That (@($mergedOld.meta['defaultFeatureIds']).Count -eq 0 -and $mergedOld.meta.builtinTools['chats'] -eq $false) 'an existing install loses auto-search on the uncensored presets and the past-chat tools on update'
+# The preset form never sets 'hidden': a preset the owner hid stays hidden on re-runs. The installer
+# shows a trial/official preset again only when it hid it itself (mock run phases 4 and 4f).
 foreach ($kind in 'Official', 'Trial') {
     $oe = @{ Preset = 'official-main'; Alias = 'localai-official-main'; Display = 'Official Main'; Description = 'd'; Vision = $true; Think = $null; Trial = ($kind -eq 'Trial'); Official = ($kind -eq 'Official') }
     $of = New-LaiPresetForm -Entry $oe -NativeTools $true -SystemPrompt 'sys'
     $om = Merge-LaiPresetForm -Managed $of -Existing ([pscustomobject]@{ id = 'official-main'; name = 'Official Main'; meta = [pscustomobject]@{ hidden = $true }; params = [pscustomobject]@{} })
-    Assert-That ($om.meta['hidden'] -eq $false) "a re-selected $kind preset that was hidden is shown again"
+    Assert-That (-not $of.meta.ContainsKey('hidden') -and $om.meta['hidden'] -eq $true) "a $kind preset the owner hid stays hidden on a re-run"
 }
 Assert-That (-not $managedForm.meta.ContainsKey('hidden')) 'a measured preset form leaves hidden alone (the user may have hidden it)'
 $existingPreset = [pscustomobject]@{ id = 'local-main'; name = 'Local Main'; base_model_id = 'localai-main:latest'; params = [pscustomobject]@{ temperature = 0.3 }

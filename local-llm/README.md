@@ -362,6 +362,12 @@ deliberately not inside the backup archives.
   and no file write access: those capabilities are turned off in every preset. Shell access (Open
   Terminal in a Docker sandbox, scoped to `C:\AI\Workspace`) is V2 and should keep the guide's
   permission levels A-F.
+- **Web pages and documents can try to steer the assistant.** Text in a search result, a fetched page
+  or an uploaded PDF reaches the model like your own words, and a page can hide instructions in it. So
+  no preset can search or read your past chats (a planted instruction could otherwise have them sent
+  out inside a web address the model fetches), and the Uncensored presets, which have no refusal
+  training, search the web only when you switch **Search** on for that chat. The Official presets search
+  by themselves. For browsing unknown sites, prefer an Official preset.
 - **Nothing listens beyond 127.0.0.1**, and `Test-LocalAI.ps1` checks this. For phone access install
   Tailscale, sign in, turn on MagicDNS and HTTPS Certificates at login.tailscale.com/admin/dns, then run
   `C:\AI\Scripts\Enable-TailscaleAccess.ps1`: HTTPS at `https://<this-pc>.<tailnet>.ts.net`, tailnet only, survives

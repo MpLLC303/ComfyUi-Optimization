@@ -78,7 +78,7 @@ $logFile = Join-Path $logDir 'backup.log'
 function Write-BackupLog {
     param([string]$Level, [string]$Message)
     Write-LaiLog $Level $Message
-    Add-Content -LiteralPath $logFile -Value ('{0} [{1}] {2}' -f (Get-Date -Format 's'), $Level, $Message)
+    Add-Content -LiteralPath $logFile -Value ('{0} [{1}] {2}' -f (Get-Date -Format 's'), $Level, $Message) -Encoding UTF8
 }
 
 function Invoke-Docker {

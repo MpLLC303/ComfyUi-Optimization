@@ -236,6 +236,8 @@ try { $script:SetupLock = Enter-LaiSetupLock }
 catch { Write-Host $_.Exception.Message -ForegroundColor Red; exit 1 }
 $State = Read-LaiState -Path $P.State
 foreach ($k in @('stages', 'tuning', 'flags')) { if (-not $State.ContainsKey($k) -or $null -eq $State[$k]) { $State[$k] = @{} } }
+# The models selected before this run: one that becomes selected now is shown in Open WebUI.
+$script:PrevSelected = @($State.flags['selectedModels'] | Where-Object { $_ })
 
 # Settings passed on an earlier run are remembered, so "Update toolkit" (which passes none) does not
 # quietly undo them (e.g. download the Vision model skipped with -SkipVision). A value passed now wins.
@@ -1478,7 +1480,7 @@ Invoke-Stage 'Stack' {
         Write-LaiLog WARN 'Found an existing open-webui container from a manual install; migrating its data into the managed stack.'
         $envDump = Invoke-Native -File 'docker' -Arguments @('inspect', '--format', '{{range .Config.Env}}{{println .}}{{end}}', 'open-webui') -Capture -AllowFail
         $oldKey = ($envDump.Output | Where-Object { $_ -like 'WEBUI_SECRET_KEY=*' } | Select-Object -First 1)
-        if ($oldKey -and -not (Test-Path -LiteralPath $secretFile)) { Set-Content -LiteralPath $secretFile -Value $oldKey.Substring(17) -NoNewline }
+        if ($oldKey -and -not (Test-Path -LiteralPath $secretFile)) { Set-Content -LiteralPath $secretFile -Value $oldKey.Substring(17) -NoNewline -Encoding ascii }
         # Where did that container keep /app/backend/data? (No double quotes in the template: PS 5.1 mangles them for native args.)
         $mounts = Invoke-Native -File 'docker' -Arguments @('inspect', '--format', '{{range .Mounts}}{{.Type}}|{{.Name}}|{{.Source}}|{{.Destination}}{{println}}{{end}}', 'open-webui') -Capture -AllowFail
         $data = $mounts.Output | Where-Object { $_ -like '*|/app/backend/data' } | Select-Object -First 1
@@ -1526,7 +1528,7 @@ Invoke-Stage 'Stack' {
         # Moved, not copied: the old file sits outside Secrets where other accounts could read it,
         # and that key signs Open WebUI logins.
         if (Test-Path -LiteralPath $guideSecret) { Move-Item -LiteralPath $guideSecret -Destination $secretFile }
-        else { Set-Content -LiteralPath $secretFile -Value (New-LaiSecret) -NoNewline }
+        else { Set-Content -LiteralPath $secretFile -Value (New-LaiSecret) -NoNewline -Encoding ascii }
     }
     Protect-Path -Path $secretFile
     $cred = Get-AdminCredential
@@ -1718,17 +1720,49 @@ Invoke-Stage 'Configure' {
 
     # Trial and official presets that are no longer selected are hidden, not deleted (chats that used
     # them stay readable).
+    # Recorded, so selecting it again shows it again; a preset the owner hid is never shown by us.
+    $hiddenByUs = @($State.flags['hiddenByInstaller'] | Where-Object { $_ })
     foreach ($tm in ((Get-LaiCatalog -Path $CatalogPath -IncludeTrials).Models | Where-Object { $_.Trial -or $_.Official })) {
         if (@($State.flags['selectedModels']) -notcontains $tm.Key -and (Get-LaiWebUIModel -BaseUrl $WebUIUrl -Token $token -Id $tm.Preset)) {
-            Hide-LaiWebUIModel -BaseUrl $WebUIUrl -Token $token -Id $tm.Preset | Out-Null
-            Write-LaiLog INFO "Preset '$($tm.Display)' hidden (not selected)"
+            if ((Hide-LaiWebUIModel -BaseUrl $WebUIUrl -Token $token -Id $tm.Preset) -eq 'hidden') {
+                Write-LaiLog INFO "Preset '$($tm.Display)' hidden (not selected)"
+                if ($hiddenByUs -notcontains $tm.Key) { $hiddenByUs += $tm.Key }
+            }
         }
+    }
+    $State.flags['hiddenByInstaller'] = @($hiddenByUs)
+
+    # New chats start on the catalog's default, unless the owner picked another model in Admin >
+    # Settings > Models since (then theirs is kept). Ours: what this installer set last time, or
+    # either catalog default (an install from before this was recorded set Uncensored Main).
+    $liveDefault = ''
+    try { $liveDefault = [string](Invoke-LaiApi -Uri "$WebUIUrl/api/v1/configs/models" -Token $token).DEFAULT_MODELS } catch { Write-Verbose 'models config not readable' }
+    $ourDefaults = @([string]$State.flags['defaultModelSet'], $Catalog.BaseDefaultPreset, $Catalog.DefaultPreset) | Where-Object { $_ }
+    $catalogPresets = @((Get-LaiCatalog -Path $CatalogPath -IncludeTrials).Models | ForEach-Object { $_.Preset })
+    $selectedPresets = @($Catalog.Models | ForEach-Object { $_.Preset })
+    $ownersDefault = $liveDefault -and $ourDefaults -notcontains $liveDefault -and ($catalogPresets -notcontains $liveDefault -or $selectedPresets -contains $liveDefault)
+    $defaultToSet = $Catalog.DefaultPreset
+    if ($ownersDefault) {
+        $defaultToSet = $liveDefault
+        Write-LaiLog INFO "Keeping the default model you chose ($liveDefault); the toolkit's would be $($Catalog.DefaultPreset)"
     }
 
     # Optional settings that did not take come back as warnings instead of stopping the install
     # before the Backup stage; they are repeated in the report and at the end.
     $State.flags['configureWarnings'] = @(Invoke-LaiWebUISetup -BaseUrl $WebUIUrl -Token $token -Models $Catalog.Models -ModelResults $State.tuning `
-        -SystemPrompt $SystemPrompt -DefaultPreset $Catalog.DefaultPreset -Collections $KnowledgeCollections)
+        -SystemPrompt $SystemPrompt -DefaultPreset $defaultToSet -DefaultIsOwners:$ownersDefault -Collections $KnowledgeCollections)
+    if (-not $ownersDefault) { $State.flags['defaultModelSet'] = $defaultToSet }
+    # Shown again: a trial or official preset this installer hid, one named on this run's command
+    # line, or one that is newly selected now (it may still be hidden from an earlier install).
+    foreach ($om in @($Catalog.Models | Where-Object { $_.Trial -or $_.Official })) {
+        $named = ($script:BoundParams.ContainsKey('TrialModels') -and $TrialModels -contains $om.Key) -or
+            ($script:BoundParams.ContainsKey('OfficialModels') -and $om.Official -and ($OfficialModels -contains $om.Key -or $OfficialModels -contains 'all'))
+        if ($hiddenByUs -contains $om.Key -or $named -or $script:PrevSelected -notcontains $om.Key) {
+            if ((Show-LaiWebUIModel -BaseUrl $WebUIUrl -Token $token -Id $om.Preset) -eq 'shown') { Write-LaiLog INFO "Preset '$($om.Display)' shown again" }
+            $hiddenByUs = @($hiddenByUs | Where-Object { $_ -ne $om.Key })
+        }
+    }
+    $State.flags['hiddenByInstaller'] = @($hiddenByUs)
     $State.flags['configureWarnings'] = @($State.flags['configureWarnings']) + @(Invoke-SkillsSetup -Token $token)
     if ($DeepResearch) {
         Write-LaiLog STEP 'Deep research: account and model check'

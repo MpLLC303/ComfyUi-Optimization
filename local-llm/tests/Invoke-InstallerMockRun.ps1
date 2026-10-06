@@ -411,6 +411,21 @@ Assert-That ($log4d -notmatch 'download \([\d.]+ GB\) was removed') 'a model thi
 & (Join-Path $aiRoot 'Scripts/Install-LocalAI.ps1') -AIRoot $aiRoot -SkipTests -TrialModels none -OfficialModels all
 $st4e = Get-Content -Encoding UTF8 -Raw (Join-Path $aiRoot 'install-state.json') | ConvertFrom-Json
 Assert-That ($LASTEXITCODE -eq 0 -and @($st4e.flags.selectedModels) -contains 'official-ok' -and -not $st4e.flags.officialFailed.PSObject.Properties['official-ok']) "naming the choice again (-OfficialModels all) retries it (exit $LASTEXITCODE)"
+
+Write-Host "`n=== PHASE 4f: the owner's own default model and hidden presets survive an update ===" -ForegroundColor Cyan
+$tokF = Connect-LaiWebUI -BaseUrl 'http://127.0.0.1:3000' -Email $Email -Password $Password
+Set-LaiWebUIModelsConfig -BaseUrl 'http://127.0.0.1:3000' -Token $tokF -DefaultModel 'local-fast' | Out-Null
+Hide-LaiWebUIModel -BaseUrl 'http://127.0.0.1:3000' -Token $tokF -Id 'official-standin' | Out-Null
+& (Join-Path $aiRoot 'Scripts/Install-LocalAI.ps1') -AIRoot $aiRoot -SkipTests -TrialModels none
+$c4f = $LASTEXITCODE
+$tokF = Connect-LaiWebUI -BaseUrl 'http://127.0.0.1:3000' -Email $Email -Password $Password
+$mcfgF = Invoke-LaiApi -Uri 'http://127.0.0.1:3000/api/v1/configs/models' -Token $tokF
+$opF = Get-TestPreset 'official-standin'
+Assert-That ($c4f -eq 0 -and [string]$mcfgF.DEFAULT_MODELS -eq 'local-fast') "a default model the owner picked is kept by an update (default '$($mcfgF.DEFAULT_MODELS)', exit $c4f)"
+Assert-That ($opF -and $opF.meta.hidden -eq $true) 'a selected preset the owner hid stays hidden'
+# Back to the toolkit's own default for the later phases.
+Set-LaiWebUIModelsConfig -BaseUrl 'http://127.0.0.1:3000' -Token $tokF -DefaultModel 'official-standin' | Out-Null
+Show-LaiWebUIModel -BaseUrl 'http://127.0.0.1:3000' -Token $tokF -Id 'official-standin' | Out-Null
 $p4 = (Get-Content -Encoding UTF8 -Raw (Join-Path $aiRoot 'install-state.json') | ConvertFrom-Json).flags.params
 Assert-That ($p4.SkipVision -eq $true -and $p4.SkipCoder -eq $true) 'older install: skips inferred from the installed models (no surprise 20 GB downloads)'
 Assert-That (@((Get-Content -Encoding UTF8 -Raw (Join-Path $aiRoot 'install-state.json') | ConvertFrom-Json).flags.configureWarnings).Count -eq 0 -and -not (Select-String -LiteralPath (Join-Path $aiRoot 'install-report.md') -Pattern 'need attention' -Encoding UTF8 -Quiet)) "the next clean run clears phase 3's warning (no stale attention section)"

@@ -50,7 +50,7 @@ $updateLog = Join-Path (Join-Path $AIRoot 'Logs') 'update.log'
 function Write-UpdateLog {
     param([string]$Level, [string]$Message)
     Write-LaiLog $Level $Message
-    try { Add-Content -LiteralPath $updateLog -Value ('{0} [{1}] {2}' -f (Get-Date -Format 's'), $Level, $Message) } catch { Write-Verbose 'no update log' }
+    try { Add-Content -LiteralPath $updateLog -Value ('{0} [{1}] {2}' -f (Get-Date -Format 's'), $Level, $Message) -Encoding UTF8 } catch { Write-Verbose 'no update log' }
 }
 function Set-EnvVersion {
     param([string]$OpenWebUI, [string]$Searxng)

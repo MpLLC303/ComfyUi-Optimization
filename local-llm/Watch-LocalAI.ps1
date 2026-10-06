@@ -61,7 +61,7 @@ $remindHours = 24
 
 function Write-WatchLog([string]$Text) {
     # A full disk must not end the watch before it can tell anyone (the toast needs no disk space).
-    try { Add-Content -LiteralPath $logFile -Value $Text -ErrorAction Stop } catch { Write-Verbose "watch.log not writable: $($_.Exception.Message)" }
+    try { Add-Content -LiteralPath $logFile -Value $Text -Encoding UTF8 -ErrorAction Stop } catch { Write-Verbose "watch.log not writable: $($_.Exception.Message)" }
 }
 function ConvertTo-WatchDate($Value) {
     # PowerShell 7's ConvertFrom-Json already turns ISO strings into dates; 5.1 leaves strings.
