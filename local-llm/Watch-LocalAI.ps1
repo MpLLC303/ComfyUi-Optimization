@@ -58,6 +58,8 @@ $healAllowed = -not $NoHeal
 # A problem that persists is announced again after this many hours (a single toast is easy to miss:
 # Focus Assist during a game, a busy morning), until it is fixed.
 $remindHours = 24
+# Windows' notification switch for PowerShell, as last seen by a toast ('' = no toast tried this run).
+$script:toastSetting = ''
 
 function Write-WatchLog([string]$Text) {
     # A full disk must not end the watch before it can tell anyone (the toast needs no disk space).
@@ -112,13 +114,16 @@ function Start-Container {
 }
 
 function Send-Notification {
-    # Returns $true when the message went out (or notifications are off and the log is the channel),
-    # $false when the toast failed: the caller then tries again on the next run.
+    # Returns $true when the message went out (or notifications are off, by this script's -NoNotify or
+    # by Windows' own switch, and the log and banner are the channel), $false when the toast failed:
+    # the caller then tries again on the next run.
     param([string]$Title, [string]$Text)
-    # Test hook (tests/Invoke-WatchTest.ps1): a toast that fails, as with a broken notification service.
+    # Test hooks (tests/Invoke-WatchTest.ps1): Windows' notification switch for PowerShell turned off
+    # (the toast is dropped silently), and a toast that fails, as with a broken notification service.
+    if ($env:LOCALAI_TEST_TOAST_SETTING) { $script:toastSetting = $env:LOCALAI_TEST_TOAST_SETTING; Write-WatchLog ('{0} NOTIFY (toast not shown, notifications are off: {1}) {2}: {3}' -f (Get-Date -Format 's'), $env:LOCALAI_TEST_TOAST_SETTING, $Title, $Text); return $true }
     if ($env:LOCALAI_TEST_TOAST_FAIL) { Write-WatchLog ('{0} NOTIFY (toast failed) {1}: {2}' -f (Get-Date -Format 's'), $Title, $Text); return $false }
     if (-not $notify) { Write-WatchLog ('{0} NOTIFY {1}: {2}' -f (Get-Date -Format 's'), $Title, $Text); return $true }
-    $shown = $false
+    $shown = $false; $why = ''
     try {
         [void][Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime]
         $xml = [Windows.UI.Notifications.ToastNotificationManager]::GetTemplateContent([Windows.UI.Notifications.ToastTemplateType]::ToastText02)
@@ -126,13 +131,25 @@ function Send-Notification {
         [void]$nodes.Item(0).AppendChild($xml.CreateTextNode($Title))
         [void]$nodes.Item(1).AppendChild($xml.CreateTextNode($Text))
         $appId = '{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\WindowsPowerShell\v1.0\powershell.exe'
-        [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier($appId).Show([Windows.UI.Notifications.ToastNotification]::new($xml))
-        $shown = $true
+        $notifier = [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier($appId)
+        # Show() does not fail when Windows has notifications off for PowerShell (or all apps, or by
+        # policy): the toast is dropped silently. Retrying would not help until the switch is turned
+        # back on, so the run goes on as if told; the Open WebUI banner below and the health check
+        # (which reports the switch) carry the news instead.
+        $setting = 'Enabled'
+        try { $setting = [string]$notifier.Setting } catch { Write-Verbose "toast setting unknown: $($_.Exception.Message)" }
+        $script:toastSetting = $setting
+        if ($setting -ne 'Enabled') { $why = "notifications are off: $setting" }
+        else { $notifier.Show([Windows.UI.Notifications.ToastNotification]::new($xml)); $shown = $true }
     } catch {
-        Write-Verbose "toast failed: $($_.Exception.Message)"
+        $why = $_.Exception.Message
+        Write-Verbose "toast failed: $why"
     }
-    Write-WatchLog ('{0} NOTIFY{1} {2}: {3}' -f (Get-Date -Format 's'), $(if ($shown) { '' } else { ' (toast failed)' }), $Title, $Text)
-    return $shown
+    $off = ($why -like 'notifications are off*')
+    $tag = ''
+    if ($off) { $tag = " (toast not shown, $why)" } elseif (-not $shown) { $tag = ' (toast failed)' }
+    Write-WatchLog ('{0} NOTIFY{1} {2}: {3}' -f (Get-Date -Format 's'), $tag, $Title, $Text)
+    return ($shown -or $off)
 }
 
 # ---- pause ----------------------------------------------------------------------------------
@@ -365,7 +382,7 @@ if ($maintenance) { $line += ' (Open WebUI stopped for a backup/restore/update; 
 Write-WatchLog $line
 Write-Verbose $line
 
-if ($toNotify.Count -gt 0) {
+function Get-WatchHint([string[]]$Failed) {
     # One concrete next step, using the Start-menu shortcuts (typed commands may be blocked by policy).
     $hint = 'Start menu > Local AI - Health check shows details.'
     $heldNow = Get-LaiWebUIHold -AIRoot $AIRoot
@@ -381,6 +398,11 @@ if ($toNotify.Count -gt 0) {
     } elseif ($failed -contains 'Backup mirror') {
         $hint = 'Check that the backup mirror drive or NAS share is reachable and has free space.'
     }
+    return $hint
+}
+
+if ($toNotify.Count -gt 0) {
+    $hint = Get-WatchHint $failed
     $title = 'Local AI: problem detected'; if ($reminder) { $title = 'Local AI: still not working' }
     $prefix = ''; if ($recovered.Count) { $prefix = 'Working again: ' + ($recovered -join ', ') + '. ' }
     if (Send-Notification $title ("{0}Not working: {1}. {2}" -f $prefix, $failedText, $hint)) { $notifiedAt = (Get-Date).ToString('s') }
@@ -399,11 +421,43 @@ if ($toNotify.Count -gt 0) {
     if (-not $sent -and $recovered.Count) { $recoveryFailed = $true }
 }
 
+# ---- banner in Open WebUI -------------------------------------------------------------------
+# The same two strikes as the toast: a problem seen on two runs in a row is also shown at the top of
+# every Open WebUI page (phone included) until it is fixed, so it is seen even when the toast was
+# missed or Windows drops it. Signs in only when the set of problems changes.
+$bannerKeys = (@($failed | Where-Object { $prevFailed -contains $_ } | Sort-Object) -join ', ')
+$prevBanner = ''; if ($previous.ContainsKey('banner')) { $prevBanner = [string]$previous['banner'] }
+$bannerDone = $null
+$credFile = Join-Path (Join-Path $AIRoot 'Secrets') 'openwebui-admin.json'
+if ($bannerKeys -ne $prevBanner -and -not $NoNotify -and $results['Open WebUI'] -and -not $maintenance -and (Test-Path -LiteralPath $credFile)) {
+    try {
+        $cred = Get-Content -Encoding UTF8 -LiteralPath $credFile -Raw | ConvertFrom-Json
+        $webUrl = "http://127.0.0.1:$webPort"
+        $tok = Connect-LaiWebUI -BaseUrl $webUrl -Email $cred.email -Password $cred.password
+        if ($bannerKeys) {
+            $shownKeys = @($bannerKeys -split ', ')
+            $what = @($shownKeys | ForEach-Object { if ($details.ContainsKey($_)) { '{0} ({1})' -f $_, $details[$_] } else { $_ } }) -join ', '
+            $text = "Health watch ({0}): not working: {1}. {2}" -f (Get-Date -Format 'yyyy-MM-dd HH:mm'), $what, (Get-WatchHint $shownKeys)
+            Set-LaiWebUIBanner -BaseUrl $webUrl -Token $tok -Text $text | Out-Null
+            Write-WatchLog ('{0} BANNER {1}' -f (Get-Date -Format 's'), $text)
+        } else {
+            Set-LaiWebUIBanner -BaseUrl $webUrl -Token $tok -Clear | Out-Null
+            Write-WatchLog ('{0} BANNER cleared' -f (Get-Date -Format 's'))
+        }
+        $bannerDone = $bannerKeys
+    } catch {
+        # Next run tries again; the toast and watch.log still carry the news.
+        Write-WatchLog ('{0} BANNER not updated: {1}' -f (Get-Date -Format 's'), ($_.Exception.Message -replace '\s+', ' '))
+    }
+}
+
 # Merge into the current file so a pause set while this run was busy survives.
 $final = Read-LaiState -Path $statePath
 $final['failed'] = $failed; $final['notified'] = $notified; $final['checked'] = (Get-Date).ToString('s')
 if ($notified.Count -and $notifiedAt) { $final['notifiedAt'] = [string]$notifiedAt } else { $final.Remove('notifiedAt') }
 if ($recoveryFailed) { $final['pendingRecovered'] = @($recovered) } else { $final.Remove('pendingRecovered') }
+if ($null -ne $bannerDone) { if ($bannerDone) { $final['banner'] = $bannerDone } else { $final.Remove('banner') } }
+if ($script:toastSetting) { if ($script:toastSetting -ne 'Enabled') { $final['toastSetting'] = $script:toastSetting } else { $final.Remove('toastSetting') } }
 if ($null -ne $ollamaNotice) { if ($ollamaNotice) { $final['ollamaNotifiedFor'] = $ollamaNotice } else { $final.Remove('ollamaNotifiedFor') } }
 Save-LaiState -State $final -Path $statePath
 exit $failed.Count

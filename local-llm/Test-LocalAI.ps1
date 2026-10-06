@@ -467,6 +467,28 @@ Add-Check 'Backups' {
     Pass $detail
 }
 
+Add-Check 'Health watch' {
+    # The watch is what tells you about everything else; nothing would notice if it stopped running.
+    $ws = Read-LaiState -Path (Join-Path $AIRoot 'watch-state.json')
+    $toDate = { param($v) if ($null -eq $v -or "$v" -eq '') { return $null }; if ($v -is [datetime]) { return $v }; try { return [datetime]::Parse([string]$v, [Globalization.CultureInfo]::InvariantCulture) } catch { return $null } }
+    $fix = 'run Start menu > Local AI - Update toolkit to set it up again'
+    if ($onWindows) {
+        $task = Get-ScheduledTask -TaskName 'LocalAI-Watch' -ErrorAction SilentlyContinue
+        if (-not $task) { return (Fail "the LocalAI-Watch task is missing, so problems are not reported - $fix") }
+        if ([string]$task.State -eq 'Disabled') { return (Fail 'the LocalAI-Watch task is disabled, so problems are not reported - enable it in Task Scheduler (Task Scheduler Library > LocalAI-Watch > Enable)') }
+    }
+    $paused = & $toDate $ws['pausedUntil']
+    if ($paused -and (Get-Date) -lt $paused) { return (Warn ("paused until {0:HH:mm} (Watch-LocalAI.ps1 -Unpause resumes it)" -f $paused)) }
+    $last = & $toDate $ws['checked']
+    if (-not $last) { return (Pass 'not run yet (every 15 minutes while you are signed in)') }
+    $mins = [int]((Get-Date) - $last).TotalMinutes
+    # Two hours: the task runs every 15 minutes while you are signed in; a PC that was asleep or off
+    # also leaves a gap, so this is a warning and says so.
+    if ($mins -gt 120) { return (Warn ("last check {0:N1} h ago ({1}); unless the PC was asleep or off since, the LocalAI-Watch task has stopped running - see its History in Task Scheduler, or {2}" -f ($mins / 60), $last.ToString('yyyy-MM-dd HH:mm'), $fix)) }
+    if ($ws['toastSetting']) { return (Warn "last check $mins min ago, but Windows has notifications switched off for PowerShell ($($ws['toastSetting'])), so its alerts never pop up: Settings > System > Notifications > Windows PowerShell. Problems that last still show as a banner in Open WebUI") }
+    Pass "last check $mins min ago"
+}
+
 Add-Check 'Nothing exposed beyond localhost' {
     if (-not $onWindows) { return (Skip 'Windows-only check') }
     $bad = @()

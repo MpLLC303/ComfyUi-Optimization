@@ -1421,6 +1421,32 @@ function Set-LaiWebUIEmbedding {
     return [pscustomobject]@{ Result = $result; Detail = $script:LaiEmbeddingModel; Warnings = $warn }
 }
 
+# The health watch's banner at the top of every Open WebUI page (phone included): a toast is easy to
+# miss, and Windows can have them switched off for PowerShell.
+$script:LaiBannerId = 'localai-health-watch'
+
+function Set-LaiWebUIBanner {
+    <#
+    .SYNOPSIS
+        Shows $Text as the health watch's banner, or removes it with -Clear. Banners the owner made
+        are kept. Returns $true when the list changed.
+    #>
+    param([string]$BaseUrl = 'http://127.0.0.1:3000', [Parameter(Mandatory)][string]$Token, [string]$Text = '', [switch]$Clear)
+    $uri = "$BaseUrl/api/v1/configs/banners"
+    $cur = @(Invoke-LaiApi -Uri $uri -Token $Token | Where-Object { $null -ne $_ })
+    $others = @($cur | Where-Object { [string]$_.id -ne $script:LaiBannerId })
+    $mine = @($cur | Where-Object { [string]$_.id -eq $script:LaiBannerId })
+    if ($Clear) {
+        if ($mine.Count -eq 0) { return $false }
+        $list = $others
+    } else {
+        if ($mine.Count -eq 1 -and [string]$mine[0].content -eq $Text) { return $false }
+        $list = @($others) + @([ordered]@{ id = $script:LaiBannerId; type = 'warning'; title = 'Local AI'; content = $Text; dismissible = $true; timestamp = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds() })
+    }
+    Invoke-LaiApi -Method POST -Uri $uri -Token $Token -Body @{ banners = @($list) } | Out-Null
+    return $true
+}
+
 function Set-LaiWebUIOllamaUrl {
     # Points Open WebUI's Ollama connection at $OllamaUrl. OLLAMA_BASE_URL is only a first-boot
     # default, so an existing install has to be changed through the API. Only connections this

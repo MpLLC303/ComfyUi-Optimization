@@ -295,6 +295,55 @@ services:
     Invoke-Watch @('-NoHeal') | Out-Null
     $l7 = & $lastFail
     Assert-That ($l7 -notmatch 'Chats reach Ollama') "and passes once Ollama answers at that URL ($l7)"
+
+    Write-Host "`n=== 9. a lasting problem is also a banner in Open WebUI; Windows' notification switch off ===" -ForegroundColor Cyan
+    # The sandbox's real Open WebUI (port 3000). A banner the owner made must survive.
+    Invoke-DockerText @('rm', '-f', 'open-webui') | Out-Null
+    $c9 = Read-LaiState -Path $cfgFile; $c9['WebUIPort'] = 3000; $c9.Remove('WebUIOllamaUrl'); Save-LaiState -State $c9 -Path $cfgFile
+    New-Item -ItemType Directory -Force -Path (Join-Path $aiRoot 'Secrets') | Out-Null
+    ConvertTo-Json @{ email = 'admin@localhost'; password = 'Test-Password-123' } | Set-Content -LiteralPath (Join-Path (Join-Path $aiRoot 'Secrets') 'openwebui-admin.json')
+    $wu = 'http://127.0.0.1:3000'
+    # Backups is the one problem here: the sandbox's own free space must not add a second.
+    $w9 = @('-NoHeal', '-MinFreeGB', '0')
+    $tok9 = Connect-LaiWebUI -BaseUrl $wu -Email 'admin@localhost' -Password 'Test-Password-123'
+    $bannersBefore = @(Invoke-LaiApi -Uri "$wu/api/v1/configs/banners" -Token $tok9 | Where-Object { $null -ne $_ })
+    $own = [ordered]@{ id = 'owner-note'; type = 'info'; title = ''; content = 'my own banner'; dismissible = $true; timestamp = 1 }
+    Invoke-LaiApi -Method POST -Uri "$wu/api/v1/configs/banners" -Token $tok9 -Body @{ banners = @($own) } | Out-Null
+    $getBanners = { @(Invoke-LaiApi -Uri "$wu/api/v1/configs/banners" -Token $tok9 | Where-Object { $null -ne $_ }) }
+    $bannerLines = { @((Get-WatchLog) -split "`n" | Where-Object { $_ -match ' BANNER ' }).Count }
+    try {
+        Get-ChildItem -LiteralPath $bdir -File | Remove-Item -Force
+        Save-LaiState -State @{ failed = @() } -Path $statePath
+        Invoke-Watch $w9 | Out-Null
+        Assert-That (@(& $getBanners | Where-Object { $_.id -eq 'localai-health-watch' }).Count -eq 0) 'a problem seen once is not a banner yet (two strikes, as for the toast)'
+        Invoke-Watch $w9 | Out-Null
+        $b = @(& $getBanners)
+        $mine = @($b | Where-Object { $_.id -eq 'localai-health-watch' })
+        Assert-That ($mine.Count -eq 1 -and $mine[0].content -match 'not working: Backups' -and $mine[0].content -match 'backup\.log' -and $mine[0].type -eq 'warning') "seen twice: a warning banner names the problem and the next step ($(@($mine | ForEach-Object { $_.content }) -join ' | '))"
+        Assert-That (@($b | Where-Object { $_.id -eq 'owner-note' -and $_.content -eq 'my own banner' }).Count -eq 1) 'the banner the owner made is kept'
+        $n9 = & $bannerLines
+        Invoke-Watch $w9 | Out-Null
+        Assert-That ((& $bannerLines) -eq $n9) 'the same problems again: no new sign-in, no banner rewrite'
+        # Windows has notifications off for PowerShell: recorded for the health check, not retried every run.
+        Save-LaiState -State @{ failed = @('Backups'); notified = @(); banner = 'Backups' } -Path $statePath
+        $env:LOCALAI_TEST_TOAST_SETTING = 'DisabledForUser'
+        try { Invoke-Watch $w9 | Out-Null } finally { $env:LOCALAI_TEST_TOAST_SETTING = '' }
+        $ws9 = Read-LaiState -Path $statePath
+        Assert-That ([string]$ws9['toastSetting'] -eq 'DisabledForUser' -and @($ws9['notified']) -contains 'Backups' -and (Get-WatchLog) -match 'toast not shown, notifications are off: DisabledForUser') 'a toast Windows drops (notifications off) is logged as such, counted as told (no retry every 15 minutes), and the switch is recorded'
+        $hc = (& pwsh -NoProfile -File (Join-Path $src 'Test-LocalAI.ps1') -AIRoot $aiRoot -Quick 2>&1 | ForEach-Object { "$_" }) -join "`n"
+        Assert-That ($hc -match 'Health watch[^\n]*notifications switched off for PowerShell \(DisabledForUser\)') 'the health check reports the switch'
+        # Fixed: the banner goes, the owner's stays.
+        Set-Content -LiteralPath (Join-Path $bdir ('open-webui-{0}.tar.gz' -f (Get-Date -Format 'yyyyMMdd-HHmmss'))) -Value 'x'
+        Invoke-Watch $w9 | Out-Null
+        $b = @(& $getBanners)
+        Assert-That (@($b | Where-Object { $_.id -eq 'localai-health-watch' }).Count -eq 0 -and @($b | Where-Object { $_.id -eq 'owner-note' }).Count -eq 1 -and -not (Read-LaiState -Path $statePath).ContainsKey('banner')) "fixed: the watch's banner is removed and the owner's kept ($(@($b | ForEach-Object { $_.id }) -join ', '))"
+        # The health check: a watch that has not run for hours.
+        $ws9 = Read-LaiState -Path $statePath; $ws9['checked'] = (Get-Date).AddHours(-5).ToString('s'); $ws9.Remove('toastSetting'); Save-LaiState -State $ws9 -Path $statePath
+        $hc = (& pwsh -NoProfile -File (Join-Path $src 'Test-LocalAI.ps1') -AIRoot $aiRoot -Quick 2>&1 | ForEach-Object { "$_" }) -join "`n"
+        Assert-That ($hc -match 'Health watch[^\n]*last check 5\.0 h ago') 'the health check notices a watch that stopped running'
+    } finally {
+        Invoke-LaiApi -Method POST -Uri "$wu/api/v1/configs/banners" -Token $tok9 -Body @{ banners = @($bannersBefore) } | Out-Null
+    }
 } finally {
     if ($holder -and -not $holder.HasExited) { $holder.Kill() }
     $tc = Join-Path (Join-Path $aiRoot 'Stack') 'docker-compose.yml'
