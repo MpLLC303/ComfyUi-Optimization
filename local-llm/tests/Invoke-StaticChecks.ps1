@@ -36,6 +36,7 @@ $files = Get-ChildItem -Path $Root -Recurse -File -Include *.ps1, *.psm1, *.psd1
 #   NOSILENT a scheduled task with -RunLevel Highest (elevated without a UAC prompt).
 #   ENCODING Get-Content of an env/config/state/secret file, or Select-String on any file, without
 #            -Encoding UTF8 (5.1 reads BOM-less UTF-8 as ANSI; .env must be BOM-less for docker compose).
+#   INSTEXIT Install-LocalAI.ps1: a bare 'exit' after Start-Transcript (use Stop-Install).
 #   HELP     a user-facing script (toolkit root) with a parameter its help never mentions: no
 #            .PARAMETER entry, no comment right above it, no -Name in the help text.
 #   DOCPARAM README.md or a script message tells the user to run a script with a -Switch that script
@@ -332,6 +333,21 @@ function Find-Pitfall([System.Management.Automation.Language.Ast]$Ast, [string[]
         if (& $marker $v 'bound') { continue }
         & $add 'BOUND' $v '$PSBoundParameters inside a scriptblock is that block''s own (empty) set; copy the script''s to $script:BoundParams first'
     }
+    # INSTEXIT: once the installer has started its transcript and taken the setup lock, a bare 'exit'
+    # leaves both behind (in a long-lived session the transcript keeps writing; the lock blocks the
+    # next run until the window closes). Stop-Install releases them.
+    if ($FileName -eq 'Install-LocalAI.ps1' -or $FileName -eq 'INSTEXIT-canary') {
+        $tr = $Ast.Find({ param($n) $n -is [System.Management.Automation.Language.CommandAst] -and $n.GetCommandName() -eq 'Start-Transcript' }, $true)
+        if ($tr) {
+            foreach ($x in @($Ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.ExitStatementAst] -and $n.Extent.StartOffset -gt $tr.Extent.StartOffset }, $true))) {
+                $fn = $x.Parent
+                while ($fn -and -not ($fn -is [System.Management.Automation.Language.FunctionDefinitionAst])) { $fn = $fn.Parent }
+                if ($fn -and $fn.Name -eq 'Stop-Install') { continue }
+                if (& $marker $x 'exit') { continue }
+                & $add 'INSTEXIT' $x 'bare exit after the transcript and setup lock are taken: use Stop-Install -Code <n> (releases both)'
+            }
+        }
+    }
     return , $found
 }
 
@@ -451,6 +467,9 @@ $canaries = @(
     @{ Rule = 'ENCODING'; Fire = $true; Code = 'Add-Content -LiteralPath $logFile -Value $line' }
     @{ Rule = 'ENCODING'; Fire = $true; Code = '$x | Out-File -FilePath $p' }
     @{ Rule = 'ENCODING'; Fire = $false; Code = 'Add-Content -LiteralPath $logFile -Value $line -Encoding UTF8' }
+    @{ Rule = 'INSTEXIT'; Fire = $true; File = 'INSTEXIT-canary'; Code = "Start-Transcript -Path `$x`nif (`$bad) { exit 1 }" }
+    @{ Rule = 'INSTEXIT'; Fire = $false; File = 'INSTEXIT-canary'; Code = "Start-Transcript -Path `$x`nfunction Stop-Install { exit 0 }`nif (`$bad) { Stop-Install -Code 1 }" }
+    @{ Rule = 'INSTEXIT'; Fire = $false; File = 'INSTEXIT-canary'; Code = "if (`$early) { exit 1 }`nStart-Transcript -Path `$x" }
     @{ Rule = 'MATCHES'; Fire = $true; Code = 'if ($l -match ''^(\w+)=(.*)$'' -and $Matches[1] -match ''KEY'') { Add-Secret $Matches[2] }' }
     @{ Rule = 'MATCHES'; Fire = $true; Code = 'if ($a -match ''x(\d)'' -and $b -match ''y'' -and $Matches[1]) { 1 }' }
     @{ Rule = 'MATCHES'; Fire = $false; Code = 'if ($l -match ''^(\w+)=(.*)$'') { $k = $Matches[1]; if ($k -match ''KEY'') { 1 } }' }

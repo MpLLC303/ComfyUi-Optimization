@@ -240,7 +240,7 @@ try { Start-Transcript -Path $script:TranscriptPath | Out-Null; $script:Transcri
 
 # One installer run or model update at a time (released when this process ends, even if killed).
 try { $script:SetupLock = Enter-LaiSetupLock }
-catch { Write-Host $_.Exception.Message -ForegroundColor Red; exit 1 }
+catch { Write-Host $_.Exception.Message -ForegroundColor Red; if ($script:TranscriptOn) { Stop-Transcript | Out-Null }; exit 1 }  # lai-ok: exit (Stop-Install is not defined yet; no lock was taken)
 $State = Read-LaiState -Path $P.State
 foreach ($k in @('stages', 'tuning', 'flags')) { if (-not $State.ContainsKey($k) -or $null -eq $State[$k]) { $State[$k] = @{} } }
 # The models selected before this run: one that becomes selected now is shown in Open WebUI.
@@ -834,7 +834,7 @@ Write-LaiLog STEP "Local AI installer $ToolkitVersion$(if ($ToolkitCommit) { ' (
 $installedVersion = [string](Read-LaiState -Path $P.Config)['ToolkitVersion']
 if ($installedVersion -match '^\d{4}\.\d{2}\.\d{2}$' -and $ToolkitVersion -match '^\d{4}\.\d{2}\.\d{2}$' -and [string]::CompareOrdinal($ToolkitVersion, $installedVersion) -lt 0 -and -not $AllowDowngrade) {
     Write-LaiLog FAIL "This is toolkit $ToolkitVersion, older than the installed $installedVersion. Nothing was changed. Use the newest one (Start menu > Local AI > Update toolkit), or pass -AllowDowngrade if you really mean to go back."
-    exit 1
+    Stop-Install -Code 1
 }
 # A run downloads for hours: Windows must not sleep meanwhile (the screen may still turn off).
 if (Enable-LaiKeepAwake) { Write-LaiLog INFO 'Windows will not go to sleep while the installer runs' }

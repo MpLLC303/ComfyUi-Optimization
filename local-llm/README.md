@@ -73,8 +73,8 @@ scheduled tasks run without administrator rights, and removes the old `C:\AI\Ins
   resume after a restart, installs the same code). An older toolkit refuses to run over a newer
   install (`-AllowDowngrade` if you really mean to go back).
 - **A backup comes first:** before the update changes anything, the chats are backed up once
-  (`C:\AI\Backups\open-webui-<time>-before-toolkit-<version>.tar.gz`; `Restore-OpenWebUI.ps1 -Archive
-  <that file>` goes back to it).
+  (`C:\AI\Backups\open-webui-<time>-before-toolkit-<version>.tar.gz`;
+  `Restore-OpenWebUI.ps1 -Archive <that file>` goes back to it).
 - **Options with the one-liner:** set them first, e.g. `$env:LOCALAI_ARGS = '-OfficialModels none'`, then
   paste the command. Plain options only (no quotes).
 - **The first update that brings the official models** (about 42 GB) says so and waits 20 seconds, so you
