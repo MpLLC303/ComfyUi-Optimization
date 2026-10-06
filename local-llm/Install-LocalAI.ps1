@@ -41,6 +41,11 @@ param(
     # trial-code27b), added as extra presets next to the four measured ones; 'none' removes them.
     # Omitted on a re-run = keep the trials chosen before.
     [string[]]$TrialModels = @(),
+    # The model makers' own releases (keys marked Official in config\models.psd1: official-main,
+    # official-deep, official-fast), listed first and installed by default next to the uncensored
+    # presets. 'all', a list of keys, or 'none' (hides them again). Omitted on a re-run = keep the
+    # choice made before; one that failed to set up is not retried until named here or -Retune.
+    [string[]]$OfficialModels = @(),
     # Loopback ports (never exposed to the LAN). A busy port is replaced by the next free one.
     [int]$WebUIPort = 3000,
     # SearXNG's loopback port (Open WebUI's web search).
@@ -72,7 +77,7 @@ param(
     [ValidateSet('cpu', 'off')][string]$RenderGuard = 'cpu',
     # Optional research agent at http://localhost:<DeepResearchPort> (Local Deep Research, about 1 GB
     # to download): it plans searches, reads the pages through the private SearXNG and writes a
-    # report with sources, using Local Main, or the Tongyi DeepResearch model when you also pass
+    # report with sources, using Uncensored Main, or the Tongyi DeepResearch model when you also pass
     # -TrialModels trial-research. Free: no search API or key. Remembered by later runs.
     [switch]$DeepResearch,
     # Remove the research agent again (its saved research stays in the localai-deep-research volume).
@@ -236,6 +241,7 @@ foreach ($k in @('stages', 'tuning', 'flags')) { if (-not $State.ContainsKey($k)
 # quietly undo them (e.g. download the Vision model skipped with -SkipVision). A value passed now wins.
 # 'powershell -File' (Install-LocalAI.cmd) passes "a,b" as ONE string; split list parameters here.
 $TrialModels = @($TrialModels | ForEach-Object { "$_" -split ',' } | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+$OfficialModels = @($OfficialModels | ForEach-Object { "$_" -split ',' } | ForEach-Object { $_.Trim() } | Where-Object { $_ })
 $KnowledgeCollections = [string[]]@($KnowledgeCollections | ForEach-Object { "$_" -split ',' } | ForEach-Object { $_.Trim() } | Where-Object { $_ })
 $RememberedParams = @('SkipVision', 'SkipCoder', 'AdminEmail', 'KvCacheType', 'GpuOverheadMiB', 'MinFreeVramMiB',
     'MaxBusyVramMiB', 'GpuWaitMinutes', 'KeepAlive', 'KnowledgeCollections', 'BackupTime', 'BackupRetentionDays', 'BackupMirror',
@@ -618,7 +624,7 @@ function Save-AdminCredential {
 
 function Get-ResearchModel {
     # The model the research agent uses: the Tongyi DeepResearch trial when it was chosen and tuned,
-    # else Local Main; with its tuned context (another num_ctx would reload the model on every call).
+    # else Uncensored Main; with its tuned context (another num_ctx would reload the model on every call).
     $entry = @($Catalog.Models | Where-Object { $_.Key -eq 'trial-research' -and $State.tuning.ContainsKey($_.Key) }) | Select-Object -First 1
     if (-not $entry) { $entry = @($Catalog.Models | Where-Object { $_.Key -eq 'main' }) | Select-Object -First 1 }
     $ctx = 32768
@@ -890,12 +896,36 @@ Invoke-Stage 'Preflight' {
     }
     $trialKeys = @($catalogAll.Models | Where-Object { $_.Trial } | ForEach-Object { $_.Key })
     foreach ($t in $trialWanted) { if ($trialKeys -notcontains $t) { Write-LaiLog WARN "Unknown trial model '$t' (known: $($trialKeys -join ', '))" } }
+    # Official releases: all of them unless a choice was made (now, or remembered from an earlier run).
+    $officialKeys = @($catalogAll.Models | Where-Object { $_.Official } | ForEach-Object { $_.Key })
+    if (-not $State.flags.ContainsKey('officialFailed') -or -not $State.flags['officialFailed']) { $State.flags['officialFailed'] = @{} }
+    if ($script:BoundParams.ContainsKey('OfficialModels')) {
+        $officialWanted = @($OfficialModels | Where-Object { $_ -and $_ -ne 'none' })
+        if ($officialWanted -contains 'all') { $officialWanted = $officialKeys }
+        foreach ($t in $officialWanted) { if ($officialKeys -notcontains $t) { Write-LaiLog WARN "Unknown official model '$t' (known: $($officialKeys -join ', '))" } }
+        $State.flags['officialChoice'] = @($officialWanted)
+        # Named again: give the ones that failed before another chance.
+        foreach ($t in $officialWanted) { $State.flags['officialFailed'].Remove($t) }
+    } elseif ($State.flags.ContainsKey('officialChoice')) {
+        $officialWanted = @($State.flags['officialChoice'] | Where-Object { $_ })
+    } else {
+        $officialWanted = $officialKeys
+    }
+    if ($Retune) { $State.flags['officialFailed'] = @{} }
+    foreach ($om in @($catalogAll.Models | Where-Object { $_.Official -and $officialWanted -contains $_.Key })) {
+        $failed = $State.flags['officialFailed'][$om.Key]
+        if ($failed -and [string]$failed['Source'] -eq $om.Source) {
+            Write-LaiLog INFO "$($om.Display) is not set up: it failed before ($($failed['Why'])). Try again with -OfficialModels $($om.Key) (or -Retune)."
+            $officialWanted = @($officialWanted | Where-Object { $_ -ne $om.Key })
+        }
+    }
+    $optInWanted = @($trialWanted) + @($officialWanted)
 
     # VRAM before disk: a model that cannot load fully on this card would fail the Models stage's
     # 100%-GPU checkpoint only after its download (Fast + Main = 28 GB), on every re-run.
     $tooBigForGpu = @()
     foreach ($m in $catalogAll.Models) {
-        if ($m.Trial -and $trialWanted -notcontains $m.Key) { continue }
+        if (($m.Trial -or $m.Official) -and $optInWanted -notcontains $m.Key) { continue }
         if (Test-LaiModelFitsVram -DownloadGB $m.DownloadGB -TotalMiB $gpu.TotalMiB) { continue }
         if (-not $m.Optional) {
             throw ("{0} ({1} GB) cannot load fully on this {2} ({3} MiB of VRAM): this toolkit's models are sized for a 24 GB NVIDIA card (RTX 3090/4090). Nothing was downloaded. For a smaller card the catalog has to be edited (README: Maintain > Add or swap a model)." -f $m.Display, $m.DownloadGB, $gpu.Name, $gpu.TotalMiB)
@@ -917,7 +947,7 @@ Invoke-Stage 'Preflight' {
     else {
         # Catalog entries are hashtables; Windows PowerShell 5.1's Measure-Object -Property can't read their keys.
         $needAll = 10
-        foreach ($cm in $catalogAll.Models) { if (-not $cm.Trial -or $trialWanted -contains $cm.Key) { $needAll += [double]$cm.DownloadGB } }
+        foreach ($cm in $catalogAll.Models) { if (-not ($cm.Trial -or $cm.Official) -or $optInWanted -contains $cm.Key) { $needAll += [double]$cm.DownloadGB } }
         $hasExisting = (Test-Path -LiteralPath (Join-Path $defaultModels 'manifests'))
         # The drive Ollama's default folder is on: the user profile can live on D: (not the system drive).
         $defaultDrive = Get-DriveOf $defaultModels
@@ -948,7 +978,7 @@ Invoke-Stage 'Preflight' {
     $budget = $freeGB - 15
     foreach ($m in ($catalogAll.Models | Sort-Object { $_.Optional })) {
         $need = $m.DownloadGB
-        if ($m.Trial -and $trialWanted -notcontains $m.Key) { continue }
+        if (($m.Trial -or $m.Official) -and $optInWanted -notcontains $m.Key) { continue }
         if ($present -contains (Resolve-LaiModelName $m.Source)) { $need = 0 }
         if ($m.Optional) {
             if (($m.Key -eq 'vision' -and $SkipVision) -or ($m.Key -eq 'code' -and $SkipCoder)) { Write-LaiLog INFO "Skipping $($m.Display) (switch, or not installed before; add it with -Skip$(if ($m.Key -eq 'vision') { 'Vision' } else { 'Coder' }):`$false)"; continue }
@@ -1171,12 +1201,18 @@ Invoke-Stage 'Models' {
         if (-not $answer.response) { throw "$($m.Source) loaded but returned an empty answer." }
         Write-LaiLog OK "  $($m.Display) answers on 100% GPU: $(([string]$answer.response).Trim() -replace '\s+', ' ')"
       } catch {
-        # A trial must never stop the install: the tag may be gone, this Ollama may not know the
-        # architecture yet, or it may not fit. The measured models still fail loudly.
-        if (-not $m.Trial) { throw }
+        # A trial or an official release must never stop the install: the tag may be gone, this
+        # Ollama may not know the architecture yet, or it may not fit. The measured models still fail loudly.
+        if (-not ($m.Trial -or $m.Official)) { throw }
         $why = Get-LaiHttpErrorText $_
         if (-not $why) { $why = $_.Exception.Message }
-        Write-LaiLog WARN "Trial $($m.Display) ($($m.Source)) skipped: $why"
+        if ($m.Official) {
+            Write-LaiLog WARN "Official model $($m.Display) ($($m.Source)) skipped: $why. The uncensored presets are unaffected; it is tried again with -OfficialModels $($m.Key)."
+            # Not retried on every run (each try loads up to 18 GB): only when named again or -Retune.
+            $State.flags['officialFailed'][$m.Key] = @{ Source = $m.Source; Why = ($why -replace '\s+', ' ').Substring(0, [Math]::Min(200, ($why -replace '\s+', ' ').Length)) }
+        } else {
+            Write-LaiLog WARN "Trial $($m.Display) ($($m.Source)) skipped: $why"
+        }
         $droppedTrials += $m.Key
         try { Stop-LaiOllamaModels -BaseUrl $OllamaUrl } catch { Write-Verbose 'unload failed' }
       }
@@ -1600,11 +1636,12 @@ Invoke-Stage 'Configure' {
         Write-LaiLog OK "Open WebUI now reaches Ollama through $($script:WebUIOllamaUrl)"
     }
 
-    # Trial presets that are no longer selected are hidden, not deleted (chats that used them stay readable).
-    foreach ($tm in ((Get-LaiCatalog -Path $CatalogPath -IncludeTrials).Models | Where-Object { $_.Trial })) {
+    # Trial and official presets that are no longer selected are hidden, not deleted (chats that used
+    # them stay readable).
+    foreach ($tm in ((Get-LaiCatalog -Path $CatalogPath -IncludeTrials).Models | Where-Object { $_.Trial -or $_.Official })) {
         if (@($State.flags['selectedModels']) -notcontains $tm.Key -and (Get-LaiWebUIModel -BaseUrl $WebUIUrl -Token $token -Id $tm.Preset)) {
             Hide-LaiWebUIModel -BaseUrl $WebUIUrl -Token $token -Id $tm.Preset | Out-Null
-            Write-LaiLog INFO "Trial preset '$($tm.Display)' hidden (not selected)"
+            Write-LaiLog INFO "Preset '$($tm.Display)' hidden (not selected)"
         }
     }
 

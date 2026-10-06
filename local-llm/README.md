@@ -69,10 +69,10 @@ scheduled tasks run without administrator rights, and removes the old `C:\AI\Ins
   update, `-Retune`). Then the installer waits up to 10 minutes for other GPU apps to let go.
 - **NVIDIA driver updates:** after one, the models are re-tuned automatically, which takes longer.
 - **Open WebUI:** it restarts briefly for the backup step.
-- **Your settings:** on the four presets the installer refreshes only what it manages (base model,
+- **Your settings:** on the presets the installer refreshes only what it manages (base model,
   system prompt, tool mode, capabilities). Your additions (attached knowledge, tools, access, extra
   parameters, hiding a preset) are kept, and so are two switches it only sets when it creates a
-  preset: **Think** (Local Fast's reasoning) and **Image Generation** (e.g. after you connect
+  preset: **Think** (Uncensored Fast's reasoning) and **Image Generation** (e.g. after you connect
   ComfyUI in Admin Panel > Settings > Images). Code execution stays off. The RAG settings (chunking,
   top-k, web search, image scaling, the fetched-page limit) are reset to the installer's values.
 - **Switches are remembered:** `-SkipVision`, `-KeepAlive` and the like apply to later runs too.
@@ -105,7 +105,7 @@ Options are in the config block at the top of `Install-LocalAI.ps1`. The common 
 | WSL | 6 | Turns on the Windows features, installs or updates WSL (no Linux distribution needed), checks WSL ≥ 2.1.5, and caps the WSL VM at 16 GB RAM if you have no `.wslconfig` (only on PCs with more than 32 GB; smaller PCs keep WSL's own limit of half the RAM, which is lower). |
 | Docker | 7 | Installs Docker Desktop (WSL2 backend, licence accepted silently), adds you to `docker-users`, sets it to start at sign-in (a Windows sign-in entry; also tick **Start Docker Desktop when you sign in** in Docker Desktop's Settings > General, because saving its settings with that box clear can remove the entry), waits for the engine, then runs `hello-world`. |
 | Stack | 8-9, 18, 26 | Starts Open WebUI, SearXNG and the render guard with docker compose. A container named `searxng` or `render-guard` from another setup (Open WebUI's own SearXNG guide uses that name) stops it before any container is changed; a port that Docker holds for another project's container is skipped like any busy port. Versions are pinned, every port is bound to 127.0.0.1, and the volume is the same `open-webui` volume the guide uses. The admin account is created headlessly. It also checks that the container can reach Ollama. |
-| Configure | 10-18 | Turns signup off and memories on. Creates the presets **Local Main / Fast / Vision / Code** (system prompt, native tool calling, memory, web search and knowledge tools), hides the raw models, makes Local Main the default, applies the RAG settings (token splitter, 2000/200, top-k 5), scales attached images to 1920 px, caps a fetched web page at 32,000 characters, sets SearXNG web search, and creates your six knowledge collections. Every setting is read back after it is written: sign-up left on stops the install; a documents/web-search setting or a knowledge collection that did not take is listed under "Settings that need attention" in `install-report.md` (and at the end of the run) instead of stopping the install before backups are scheduled. |
+| Configure | 10-18 | Turns signup off and memories on. Creates the presets **Official Main / Deep / Fast** and **Uncensored Main / Fast / Vision / Code** (system prompt, native tool calling, memory, web search and knowledge tools), hides the raw models, makes Uncensored Main the default, applies the RAG settings (token splitter, 2000/200, top-k 5), scales attached images to 1920 px, caps a fetched web page at 32,000 characters, sets SearXNG web search, and creates your six knowledge collections. Every setting is read back after it is written: sign-up left on stops the install; a documents/web-search setting or a knowledge collection that did not take is listed under "Settings that need attention" in `install-report.md` (and at the end of the run) instead of stopping the install before backups are scheduled. |
 | Backup | 22 | Takes a nightly consistent backup with a scheduled task, then runs the first backup and verifies the archive. Also registers `LocalAI-Watch`, a 15-minute health check (see Maintain). |
 | Verify | 28 | Runs `Test-LocalAI.ps1`, which executes the "finished V1" checklist for real (details below). |
 
@@ -121,10 +121,10 @@ used by the desktop and open apps):
 
 | Preset | Model | Context (tokens) | VRAM with cache | Generation (new chat, short prompt) |
 |---|---|---:|---:|---:|
-| Local Main | Qwen3 30B-A3B 2507 | 65,536 | 20.6 GiB | **188.5 tok/s** |
-| Local Code | Qwen3-Coder 30B-A3B | 65,536 | 20.6 GiB | 178.5 tok/s |
-| Local Vision | Qwen3-VL 30B-A3B | 32,768 | 19.2 GiB | 184.8 tok/s |
-| Local Fast | Qwen3 14B (dense) | 40,960 (its maximum) | 11.6 GiB | 79 tok/s |
+| Uncensored Main | Qwen3 30B-A3B 2507 | 65,536 | 20.6 GiB | **188.5 tok/s** |
+| Uncensored Code | Qwen3-Coder 30B-A3B | 65,536 | 20.6 GiB | 178.5 tok/s |
+| Uncensored Vision | Qwen3-VL 30B-A3B | 32,768 | 19.2 GiB | 184.8 tok/s |
+| Uncensored Fast | Qwen3 14B (dense) | 40,960 (its maximum) | 11.6 GiB | 79 tok/s |
 
 The speeds are measured with a short prompt, so the context is nearly empty. Each new token reads
 the whole KV cache, so generation slows as a chat grows: expect roughly a fifth slower at about 16K
@@ -143,12 +143,12 @@ prompt processing before the first token appears. Both are normal.
    rather update Ollama yourself with `Update-Models.ps1 -UpdateOllama`, which re-checks in the same run.
 2. **The 14B can't use 64K.** Qwen3-14B was trained to 40,960 positions, and Ollama silently caps
    `num_ctx` there. The guide's "later try 65536" is a no-op, so the tuner caps at 40,960.
-3. **"Local Fast" is *not* faster than "Local Main": it is about 2.4× slower.** The 30B-A3B is a mixture of experts
+3. **"Uncensored Fast" is *not* faster than "Uncensored Main": it is about 2.4× slower.** The 30B-A3B is a mixture of experts
    with about 3.3B parameters active per token; the 14B is dense, with 14.8B active, and generation speed tracks the
    active parameters. My pre-install estimates (90-140 and 50-65 tok/s) were too low on both counts. Fast also reasons
    ("thinks") by default, which delays the first token, so the preset turns that off. Open WebUI 0.11.4 applies the
    preset's Think setting over the per-chat Chat Controls switch, so that switch cannot turn it back on. For
-   step-by-step reasoning set **Think (Ollama)** to On in Workspace > Models > Local Fast > Advanced Params; re-runs keep it.
+   step-by-step reasoning set **Think (Ollama)** to On in Workspace > Models > Uncensored Fast > Advanced Params; re-runs keep it.
    Use Fast for its smaller VRAM footprint (11.6 GiB, so it can sit next to a small ComfyUI job) or for step-by-step reasoning.
 4. **`num_ctx` is baked into Ollama aliases, not set in Open WebUI.** Open WebUI's background tasks
    (titles, tags, search queries) don't always send the chat's `num_ctx`. When two callers ask for
@@ -171,16 +171,35 @@ prompt processing before the first token appears. Both are normal.
    context from, which drops from 32K to 4K above 1 GiB. The real desktop margin is the tuner's `-MinFreeVramMiB`, 768 MiB),
    and `OLLAMA_IGPU_ENABLE=0` (never use the Ryzen
    iGPU). Open WebUI telemetry, community sharing and the update check are off, and open signup is disabled.
-9. **The raw models are hidden.** The model selector shows just the four presets from the guide's "eventual selector".
+9. **The raw models are hidden.** The model selector shows just the presets: the official releases first, then the
+   uncensored ones (the guide's "eventual selector").
 
 ## Daily use
 
-- **Local Main** for everything, **Local Vision** when you attach images, **Local Code** for code.
-- **Once a chat has an image, keep that chat on Local Vision** (it handles text and code too) or
+- **Two families of presets, picked per chat in the model selector.** Every one runs on your own GPU and
+  costs nothing.
+
+  | Preset | Model | Use it for |
+  |---|---|---|
+  | **Official Main** (new chats start here) | Gemma 4 26B-A4B, Google's own release (QAT 4-bit) | Everyday questions, writing, images. Mixture of experts (~4B active per token), so it is fast |
+  | **Official Deep** | Qwen3.8 27B, Alibaba's own release | Hard reasoning, maths, careful code. The strongest model that fits a 24 GB card; dense, so roughly a quarter of the speed |
+  | **Official Fast** | Qwen3.5 9B, Alibaba's own release | Quick answers and light tasks |
+  | **Uncensored Main / Fast / Vision / Code** | Community "abliterated" builds of Qwen3 (refusals removed) | Anything an official model refuses. Slightly less capable, and they will do what is asked without the safety judgement |
+
+  The official models are the makers' own releases, so they are the most capable and also decline some
+  requests; switch the chat to an Uncensored preset when that gets in the way (Open WebUI keeps the
+  conversation). All three official ones read images. Their speeds are measured by your install (see
+  the install report); the table above under "What the installer does" has the uncensored ones.
+  They take about 42 GB of disk next to the uncensored ones. Leave them out with
+  `Install-LocalAI.cmd -OfficialModels none`, or pick some (`-OfficialModels official-main,official-fast`);
+  the choice is remembered. One whose download or GPU check fails is skipped with a warning and tried
+  again only when you name it (`-OfficialModels official-deep`) or pass `-Retune`.
+- On the uncensored side: **Uncensored Main** for everything, **Uncensored Vision** when you attach images, **Uncensored Code** for code.
+- **Once a chat has an image, keep that chat on a preset that sees images** (any Official one, or Uncensored Vision) or
   start a new chat for the other presets. Open WebUI sends every earlier image again with each
-  message, and Main, Fast and Code can't take images. The render guard drops them for those presets
+  message, and Uncensored Main, Fast and Code can't take images. The render guard drops them for those presets
   and leaves a note in the message ("image omitted"), so the chat keeps working, but the model can't
-  see the screenshot any more. Only what Local Vision already wrote about it stays in the chat.
+  see the screenshot any more. Only what Uncensored Vision already wrote about it stays in the chat.
 - **It learns you (memory).** Every preset saves lasting things you tell it (preferences, projects,
   your setup, standing instructions) without being asked, says so in one line ("Noted: ..."), and
   updates rather than duplicates. It never keeps passwords, keys, account or ID numbers. See, edit or
@@ -209,13 +228,13 @@ prompt processing before the first token appears. Both are normal.
   `http://localhost:5055`. Sign in as `localai` with the password in `C:\AI\Secrets\deep-research.json`
   (the installer made the account and then turned sign-up off). Ask a question and pick *Quick
   summary* (a few minutes) or *Detailed report* (longer, several sections). It plans searches, reads
-  the pages through your private SearXNG, and writes an answer with its sources, using Local Main, or
+  the pages through your private SearXNG, and writes an answer with its sources, using Uncensored Main, or
   the Tongyi DeepResearch model if you installed it with `-TrialModels trial-research`. Nothing goes to
   a paid service: the searches go through SearXNG, the pages it reads are fetched directly (as your
   browser would), and it downloads public journal lists (OpenAlex, DOAJ) to rate its sources. Searches are spaced 3 s apart, because a run sends dozens and the sites SearXNG asks
   answer a burst with CAPTCHAs, which looks like "no sources found"; if that happens, wait a while and
   run it again. During a ComfyUI render it runs on the CPU like chats do, so it is much slower then.
-  Its accounts and saved research are in the nightly backup too (`C:\AI\Backups\deep-research-<time>.tar.gz`; it is paused for a second or two, so a research run carries on); restore them with `Restore-OpenWebUI.ps1 -DeepResearch`. They are encrypted with the password in `C:\AI\Secrets\deep-research.json`, so keep that file with your other secrets. With the Tongyi model, research and Local Main (both about 19 GB) take turns on the GPU, so the first message after switching reloads the model.
+  Its accounts and saved research are in the nightly backup too (`C:\AI\Backups\deep-research-<time>.tar.gz`; it is paused for a second or two, so a research run carries on); restore them with `Restore-OpenWebUI.ps1 -DeepResearch`. They are encrypted with the password in `C:\AI\Secrets\deep-research.json`, so keep that file with your other secrets. With the Tongyi model, research and Uncensored Main (both about 19 GB) take turns on the GPU, so the first message after switching reloads the model.
 - **Start menu → Local AI:** opens Open WebUI, has *Gaming mode (free GPU)*, *Start again*, *Health check*, *ComfyUI (free GPU first)*, *Sync skills*, *Diagnostics (redacted zip)* and *Update toolkit*. Each script window stays open until you press Enter, so you can read the result.
 - **Before ComfyUI/Forge:** start ComfyUI with `C:\AI\Scripts\Start-ComfyUI.ps1` (add `-CreateShortcut` once for a desktop icon). It unloads Ollama, shows free VRAM and launches Comfy Desktop or the portable build. If ComfyUI is installed somewhere unusual, run it once as `C:\AI\Scripts\Start-ComfyUI.ps1 -Path <...\run_nvidia_gpu.bat or Comfy Desktop.exe>`; the path is remembered. For Forge or anything else, run `C:\AI\Scripts\Release-GPU.ps1`. Ollama keeps the last model in
   VRAM for 15 minutes, and a resident 19 GB model plus Wan 2.2 doesn't fit in 24 GB. On Windows, the
@@ -229,11 +248,11 @@ prompt processing before the first token appears. Both are normal.
   render starts while a chat model sits idle in VRAM, the model is unloaded. If ComfyUI is idle but
   still caches models in VRAM, the guard asks ComfyUI to free them before a chat loads. If something
   answers on 8188/8000 but the guard can't read a ComfyUI queue there, `docker logs render-guard`
-  says so once and chats stay on the GPU. Expect roughly 15-25 tok/s for Local Main
+  says so once and chats stay on the GPU. Expect roughly 15-25 tok/s for Uncensored Main
   on the CPU, and a slow first token with long web or RAG context. That's an estimate, not measured
   on your PC. Measure it with `C:\AI\Scripts\Test-LocalAI.ps1 -Quick -CpuCheck` (close ComfyUI first; it reports CPU tok/s, prompt speed and the VRAM the CPU mode still takes), and see the guard's decisions in `docker logs render-guard`.
   On the CPU the whole model sits in RAM: a preset needs about its download size plus 12 GB of RAM
-  (Local Main about 31 GB). On a PC with less, the installer warns which presets would page to
+  (Uncensored Main about 31 GB). On a PC with less, the installer warns which presets would page to
   disk during a render (and slow the render too); wait for the render before chatting with those. Turn it off
   with `C:\AI\Scripts\Install-LocalAI.cmd -RenderGuard off` (the image fix above stays on).
 - **Memory vs knowledge:** memory holds durable facts and preferences (Settings → Personalization →
@@ -244,9 +263,9 @@ prompt processing before the first token appears. Both are normal.
   fill the context.
 - **Context limits:** each preset holds its tuned context (table above). When a chat outgrows it,
   Ollama drops the oldest messages without telling you, so answers start ignoring the beginning of
-  the chat. Start a new chat for a new topic, and use Local Main (65K) for long documents.
+  the chat. Start a new chat for a new topic, and use Uncensored Main (65K) for long documents.
 - **Images:** the browser scales an attached image to fit 1920 x 1920 before sending it (1080p
-  screenshots stay as they are). Each image costs Local Vision about 1,000-2,700 of its 32K tokens,
+  screenshots stay as they are). Each image costs Uncensored Vision about 1,000-2,700 of its 32K tokens,
   and every image in a chat is sent again with each message. After roughly ten images Vision answers
   "exceeds the available context size" or stops mid-sentence: start a new chat (don't raise the
   context; 32K is what fits in VRAM next to the image encoder).
@@ -268,7 +287,7 @@ Every item on the guide's V1 list is a real test. It checks:
 - that no Context Length set in Open WebUI overrides the tuned aliases (your settings, the default parameters, the presets)
 - signup off and memories on
 - the RAG and search settings (including image scaling and the fetched-page limit)
-- a chat through every preset, and for Local Vision an image whose colour it must name
+- a chat through every preset, and for Uncensored Vision an image whose colour it must name
 - that a memory is recalled in a new conversation (it uses a random number, then deletes it)
 - that a document is retrieved from a freshly indexed collection (random code, deleted afterwards)
 - that a SearXNG search returns results
@@ -316,18 +335,18 @@ deliberately not inside the backup archives.
 | Main runs well under ~150 tok/s in a new, short chat (normal is ~188) | The desktop or browser grew its VRAM use, so the driver is spilling into system RAM | First run `C:\AI\Scripts\Test-LocalAI.ps1`: its speed check uses a short prompt, so a warning there means spilling, not a long chat. Then run `Release-GPU.ps1` and close GPU-heavy apps, or re-run with `-Retune`. If Ollama updated itself recently, run `Update-Models.ps1` first: it re-checks every preset on the new version. Optionally set NVIDIA Control Panel → *CUDA - Sysmem Fallback Policy* → *Prefer No Sysmem Fallback* for `%LOCALAPPDATA%\Programs\Ollama\lib\ollama\llama-server.exe` so it fails loudly instead of crawling. That is the process holding the model in VRAM (Task Manager and `nvidia-smi` show it); a setting for `ollama.exe` has no effect since Ollama 0.35. Check the name again after an Ollama update. Plugging the monitor into the motherboard (the Ryzen iGPU) frees about 0.5-1 GB. |
 | A long chat gets slower (e.g. ~120-140 tok/s past 32K tokens) | Expected: every new token reads the whole KV cache, which grows with the chat | Nothing to fix. Start a new chat for a new topic |
 | Model reloads (pause of several seconds) on every message, or one preset is slow while `Test-LocalAI.ps1` passes | A Context Length set in Open WebUI overrides the tuned alias | `Test-LocalAI.ps1` names the place (check "Context decided by the tuned aliases"); set it back to Default there. A chat's own Controls can't be checked: look there too |
-| Local Vision: "exceeds the available context size", or answers stop mid-sentence | The chat's images (each sent again with every message) plus the text no longer fit in Vision's 32K | Start a new chat, with fewer images per chat |
+| Uncensored Vision: "exceeds the available context size", or answers stop mid-sentence | The chat's images (each sent again with every message) plus the text no longer fit in Vision's 32K | Start a new chat, with fewer images per chat |
 | ComfyUI OOM or slow right after chatting | An Ollama model is still resident | Run `Release-GPU.ps1`, or install with `-KeepAlive 5m` |
 | Open WebUI lists no models | Ollama isn't running | Start Ollama from the Start menu, then run `Test-LocalAI.ps1 -Quick` |
 | "Docker engine did not start" | Licence prompt, virtualization off, or WSL broken | Open Docker Desktop once. Enable virtualization in the BIOS (**SVM Mode** on AMD, **Intel Virtualization Technology / VT-x** on Intel). Run `wsl --update`. Re-run. |
 | Web search: "no results" | The sites SearXNG asks (DuckDuckGo, Brave, Google CSE by default) are rate-limiting this PC, or one changed its pages so the pinned SearXNG cannot read them | Run the Health check: its *SearXNG search* line names each engine and its reason. *CAPTCHA* or *too many requests*: wait a few minutes to an hour. *HTTP error* or *server API error*: the site answered but refused; wait, and if it lasts try a newer SearXNG. *parsing error*: only a newer SearXNG fixes it, see Update SearXNG under Maintain. If that line finds results but Open WebUI's search does not, Open WebUI could not load the pages: check Admin Settings > Web Search (web loader, SSL verification) and `docker logs --tail 50 open-webui`. Details: `docker logs --tail 50 searxng`. |
 | RAG gives a wrong or empty answer | File not processed, collection not attached, or the chunk wasn't retrieved | Check Workspace → Knowledge (processing status). Attach the collection with `#`. Ask with the manual's own wording. |
-| A scanned PDF fails with "The content provided is empty", or values printed inside pictures are never found | Open WebUI reads only a PDF's text layer by default | Turn on Admin Panel > Settings > Documents > **PDF Extract Images (OCR)** (re-runs keep it; OCR runs on the CPU and makes indexing slower), then upload the PDF again. For a page or two, a screenshot in a Local Vision chat also works |
+| A scanned PDF fails with "The content provided is empty", or values printed inside pictures are never found | Open WebUI reads only a PDF's text layer by default | Turn on Admin Panel > Settings > Documents > **PDF Extract Images (OCR)** (re-runs keep it; OCR runs on the CPU and makes indexing slower), then upload the PDF again. For a page or two, a screenshot in a Uncensored Vision chat also works |
 | Odd answers in Open WebUI but fine in `ollama run localai-main` | A preset or chat parameter was changed in the UI | Re-run the installer to restore its system prompt and tool mode. Your own extra parameters are kept, so remove those in Workspace > Models if they are the cause |
 | Ollama tray settings | The new Ollama app's **Expose to network**, **Context length** and **Model location** settings override the environment variables. Model location is saved as soon as the app's window is used, so it then stays on the folder of that time | Leave Expose off (the installer warns, and Health check fails, when Ollama listens beyond 127.0.0.1). After changing `-ModelDir`, set Model location in the app to the same folder (the installer stops if they differ and a model still has to be downloaded). The tuned aliases keep their own context either way. |
 | Port 3000 or 8888 already in use | Another local service, or another project's Docker container | The installer picks the next free port and records it in `install-report.md` |
 | Chat is suddenly slow (CPU speed) | ComfyUI has a job queued or finished less than 60 s ago, so the render guard runs chats on the CPU. Afterwards the guard unloads the CPU copy, so the next chat after that loads onto the GPU again | Expected. `docker logs render-guard` shows why ("runs on the CPU", then "unloaded the CPU copy"). Wait for the render, or re-run the installer with `-RenderGuard off`. Still slow a minute after the render: run `C:\AI\Scripts\Release-GPU.ps1` and send the message again |
-| A chat answers "image omitted", or fails with "does not support multimodal requests" | The chat has an image from Local Vision and you switched it to Main, Fast or Code. The render guard drops such images (without it, every message in that chat fails) | Switch that chat back to Local Vision, or start a new chat |
+| A chat answers "image omitted", or fails with "does not support multimodal requests" | The chat has an image from Uncensored Vision and you switched it to Main, Fast or Code. The render guard drops such images (without it, every message in that chat fails) | Switch that chat back to Uncensored Vision, or start a new chat |
 | Open WebUI: "render-guard: Ollama ... is not reachable" | Ollama isn't running (the guard only relays the error) | Start Ollama from the Start menu, then send the message again. `-RenderGuard off` does not help here: it only stops the CPU routing, and chats still go through the guard (changing the URL by hand in Admin Settings is undone by the next installer run) |
 | Installer interrupted | Power loss, closed window | Run it again. It's idempotent, and tuning results are reused. |
 | "Another Local AI installer run or model update is already running" | An installer window (often the Administrator one) or `Update-Models.ps1` is still open | Let it finish or close that window, then try again |

@@ -917,6 +917,15 @@ Write-Host "`n=== Open WebUI: user settings survive re-runs; a newer Open WebUI 
 # capability, an unknown key. A re-run must change only what the installer manages.
 $entry = @{ Preset = 'local-main'; Alias = 'localai-main'; Display = 'Local Main'; Description = 'd'; Vision = $false; Think = $null; Trial = $false }
 $managedForm = New-LaiPresetForm -Entry $entry -NativeTools $true -SystemPrompt 'sys'
+# Selected again after -OfficialModels none / -TrialModels none hid them: shown again. A measured
+# preset keeps the user's own hidden choice (no 'hidden' key in the managed form).
+foreach ($kind in 'Official', 'Trial') {
+    $oe = @{ Preset = 'official-main'; Alias = 'localai-official-main'; Display = 'Official Main'; Description = 'd'; Vision = $true; Think = $null; Trial = ($kind -eq 'Trial'); Official = ($kind -eq 'Official') }
+    $of = New-LaiPresetForm -Entry $oe -NativeTools $true -SystemPrompt 'sys'
+    $om = Merge-LaiPresetForm -Managed $of -Existing ([pscustomobject]@{ id = 'official-main'; name = 'Official Main'; meta = [pscustomobject]@{ hidden = $true }; params = [pscustomobject]@{} })
+    Assert-That ($om.meta['hidden'] -eq $false) "a re-selected $kind preset that was hidden is shown again"
+}
+Assert-That (-not $managedForm.meta.ContainsKey('hidden')) 'a measured preset form leaves hidden alone (the user may have hidden it)'
 $existingPreset = [pscustomobject]@{ id = 'local-main'; name = 'Local Main'; base_model_id = 'localai-main:latest'; params = [pscustomobject]@{ temperature = 0.3 }
     meta = [pscustomobject]@{ builtinTools = [pscustomobject]@{ calendar = $false; web_search = $false; code_interpreter = $true }
         capabilities = [pscustomobject]@{ usage = $true; code_interpreter = $true }; myOwnKey = 'kept' } }
@@ -964,6 +973,21 @@ foreach ($line in ($readme -split "`n")) {
     if ($isRow -and $line -match 'tok/s' -and ($line + ' ' + $header) -notmatch '(?i)short prompt|short chat|long chat') { $speedRows += $line.Trim() }
 }
 Assert-That ($speedRows.Count -eq 0) "every README table row with a tok/s figure says what chat length it applies to ($($speedRows -join ' || '))"
+# Official releases next to the uncensored presets: listed first, opt-out-able, never fatal, and the
+# default chat model once installed.
+$offs = @($catData.Models | Where-Object { $_.Official })
+$uncens = @($catData.Models | Where-Object { -not $_.Official -and -not $_.Trial })
+Assert-That ($offs.Count -ge 3 -and @($offs | Where-Object { -not $_.Optional -or $_.Key -notlike 'official-*' -or $_.Source -match '/' }).Count -eq 0) "official entries are optional, keyed official-*, and pulled from the Ollama library itself (no community namespace): $(@($offs | ForEach-Object { $_.Source }) -join ', ')"
+$maxOff = [int](@($offs | ForEach-Object { [int]$_.Order } | Sort-Object)[-1]); $minUnc = [int](@($uncens | ForEach-Object { [int]$_.Order } | Sort-Object)[0])
+Assert-That ($maxOff -lt $minUnc) "official presets are listed before the uncensored ones (orders up to $maxOff vs from $minUnc)"
+Assert-That (@($uncens | Where-Object { $_.Display -notlike 'Uncensored *' }).Count -eq 0) "the uncensored presets say so in their name: $(@($uncens | ForEach-Object { $_.Display }) -join ', ')"
+Assert-That (@($catData.Models | Where-Object { $_.Preset -eq $catData.PreferredDefaultPreset -and $_.Official }).Count -eq 1) 'the preferred default preset is an official release from the catalog'
+$catPath = Join-Path (Join-Path $src 'config') 'models.psd1'
+$cWith = Get-LaiCatalog -Path $catPath -IncludeKeys @('main', 'fast', 'official-main')
+$cWithout = Get-LaiCatalog -Path $catPath -IncludeKeys @('main', 'fast')
+$cDefault = Get-LaiCatalog -Path $catPath
+Assert-That ($cWith.DefaultPreset -eq 'official-main' -and $cWithout.DefaultPreset -eq 'local-main') "new chats start on Official Main once it is installed, on Uncensored Main otherwise ($($cWith.DefaultPreset) / $($cWithout.DefaultPreset))"
+Assert-That (@($cDefault.Models | Where-Object { $_.Official -or $_.Trial }).Count -eq 0 -and $cDefault.DefaultPreset -eq 'local-main') 'without a selection the catalog holds no opt-in model (scripts reading an old install see what it has)'
 
 $need = @('Test-LaiPresetVision', 'Test-LaiWebUIVision', 'Get-LaiContextOverride', 'Get-LaiRagWanted')
 $missingFn = @($need | Where-Object { -not (Get-Command $_ -ErrorAction SilentlyContinue) })
@@ -1172,9 +1196,9 @@ foreach ($cm in $realCatalog.Models) {
 }
 $mainGB = @($realCatalog.Models | Where-Object { $_.Key -eq 'main' })[0].DownloadGB
 $fastGB = @($realCatalog.Models | Where-Object { $_.Key -eq 'fast' })[0].DownloadGB
-Assert-That (-not (Test-LaiModelFitsVram -DownloadGB $mainGB -TotalMiB 16376)) 'Local Main does not fit a 16 GB RTX 4080 (refused before its download)'
-Assert-That (Test-LaiModelFitsVram -DownloadGB $fastGB -TotalMiB 16376) 'Local Fast fits a 16 GB card'
-Assert-That (-not (Test-LaiModelFitsVram -DownloadGB $fastGB -TotalMiB 8192)) 'Local Fast does not fit an 8 GB card'
+Assert-That (-not (Test-LaiModelFitsVram -DownloadGB $mainGB -TotalMiB 16376)) 'Uncensored Main does not fit a 16 GB RTX 4080 (refused before its download)'
+Assert-That (Test-LaiModelFitsVram -DownloadGB $fastGB -TotalMiB 16376) 'Uncensored Fast fits a 16 GB card'
+Assert-That (-not (Test-LaiModelFitsVram -DownloadGB $fastGB -TotalMiB 8192)) 'Uncensored Fast does not fit an 8 GB card'
 # Two GPUs: nvidia-smi lists them in PCI order, often the small display card first. A stand-in
 # nvidia-smi inside the module: an alias (Get-Command finds it before any real one) for a function
 # with an approved verb, so PSScriptAnalyzer's PSUseApprovedVerbs stays quiet.

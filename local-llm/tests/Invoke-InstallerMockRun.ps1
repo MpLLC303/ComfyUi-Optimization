@@ -252,6 +252,14 @@ function Get-TestPreset([string]$Id) {
 }
 $tp = Get-TestPreset 'trial-standin'
 Assert-That ($tp -and -not $tp.meta.hidden) 'trial preset created in Open WebUI and visible'
+# Official releases are installed by default (no -OfficialModels), listed first, and new chats start on one.
+Assert-That ($sel -contains 'official-ok' -and $sel -notcontains 'official-missing') "official models are installed by default; one whose tag cannot be pulled is skipped, not fatal ($($sel -join ', '))"
+$allLogs = (Get-ChildItem (Join-Path $aiRoot 'Logs') -Filter 'install-*.log' | ForEach-Object { Get-Content -Raw $_.FullName }) -join "`n"
+Assert-That ($allLogs -match 'Official model Official: missing tag \(testorg/official-does-not-exist:1b\) skipped: .*The uncensored presets are unaffected') 'the official skip came from the Models stage and says the uncensored presets are unaffected'
+Assert-That ($state.flags.officialFailed.PSObject.Properties['official-missing'] -and [string]$state.flags.officialFailed.'official-missing'.Source -eq 'testorg/official-does-not-exist:1b') 'the failed official model is recorded, so later runs do not download and load it again'
+$op = Get-TestPreset 'official-standin'
+$mcfg = Invoke-LaiApi -Uri 'http://127.0.0.1:3000/api/v1/configs/models' -Token $tok2
+Assert-That ($op -and -not $op.meta.hidden -and [string]$mcfg.DEFAULT_MODELS -eq 'official-standin') "the official preset is visible and new chats start on it (default '$($mcfg.DEFAULT_MODELS)', preset found: $([bool]$op), hidden: $($op.meta.hidden))"
 Assert-That ($global:Tasks.ContainsKey('LocalAI-Backup-OpenWebUI')) 'daily backup task registered'
 $guardAfter = [int](Invoke-RestMethod $guardStatus -TimeoutSec 5).stats.requests
 Assert-That (($guardAfter - $guardBefore) -ge 1) "Open WebUI reaches Ollama through the render guard ($($guardAfter - $guardBefore) requests)"
@@ -337,6 +345,9 @@ Assert-That ($kc.Count -eq 2 -and $kc -contains "Dad$([char]0x2019)s References"
 Assert-That ($cfgAfter.KeepAlive -eq '7m' -and [int]$cfgAfter.BackupRetentionDays -eq 9) 're-run without switches keeps -KeepAlive / -BackupRetentionDays from the first run'
 
 Assert-That (@((Get-Content -Encoding UTF8 -Raw (Join-Path $aiRoot 'install-state.json') | ConvertFrom-Json).flags.selectedModels) -contains 'trial-ok') 're-run without -TrialModels keeps the chosen trial'
+$p3Log = Get-Content -Raw (Get-ChildItem (Join-Path $aiRoot 'Logs') -Filter 'install-*.log' | Sort-Object LastWriteTime | Select-Object -Last 1).FullName  # lai-ok: objects
+Assert-That ($p3Log -match 'Official: missing tag is not set up: it failed before' -and $p3Log -notmatch 'Downloading testorg/official-does-not-exist') 'a re-run does not try the failed official model again, and says how to'
+Assert-That (@((Get-Content -Encoding UTF8 -Raw (Join-Path $aiRoot 'install-state.json') | ConvertFrom-Json).flags.selectedModels) -contains 'official-ok') 're-run keeps the official model'
 
 # ---- phase 4: drop the trial again ---------------------------------------------------------------
 Write-Host "`n=== PHASE 4: re-run with -TrialModels none ===" -ForegroundColor Cyan
@@ -346,7 +357,7 @@ $st.flags.PSObject.Properties.Remove('params')
 $st | ConvertTo-Json -Depth 20 | Set-Content (Join-Path $aiRoot 'install-state.json')
 # This run: a standard account signed in, an administrator's password typed at the UAC prompt.
 $global:ConsoleUser = 'MOCKPC\kid'
-& (Join-Path $aiRoot 'Scripts/Install-LocalAI.ps1') -AIRoot $aiRoot -SkipTests -TrialModels none
+& (Join-Path $aiRoot 'Scripts/Install-LocalAI.ps1') -AIRoot $aiRoot -SkipTests -TrialModels none -OfficialModels none
 Assert-That ($LASTEXITCODE -eq 0) "phase 4 completes (exit $LASTEXITCODE)"
 $global:ConsoleUser = 'MOCKPC\testuser'
 $lastLog = Get-ChildItem (Join-Path $aiRoot 'Logs') -Filter 'install-*.log' | Sort-Object LastWriteTime | Select-Object -Last 1  # lai-ok: objects
@@ -355,6 +366,11 @@ Assert-That ((& $restartCalls) -eq 1) 'unchanged render_guard.py: no restart'
 Assert-That (@((Get-Content -Encoding UTF8 -Raw (Join-Path $aiRoot 'install-state.json') | ConvertFrom-Json).flags.selectedModels) -notcontains 'trial-ok') '-TrialModels none deselects the trial'
 $tp = Get-TestPreset 'trial-standin'
 Assert-That ($tp -and $tp.meta.hidden -eq $true) 'deselected trial preset is hidden (kept for old chats)'
+$op = Get-TestPreset 'official-standin'
+$tok4 = Connect-LaiWebUI -BaseUrl 'http://127.0.0.1:3000' -Email $Email -Password $Password
+$mcfg = Invoke-LaiApi -Uri 'http://127.0.0.1:3000/api/v1/configs/models' -Token $tok4
+$st4 = Get-Content -Encoding UTF8 -Raw (Join-Path $aiRoot 'install-state.json') | ConvertFrom-Json
+Assert-That (@($st4.flags.selectedModels) -notcontains 'official-ok' -and $op -and $op.meta.hidden -eq $true -and [string]$mcfg.DEFAULT_MODELS -eq 'local-main') "-OfficialModels none hides the official preset and new chats start on Local Main again (default '$($mcfg.DEFAULT_MODELS)')"
 $p4 = (Get-Content -Encoding UTF8 -Raw (Join-Path $aiRoot 'install-state.json') | ConvertFrom-Json).flags.params
 Assert-That ($p4.SkipVision -eq $true -and $p4.SkipCoder -eq $true) 'older install: skips inferred from the installed models (no surprise 20 GB downloads)'
 Assert-That (@((Get-Content -Encoding UTF8 -Raw (Join-Path $aiRoot 'install-state.json') | ConvertFrom-Json).flags.configureWarnings).Count -eq 0 -and -not (Select-String -LiteralPath (Join-Path $aiRoot 'install-report.md') -Pattern 'need attention' -Encoding UTF8 -Quiet)) "the next clean run clears phase 3's warning (no stale attention section)"
@@ -488,7 +504,7 @@ $env:LOCALAI_TEST_CATALOG = Join-Path $copy 'config/models.psd1'
 $c7a = $LASTEXITCODE
 $log7a = Get-NewestLog
 $env:LOCALAI_TEST_CATALOG = Join-Path $copy 'tests/models.test.psd1'
-Assert-That ($c7a -ne 0 -and $log7a -match 'Local Main \([\d.,]+ GB\) cannot load fully on this NVIDIA GeForce RTX 4080' -and $log7a -match '24 GB NVIDIA card' -and $log7a -match 'Nothing was downloaded') "a 16 GB card: stops and says why (exit $c7a)"
+Assert-That ($c7a -ne 0 -and $log7a -match 'Uncensored Main \([\d.,]+ GB\) cannot load fully on this NVIDIA GeForce RTX 4080' -and $log7a -match '24 GB NVIDIA card' -and $log7a -match 'Nothing was downloaded') "a 16 GB card: stops and says why (exit $c7a)"
 Assert-That ($log7a -notmatch '=+ Ollama =+' -and $log7a -notmatch 'Downloading ') 'it stops in Preflight: no Ollama stage, no download'
 $global:MockGpu = 'none'; $global:MockVideo = @('AMD Radeon RX 7900 XTX')
 & (Join-Path $aiRoot 'Scripts/Install-LocalAI.ps1') -AIRoot $aiRoot -SkipTests -TrialModels none

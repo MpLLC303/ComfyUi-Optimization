@@ -20,15 +20,79 @@
 #               Install-LocalAI.ps1 -TrialModels <key>. A trial whose tag is missing, that this
 #               Ollama cannot load, or that is not 100% on the GPU is skipped with a warning; the
 #               four measured presets are never replaced. Their speeds are estimates until tuned.
+#   Official    $true = the model maker's own release from the Ollama library (not uncensored).
+#               Installed by default next to the uncensored presets and listed first; when it is set
+#               up, PreferredDefaultPreset becomes the preset new chats start with. Like a trial it is
+#               skipped with a warning (never fatal) when its tag is missing, this Ollama cannot load
+#               it, it is not 100% on the GPU, or the disk is short. Install-LocalAI.ps1
+#               -OfficialModels picks them ('none' hides them again).
 @{
-    DefaultPreset     = 'local-main'
-    ContextCandidates = @(65536, 57344, 49152, 40960, 32768, 24576, 16384, 12288, 8192)
+    DefaultPreset          = 'local-main'
+    # New chats start here when it is installed (falls back to DefaultPreset otherwise).
+    PreferredDefaultPreset = 'official-main'
+    ContextCandidates      = @(65536, 57344, 49152, 40960, 32768, 24576, 16384, 12288, 8192)
 
-    Models            = @(
+    Models                 = @(
+        # ---- official releases (the model makers' own, from the Ollama library; see Official above) --
+        @{
+            Key             = 'official-main'
+            Order           = 1
+            Display         = 'Official Main'
+            Preset          = 'official-main'
+            Alias           = 'localai-official-main'
+            # Google's quantization-aware 4-bit build: about the quality of the full model at ~16 GB,
+            # which leaves room on the card for a long context.
+            Source          = 'gemma4:26b-a4b-it-qat'
+            Optional        = $true
+            Official        = $true
+            DownloadGB      = 17.5
+            MaxContext      = 65536
+            Vision          = $true
+            Think           = $null
+            MinTokensPerSec = 60
+            # Gemma model card: temperature 1.0, top_p 0.95, top_k 64.
+            Parameters      = @{ temperature = 1.0; top_p = 0.95; top_k = 64; min_p = 0.0 }
+            Description     = 'Gemma 4 26B-A4B, Google''s own release (mixture of experts, ~4B active per token; reads images). The most capable everyday model: start here, and switch to an Uncensored preset when it refuses something you need.'
+        }
+        @{
+            Key             = 'official-deep'
+            Order           = 2
+            Display         = 'Official Deep'
+            Preset          = 'official-deep'
+            Alias           = 'localai-official-deep'
+            Source          = 'qwen3.8:27b'
+            Optional        = $true
+            Official        = $true
+            DownloadGB      = 18
+            MaxContext      = 65536
+            Vision          = $true
+            Think           = $null
+            MinTokensPerSec = 18
+            Parameters      = @{ temperature = 0.6; top_p = 0.95; top_k = 20; min_p = 0.0 }
+            Description     = 'Qwen3.8 27B, Alibaba''s own release (dense, thinks step by step; reads images). The strongest model that fits this card: hard reasoning, maths and code, at roughly a quarter of Official Main''s speed.'
+        }
+        @{
+            Key             = 'official-fast'
+            Order           = 3
+            Display         = 'Official Fast'
+            Preset          = 'official-fast'
+            Alias           = 'localai-official-fast'
+            Source          = 'qwen3.5:9b'
+            Optional        = $true
+            Official        = $true
+            DownloadGB      = 6.6
+            MaxContext      = 65536
+            Vision          = $true
+            Think           = $false
+            MinTokensPerSec = 50
+            Parameters      = @{ temperature = 0.7; top_p = 0.8; top_k = 20; min_p = 0.0 }
+            Description     = 'Qwen3.5 9B, Alibaba''s own release (dense, reads images). Quick answers and light tasks.'
+        }
+        # ---- uncensored (abliterated community builds: refusals removed, a little less capable) ------
         @{
             Key             = 'fast'
-            Order           = 2
-            Display         = 'Local Fast'
+            Order           = 5
+            Display         = 'Uncensored Fast'
             Preset          = 'local-fast'
             Alias           = 'localai-fast'
             Source          = 'huihui_ai/qwen3-abliterated:14b-v2'
@@ -39,12 +103,12 @@
             Think           = $false
             MinTokensPerSec = 40
             Parameters      = @{ temperature = 0.6; top_p = 0.95; top_k = 20; min_p = 0.0 }
-            Description     = 'Qwen3 14B abliterated (dense, hybrid reasoning). Thinking is off; for step-by-step answers set Think on in Workspace > Models > Local Fast > Advanced Params (the per-chat Chat Controls switch cannot override it).'
+            Description     = 'Qwen3 14B abliterated (dense, hybrid reasoning). Thinking is off; for step-by-step answers set Think on in Workspace > Models > Uncensored Fast > Advanced Params (the per-chat Chat Controls switch cannot override it).'
         }
         @{
             Key             = 'main'
-            Order           = 1
-            Display         = 'Local Main'
+            Order           = 4
+            Display         = 'Uncensored Main'
             Preset          = 'local-main'
             Alias           = 'localai-main'
             Source          = 'huihui_ai/qwen3-abliterated:30b-a3b-instruct-2507-q4_K_M'
@@ -59,8 +123,8 @@
         }
         @{
             Key             = 'vision'
-            Order           = 3
-            Display         = 'Local Vision'
+            Order           = 6
+            Display         = 'Uncensored Vision'
             Preset          = 'local-vision'
             Alias           = 'localai-vision'
             Source          = 'huihui_ai/qwen3-vl-abliterated:30b-a3b-instruct-q4_K_M'
@@ -75,8 +139,8 @@
         }
         @{
             Key             = 'code'
-            Order           = 4
-            Display         = 'Local Code'
+            Order           = 7
+            Display         = 'Uncensored Code'
             Preset          = 'local-code'
             Alias           = 'localai-code'
             Source          = 'huihui_ai/qwen3-coder-abliterated:30b-a3b-instruct-q4_K_M'
@@ -92,7 +156,7 @@
         # ---- trials (opt-in; see Trial above) ---------------------------------------------------
         @{
             Key             = 'trial-fast'
-            Order           = 5
+            Order           = 8
             Display         = 'Trial: Qwen3.5 9B (fast)'
             Preset          = 'trial-qwen35-9b'
             Alias           = 'localai-trial-qwen35-9b'
@@ -105,11 +169,11 @@
             Think           = $false
             MinTokensPerSec = 60
             Parameters      = @{ temperature = 0.6; top_p = 0.95; top_k = 20; min_p = 0.0 }
-            Description     = 'Trial: Qwen3.5 9B abliterated (dense, 2026). Candidate replacement for Local Fast: smaller, newer, much longer context.'
+            Description     = 'Trial: Qwen3.5 9B abliterated (dense, 2026). Candidate replacement for Uncensored Fast: smaller, newer, much longer context.'
         }
         @{
             Key             = 'trial-gemma4'
-            Order           = 6
+            Order           = 9
             Display         = 'Trial: Gemma 4 26B'
             Preset          = 'trial-gemma4-26b'
             Alias           = 'localai-trial-gemma4-26b'
@@ -126,7 +190,7 @@
         }
         @{
             Key             = 'trial-code27b'
-            Order           = 7
+            Order           = 10
             Display         = 'Trial: Qwen3.6 27B (slow, careful)'
             Preset          = 'trial-qwen36-27b'
             Alias           = 'localai-trial-qwen36-27b'
@@ -139,11 +203,11 @@
             Think           = $null
             MinTokensPerSec = 18
             Parameters      = @{ temperature = 0.6; top_p = 0.95; top_k = 20; min_p = 0.0 }
-            Description     = 'Trial: Qwen3.6 27B abliterated (dense, 2026). Quality-first coding and reasoning at roughly a fifth of Local Code speed.'
+            Description     = 'Trial: Qwen3.6 27B abliterated (dense, 2026). Quality-first coding and reasoning at roughly a fifth of Uncensored Code speed.'
         }
         @{
             Key             = 'trial-research'
-            Order           = 8
+            Order           = 11
             Display         = 'Trial: Tongyi DeepResearch 30B'
             Preset          = 'trial-tongyi-research'
             Alias           = 'localai-trial-tongyi-research'
@@ -157,7 +221,7 @@
             MinTokensPerSec = 90
             # Alibaba's own research runs: temperature 0.6, top_p 0.95, presence_penalty 1.1.
             Parameters      = @{ temperature = 0.6; top_p = 0.95; top_k = 20; min_p = 0.0; presence_penalty = 1.1 }
-            Description     = 'Trial: Tongyi DeepResearch 30B-A3B abliterated (Alibaba, mixture of experts like Local Main, trained for long web research). With -DeepResearch it becomes the research agent''s model.'
+            Description     = 'Trial: Tongyi DeepResearch 30B-A3B abliterated (Alibaba, mixture of experts like Uncensored Main, trained for long web research). With -DeepResearch it becomes the research agent''s model.'
         }
     )
 }

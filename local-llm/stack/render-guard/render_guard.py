@@ -21,7 +21,7 @@ What it does:
   * In every mode: a chat whose history holds images, sent to a model without the 'vision'
     capability (/api/show) -> the images are dropped with a short note. Open WebUI re-sends every
     earlier image of a chat on each turn, and a text-only model rejects them, so without this a
-    chat switched from Local Vision to another preset fails on every later message.
+    chat switched from a preset that sees images to one that does not fails on every later message.
 Model list, pulls, embeddings and unload calls always pass through unchanged. Unlike an Open
 WebUI filter function, this also covers Open WebUI's background calls (titles, tags, web-search
 queries), which go straight to Ollama. Any error inside the guard passes the request through
@@ -71,7 +71,7 @@ CONFIG = {
 }
 GUARDED_PATHS = ('/api/chat', '/api/generate')
 MODEL_CHANGE_PATHS = ('/api/pull', '/api/create', '/api/delete', '/api/copy')
-IMAGE_NOTE = '[image omitted: this model cannot see images; switch this chat to Local Vision or start a new chat]'
+IMAGE_NOTE = '[image omitted: this model cannot see images; switch this chat to a preset that sees images (Official Main, Official Deep, Official Fast or Uncensored Vision) or start a new chat]'
 HOP_BY_HOP = {'connection', 'keep-alive', 'proxy-authenticate', 'proxy-authorization', 'te',
               'trailer', 'trailers', 'transfer-encoding', 'upgrade', 'content-length', 'host'}
 
@@ -455,7 +455,7 @@ def strip_images(path, body):
                 m['content'] = (m['content'] + '\n\n' + IMAGE_NOTE) if m['content'] else IMAGE_NOTE
         fixed.append(m)
     body['messages'] = fixed
-    return '%s cannot see images: dropped %d image(s) from the chat history (keep image chats on Local Vision)' % (
+    return '%s cannot see images: dropped %d image(s) from the chat history (keep image chats on a preset that sees images)' % (
         body.get('model'), n)
 
 

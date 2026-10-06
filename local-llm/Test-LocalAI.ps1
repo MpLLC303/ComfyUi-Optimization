@@ -13,7 +13,7 @@
       Docker, containers, Open WebUI login, presets (system prompt + native tool calling, image
       upload matching what Ollama reports for the model), no context size set in Open WebUI over
       the tuned aliases, signup off / memories on, RAG + web search settings, a chat per preset, an
-      image read by each preset with images (Local Vision), memory recall, document retrieval, web
+      image read by each preset with images (Uncensored Vision), memory recall, document retrieval, web
       search, backups, and that nothing listens beyond 127.0.0.1.
 
     The functional tests create a temporary memory and a temporary knowledge collection and delete
@@ -26,7 +26,7 @@
     Also measure what the render guard does while ComfyUI renders: load the default preset's model
     with num_gpu 0 (CPU only), and report generation speed, prompt-processing speed for a ~1,500-token
     prompt, and how much VRAM the CPU load still takes. Close ComfyUI first so the reading is
-    clean. The first CPU load reads the whole model into RAM (about 19 GB for Local Main).
+    clean. The first CPU load reads the whole model into RAM (about 19 GB for Uncensored Main).
 #>
 param(
     # Install folder (the installer's -AIRoot).

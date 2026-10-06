@@ -23,11 +23,11 @@
 .EXAMPLE
     .\Update-Models.ps1 -Retune            # re-measure every model even if nothing changed
 .EXAMPLE
-    .\Update-Models.ps1 -Rollback main     # go back to the previous version of Local Main ('all' = every kept one)
+    .\Update-Models.ps1 -Rollback main     # go back to the previous version of Uncensored Main ('all' = every kept one)
 .EXAMPLE
     .\Update-Models.ps1 -DropPrevious      # delete the kept previous versions to free the disk space
 .EXAMPLE
-    .\Update-Models.ps1 -Unpin main        # after a -Rollback: let updates touch Local Main again
+    .\Update-Models.ps1 -Unpin main        # after a -Rollback: let updates touch Uncensored Main again
 #>
 param(
     # Install folder (the installer's -AIRoot).

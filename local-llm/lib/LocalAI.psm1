@@ -1237,7 +1237,7 @@ function Merge-LaiPresetForm {
     if (-not $Existing) { return $Managed }
     # Set when the preset is created, then left to the user:
     #   think            Open WebUI 0.11.4 re-applies a preset's think over the per-chat Chat Controls
-    #                    switch, so the preset is the only place to turn Local Fast's reasoning on.
+    #                    switch, so the preset is the only place to turn Uncensored Fast's reasoning on.
     #   image_generation an image button the user wired to ComfyUI (not code execution, which stays off).
     $createOnly = @{ params = @('think'); capabilities = @('image_generation'); builtinTools = @('image_generation') }
     $old = ConvertTo-LaiHashtable $Existing
@@ -2207,14 +2207,18 @@ function Invoke-LaiResearchQuick {
 
 function Get-LaiCatalog {
     # Loads config/models.psd1. -IncludeKeys filters to the models selected for this install;
-    # without it, opt-in trial models are left out unless -IncludeTrials.
+    # without it, opt-in models (trials, official releases) are left out unless -IncludeTrials.
     param([Parameter(Mandatory)][string]$Path, [string[]]$IncludeKeys = @(), [switch]$IncludeTrials)
     $data = Import-PowerShellDataFile -Path $Path
     $models = @($data.Models)
     if ($IncludeKeys.Count -gt 0) { $models = @($models | Where-Object { $IncludeKeys -contains $_.Key }) }
-    elseif (-not $IncludeTrials) { $models = @($models | Where-Object { -not $_.Trial }) }
+    # Without a selection: no opt-in models (trials, official releases), which are only there once chosen.
+    elseif (-not $IncludeTrials) { $models = @($models | Where-Object { -not ($_.Trial -or $_.Official) }) }
+    # New chats start on the preferred preset (an official release) once it is installed.
+    $default = $data.DefaultPreset
+    if ($data.ContainsKey('PreferredDefaultPreset') -and @($models | Where-Object { $_.Preset -eq $data.PreferredDefaultPreset }).Count) { $default = $data.PreferredDefaultPreset }
     return [pscustomobject]@{
-        DefaultPreset     = $data.DefaultPreset
+        DefaultPreset     = $default
         ContextCandidates = @($data.ContextCandidates)
         Models            = $models
         AllModels         = @($data.Models)
@@ -2422,9 +2426,9 @@ function New-LaiPresetForm {
         }
         tags              = @(@{ name = 'local' })
     }
-    # A trial that is selected again must be shown again (the installer hid it when it was dropped);
-    # the measured presets keep whatever the user chose.
-    if ($Entry.Trial) { $meta['hidden'] = $false }
+    # A trial or official release that is selected again must be shown again (the installer hid it
+    # when it was dropped); the measured presets keep whatever the user chose.
+    if ($Entry.Trial -or $Entry.Official) { $meta['hidden'] = $false }
     # Native tool calling lets the model decide when to search. In legacy (prompt-based) mode a
     # default-on web search would run a search before every single message, so leave it off there.
     if ($NativeTools) { $meta['defaultFeatureIds'] = @('web_search') }
