@@ -393,6 +393,24 @@ Assert-That (-not $st4b.flags.officialFailed.PSObject.Properties['official-ok'] 
 $st4c = Get-Content -Encoding UTF8 -Raw (Join-Path $aiRoot 'install-state.json') | ConvertFrom-Json
 $op = Get-TestPreset 'official-standin'
 Assert-That ($LASTEXITCODE -eq 0 -and @($st4c.flags.selectedModels) -contains 'official-ok' -and $op -and -not $op.meta.hidden) "the next run with an idle GPU sets it up and shows its preset again (exit $LASTEXITCODE)"
+
+Write-Host "`n=== PHASE 4d: an official model whose tuned alias fails to load: left out, the update completes ===" -ForegroundColor Cyan
+# The 8K check (on the source) passes; tuning loads the alias, which this hook makes fail like a
+# model this Ollama cannot run. Before the fix this threw out of the Tuning stage and stopped the run.
+$st = Get-Content -Encoding UTF8 -Raw (Join-Path $aiRoot 'install-state.json') | ConvertFrom-Json
+$st.tuning.PSObject.Properties.Remove('official-ok')
+$st | ConvertTo-Json -Depth 20 | Set-Content (Join-Path $aiRoot 'install-state.json')
+$env:LOCALAI_TEST_LOAD_FAIL = 'localai-official-standin'
+try { & (Join-Path $aiRoot 'Scripts/Install-LocalAI.ps1') -AIRoot $aiRoot -SkipTests -TrialModels none } finally { $env:LOCALAI_TEST_LOAD_FAIL = '' }
+$c4d = $LASTEXITCODE
+$log4d = Get-Content -Raw (Get-ChildItem (Join-Path $aiRoot 'Logs') -Filter 'install-*.log' | Sort-Object LastWriteTime | Select-Object -Last 1).FullName  # lai-ok: objects
+$st4d = Get-Content -Encoding UTF8 -Raw (Join-Path $aiRoot 'install-state.json') | ConvertFrom-Json
+Assert-That ($c4d -eq 0 -and $log4d -match 'Official model Official: stand-in \(testorg/qwen3-abliterated:1\.7b\) skipped: .*incompatible' -and $log4d -match '=+ Backup =+') "a tuning failure of an official model skips it and the run goes on to the Backup stage (exit $c4d)"
+Assert-That (@($st4d.flags.selectedModels) -notcontains 'official-ok' -and [string]$st4d.flags.officialFailed.'official-ok'.Why -match 'incompatible' -and $null -ne $st4d.tuning.main) 'it is recorded as the model''s own failure; the uncensored presets stay tuned'
+Assert-That ($log4d -notmatch 'download \([\d.]+ GB\) was removed') 'a model this run did not download is not deleted (its files are shared with Uncensored Main here)'
+& (Join-Path $aiRoot 'Scripts/Install-LocalAI.ps1') -AIRoot $aiRoot -SkipTests -TrialModels none -OfficialModels all
+$st4e = Get-Content -Encoding UTF8 -Raw (Join-Path $aiRoot 'install-state.json') | ConvertFrom-Json
+Assert-That ($LASTEXITCODE -eq 0 -and @($st4e.flags.selectedModels) -contains 'official-ok' -and -not $st4e.flags.officialFailed.PSObject.Properties['official-ok']) "naming the choice again (-OfficialModels all) retries it (exit $LASTEXITCODE)"
 $p4 = (Get-Content -Encoding UTF8 -Raw (Join-Path $aiRoot 'install-state.json') | ConvertFrom-Json).flags.params
 Assert-That ($p4.SkipVision -eq $true -and $p4.SkipCoder -eq $true) 'older install: skips inferred from the installed models (no surprise 20 GB downloads)'
 Assert-That (@((Get-Content -Encoding UTF8 -Raw (Join-Path $aiRoot 'install-state.json') | ConvertFrom-Json).flags.configureWarnings).Count -eq 0 -and -not (Select-String -LiteralPath (Join-Path $aiRoot 'install-report.md') -Pattern 'need attention' -Encoding UTF8 -Quiet)) "the next clean run clears phase 3's warning (no stale attention section)"

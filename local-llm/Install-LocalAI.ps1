@@ -310,6 +310,46 @@ function Get-OfficialRetryArg {
     return ($c -join ',')
 }
 
+$script:DroppedOptIn = @()
+function Skip-OptInModel {
+    # A trial or official model that cannot be set up is left out of this run, never stopping the
+    # install (the Models and Tuning stages both use this). An official one is recorded, and not
+    # retried on every run (each try loads up to 18 GB), only when the model itself is the reason:
+    # its tag, an Ollama that cannot load it, no fit on this card. A download this run made for such a
+    # model is removed again. A busy GPU, a dropped connection or a full disk: the next run tries again.
+    param([Parameter(Mandatory)]$Model, [string]$Why, [string]$OllamaVersion = '', [switch]$GpuBusy, [switch]$PulledNow)
+    $short = ([string]$Why -replace '\s+', ' ').Trim(); $short = $short.Substring(0, [Math]::Min(200, $short.Length))
+    if ($GpuBusy) {
+        Write-LaiLog WARN "$($Model.Display) is set up on the next run: the GPU was busy ($short)"
+    } elseif ($Model.Official) {
+        $own = $short -match '(?i)file does not exist|not found|manifest|incompatible|requires a newer version|unknown model architecture|unsupported|on the GPU even at 8K|could not be loaded at any context|empty answer'
+        $again = 'the next run tries it again'
+        if ($own) {
+            if (-not $State.flags.ContainsKey('officialFailed') -or -not $State.flags['officialFailed']) { $State.flags['officialFailed'] = @{} }
+            $State.flags['officialFailed'][$Model.Key] = @{ Source = $Model.Source; Why = $short; OllamaVersion = $OllamaVersion }
+            $again = "it is tried again after an Ollama update, or with -OfficialModels $(Get-OfficialRetryArg)"
+            $shared = @($script:Catalog.Models | Where-Object { $_.Key -ne $Model.Key -and $_.Source -eq $Model.Source }).Count -gt 0
+            if ($PulledNow -and -not $shared) {
+                try { Invoke-LaiApi -Method DELETE -Uri "$OllamaUrl/api/delete" -Body @{ model = $Model.Source } | Out-Null; $again += "; its download ($($Model.DownloadGB) GB) was removed again" }
+                catch { Write-Verbose "could not remove $($Model.Source)" }
+            }
+        }
+        Write-LaiLog WARN "Official model $($Model.Display) ($($Model.Source)) skipped: $short. The uncensored presets are unaffected; $again."
+    } else {
+        Write-LaiLog WARN "Trial $($Model.Display) ($($Model.Source)) skipped: $short"
+    }
+    if ($script:DroppedOptIn -notcontains $Model.Key) { $script:DroppedOptIn += $Model.Key }
+}
+
+function Remove-DroppedOptIn {
+    # Applies Skip-OptInModel's list: the selection, the saved state and this run's catalog.
+    if ($script:DroppedOptIn.Count -eq 0) { return }
+    $State.flags['selectedModels'] = @($State.flags['selectedModels'] | Where-Object { $script:DroppedOptIn -notcontains $_ })
+    Save-State
+    $script:Catalog = Get-LaiCatalog -Path $CatalogPath -IncludeKeys @($State.flags['selectedModels'])
+    $script:DroppedOptIn = @()
+}
+
 function Invoke-Stage {
     param([Parameter(Mandatory)][string]$Name, [Parameter(Mandatory)][scriptblock]$Body)
     Write-Host ''
@@ -1177,7 +1217,6 @@ Invoke-Stage 'Ollama' {
 Invoke-Stage 'Models' {
     # The ollama CLI is a client of the local server; never let it target 0.0.0.0 (LAN fallback mode).
     $env:OLLAMA_HOST = '127.0.0.1:11434'
-    $droppedTrials = @()
     $gpuReady = $false
     $gpuWaitFailed = ''
     $ollamaVerNow = ''; try { $ollamaVerNow = [string](Get-LaiOllamaVersion -BaseUrl $OllamaUrl) } catch { Write-Verbose 'Ollama version unknown' }
@@ -1185,11 +1224,11 @@ Invoke-Stage 'Models' {
       if ($gpuWaitFailed -and ($m.Trial -or $m.Official)) {
         # The GPU stayed busy (ComfyUI, a game): nothing to learn about this model now, and no reason
         # to download it only to wait again. Not recorded as a failure: the next run sets it up.
-        Write-LaiLog WARN "$($m.Display) is set up on the next run: the GPU was busy ($gpuWaitFailed)"
-        $droppedTrials += $m.Key
+        Skip-OptInModel -Model $m -Why $gpuWaitFailed -GpuBusy
         continue
       }
       $waitingForGpu = $false
+      $pulledNow = $false
       try {
         if (Test-LaiOllamaModel -BaseUrl $OllamaUrl -Name $m.Source) {
             # Installed and already proven on 100% GPU by an earlier run: no 8K checkpoint load again
@@ -1207,6 +1246,7 @@ Invoke-Stage 'Models' {
             if ($free -lt ($m.DownloadGB + 5)) { throw "Only $free GB free for $($m.Source) (~$($m.DownloadGB) GB)." }
             Write-LaiLog STEP "Downloading $($m.Source) (~$($m.DownloadGB) GB)"
             Invoke-LaiOllamaPull -BaseUrl $OllamaUrl -Name $m.Source
+            $pulledNow = $true
             Write-LaiLog OK "$($m.Source) downloaded"
         }
         # Checkpoint (guide Steps 10-12, 14): it must load entirely on the RTX 3090 at a modest context.
@@ -1231,33 +1271,12 @@ Invoke-Stage 'Models' {
         if (-not ($m.Trial -or $m.Official)) { throw }
         $why = Get-LaiHttpErrorText $_
         if (-not $why) { $why = $_.Exception.Message }
-        if ($waitingForGpu) {
-            $gpuWaitFailed = ($why -replace '\s+', ' ')
-            Write-LaiLog WARN "$($m.Display) is set up on the next run: the GPU was busy ($gpuWaitFailed)"
-        } elseif ($m.Official) {
-            # Recorded (and not retried on every run, each try loads up to 18 GB) only when the model
-            # itself is the reason: its tag, an Ollama that cannot load it, or no fit on this card. A
-            # dropped connection or a full disk is tried again next time.
-            $short = ($why -replace '\s+', ' '); $short = $short.Substring(0, [Math]::Min(200, $short.Length))
-            $own = $short -match '(?i)file does not exist|not found|manifest|incompatible|requires a newer version|unknown model architecture|unsupported|on the GPU even at 8K|empty answer'
-            $again = 'the next run tries it again'
-            if ($own) {
-                $State.flags['officialFailed'][$m.Key] = @{ Source = $m.Source; Why = $short; OllamaVersion = $ollamaVerNow }
-                $again = "it is tried again after an Ollama update, or with -OfficialModels $(Get-OfficialRetryArg)"
-            }
-            Write-LaiLog WARN "Official model $($m.Display) ($($m.Source)) skipped: $short. The uncensored presets are unaffected; $again."
-        } else {
-            Write-LaiLog WARN "Trial $($m.Display) ($($m.Source)) skipped: $why"
-        }
-        $droppedTrials += $m.Key
+        if ($waitingForGpu) { $gpuWaitFailed = ($why -replace '\s+', ' ') }
+        Skip-OptInModel -Model $m -Why $why -OllamaVersion $ollamaVerNow -GpuBusy:$waitingForGpu -PulledNow:$pulledNow
         try { Stop-LaiOllamaModels -BaseUrl $OllamaUrl } catch { Write-Verbose 'unload failed' }
       }
     }
-    if ($droppedTrials.Count -gt 0) {
-        $State.flags['selectedModels'] = @($State.flags['selectedModels'] | Where-Object { $droppedTrials -notcontains $_ })
-        Save-State
-        $script:Catalog = Get-LaiCatalog -Path $CatalogPath -IncludeKeys @($State.flags['selectedModels'])
-    }
+    Remove-DroppedOptIn
     Stop-LaiOllamaModels -BaseUrl $OllamaUrl
 }
 #endregion
@@ -1271,10 +1290,35 @@ Invoke-Stage 'Tuning' {
         Stop-LaiOllamaModels -BaseUrl $OllamaUrl
         Wait-LaiGpuIdle -MaxUsedMiB $MaxBusyVramMiB -TimeoutSec ($GpuWaitMinutes * 60) | Out-Null
     }
-    $results = Invoke-LaiModelSetup -BaseUrl $OllamaUrl -Models $Catalog.Models -Candidates $Catalog.ContextCandidates `
+    # The measured presets first, all together: they must be tuned, and a failure stops the install.
+    $required = @($Catalog.Models | Where-Object { -not ($_.Trial -or $_.Official) })
+    $results = Invoke-LaiModelSetup -BaseUrl $OllamaUrl -Models $required -Candidates $Catalog.ContextCandidates `
         -SystemPrompt $SystemPrompt -Previous $State.tuning -Fingerprint $fingerprint -MinFreeMiB $MinFreeVramMiB -Retune:$Retune -AllowCpu:$AllowCpu `
         -BeforeFirstLoad $beforeLoad
     foreach ($k in $results.Keys) { $State.tuning[$k] = $results[$k] }
+    # Then each trial or official model on its own: one that cannot be tuned (no context fits, its
+    # tuned alias does not load, the speed test fails) or a GPU that stays busy leaves just that
+    # model out of this run, like in the Models stage, instead of stopping the whole update.
+    $ollamaVerNow = ''; try { $ollamaVerNow = [string](Get-LaiOllamaVersion -BaseUrl $OllamaUrl) } catch { Write-Verbose 'Ollama version unknown' }
+    $gpuBusy = ''
+    foreach ($m in @($Catalog.Models | Where-Object { $_.Trial -or $_.Official })) {
+        if ($gpuBusy) { Skip-OptInModel -Model $m -Why $gpuBusy -GpuBusy; continue }
+        $script:TuneWaitingForGpu = $false
+        $before = { $script:TuneWaitingForGpu = $true; & $beforeLoad; $script:TuneWaitingForGpu = $false }
+        try {
+            $r = Invoke-LaiModelSetup -BaseUrl $OllamaUrl -Models @($m) -Candidates $Catalog.ContextCandidates `
+                -SystemPrompt $SystemPrompt -Previous $State.tuning -Fingerprint $fingerprint -MinFreeMiB $MinFreeVramMiB -Retune:$Retune -AllowCpu:$AllowCpu `
+                -BeforeFirstLoad $before
+            foreach ($k in $r.Keys) { $State.tuning[$k] = $r[$k] }
+        } catch {
+            $why = Get-LaiHttpErrorText $_
+            if (-not $why) { $why = $_.Exception.Message }
+            if ($script:TuneWaitingForGpu) { $gpuBusy = ($why -replace '\s+', ' ') }
+            Skip-OptInModel -Model $m -Why $why -OllamaVersion $ollamaVerNow -GpuBusy:([bool]$script:TuneWaitingForGpu)
+            try { Stop-LaiOllamaModels -BaseUrl $OllamaUrl } catch { Write-Verbose 'unload failed' }
+        }
+    }
+    Remove-DroppedOptIn
 }
 #endregion
 
