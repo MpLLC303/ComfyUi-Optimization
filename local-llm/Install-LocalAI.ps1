@@ -301,6 +301,15 @@ if ($NoDeepResearch) { $DeepResearch = $false; $savedParams['DeepResearch'] = $f
 
 function Save-State { Save-LaiState -State $State -Path $P.State }
 
+function Get-OfficialRetryArg {
+    # The current official-model choice as -OfficialModels takes it: naming it again retries a failed
+    # one without dropping the others (a bare key would select only that one).
+    if (-not $State.flags.ContainsKey('officialChoice')) { return 'all' }
+    $c = @($State.flags['officialChoice'] | Where-Object { $_ })
+    if ($c.Count -eq 0 -or $c -contains 'all') { return 'all' }
+    return ($c -join ',')
+}
+
 function Invoke-Stage {
     param([Parameter(Mandatory)][string]$Name, [Parameter(Mandatory)][scriptblock]$Body)
     Write-Host ''
@@ -901,21 +910,25 @@ Invoke-Stage 'Preflight' {
     if (-not $State.flags.ContainsKey('officialFailed') -or -not $State.flags['officialFailed']) { $State.flags['officialFailed'] = @{} }
     if ($script:BoundParams.ContainsKey('OfficialModels')) {
         $officialWanted = @($OfficialModels | Where-Object { $_ -and $_ -ne 'none' })
-        if ($officialWanted -contains 'all') { $officialWanted = $officialKeys }
-        foreach ($t in $officialWanted) { if ($officialKeys -notcontains $t) { Write-LaiLog WARN "Unknown official model '$t' (known: $($officialKeys -join ', '))" } }
+        foreach ($t in $officialWanted) { if ($officialKeys -notcontains $t -and $t -ne 'all') { Write-LaiLog WARN "Unknown official model '$t' (known: all, $($officialKeys -join ', '))" } }
+        # 'all' is kept as the word, so an official model added to the catalog later is included too.
         $State.flags['officialChoice'] = @($officialWanted)
+        if ($officialWanted -contains 'all') { $officialWanted = $officialKeys }
         # Named again: give the ones that failed before another chance.
         foreach ($t in $officialWanted) { $State.flags['officialFailed'].Remove($t) }
     } elseif ($State.flags.ContainsKey('officialChoice')) {
         $officialWanted = @($State.flags['officialChoice'] | Where-Object { $_ })
+        if ($officialWanted -contains 'all') { $officialWanted = $officialKeys }
     } else {
         $officialWanted = $officialKeys
     }
     if ($Retune) { $State.flags['officialFailed'] = @{} }
+    $ollamaNow = ''; try { $ollamaNow = [string](Get-LaiOllamaVersion -BaseUrl $OllamaUrl) } catch { Write-Verbose 'Ollama version unknown' }
     foreach ($om in @($catalogAll.Models | Where-Object { $_.Official -and $officialWanted -contains $_.Key })) {
         $failed = $State.flags['officialFailed'][$om.Key]
-        if ($failed -and [string]$failed['Source'] -eq $om.Source) {
-            Write-LaiLog INFO "$($om.Display) is not set up: it failed before ($($failed['Why'])). Try again with -OfficialModels $($om.Key) (or -Retune)."
+        # Retried by itself once the tag or the Ollama version changes (a newer Ollama may load it).
+        if ($failed -and [string]$failed['Source'] -eq $om.Source -and (-not $ollamaNow -or [string]$failed['OllamaVersion'] -eq $ollamaNow)) {
+            Write-LaiLog INFO "$($om.Display) is not set up: it failed before ($($failed['Why'])). Try again with -OfficialModels $(Get-OfficialRetryArg), or after an Ollama update (Update-Models.ps1 -UpdateOllama)."
             $officialWanted = @($officialWanted | Where-Object { $_ -ne $om.Key })
         }
     }
@@ -976,7 +989,9 @@ Invoke-Stage 'Preflight' {
         if ($present.Count) { Write-LaiLog INFO "Ollama is not answering yet; found $($present.Count) installed model(s) in $target" }
     }
     $budget = $freeGB - 15
-    foreach ($m in ($catalogAll.Models | Sort-Object { $_.Optional })) {
+    # Required models first; among the optional ones the catalog order decides who gets the disk
+    # (Windows PowerShell 5.1's Sort-Object does not keep the input order of equal keys).
+    foreach ($m in ($catalogAll.Models | Sort-Object { $_.Optional }, { [int]$_.Order })) {
         $need = $m.DownloadGB
         if (($m.Trial -or $m.Official) -and $optInWanted -notcontains $m.Key) { continue }
         if ($present -contains (Resolve-LaiModelName $m.Source)) { $need = 0 }
@@ -1164,7 +1179,17 @@ Invoke-Stage 'Models' {
     $env:OLLAMA_HOST = '127.0.0.1:11434'
     $droppedTrials = @()
     $gpuReady = $false
+    $gpuWaitFailed = ''
+    $ollamaVerNow = ''; try { $ollamaVerNow = [string](Get-LaiOllamaVersion -BaseUrl $OllamaUrl) } catch { Write-Verbose 'Ollama version unknown' }
     foreach ($m in ($Catalog.Models | Sort-Object { $_.Optional }, { $_.DownloadGB })) {
+      if ($gpuWaitFailed -and ($m.Trial -or $m.Official)) {
+        # The GPU stayed busy (ComfyUI, a game): nothing to learn about this model now, and no reason
+        # to download it only to wait again. Not recorded as a failure: the next run sets it up.
+        Write-LaiLog WARN "$($m.Display) is set up on the next run: the GPU was busy ($gpuWaitFailed)"
+        $droppedTrials += $m.Key
+        continue
+      }
+      $waitingForGpu = $false
       try {
         if (Test-LaiOllamaModel -BaseUrl $OllamaUrl -Name $m.Source) {
             # Installed and already proven on 100% GPU by an earlier run: no 8K checkpoint load again
@@ -1187,7 +1212,7 @@ Invoke-Stage 'Models' {
         # Checkpoint (guide Steps 10-12, 14): it must load entirely on the RTX 3090 at a modest context.
         Stop-LaiOllamaModels -BaseUrl $OllamaUrl
         # Once, and only when something is loaded (Ollama's own models are unloaded first, so they don't count as busy).
-        if (-not $gpuReady) { Wait-LaiGpuIdle -MaxUsedMiB $MaxBusyVramMiB -TimeoutSec ($GpuWaitMinutes * 60) | Out-Null; $gpuReady = $true }
+        if (-not $gpuReady) { $waitingForGpu = $true; Wait-LaiGpuIdle -MaxUsedMiB $MaxBusyVramMiB -TimeoutSec ($GpuWaitMinutes * 60) | Out-Null; $gpuReady = $true; $waitingForGpu = $false }
         $load = Invoke-LaiOllamaLoad -BaseUrl $OllamaUrl -Name $m.Source -NumCtx 8192 -KeepAlive '1m'
         $gpu = Get-LaiGpuInfo
         Write-LaiLog INFO ("  loaded at 8K context: {0}% GPU, {1} GiB, VRAM used {2}/{3} MiB" -f $load.GpuPercent, $load.SizeGiB, $gpu.UsedMiB, $gpu.TotalMiB)
@@ -1206,10 +1231,21 @@ Invoke-Stage 'Models' {
         if (-not ($m.Trial -or $m.Official)) { throw }
         $why = Get-LaiHttpErrorText $_
         if (-not $why) { $why = $_.Exception.Message }
-        if ($m.Official) {
-            Write-LaiLog WARN "Official model $($m.Display) ($($m.Source)) skipped: $why. The uncensored presets are unaffected; it is tried again with -OfficialModels $($m.Key)."
-            # Not retried on every run (each try loads up to 18 GB): only when named again or -Retune.
-            $State.flags['officialFailed'][$m.Key] = @{ Source = $m.Source; Why = ($why -replace '\s+', ' ').Substring(0, [Math]::Min(200, ($why -replace '\s+', ' ').Length)) }
+        if ($waitingForGpu) {
+            $gpuWaitFailed = ($why -replace '\s+', ' ')
+            Write-LaiLog WARN "$($m.Display) is set up on the next run: the GPU was busy ($gpuWaitFailed)"
+        } elseif ($m.Official) {
+            # Recorded (and not retried on every run, each try loads up to 18 GB) only when the model
+            # itself is the reason: its tag, an Ollama that cannot load it, or no fit on this card. A
+            # dropped connection or a full disk is tried again next time.
+            $short = ($why -replace '\s+', ' '); $short = $short.Substring(0, [Math]::Min(200, $short.Length))
+            $own = $short -match '(?i)file does not exist|not found|manifest|incompatible|requires a newer version|unknown model architecture|unsupported|on the GPU even at 8K|empty answer'
+            $again = 'the next run tries it again'
+            if ($own) {
+                $State.flags['officialFailed'][$m.Key] = @{ Source = $m.Source; Why = $short; OllamaVersion = $ollamaVerNow }
+                $again = "it is tried again after an Ollama update, or with -OfficialModels $(Get-OfficialRetryArg)"
+            }
+            Write-LaiLog WARN "Official model $($m.Display) ($($m.Source)) skipped: $short. The uncensored presets are unaffected; $again."
         } else {
             Write-LaiLog WARN "Trial $($m.Display) ($($m.Source)) skipped: $why"
         }

@@ -71,7 +71,7 @@ CONFIG = {
 }
 GUARDED_PATHS = ('/api/chat', '/api/generate')
 MODEL_CHANGE_PATHS = ('/api/pull', '/api/create', '/api/delete', '/api/copy')
-IMAGE_NOTE = '[image omitted: this model cannot see images; switch this chat to a preset that sees images (Official Main, Official Deep, Official Fast or Uncensored Vision) or start a new chat]'
+IMAGE_NOTE = '[image omitted: this model cannot see images; switch this chat to a preset that sees images (Uncensored Vision, or an Official one if installed) or start a new chat]'
 HOP_BY_HOP = {'connection', 'keep-alive', 'proxy-authenticate', 'proxy-authorization', 'te',
               'trailer', 'trailers', 'transfer-encoding', 'upgrade', 'content-length', 'host'}
 

@@ -988,6 +988,7 @@ $cWithout = Get-LaiCatalog -Path $catPath -IncludeKeys @('main', 'fast')
 $cDefault = Get-LaiCatalog -Path $catPath
 Assert-That ($cWith.DefaultPreset -eq 'official-main' -and $cWithout.DefaultPreset -eq 'local-main') "new chats start on Official Main once it is installed, on Uncensored Main otherwise ($($cWith.DefaultPreset) / $($cWithout.DefaultPreset))"
 Assert-That (@($cDefault.Models | Where-Object { $_.Official -or $_.Trial }).Count -eq 0 -and $cDefault.DefaultPreset -eq 'local-main') 'without a selection the catalog holds no opt-in model (scripts reading an old install see what it has)'
+Assert-That ($cWith.BaseDefaultPreset -eq 'local-main') 'the health check keeps testing memory, documents and search on the measured Uncensored Main'
 
 $need = @('Test-LaiPresetVision', 'Test-LaiWebUIVision', 'Get-LaiContextOverride', 'Get-LaiRagWanted')
 $missingFn = @($need | Where-Object { -not (Get-Command $_ -ErrorAction SilentlyContinue) })

@@ -145,7 +145,7 @@ if (-not $Quick) {
 if ($CpuCheck) {
     Add-Check 'CPU fallback (render guard)' {
         if (-not $script:ollamaUp) { return (Skip 'Ollama not running') }
-        $m = $catalog.Models | Where-Object { $_.Preset -eq $catalog.DefaultPreset } | Select-Object -First 1
+        $m = $catalog.Models | Where-Object { $_.Preset -eq $catalog.BaseDefaultPreset } | Select-Object -First 1
         if (-not $m) { $m = @($catalog.Models)[0] }
         Stop-LaiOllamaModels -BaseUrl $ollamaUrl
         Start-Sleep -Seconds 2
@@ -304,10 +304,10 @@ if ($script:token) {
             } | ForEach-Object { $_.Name })
         $drafts = @($all.Values | Where-Object { (Test-LaiSkillTag $_ 'learned') -and -not $_.is_active })
         $on = @($all.Values | Where-Object { $_.is_active }).Count
-        $main = Get-LaiWebUIModel -BaseUrl $webUrl -Token $token -Id $catalog.DefaultPreset
+        $main = Get-LaiWebUIModel -BaseUrl $webUrl -Token $token -Id $catalog.BaseDefaultPreset
         $hasNotebook = $main -and $main.meta -and $main.meta.PSObject.Properties['toolIds'] -and (@($main.meta.toolIds) -contains 'localai_skill_notebook')
         $draftNote = ''; if ($drafts.Count) { $draftNote = "; $($drafts.Count) learned draft(s) waiting for you in Workspace > Skills" }
-        if (-not $hasNotebook) { return (Warn "the skill notebook is not offered in $($catalog.DefaultPreset) - run the installer again$draftNote") }
+        if (-not $hasNotebook) { return (Warn "the skill notebook is not offered in $($catalog.BaseDefaultPreset) - run the installer again$draftNote") }
         if ($notLoaded.Count) { return (Warn "not loaded yet: $($notLoaded -join ', ') - Start menu > Local AI > Sync skills$draftNote") }
         Pass "$on skill(s) on, notebook offered$draftNote"
     }
@@ -381,7 +381,7 @@ if ($script:token) {
     }
 
     if (-not $Quick) {
-        $main = $catalog.DefaultPreset
+        $main = $catalog.BaseDefaultPreset
         if (-not ($catalog.Models | Where-Object { $_.Preset -eq $main })) { $main = $catalog.Models[0].Preset }
         foreach ($m in $catalog.Models) {
             Add-Check "Chat via $($m.Display)" {
@@ -391,7 +391,10 @@ if ($script:token) {
             }
             # Right after its text chat, while the model is still loaded: a real image through the
             # browser's path (Open WebUI's image conversion, render guard, Ollama's projector).
-            if ($m.Vision) {
+            # Only when the download can read images (the installer turned image upload off otherwise).
+            $canSee = $m.Vision
+            if ($tuning.ContainsKey($m.Key) -and $tuning[$m.Key] -is [System.Collections.IDictionary] -and $tuning[$m.Key].Contains('Vision') -and -not $tuning[$m.Key]['Vision']) { $canSee = $false }
+            if ($canSee) {
                 Add-Check "Vision: $($m.Display) reads an image" {
                     try { $r = Test-LaiWebUIVision -BaseUrl $webUrl -Token $token -Model $m.Preset }
                     catch { return (Fail "the image request failed ($((Get-LaiHttpErrorText $_))); if this started after an update, roll it back (Update-Models.ps1 -Rollback $($m.Key) or Update-OpenWebUI.ps1 -Rollback)") }

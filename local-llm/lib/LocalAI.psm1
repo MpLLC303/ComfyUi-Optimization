@@ -2219,6 +2219,9 @@ function Get-LaiCatalog {
     if ($data.ContainsKey('PreferredDefaultPreset') -and @($models | Where-Object { $_.Preset -eq $data.PreferredDefaultPreset }).Count) { $default = $data.PreferredDefaultPreset }
     return [pscustomobject]@{
         DefaultPreset     = $default
+        # The measured everyday preset (Uncensored Main): Test-LocalAI's functional checks run on it, so
+        # they keep testing the same, well-known model whichever preset new chats start on.
+        BaseDefaultPreset = $data.DefaultPreset
         ContextCandidates = @($data.ContextCandidates)
         Models            = $models
         AllModels         = @($data.Models)
@@ -2293,6 +2296,7 @@ function Invoke-LaiModelSetup {
             $results[$m.Key] = $prev.Clone()
             $results[$m.Key]['Alias'] = $m.Alias
             $results[$m.Key]['Tools'] = ($info.Capabilities -contains 'tools')
+            $results[$m.Key]['Vision'] = ($info.Capabilities -contains 'vision')
             $results[$m.Key]['Digest'] = $digest
             $results[$m.Key]['Reused'] = $true
             continue
@@ -2337,6 +2341,7 @@ function Invoke-LaiModelSetup {
             SizeGiB      = $load.SizeGiB
             TokensPerSec = $speed
             Tools        = ($info.Capabilities -contains 'tools')
+            Vision       = ($info.Capabilities -contains 'vision')
             Fingerprint  = $Fingerprint
             Digest       = $digest
             OllamaVersion = $ollamaVer
@@ -2518,7 +2523,15 @@ function Invoke-LaiWebUISetup {
     foreach ($m in $Models) {
         $native = [bool]$ModelResults[$m.Key]['Tools']
         if (-not $native) { Write-LaiLog WARN "$($m.Source) has no native tool-calling template; $($m.Display) uses legacy (prompt-based) function calling" }
-        $form = Merge-LaiPresetForm -Managed (New-LaiPresetForm -Entry $m -NativeTools $native -SystemPrompt $SystemPrompt) `
+        # Image upload follows what Ollama says the download can do: a build without the image part
+        # would turn every image into an error.
+        $entry = $m
+        $r = $ModelResults[$m.Key]
+        if ($m.Vision -and $r -is [System.Collections.IDictionary] -and $r.Contains('Vision') -and -not $r['Vision']) {
+            $entry = $m.Clone(); $entry['Vision'] = $false
+            Write-LaiLog WARN "$($m.Source) cannot read images (Ollama reports no vision capability); image upload is off for $($m.Display)"
+        }
+        $form = Merge-LaiPresetForm -Managed (New-LaiPresetForm -Entry $entry -NativeTools $native -SystemPrompt $SystemPrompt) `
             -Existing (Get-LaiWebUIModel -BaseUrl $BaseUrl -Token $Token -Id $m.Preset)
         $action = Set-LaiWebUIModel -BaseUrl $BaseUrl -Token $Token -Model $form
         Write-LaiLog OK "Preset '$($m.Display)' $action (base $($m.Alias), function calling $(if ($native) { 'native' } else { 'legacy' }))"

@@ -49,7 +49,8 @@
             Official        = $true
             DownloadGB      = 1.1
             MaxContext      = 8192
-            Vision          = $false
+            # The stand-in cannot read images: the installer must turn image upload off for it.
+            Vision          = $true
             Think           = $false
             MinTokensPerSec = 1
             Parameters      = @{ temperature = 0.6; top_p = 0.95; top_k = 20; min_p = 0.0 }

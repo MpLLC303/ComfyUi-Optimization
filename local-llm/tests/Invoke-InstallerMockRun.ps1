@@ -101,7 +101,8 @@ $patches = @(
     @('[Security.Principal.WindowsIdentity]::GetCurrent().Name', "'MOCKPC\testuser'"),
     @('[Security.Principal.WindowsIdentity]::GetCurrent().User.Value', "'S-1-5-21-1-2-3-1001'"),
     @('[Environment]::OSVersion.Version.Build', '22631'),
-    @('$qualifier = Split-Path -Qualifier $Path', 'return [Math]::Round((Get-PSDrive -Name "/").Free / 1GB, 1)')
+    # A fixed free-space figure ($global:MockFreeBytes): the sandbox's real one is often under 5 GB.
+    @('$qualifier = Split-Path -Qualifier $Path', 'return [Math]::Round($global:MockFreeBytes / 1GB, 1)')
 )
 foreach ($p in $patches) {
     if (-not $text.Contains($p[0])) { throw "patch target not found: $($p[0])" }
@@ -123,6 +124,7 @@ function global:Record([string]$s) { [void]$global:Calls.Add($s) }
 $global:MockGpu = $null
 $global:MockVideo = @('NVIDIA GeForce RTX 3090')
 $global:MockRamBytes = 64GB
+$global:MockFreeBytes = 60GB
 function global:nvidia-smi {
     if ($global:MockGpu -eq 'none') { $global:LASTEXITCODE = 6; 'No devices were found'; return }
     $global:LASTEXITCODE = 0
@@ -130,7 +132,9 @@ function global:nvidia-smi {
 }
 function global:Get-CimInstance {
     param([Parameter(Position = 0)][string]$ClassName, [string]$Filter)
-    $free = (Get-PSDrive -Name '/').Free
+    # A fixed figure: the sandbox's real free space (often under 5 GB) would make the installer's
+    # per-model 5 GB margin, not the missing tag under test, decide whether a pull is even tried.
+    $free = $global:MockFreeBytes
     switch ($ClassName) {
         'Win32_LogicalDisk' { [pscustomobject]@{ DeviceID = 'C:'; FreeSpace = $free } }
         'Win32_ComputerSystem' { [pscustomobject]@{ TotalPhysicalMemory = $global:MockRamBytes; HypervisorPresent = $true; UserName = $global:ConsoleUser } }
@@ -259,6 +263,7 @@ Assert-That ($allLogs -match 'Official model Official: missing tag \(testorg/off
 Assert-That ($state.flags.officialFailed.PSObject.Properties['official-missing'] -and [string]$state.flags.officialFailed.'official-missing'.Source -eq 'testorg/official-does-not-exist:1b') 'the failed official model is recorded, so later runs do not download and load it again'
 $op = Get-TestPreset 'official-standin'
 $mcfg = Invoke-LaiApi -Uri 'http://127.0.0.1:3000/api/v1/configs/models' -Token $tok2
+Assert-That ($op -and $op.meta.capabilities.vision -eq $false -and $allLogs -match 'cannot read images \(Ollama reports no vision capability\); image upload is off for Official: stand-in') 'a model listed as seeing images whose download cannot gets image upload turned off (instead of an error on every image)'
 Assert-That ($op -and -not $op.meta.hidden -and [string]$mcfg.DEFAULT_MODELS -eq 'official-standin') "the official preset is visible and new chats start on it (default '$($mcfg.DEFAULT_MODELS)', preset found: $([bool]$op), hidden: $($op.meta.hidden))"
 Assert-That ($global:Tasks.ContainsKey('LocalAI-Backup-OpenWebUI')) 'daily backup task registered'
 $guardAfter = [int](Invoke-RestMethod $guardStatus -TimeoutSec 5).stats.requests
@@ -371,6 +376,23 @@ $tok4 = Connect-LaiWebUI -BaseUrl 'http://127.0.0.1:3000' -Email $Email -Passwor
 $mcfg = Invoke-LaiApi -Uri 'http://127.0.0.1:3000/api/v1/configs/models' -Token $tok4
 $st4 = Get-Content -Encoding UTF8 -Raw (Join-Path $aiRoot 'install-state.json') | ConvertFrom-Json
 Assert-That (@($st4.flags.selectedModels) -notcontains 'official-ok' -and $op -and $op.meta.hidden -eq $true -and [string]$mcfg.DEFAULT_MODELS -eq 'local-main') "-OfficialModels none hides the official preset and new chats start on Local Main again (default '$($mcfg.DEFAULT_MODELS)')"
+
+Write-Host "`n=== PHASE 4b: the official models come back while the GPU is busy ===" -ForegroundColor Cyan
+# Forget official-ok's GPU check, so this run has to wait for an idle GPU before checking it again.
+$st = Get-Content -Encoding UTF8 -Raw (Join-Path $aiRoot 'install-state.json') | ConvertFrom-Json
+$st.tuning.PSObject.Properties.Remove('official-ok')
+$st | ConvertTo-Json -Depth 20 | Set-Content (Join-Path $aiRoot 'install-state.json')
+$global:MockGpu = 'NVIDIA GeForce RTX 3090, 566.36, 24576, 20000, 4576'
+try { & (Join-Path $aiRoot 'Scripts/Install-LocalAI.ps1') -AIRoot $aiRoot -SkipTests -TrialModels none -OfficialModels all -GpuWaitMinutes 0 } finally { $global:MockGpu = $null }
+$c4b = $LASTEXITCODE
+$log4b = Get-Content -Raw (Get-ChildItem (Join-Path $aiRoot 'Logs') -Filter 'install-*.log' | Sort-Object LastWriteTime | Select-Object -Last 1).FullName  # lai-ok: objects
+$st4b = Get-Content -Encoding UTF8 -Raw (Join-Path $aiRoot 'install-state.json') | ConvertFrom-Json
+Assert-That ($c4b -eq 0 -and $log4b -match 'Official: stand-in is set up on the next run: the GPU was busy') "a busy GPU skips the official model for now and the install completes (exit $c4b)"
+Assert-That (-not $st4b.flags.officialFailed.PSObject.Properties['official-ok'] -and [string]$st4b.flags.officialFailed.'official-missing'.Source) 'a busy GPU is not recorded as the model failing (a missing tag is)'
+& (Join-Path $aiRoot 'Scripts/Install-LocalAI.ps1') -AIRoot $aiRoot -SkipTests -TrialModels none -GpuWaitMinutes 10
+$st4c = Get-Content -Encoding UTF8 -Raw (Join-Path $aiRoot 'install-state.json') | ConvertFrom-Json
+$op = Get-TestPreset 'official-standin'
+Assert-That ($LASTEXITCODE -eq 0 -and @($st4c.flags.selectedModels) -contains 'official-ok' -and $op -and -not $op.meta.hidden) "the next run with an idle GPU sets it up and shows its preset again (exit $LASTEXITCODE)"
 $p4 = (Get-Content -Encoding UTF8 -Raw (Join-Path $aiRoot 'install-state.json') | ConvertFrom-Json).flags.params
 Assert-That ($p4.SkipVision -eq $true -and $p4.SkipCoder -eq $true) 'older install: skips inferred from the installed models (no surprise 20 GB downloads)'
 Assert-That (@((Get-Content -Encoding UTF8 -Raw (Join-Path $aiRoot 'install-state.json') | ConvertFrom-Json).flags.configureWarnings).Count -eq 0 -and -not (Select-String -LiteralPath (Join-Path $aiRoot 'install-report.md') -Pattern 'need attention' -Encoding UTF8 -Quiet)) "the next clean run clears phase 3's warning (no stale attention section)"
