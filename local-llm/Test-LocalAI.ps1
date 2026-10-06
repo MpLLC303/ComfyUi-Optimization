@@ -441,6 +441,17 @@ Add-Check 'Backups' {
     $detail = '{0} ({1:N1} MB, {2:N0} h old)' -f $daily.Name, ($daily.Length / 1MB), $age.TotalHours
     if ($onWindows -and -not (Get-ScheduledTask -TaskName 'LocalAI-Backup-OpenWebUI' -ErrorAction SilentlyContinue)) { return (Fail "$detail; the nightly backup task is missing - run Start menu > Local AI - Update toolkit to set it up again") }
     if ($age.TotalHours -gt 50) { return (Warn "$detail - older than two days") }
+    if ($researchPort -gt 0) {
+        # Deep research's own archive, made by the same nightly run (a failure there is only a warning
+        # in backup.log, so it is reported here).
+        $bs = Read-LaiState -Path (Join-Path $AIRoot 'backup-state.json')
+        $rNewest = Get-ChildItem -LiteralPath $dir -Filter 'deep-research-*.tar.gz' -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -match '^deep-research-\d{8}-\d{6}\.tar\.gz$' } | Sort-Object LastWriteTime -Descending | Select-Object -First 1  # lai-ok: objects
+        if ($bs['researchError']) { return (Warn "$detail; deep research's last backup failed: $($bs['researchError']) (see Logs\backup.log)") }
+        if (-not $rNewest) { return (Warn "$detail; no deep research backup yet (the nightly run makes one once deep research is installed)") }
+        if (((Get-Date) - $rNewest.LastWriteTime).TotalHours -gt 50) { return (Warn "$detail; deep research's newest backup $($rNewest.Name) is older than two days") }
+        $detail += "; deep research $($rNewest.Name)"
+    }
     Pass $detail
 }
 

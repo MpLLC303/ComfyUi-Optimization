@@ -453,6 +453,65 @@ exec 'REALDOCKER' "$@"
     # Open WebUI runs does the check instead.
     $b = & $runScript 'Backup-OpenWebUI.ps1' @('-Volume', 'lai-ok-test', '-Container', 'open-webui', '-NoStop', '-Tag', 'noimage', '-NoPrune')
     Assert-That ($b.Code -eq 0 -and $b.Text -match 'using the image Open WebUI runs \(alpine:') "with the .env image missing, the check uses the image Open WebUI runs (exit $($b.Code))"
+
+    Write-Host "`n=== deep research: nightly archive (paused, not stopped), retention, mirror, restore ===" -ForegroundColor Cyan
+    $bk = Join-Path $aiRoot 'Backups'
+    $rMirror = Join-Path $aiRoot 'research-mirror'
+    $rData = { (Invoke-DockerText @('run', '--rm', '-v', 'lai-research-test:/d', 'alpine:3.20', 'cat', '/d/encrypted_databases/u.db')) }
+    try {
+        Invoke-DockerText @('rm', '-f', 'lai-research-ct') | Out-Null
+        foreach ($v in 'lai-research-test', 'lai-research-bad') { Invoke-DockerText @('volume', 'rm', '-f', $v) | Out-Null; Invoke-DockerText @('volume', 'create', $v) | Out-Null }
+        Invoke-DockerText @('run', '--rm', '-v', 'lai-research-test:/d', 'alpine:3.20', 'sh', '-c', 'mkdir /d/encrypted_databases; echo v1 > /d/encrypted_databases/u.db; echo k > /d/.secret_key') | Out-Null
+        Invoke-DockerText @('run', '-d', '--name', 'lai-research-ct', '--label', 'lai-test=1', '-v', 'lai-research-test:/data', 'alpine:3.20', 'sleep', '3600') | Out-Null
+        # Old daily research archives (dated 30 days back): beyond the newest three they go; a
+        # pre-uninstall one never does.
+        foreach ($i in 1..4) {
+            $f = Join-Path $bk ('deep-research-2026010{0}-030000.tar.gz' -f $i)
+            Set-Content -LiteralPath $f -Value 'old'; (Get-Item -LiteralPath $f).LastWriteTime = (Get-Date).AddDays(-30 - $i)
+        }
+        $pu = Join-Path $bk 'deep-research-20260101-020000-pre-uninstall.tar.gz'
+        Set-Content -LiteralPath $pu -Value 'old'; (Get-Item -LiteralPath $pu).LastWriteTime = (Get-Date).AddDays(-60)
+        $before = @(Get-ChildItem -LiteralPath $bk -Filter 'deep-research-*.tar.gz' | ForEach-Object { $_.Name })
+        $rArgs = @('-Volume', 'lai-ok-test', '-Container', 'lai-no-such-container', '-SkipDeepVerify', '-RetentionDays', '7', '-ResearchVolume', 'lai-research-test', '-ResearchContainer', 'lai-research-ct')
+        $b = & $runScript 'Backup-OpenWebUI.ps1' ($rArgs + @('-Mirror', $rMirror))
+        $made = @(Get-ChildItem -LiteralPath $bk -Filter 'deep-research-*.tar.gz' | Where-Object { $before -notcontains $_.Name })
+        $status = Invoke-DockerText @('inspect', '-f', '{{.State.Status}}', 'lai-research-ct')
+        $listing = if ($made.Count -eq 1) { Invoke-DockerText @('run', '--rm', '-v', "${bk}:/b:ro", 'alpine:3.20', 'tar', 'tzf', "/b/$($made[0].Name)") } else { '' }
+        Assert-That ($b.Code -eq 0 -and $made.Count -eq 1 -and $made[0].Name -match '^deep-research-\d{8}-\d{6}\.tar\.gz$' -and $listing -match 'encrypted_databases/u\.db') "a daily run archives deep research next to Open WebUI (exit $($b.Code), made $($made.Name -join ','))"
+        Assert-That ($status -eq 'running') "the research container runs on afterwards: paused, never stopped (status $status)"
+        $left = @(Get-ChildItem -LiteralPath $bk -Filter 'deep-research-2026010*-030000.tar.gz' | ForEach-Object { $_.Name })
+        Assert-That ($left.Count -eq 2 -and (Test-Path -LiteralPath $pu)) "old research archives beyond the newest three are pruned, the pre-uninstall one kept (left: $($left -join ', '))"
+        Assert-That ($made.Count -eq 1 -and (Test-Path -LiteralPath (Join-Path $rMirror $made[0].Name))) 'the research archive is mirrored too'
+        $bs = Read-LaiState -Path (Join-Path $aiRoot 'backup-state.json')
+        Assert-That ($bs['researchOkAt'] -and -not $bs['researchError']) 'backup-state records the research backup'
+        # Tagged runs (a restore's safety copy, before an update) leave deep research alone.
+        $n = @(Get-ChildItem -LiteralPath $bk -Filter 'deep-research-*.tar.gz').Count
+        $b = & $runScript 'Backup-OpenWebUI.ps1' ($rArgs + @('-Tag', 'before-x', '-NoPrune', '-NoMirror'))
+        Assert-That ($b.Code -eq 0 -and @(Get-ChildItem -LiteralPath $bk -Filter 'deep-research-*.tar.gz').Count -eq $n) 'a tagged run makes no research archive'
+        # A volume that is not Local Deep Research's: a warning and a recorded error, Open WebUI's backup fine.
+        $b = & $runScript 'Backup-OpenWebUI.ps1' @('-Volume', 'lai-ok-test', '-Container', 'lai-no-such-container', '-SkipDeepVerify', '-NoMirror', '-ResearchVolume', 'lai-research-bad', '-ResearchContainer', 'lai-no-such-container')
+        $bs = Read-LaiState -Path (Join-Path $aiRoot 'backup-state.json')
+        Assert-That ($b.Code -eq 0 -and $b.Text -match 'Deep research backup failed' -and [string]$bs['researchError'] -match 'encrypted_databases' -and @(Get-ChildItem -LiteralPath $bk -Filter 'incomplete-deep-research-*').Count -eq 0) "a failed research archive is a recorded warning, not a failed backup, and leaves no partial file (exit $($b.Code))"
+        # Restore: changed data goes back to the archive; the replaced data is kept as a safety copy.
+        Invoke-DockerText @('run', '--rm', '-v', 'lai-research-test:/d', 'alpine:3.20', 'sh', '-c', 'echo v2 > /d/encrypted_databases/u.db') | Out-Null
+        $rr = @('-DeepResearch', '-Force', '-ResearchVolume', 'lai-research-test', '-ResearchContainer', 'lai-research-ct')
+        $r = & $runScript 'Restore-OpenWebUI.ps1' ($rr + @('-Archive', $made[0].FullName))
+        $safetyR = Get-ChildItem -LiteralPath $bk -Filter 'deep-research-*-pre-restore.tar.gz' | Sort-Object LastWriteTime -Descending | Select-Object -First 1  # lai-ok: objects
+        $sList = if ($safetyR) { Invoke-DockerText @('run', '--rm', '-v', "${bk}:/b:ro", 'alpine:3.20', 'sh', '-c', "tar xzOf /b/$($safetyR.Name) ./encrypted_databases/u.db") } else { '' }
+        Assert-That ($r.Code -eq 0 -and (& $rData) -eq 'v1' -and $sList -eq 'v2') "restore -DeepResearch puts the archive back and keeps the replaced data (exit $($r.Code), now $(& $rData), safety $sList)"
+        Assert-That ((Invoke-DockerText @('inspect', '-f', '{{.State.Status}}', 'lai-research-ct')) -eq 'running') 'the research container runs again after the restore'
+        # An Open WebUI archive is refused before anything changes.
+        $r = & $runScript 'Restore-OpenWebUI.ps1' ($rr + @('-Archive', $good.FullName))
+        Assert-That ($r.Code -ne 0 -and $r.Text -match 'not a deep research backup' -and (& $rData) -eq 'v1') "an Open WebUI archive is refused, nothing changed (exit $($r.Code))"
+        # With no -Archive: the newest daily (or pre-uninstall) research archive.
+        $r = & $runScript 'Restore-OpenWebUI.ps1' $rr
+        Assert-That ($r.Code -eq 0 -and $r.Text -match [regex]::Escape($made[0].Name)) "without -Archive the newest research archive is used (exit $($r.Code))"
+    } finally {
+        Invoke-DockerText @('rm', '-f', 'lai-research-ct') | Out-Null
+        foreach ($v in 'lai-research-test', 'lai-research-bad') { Invoke-DockerText @('volume', 'rm', '-f', $v) | Out-Null }
+        Get-ChildItem -LiteralPath $bk -Filter 'deep-research-*' -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $rMirror -Recurse -Force -ErrorAction SilentlyContinue
+    }
     Invoke-DockerText @('volume', 'rm', 'lai-ok-test') | Out-Null
     Invoke-DockerText @('volume', 'rm', 'lai-deep-test') | Out-Null
 } finally {

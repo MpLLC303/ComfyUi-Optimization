@@ -21,6 +21,8 @@
     .\Restore-OpenWebUI.ps1                                   # newest daily backup
 .EXAMPLE
     .\Restore-OpenWebUI.ps1 -Archive \\nas\backups\open-webui-20261002-175511.tar.gz
+.EXAMPLE
+    .\Restore-OpenWebUI.ps1 -DeepResearch                    # deep research's newest backup instead
 #>
 param(
     # Install folder (the installer's -AIRoot).
@@ -35,7 +37,14 @@ param(
     # Small local image that runs tar on the volume.
     [string]$HelperImage = 'alpine:3.20',
     # Skip the "type YES" confirmation (scripts, automation).
-    [switch]$Force
+    [switch]$Force,
+    # Restore deep research's data (accounts, history, reports) instead of Open WebUI's, from a
+    # deep-research-*.tar.gz (the newest daily one unless -Archive is given).
+    [switch]$DeepResearch,
+    # Deep research's volume (tests use throwaway ones).
+    [string]$ResearchVolume = 'localai-deep-research',
+    # Deep research's container; stopped during its restore.
+    [string]$ResearchContainer = 'deep-research'
 )
 $ErrorActionPreference = 'Stop'
 Import-Module (Join-Path (Join-Path $PSScriptRoot 'lib') 'LocalAI.psm1') -Force
@@ -106,6 +115,69 @@ function Set-Hold([string]$Why, [object[]]$Held) {
     if (-not $archive -and $old -and $old['Archive']) { $archive = [string]$old['Archive']; $recover = [string]$old['Recover'] }
     Save-LaiState -State @{ Reason = $Why; Recover = $recover; Archive = $archive; Containers = $list; Since = (Get-Date).ToString('s') } -Path $holdPath
     if ($recover -ne $script:recoverCmd) { Write-LaiLog FAIL "The earlier recovery command still applies: $recover" }
+}
+
+if ($DeepResearch) {
+    # Deep research is much simpler than Open WebUI: one container, no hold. The current data is
+    # archived first and put back if the swap fails; its database stays readable only with the
+    # password in Secrets\deep-research.json, which a restore does not change.
+    if (-not $Archive) {
+        $newest = Get-ChildItem -LiteralPath $backupDir -Filter 'deep-research-*.tar.gz' -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -match '^deep-research-\d{8}-\d{6}(-pre-uninstall)?\.tar\.gz$' -and $_.LastWriteTime -le (Get-Date).AddHours(1) } | Sort-Object LastWriteTime -Descending | Select-Object -First 1  # lai-ok: objects
+        if (-not $newest) { throw "No deep research backups found in $backupDir. Pass -Archive <file>." }
+        $Archive = $newest.FullName
+    }
+    if (-not (Test-Path -LiteralPath $Archive)) { throw "Archive not found: $Archive" }
+    $source = Get-Item -LiteralPath $Archive
+    if (-not $Force) {
+        Write-LaiLog WARN ("This replaces ALL current deep research data (accounts, research history, reports) with {0} from {1}." -f $source.Name, $source.LastWriteTime.ToString('yyyy-MM-dd HH:mm'))
+        if ((Read-Host 'Type YES to restore') -cne 'YES') { Write-LaiLog INFO 'Nothing changed.'; exit 1 }
+    }
+    $rSwap = $swapScript.Replace('test -f /data/.restore-staging/webui.db', 'test -d /data/.restore-staging/encrypted_databases')
+    $wasRunning = $false
+    $rSafety = $null
+    $rTouched = $false
+    $code = 0
+    try {
+        $lock = Enter-LaiVolumeLock
+        if ((Invoke-Docker -Arguments @('version', '--format', '{{.Server.Version}}') -AllowFail).ExitCode -ne 0) {
+            throw 'Docker Desktop is not running. Start it (Start menu > Local AI - Start again), then run the restore again. Nothing was changed.'
+        }
+        if (-not (Test-Path -LiteralPath $stagingDir)) { New-Item -ItemType Directory -Force -Path $stagingDir | Out-Null }
+        $staged = Join-Path $stagingDir 'restore-deep-research.tar.gz'
+        Copy-Item -LiteralPath $source.FullName -Destination $staged -Force
+        $list = Invoke-Docker -Arguments @('run', '--rm', '-v', "${staged}:/restore.tar.gz:ro", $img, 'tar', 'tzf', '/restore.tar.gz') -AllowFail
+        if ($list.ExitCode -ne 0 -or $list.Text -notmatch '(?m)^(\./)?encrypted_databases/?\s*$') { throw "$($source.Name) is not a deep research backup (unreadable, or no encrypted_databases folder). Nothing was changed." }
+        # Stopped first, so the safety copy is consistent and nothing writes during the swap.
+        $wasRunning = (Invoke-Docker -Arguments @('inspect', '-f', '{{.State.Running}}', $ResearchContainer) -AllowFail).Text.Trim() -eq 'true'
+        if ($wasRunning) { Invoke-Docker -Arguments @('stop', '-t', '30', $ResearchContainer) | Out-Null }
+        if ((Invoke-Docker -Arguments @('volume', 'inspect', $ResearchVolume) -AllowFail).ExitCode -ne 0) {
+            Invoke-Docker -Arguments @('volume', 'create', $ResearchVolume) | Out-Null
+        } elseif (-not $SkipSafetyBackup) {
+            $rSafety = Join-Path $backupDir ('deep-research-{0}-pre-restore.tar.gz' -f (Get-Date -Format 'yyyyMMdd-HHmmss'))
+            Invoke-Docker -Arguments @('run', '--rm', '-v', "${ResearchVolume}:/data:ro", '-v', "${backupDir}:/backup", $img, 'tar', 'czf', "/backup/$(Split-Path -Leaf $rSafety)", '-C', '/data', '.') | Out-Null
+            Write-LaiLog OK "Current deep research data saved as $rSafety"
+        }
+        $rTouched = $true
+        Invoke-Docker -Arguments @('run', '--rm', '-v', "${ResearchVolume}:/data", '-v', "${staged}:/restore.tar.gz:ro", $img, 'sh', '-c', $rSwap) | Out-Null
+        Write-LaiLog OK "Deep research data restored from $($source.Name)"
+    } catch {
+        $code = 1
+        Write-LaiLog FAIL $_.Exception.Message
+        if ($rTouched -and $rSafety -and (Test-Path -LiteralPath $rSafety)) {
+            try {
+                Invoke-Docker -Arguments @('run', '--rm', '-v', "${ResearchVolume}:/data", '-v', "${rSafety}:/restore.tar.gz:ro", $img, 'sh', '-c', $rSwap) | Out-Null
+                Write-LaiLog OK 'The data from before the restore was put back.'
+            } catch { Write-LaiLog FAIL "Putting the earlier data back failed too ($($_.Exception.Message)); it is in ${rSafety}: run this again with -Archive '$rSafety' -DeepResearch." }
+        }
+    } finally {
+        if ($wasRunning) {
+            if ((Invoke-Docker -Arguments @('start', $ResearchContainer) -AllowFail).ExitCode -ne 0) { Write-LaiLog WARN 'Deep research did not start again: Start menu > Local AI > Start again.' }
+        }
+        Remove-Item -LiteralPath (Join-Path $stagingDir 'restore-deep-research.tar.gz') -Force -ErrorAction SilentlyContinue
+        Exit-LaiVolumeLock $lock
+    }
+    exit $code
 }
 
 # Pick and confirm the archive before taking the lock, so an unanswered prompt never blocks the

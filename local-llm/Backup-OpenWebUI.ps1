@@ -13,6 +13,11 @@
     prunes old archives and optionally mirrors the newest one to a second location. The installer
     schedules this daily (and at sign-in, to catch up a missed night).
 
+    With deep research installed (-DeepResearch), its accounts, research history and reports are
+    archived too, as <AIRoot>\Backups\deep-research-<timestamp>.tar.gz (paused for a second or two,
+    not stopped; restore with Restore-OpenWebUI.ps1 -DeepResearch). Its database is encrypted with
+    the password in <AIRoot>\Secrets\deep-research.json, so keep that file with your secrets.
+
     The models are not backed up (re-download them). Secrets live in <AIRoot>\Secrets: keep a copy of
     that folder in your password manager, not next to the backups.
 
@@ -53,6 +58,11 @@ param(
     # is still being written (the render guard counts them), so a run that catches up after wake or
     # sign-in does not cut one off. 0 = do not wait.
     [int]$WaitForChatsSec = 0,
+    # Deep research's volume (Install-LocalAI.ps1 -DeepResearch); archived on daily and pre-uninstall
+    # runs when it exists. '' = never.
+    [string]$ResearchVolume = 'localai-deep-research',
+    # Deep research's container; paused (not stopped) while its archive is written unless -NoStop.
+    [string]$ResearchContainer = 'deep-research',
     # Scheduled runs: the daily backup time (HH:mm). A run that finds a nightly backup made since that
     # time last came round does nothing, so the extra run at sign-in only catches up a missed night.
     [string]$DailyAt = ''
@@ -172,6 +182,67 @@ if ($WaitForChatsSec -gt 0 -and -not $NoStop) {
     $waited = [int]((Get-Date) - $chatStart).TotalSeconds
     if ($capped) { Write-BackupLog WARN "A chat answer was still being written after $waited s; stopping Open WebUI anyway (regenerate that answer if it was cut off)." }
     elseif ($waited -ge $poll) { Write-BackupLog INFO "Waited $waited s for a chat answer to finish before stopping Open WebUI." }
+}
+
+function Save-ResearchArchive {
+    param([string]$RVolume, [string]$RContainer)
+    # Local Deep Research's accounts, history and reports, in a small archive next to Open WebUI's.
+    # Paused rather than stopped while tar runs (a second or two): a research run in progress carries
+    # on afterwards, and the copy is what a power cut at that instant would leave, which SQLite (its
+    # SQLCipher databases) recovers from by design. A failure is a warning: Open WebUI's archive above
+    # is complete, and the next run tries again; Test-LocalAI reports a lasting failure.
+    $rName = 'deep-research-{0}{1}.tar.gz' -f (Get-Date -Format 'yyyyMMdd-HHmmss'), $suffix
+    $rWork = Join-Path $backupDir "incomplete-$rName"
+    $paused = $false
+    try {
+        Get-ChildItem -LiteralPath $backupDir -Filter 'incomplete-deep-research-*' -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
+        $state = (Invoke-Docker -Arguments @('inspect', '-f', '{{.State.Status}}', $RContainer) -AllowFail).Text.Trim()
+        if ($state -eq 'running' -and -not $NoStop) { Invoke-Docker -Arguments @('pause', $RContainer) | Out-Null; $paused = $true }
+        try {
+            Invoke-Docker -Arguments @('run', '--rm', '-v', ($RVolume + ':/data:ro'), '-v', "${backupDir}:/backup", $HelperImage,
+                'tar', 'czf', "/backup/incomplete-$rName", '-C', '/data', '.') | Out-Null
+        } finally {
+            if ($paused -and (Invoke-Docker -Arguments @('unpause', $RContainer) -AllowFail).ExitCode -ne 0) {
+                Write-BackupLog FAIL "Deep research is still paused; Start menu > Local AI > Start again (or 'docker unpause $RContainer') wakes it."
+            }
+        }
+        $list = (Invoke-Docker -Arguments @('run', '--rm', '-v', "${backupDir}:/backup:ro", $HelperImage, 'tar', 'tzf', "/backup/incomplete-$rName")).Text
+        if ($list -notmatch '(?m)^(\./)?encrypted_databases/?\s*$') { throw "$rName has no encrypted_databases folder (the volume is not Local Deep Research's data)" }
+        $rArchive = Join-Path $backupDir $rName
+        Move-Item -LiteralPath $rWork -Destination $rArchive -Force -ErrorAction Stop
+        $rSize = (Get-Item -LiteralPath $rArchive).Length
+        $note = ''
+        if ($Mirror -and -not $NoMirror) {
+            try {
+                if (-not (Test-Path -LiteralPath $Mirror)) { New-Item -ItemType Directory -Force -Path $Mirror -ErrorAction Stop | Out-Null }
+                Copy-Item -LiteralPath $rArchive -Destination (Join-Path $Mirror "incomplete-$rName") -Force -ErrorAction Stop
+                Move-Item -LiteralPath (Join-Path $Mirror "incomplete-$rName") -Destination (Join-Path $Mirror $rName) -Force -ErrorAction Stop
+                $note = '; mirrored'
+            } catch { $note = "; mirror copy failed ($($_.Exception.Message))" }
+        }
+        # Same rule as Open WebUI's: daily archives older than N days go, the newest three always stay,
+        # and a pre-uninstall one is never pruned.
+        if (-not $NoPrune) {
+            foreach ($dir in @($backupDir) + @($(if ($Mirror -and -not $NoMirror -and (Test-Path -LiteralPath $Mirror)) { $Mirror }))) {
+                $daily = @(Get-ChildItem -LiteralPath $dir -Filter 'deep-research-*.tar.gz' -ErrorAction SilentlyContinue |
+                    Where-Object { $_.Name -match '^deep-research-\d{8}-\d{6}\.tar\.gz$' } | Sort-Object LastWriteTime -Descending)  # lai-ok: objects
+                # Safety copies of a restore (-pre-restore) go by age alone, like Open WebUI's tagged ones.
+                $tagged = @(Get-ChildItem -LiteralPath $dir -Filter 'deep-research-*-pre-restore.tar.gz' -ErrorAction SilentlyContinue)
+                foreach ($old in @(@($daily | Select-Object -Skip 3) + $tagged | Where-Object { $_.LastWriteTime -lt (Get-Date).AddDays(-$RetentionDays) -and $_.Name -ne $rName })) {
+                    try { Remove-Item -LiteralPath $old.FullName -Force -ErrorAction Stop; Write-BackupLog INFO "Pruned $($old.FullName)" }
+                    catch { Write-BackupLog WARN "Could not prune $($old.FullName): $($_.Exception.Message)" }
+                }
+            }
+        }
+        Write-BackupLog OK ("Deep research backup {0} ({1:N1} MB){2}" -f $rArchive, ($rSize / 1MB), $note)
+        try { $bs = Read-LaiState -Path $backupStatePath; $bs['researchOkAt'] = (Get-Date).ToString('s'); $bs.Remove('researchError'); Save-LaiState -State $bs -Path $backupStatePath }
+        catch { Write-BackupLog WARN "Could not record the deep research backup: $($_.Exception.Message)" }
+    } catch {
+        Remove-Item -LiteralPath $rWork -Force -ErrorAction SilentlyContinue
+        Write-BackupLog WARN "Deep research backup failed: $($_.Exception.Message). Open WebUI's backup is not affected; the next run tries again."
+        try { $bs = Read-LaiState -Path $backupStatePath; $bs['researchError'] = $_.Exception.Message; $bs['researchErrorAt'] = (Get-Date).ToString('s'); Save-LaiState -State $bs -Path $backupStatePath }
+        catch { Write-BackupLog WARN "Could not record the failure: $($_.Exception.Message)" }
+    }
 }
 
 $lock = $null
@@ -367,6 +438,10 @@ try {
             try { $bs = Read-LaiState -Path $backupStatePath; $bs['mirrorError'] = $_.Exception.Message; $bs['mirrorErrorAt'] = (Get-Date).ToString('s'); Save-LaiState -State $bs -Path $backupStatePath }
             catch { Write-BackupLog WARN "Could not record the mirror failure: $($_.Exception.Message)" }
         }
+    }
+
+    if ($ResearchVolume -and (-not $Tag -or $Tag -eq 'pre-uninstall') -and (Invoke-Docker -Arguments @('volume', 'inspect', $ResearchVolume) -AllowFail).ExitCode -eq 0) {
+        Save-ResearchArchive -RVolume $ResearchVolume -RContainer $ResearchContainer
     }
 } catch {
     Write-BackupLog FAIL $_.Exception.Message
