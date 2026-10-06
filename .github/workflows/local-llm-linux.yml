@@ -32,6 +32,9 @@ jobs:
           docker exec ollama-test ollama pull nomic-embed-text
           docker pull -q alpine:3.20
 
+      - name: Local Deep Research image (the optional -DeepResearch service)
+        run: docker pull -q localdeepresearch/local-deep-research:1.10.7
+
       - name: SearXNG from the stack's compose file
         working-directory: local-llm/stack
         env:

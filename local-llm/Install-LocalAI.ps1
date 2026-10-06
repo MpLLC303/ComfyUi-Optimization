@@ -70,6 +70,14 @@ param(
     # While ComfyUI has a job running or queued, answer chats on the CPU instead of taking VRAM from
     # the render (stack/render-guard). 'off' = plain pass-through to Ollama.
     [ValidateSet('cpu', 'off')][string]$RenderGuard = 'cpu',
+    # Optional research agent at http://localhost:<DeepResearchPort> (Local Deep Research, about 1 GB
+    # to download): it plans searches, reads the pages through the private SearXNG and writes a
+    # report with sources, using Local Main, or the Tongyi DeepResearch model when you also pass
+    # -TrialModels trial-research. Free: no search API or key. -DeepResearch:$false removes the
+    # container again (its saved research stays in the localai-deep-research volume).
+    [switch]$DeepResearch,
+    # Its loopback port (a busy port is replaced by the next free one).
+    [int]$DeepResearchPort = 5055,
     # Empty Open WebUI knowledge collections to create (existing ones are kept).
     [string[]]$KnowledgeCollections = @('PC & Electronics', '3D Printing', 'Property', 'School', 'Home Projects', 'General References'),
     # Nightly backup of the Open WebUI volume (chats, memories, settings, knowledge).
@@ -227,7 +235,8 @@ foreach ($k in @('stages', 'tuning', 'flags')) { if (-not $State.ContainsKey($k)
 $TrialModels = @($TrialModels | ForEach-Object { "$_" -split ',' } | ForEach-Object { $_.Trim() } | Where-Object { $_ })
 $KnowledgeCollections = [string[]]@($KnowledgeCollections | ForEach-Object { "$_" -split ',' } | ForEach-Object { $_.Trim() } | Where-Object { $_ })
 $RememberedParams = @('SkipVision', 'SkipCoder', 'AdminEmail', 'KvCacheType', 'GpuOverheadMiB', 'MinFreeVramMiB',
-    'MaxBusyVramMiB', 'GpuWaitMinutes', 'KeepAlive', 'KnowledgeCollections', 'BackupTime', 'BackupRetentionDays', 'BackupMirror')
+    'MaxBusyVramMiB', 'GpuWaitMinutes', 'KeepAlive', 'KnowledgeCollections', 'BackupTime', 'BackupRetentionDays', 'BackupMirror',
+    'DeepResearch', 'DeepResearchPort')
 if ($ForgetSettings) { $State.flags['params'] = @{}; Write-LaiLog INFO 'Forgetting settings remembered from earlier runs (-ForgetSettings)' }
 if (-not $State.flags.ContainsKey('params') -or $null -eq $State.flags['params']) {
     $State.flags['params'] = @{}
@@ -603,6 +612,77 @@ function Save-AdminCredential {
     Protect-Path -Path $file
 }
 
+function Get-ResearchModel {
+    # The model the research agent uses: the Tongyi DeepResearch trial when it was chosen and tuned,
+    # else Local Main; with its tuned context (another num_ctx would reload the model on every call).
+    $entry = @($Catalog.Models | Where-Object { $_.Key -eq 'trial-research' -and $State.tuning.ContainsKey($_.Key) }) | Select-Object -First 1
+    if (-not $entry) { $entry = @($Catalog.Models | Where-Object { $_.Key -eq 'main' }) | Select-Object -First 1 }
+    $ctx = 32768
+    if ($entry -and $State.tuning.ContainsKey($entry.Key) -and $State.tuning[$entry.Key]['Context']) { $ctx = [int]$State.tuning[$entry.Key]['Context'] }
+    $alias = 'localai-main'; if ($entry) { $alias = $entry.Alias }
+    return [pscustomobject]@{ Alias = "$($alias):latest"; Context = $ctx }
+}
+
+function Get-StackEnvValue([string]$Name) {
+    $envPath = Join-Path $P.Stack '.env'
+    if (-not (Test-Path -LiteralPath $envPath)) { return '' }
+    foreach ($line in (Get-Content -Encoding UTF8 -LiteralPath $envPath)) { if ($line -like "$Name=*") { return $line.Substring($Name.Length + 1) } }
+    return ''
+}
+
+function Invoke-DeepResearchSetup {
+    # The research agent has no use without an account (one encrypted database per account, made only
+    # through its sign-up form): create it once, keep the password in Secrets, then turn sign-up off.
+    # Returns warnings (an optional part: it must not stop the install before the backup is scheduled).
+    $url = "http://127.0.0.1:$($script:ResearchPortEffective)"
+    $credFile = Join-Path $P.Secrets 'deep-research.json'
+    $model = (Get-ResearchModel).Alias
+    $session = $null
+    try {
+        Wait-LaiHttp -Uri "$url/api/v1/health" -TimeoutSec 300 | Out-Null
+        $cred = $null
+        if (Test-Path -LiteralPath $credFile) { $cred = Get-Content -Encoding UTF8 -Raw -LiteralPath $credFile | ConvertFrom-Json }
+        $loginError = ''
+        if ($cred) {
+            try { $session = Connect-LaiResearch -BaseUrl $url -Account $cred.username -Password $cred.password }
+            catch { $loginError = $_.Exception.Message }
+        }
+        if (-not $session) {
+            if ($loginError -match 'too many sign-ins') { throw $loginError }
+            # First run, or its data volume was deleted since: sign-up has to be on to make the account.
+            if ((Get-StackEnvValue 'DEEP_RESEARCH_ALLOW_REGISTRATIONS') -ne 'true') {
+                Write-StackEnv -Values @{ DEEP_RESEARCH_ALLOW_REGISTRATIONS = 'true' }
+                Invoke-ComposeUp -Arguments @('up', '-d', 'deep-research')
+                Wait-LaiHttp -Uri "$url/api/v1/health" -TimeoutSec 300 | Out-Null
+            }
+            $new = [pscustomobject]@{ username = 'localai'; password = (New-LaiPassword); url = "http://localhost:$($script:ResearchPortEffective)" }
+            try { Register-LaiResearchUser -BaseUrl $url -Account $new.username -Password $new.password }
+            catch {
+                if ($cred) { throw "the stored password for '$($cred.username)' no longer works ($loginError), and a new account could not be made ($($_.Exception.Message)). Sign in at http://localhost:$($script:ResearchPortEffective) with the password you know, or delete its data with: docker volume rm localai-deep-research (after: docker rm -f deep-research), then run the installer again" }
+                throw
+            }
+            ConvertTo-Json -InputObject $new | Set-Content -LiteralPath $credFile -Encoding UTF8
+            Protect-Path -Path $credFile
+            $session = Connect-LaiResearch -BaseUrl $url -Account $new.username -Password $new.password
+            Write-LaiLog OK "Deep research account 'localai' created (password in $credFile)"
+        }
+        $m = Test-LaiResearchModel -Session $session -Model $model
+        $warn = @()
+        if (-not $m.Available) { $warn += "Deep research cannot use its model $model ($($m.Message)); check that Ollama is running, then run the installer again" }
+        if ((Get-StackEnvValue 'DEEP_RESEARCH_ALLOW_REGISTRATIONS') -ne 'false') {
+            Write-StackEnv -Values @{ DEEP_RESEARCH_ALLOW_REGISTRATIONS = 'false' }
+            Invoke-ComposeUp -Arguments @('up', '-d', 'deep-research')
+            Wait-LaiHttp -Uri "$url/api/v1/health" -TimeoutSec 300 | Out-Null
+        }
+        Write-LaiLog OK "Deep research at http://localhost:$($script:ResearchPortEffective) (model $model; sign in as localai, password in $credFile)"
+        return $warn
+    } catch {
+        $why = $_.Exception.Message -replace '\s+', ' '
+        Write-LaiLog WARN "Deep research is not ready: $why"
+        return @("Deep research is not ready ($why); run the installer again")
+    } finally { if ($session) { $session.Client.Dispose() } }
+}
+
 #endregion
 
 $SystemPrompt = (Get-Content -Encoding UTF8 -LiteralPath (Join-Path $SourceRoot 'config\system-prompt.txt') -Raw).Trim()
@@ -614,6 +694,8 @@ $script:WebUIPortEffective = $WebUIPort
 if ($State.flags.ContainsKey('webuiPort')) { $script:WebUIPortEffective = [int]$State.flags['webuiPort'] }
 $script:SearxngPortEffective = $SearxngPort
 if ($State.flags.ContainsKey('searxngPort')) { $script:SearxngPortEffective = [int]$State.flags['searxngPort'] }
+$script:ResearchPortEffective = $DeepResearchPort
+if ($State.flags.ContainsKey('researchPort') -and -not $script:BoundParams.ContainsKey('DeepResearchPort')) { $script:ResearchPortEffective = [int]$State.flags['researchPort'] }
 
 # A re-run keeps what changed since the first install unless the parameter is passed explicitly:
 # image versions bumped by Update-OpenWebUI.ps1 (the volume is already migrated to them, so going
@@ -1298,6 +1380,10 @@ Invoke-Stage 'Stack' {
     $script:SearxngPortEffective = Select-FreePort -Preferred $script:SearxngPortEffective
     $State.flags['webuiPort'] = $script:WebUIPortEffective
     $State.flags['searxngPort'] = $script:SearxngPortEffective
+    if ($DeepResearch) {
+        $script:ResearchPortEffective = Select-FreePort -Preferred $script:ResearchPortEffective
+        $State.flags['researchPort'] = $script:ResearchPortEffective
+    }
 
     $envValues = @{
         OPEN_WEBUI_VERSION = $OpenWebUIVersion
@@ -1311,7 +1397,21 @@ Invoke-Stage 'Stack' {
         RENDER_GUARD_MODE  = $RenderGuard
     }
     if (-not $State.flags['adminVerified']) { $envValues['WEBUI_ADMIN_PASSWORD'] = $cred.password }
+    $rm = Get-ResearchModel
+    # Sign-up stays as it is (the account step below turns it off); a first start has it on.
+    $allowNow = (Get-StackEnvValue 'DEEP_RESEARCH_ALLOW_REGISTRATIONS') -ne 'false'
+    $researchEnv = Get-LaiDeepResearchEnv -Enabled ([bool]$DeepResearch) -Model $rm.Alias -Context $rm.Context -Port $script:ResearchPortEffective -AllowRegistrations $allowNow
+    foreach ($k in $researchEnv.Keys) { $envValues[$k] = $researchEnv[$k] }
     Write-StackEnv -Values $envValues
+    if (-not $DeepResearch) {
+        # Turned off: compose never removes a service whose profile is off, so do it here. The
+        # research history stays in its volume for a later -DeepResearch.
+        $dr = Invoke-Native -File 'docker' -Arguments @('container', 'inspect', 'deep-research') -Capture -AllowFail
+        if ($dr.ExitCode -eq 0) {
+            Invoke-Native -File 'docker' -Arguments @('rm', '-f', 'deep-research') -Capture -AllowFail | Out-Null
+            Write-LaiLog INFO 'Deep research turned off: container removed (its data volume localai-deep-research is kept)'
+        }
+    }
 
     Write-LaiLog INFO "Pulling images (Open WebUI $OpenWebUIVersion is several GB on first install)"
     # Pinned versions: an image already on disk is the right one, so re-runs need no registry
@@ -1461,6 +1561,10 @@ Invoke-Stage 'Configure' {
     # before the Backup stage; they are repeated in the report and at the end.
     $State.flags['configureWarnings'] = @(Invoke-LaiWebUISetup -BaseUrl $WebUIUrl -Token $token -Models $Catalog.Models -ModelResults $State.tuning `
         -SystemPrompt $SystemPrompt -DefaultPreset $Catalog.DefaultPreset -Collections $KnowledgeCollections)
+    if ($DeepResearch) {
+        Write-LaiLog STEP 'Deep research: account and model check'
+        $State.flags['configureWarnings'] = @($State.flags['configureWarnings']) + @(Invoke-DeepResearchSetup)
+    }
 }
 #endregion
 
@@ -1475,6 +1579,7 @@ Invoke-Stage 'Backup' {
         BackupRetentionDays = $BackupRetentionDays; BackupMirror = $BackupMirror; KeepAlive = $KeepAlive
         MinFreeVramMiB = $MinFreeVramMiB; MaxBusyVramMiB = $MaxBusyVramMiB; RenderGuard = $RenderGuard
         WebUIOllamaUrl = $script:WebUIOllamaUrl; ToolkitVersion = $ToolkitVersion
+        DeepResearchPort = $(if ($DeepResearch) { $script:ResearchPortEffective } else { 0 })
     }
     foreach ($k in $managed.Keys) { $config[$k] = $managed[$k] }
     ConvertTo-Json -InputObject $config -Depth 5 | Set-Content -LiteralPath $P.Config -Encoding UTF8
@@ -1528,7 +1633,8 @@ Invoke-Stage 'Backup' {
             $shell = $null
             try { $shell = New-Object -ComObject WScript.Shell } catch { Write-Verbose 'WScript.Shell unavailable' }
             $made = @()
-            foreach ($sc in (Get-LaiShortcutSpecs -AIRoot $AIRoot -WebUIPort $script:WebUIPortEffective)) {
+            $researchShortcutPort = 0; if ($DeepResearch) { $researchShortcutPort = $script:ResearchPortEffective }
+            foreach ($sc in (Get-LaiShortcutSpecs -AIRoot $AIRoot -WebUIPort $script:WebUIPortEffective -DeepResearchPort $researchShortcutPort)) {
                 if ($sc.TooLong) {
                     Write-LaiLog WARN "Start-menu shortcut '$($sc.Name)' skipped: the install folder path is too long for a shortcut (1024 characters). Run $($sc.Script) from $($P.Scripts) instead."
                 } elseif ($sc.Kind -eq 'url') {
@@ -1543,6 +1649,9 @@ Invoke-Stage 'Backup' {
                     $made += $sc.Name
                 }
             }
+            # Deep research turned off since the last run: its shortcut would open nothing.
+            $staleResearch = Join-Path $menu 'Local AI - Deep Research.url'
+            if (-not $DeepResearch -and (Test-Path -LiteralPath $staleResearch)) { Remove-Item -LiteralPath $staleResearch -Force }
             Write-LaiLog OK "Start menu folder 'Local AI': $($made -join '; ')"
         } catch { Write-LaiLog WARN "Could not create the Start-menu shortcuts: $($_.Exception.Message)" }
     }
@@ -1580,6 +1689,7 @@ $report = @(
     ''
     "- Open WebUI: http://localhost:$($script:WebUIPortEffective) (login in $($P.Secrets)\openwebui-admin.json)"
     "- Private search: http://localhost:$($script:SearxngPortEffective)"
+) + @(if ($DeepResearch) { "- Deep research: http://localhost:$($script:ResearchPortEffective) (sign in as localai; password in $($P.Secrets)\deep-research.json)" }) + @(
     "- Ollama API: $OllamaUrl (models in $($State.flags['modelDir']))"
     "- Backups: $($P.Backups), daily at $BackupTime, kept $BackupRetentionDays days"
     "- Scripts: $($P.Scripts) (Test-LocalAI, Stop-/Start-LocalAI, Start-ComfyUI, Release-GPU, Backup-/Restore-OpenWebUI, Update-OpenWebUI, Update-Models, Set-OpenWebUIPassword, Watch-LocalAI, Enable-TailscaleAccess, Get-LocalAIDiagnostics, Uninstall-LocalAI); Start menu folder 'Local AI'"
@@ -1606,6 +1716,7 @@ $script:TranscriptOn = $false
 Write-Host ''
 Write-Host "Open WebUI:  http://localhost:$($script:WebUIPortEffective)" -ForegroundColor Green
 Write-Host "Login:       $($cred.email)" -ForegroundColor Green
+if ($DeepResearch) { Write-Host "Research:    http://localhost:$($script:ResearchPortEffective) (sign in as localai; password in $($P.Secrets)\deep-research.json)" -ForegroundColor Green }
 Write-Host "Password:    $($cred.password)   (also in $($P.Secrets)\openwebui-admin.json)" -ForegroundColor Green
 foreach ($a in $attention) { Write-Host "Needs attention: $a" -ForegroundColor Yellow }
 Write-Host 'Open a NEW terminal to use the ollama command (windows opened before the install do not see the PATH change).' -ForegroundColor Gray

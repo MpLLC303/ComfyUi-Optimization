@@ -16,7 +16,7 @@
     (~67 GB), the Ollama settings, the backups, and everything outside C:\AI. Ollama, Docker Desktop
     and WSL are never uninstalled (other programs may use them; remove them in Settings > Apps).
 
-      -RemoveData       also delete the open-webui volume and C:\AI\{Stack,Scripts,Secrets,Logs}
+      -RemoveData       also delete the open-webui volume (and the deep research one) and C:\AI\{Stack,Scripts,Secrets,Logs}
                         and state files. The Backups folder is always kept.
       -RemoveModels     also delete the catalog's source models from Ollama (and OLLAMA_MODELS).
       -ResetOllamaSettings  remove the OLLAMA_* user variables the installer set (flash attention,
@@ -142,7 +142,7 @@ if ($dockerUp) {
             if ($r.ExitCode -ne 0) { Write-LaiLog WARN "docker compose down: $($r.Text)" }
         }
         # Also catch containers whose compose file is gone or that were renamed by hand.
-        foreach ($c in @('open-webui', 'searxng', 'render-guard')) {
+        foreach ($c in @('open-webui', 'searxng', 'render-guard', 'deep-research')) {
             if ((Invoke-Docker @('container', 'inspect', $c)).ExitCode -eq 0) {
                 $r = Invoke-Docker @('rm', '-f', $c)
                 if ($r.ExitCode -ne 0) { throw "docker rm $c failed: $($r.Text)" }
@@ -155,6 +155,14 @@ if ($dockerUp) {
             $r = Invoke-Docker @('volume', 'rm', 'open-webui')
             if ($r.ExitCode -ne 0) { throw $r.Text }
             Write-LaiLog OK 'Open WebUI data volume deleted'
+        }
+    }
+    # The optional research agent's saved research (Install-LocalAI.ps1 -DeepResearch).
+    if ($RemoveData -and (Invoke-Docker @('volume', 'inspect', 'localai-deep-research')).ExitCode -eq 0) {
+        Invoke-Step 'deep research volume' {
+            $r = Invoke-Docker @('volume', 'rm', 'localai-deep-research')
+            if ($r.ExitCode -ne 0) { throw $r.Text }
+            Write-LaiLog OK 'Deep research data volume deleted'
         }
     }
 } else {

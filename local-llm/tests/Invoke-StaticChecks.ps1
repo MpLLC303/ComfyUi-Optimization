@@ -54,6 +54,9 @@ $files = Get-ChildItem -Path $Root -Recurse -File -Include *.ps1, *.psm1, *.psd1
 #   HIDDENTASK a scheduled task action that runs powershell.exe directly: on Windows 11 (Windows
 #            Terminal as console host) -WindowStyle Hidden still shows a window, and closing it kills
 #            the run. Use Get-LaiHiddenTaskLaunch (conhost --headless).
+#   NETCATCH a .GetResult() (HttpClient and other .NET async calls) outside a try that has a catch:
+#            a .NET exception is only statement-terminating, so the function carries on with no
+#            result and the real cause is lost (a later 'HTTP ' or 'variable not set' error instead).
 #   ENVRESTORE [Environment]::SetEnvironmentVariable for this process (no 'User'/'Machine' target):
 #            restoring a variable that was not set passes '' from PowerShell, which PowerShell 7 on
 #            Linux keeps as an empty variable (docker compose then prefers it over .env). Use
@@ -218,7 +221,8 @@ function Find-Pitfall([System.Management.Automation.Language.Ast]$Ast, [string[]
 
     # Ollama's settings line searched for a hard-coded key and value instead of parsed.
     foreach ($b in $Ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.BinaryExpressionAst] -and [string]$n.Operator -match '^[IC]?(Match|NotMatch|Like|NotLike)$' }, $true)) {
-        if ($b.Right.Extent.Text -cmatch 'OLLAMA_[A-Z_]+:' -and -not (& $marker $b 'serverlog')) {
+        # Ollama's own 'OLLAMA_X:value' (no space; not part of a longer name such as LDR_LLM_OLLAMA_URL: in compose).
+        if ($b.Right.Extent.Text -cmatch '(?<![A-Z_])OLLAMA_[A-Z_]+:(?! )' -and -not (& $marker $b 'serverlog')) {
             & $add 'SERVERLOG' $b "server.log searched for $($b.Right.Extent.Text): a key a newer Ollama no longer logs reads as a wrong setting; use Test-LaiOllamaServerSettings"
         }
     }
@@ -265,6 +269,18 @@ function Find-Pitfall([System.Management.Automation.Language.Ast]$Ast, [string[]
                 & $add 'LOCATOR' $s 'hard-coded Ollama / Docker Desktop install folder (a custom install folder is missed); use Find-LaiOllamaDir / Find-LaiDockerDesktopExe'
             }
         }
+    }
+
+    # .GetResult() must sit in a try with a catch (statement-terminating .NET exceptions).
+    foreach ($gr in $Ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.InvokeMemberExpressionAst] -and [string]$n.Member.Value -eq 'GetResult' }, $true)) {
+        $caught = $false
+        $q = $gr.Parent
+        while ($q) {
+            if ($q -is [System.Management.Automation.Language.TryStatementAst] -and $q.CatchClauses.Count -gt 0 -and
+                $gr.Extent.StartOffset -ge $q.Body.Extent.StartOffset -and $gr.Extent.EndOffset -le $q.Body.Extent.EndOffset) { $caught = $true; break }
+            $q = $q.Parent
+        }
+        if (-not $caught -and -not (& $marker $gr 'netcatch')) { & $add 'NETCATCH' $gr '.GetResult() outside a try with a catch: a failed .NET call would let the function carry on with no result; catch it and throw a clear message' }
     }
 
     # A process-scope environment variable set directly (Set-LaiProcessEnv removes one restored to $null).
@@ -433,6 +449,9 @@ $canaries = @(
     @{ Rule = 'BOUND'; Fire = $false; Code = 'function F { param($X) $PSBoundParameters.ContainsKey(''X'') }' }
     @{ Rule = 'BOUND'; Fire = $false; Code = 'function F { param($X) $PSBoundParameters.Keys | ForEach-Object { $PSBoundParameters[$_] } }' }
     @{ Rule = 'HELP'; Fire = $true; UserFacing = $true; Code = "<#`n.SYNOPSIS`n  x`n#>`nparam(`n  [switch]`$Force`n)" }
+    @{ Rule = 'NETCATCH'; Fire = $true; Code = 'try { $r = $c.SendAsync($q).GetAwaiter().GetResult() } finally { $c.Dispose() }' }
+    @{ Rule = 'NETCATCH'; Fire = $true; Code = '$r = $c.SendAsync($q).GetAwaiter().GetResult()' }
+    @{ Rule = 'NETCATCH'; Fire = $false; Code = 'try { $r = $c.SendAsync($q).GetAwaiter().GetResult() } catch { throw ''x'' } finally { $c.Dispose() }' }
     @{ Rule = 'ENVRESTORE'; Fire = $true; Code = 'foreach ($n in @($saved.Keys)) { [Environment]::SetEnvironmentVariable($n, $saved[$n], ''Process'') }' }
     @{ Rule = 'ENVRESTORE'; Fire = $true; Code = '[Environment]::SetEnvironmentVariable($k, $before[$k])' }
     @{ Rule = 'ENVRESTORE'; Fire = $false; Code = '[Environment]::SetEnvironmentVariable(''OLLAMA_HOST'', $v, ''User'')' }
@@ -468,6 +487,7 @@ $canaries = @(
     @{ Rule = 'OLLAMAAPP'; Fire = $false; Code = "`$lnk = Join-Path `$env:APPDATA 'Microsoft\Windows\Start Menu\Programs\Startup\Ollama.lnk'`nif (Test-Path -LiteralPath `$lnk) { Remove-Item -LiteralPath `$lnk }" }
     @{ Rule = 'SERVERLOG'; Fire = $true; Code = '$ok = ($cfgLine.Line -match ''OLLAMA_FLASH_ATTENTION:true'') -and ($cfgLine.Line -match "OLLAMA_KV_CACHE_TYPE:$KvCacheType")' }
     @{ Rule = 'SERVERLOG'; Fire = $false; Code = '$chk = Test-LaiOllamaServerSettings -Line $cfgLine.Line -KvCacheType $KvCacheType' }
+    @{ Rule = 'SERVERLOG'; Fire = $false; Code = '$ok = $svc -match ''LDR_LLM_OLLAMA_URL: http://render-guard:11434''' }
     @{ Rule = 'SERVERLOG'; Fire = $false; Code = 'if ($line -match ''msg="server config"'') { 1 }' }
     @{ Rule = 'HELP'; Fire = $true; UserFacing = $true; Code = "#Requires -Version 5.1`n<#`n.SYNOPSIS`n  x`n#>`nparam(`n  # y`n  [switch]`$Force`n)" }
     @{ Rule = 'HELP'; Fire = $false; UserFacing = $true; Code = "#Requires -Version 5.1`n`n<#`n.SYNOPSIS`n  x`n#>`nparam(`n  # y`n  [switch]`$Force`n)" }

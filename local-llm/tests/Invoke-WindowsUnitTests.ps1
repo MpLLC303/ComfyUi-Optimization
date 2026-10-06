@@ -749,6 +749,25 @@ Assert-That ($adv -notmatch 'Rollback' -and $adv -match 'close ComfyUI') "a re-c
 $adv = @(Get-LaiModelSetupAdvice -Why 'connection refused' -Display 'Main' -Key 'main') -join ' | '
 Assert-That ($adv -match 'run Update-Models\.ps1 again' -and $adv -notmatch 'Rollback') "anything else: run it again ($adv)"
 
+Write-Host "`n=== deep research (optional Local Deep Research service) ===" -ForegroundColor Cyan
+$offEnv = Get-LaiDeepResearchEnv -Enabled $false
+$onEnv = Get-LaiDeepResearchEnv -Enabled $true -Model 'localai-trial-tongyi-research' -Context 57344 -Port 5056 -AllowRegistrations $false
+Assert-That ($offEnv['COMPOSE_PROFILES'] -eq '' -and $onEnv['COMPOSE_PROFILES'] -eq 'research') 'off: no compose profile (compose never starts it); on: the research profile'
+Assert-That ($onEnv['DEEP_RESEARCH_MODEL'] -eq 'localai-trial-tongyi-research:latest' -and $onEnv['DEEP_RESEARCH_CONTEXT'] -eq '57344' -and $onEnv['DEEP_RESEARCH_PORT'] -eq '5056' -and $onEnv['DEEP_RESEARCH_ALLOW_REGISTRATIONS'] -eq 'false') 'model (with its :latest tag, as Ollama lists it), tuned context, port and sign-up land in .env as text'
+$composeText = Get-Content -Raw -Encoding UTF8 -LiteralPath (Join-Path (Join-Path $src 'stack') 'docker-compose.yml')
+$svc = [regex]::Match($composeText, '(?ms)^  deep-research:\r?\n(.*?)(?=^\S|^  \S)').Groups[1].Value
+Assert-That ($svc -match 'profiles: \["research"\]' -and $svc -match '"127\.0\.0\.1:\$\{DEEP_RESEARCH_PORT' -and $svc -match 'LDR_LLM_OLLAMA_URL: http://render-guard:11434' -and $svc -match 'LDR_LLM_LOCAL_CONTEXT_WINDOW_SIZE: \$\{DEEP_RESEARCH_CONTEXT' -and $svc -match 'cap_drop: \[ALL\]') 'compose: only with the research profile, loopback port, through the render guard, at the tuned context, capabilities dropped'
+Assert-That ($svc -match 'LDR_SEARCH_TOOL: searxng' -and $svc -notmatch '(?i)api_key|tavily|serpapi|brave_api') 'compose: free search only (the private SearXNG), no search API key'
+foreach ($k in @($onEnv.Keys)) { if ($k -ne 'COMPOSE_PROFILES') { Assert-That ($composeText -match [regex]::Escape('${' + $k)) "compose reads $k" } }
+$rsCat = @((Get-LaiCatalog -Path (Join-Path (Join-Path $src 'config') 'models.psd1') -IncludeTrials).Models | Where-Object { $_.Key -eq 'trial-research' })
+Assert-That ($rsCat.Count -eq 1 -and $rsCat[0].Trial -and $rsCat[0].Source -eq 'huihui_ai/tongyi-deepresearch-abliterated:30b' -and $rsCat[0].Parameters['presence_penalty'] -eq 1.1) 'the Tongyi DeepResearch trial is in the catalog, opt-in, with its own sampling'
+$rsSpecs = @(Get-LaiShortcutSpecs -AIRoot 'C:\AI' -WebUIPort 3000 -DeepResearchPort 5056 | Where-Object { $_.Name -eq 'Local AI - Deep Research' })
+Assert-That ($rsSpecs.Count -eq 1 -and $rsSpecs[0].Target -eq 'http://localhost:5056/' -and @(Get-LaiShortcutSpecs -AIRoot 'C:\AI' | Where-Object { $_.Name -like '*Deep Research*' }).Count -eq 0) 'a Deep Research shortcut only when it is installed'
+$closedPort = 1; $refused = ''
+try { Connect-LaiResearch -BaseUrl "http://127.0.0.1:$closedPort" -Account 'a' -Password 'b' -TimeoutSec 5 | Out-Null; $refused = 'no error' } catch { $refused = $_.Exception.Message }
+Assert-That ($refused -match '^Local Deep Research at http://127\.0\.0\.1:1 could not be reached') "nothing listening: one clear error naming the address, not a half-run request ($refused)"
+Assert-That ((Get-LaiResearchFormError '<div class="alert alert-error">Invalid username or password</div>') -eq 'Invalid username or password' -and (Get-LaiResearchFormError '<p>ok</p>') -eq '') "a refused form's message is read for the error"
+
 Write-Host "`n=== process environment: a variable restored to 'not set' is removed, not left empty ===" -ForegroundColor Cyan
 Remove-Item -LiteralPath 'Env:LAI_UNIT_ENV' -ErrorAction SilentlyContinue
 $before = [Environment]::GetEnvironmentVariable('LAI_UNIT_ENV', 'Process')

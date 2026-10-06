@@ -1427,8 +1427,14 @@ function Send-LaiWebUIFile {
         $part = New-Object System.Net.Http.ByteArrayContent -ArgumentList (, $bytes)
         $part.Headers.ContentType = [System.Net.Http.Headers.MediaTypeHeaderValue]::Parse($ContentType)
         $form.Add($part, 'file', [System.IO.Path]::GetFileName($Path))
-        $resp = $client.PostAsync("$BaseUrl/api/v1/files/", $form).GetAwaiter().GetResult()
-        $text = $resp.Content.ReadAsStringAsync().GetAwaiter().GetResult()
+        # Caught: a .NET exception is only statement-terminating, so the real cause would be lost.
+        try {
+            $resp = $client.PostAsync("$BaseUrl/api/v1/files/", $form).GetAwaiter().GetResult()
+            $text = $resp.Content.ReadAsStringAsync().GetAwaiter().GetResult()
+        } catch {
+            $e = $_.Exception; while ($e.InnerException) { $e = $e.InnerException }
+            throw "Upload to $BaseUrl failed: $($e.Message)"
+        }
         if (-not $resp.IsSuccessStatusCode) { throw "Upload failed: HTTP $([int]$resp.StatusCode) $text" }
         return ($text | ConvertFrom-Json).id
     } finally { $client.Dispose() }
@@ -1734,6 +1740,163 @@ function Get-LaiSearxngProbe {
     $r = Invoke-LaiApi -Uri ("$BaseUrl/search?format=json&q=" + [uri]::EscapeDataString($Query)) -TimeoutSec $TimeoutSec
     if ($null -eq $r -or $r -is [string]) { throw "SearXNG at $BaseUrl did not answer with JSON (its settings.yml must list json under search: formats:)" }
     return (ConvertTo-LaiSearxngDiagnosis -Response $r)
+}
+
+#endregion
+
+#region Deep research (Local Deep Research, optional: Install-LocalAI.ps1 -DeepResearch) ---------
+
+function Get-LaiDeepResearchEnv {
+    <#
+    .SYNOPSIS
+        The Stack\.env values for the optional deep-research service. Off: COMPOSE_PROFILES is empty,
+        so docker compose never starts it. On: it uses the preset's tuned context, because a num_ctx
+        that differs from the alias makes Ollama reload the model (and fit it differently) on every call.
+    #>
+    param([bool]$Enabled, [string]$Model = 'localai-main:latest', [int]$Context = 32768, [int]$Port = 5055, [bool]$AllowRegistrations = $true)
+    # With its tag: its model list and checks compare names exactly with Ollama's ('x:latest').
+    if ($Model -notmatch ':[^/]+$') { $Model += ':latest' }
+    $profiles = ''; if ($Enabled) { $profiles = 'research' }
+    $allow = 'false'; if ($AllowRegistrations) { $allow = 'true' }
+    return @{
+        COMPOSE_PROFILES                  = $profiles
+        DEEP_RESEARCH_PORT                = [string]$Port
+        DEEP_RESEARCH_MODEL               = $Model
+        DEEP_RESEARCH_CONTEXT             = [string]$Context
+        DEEP_RESEARCH_ALLOW_REGISTRATIONS = $allow
+    }
+}
+
+function New-LaiResearchSession {
+    # An HTTP client with its own cookie jar and no automatic redirects: Local Deep Research answers a
+    # good sign-up or sign-in with a redirect to '/', a refused one by showing the form again (200).
+    # HttpClient behaves the same on Windows PowerShell 5.1 and PowerShell 7 (Invoke-WebRequest does
+    # not: 5.1 has no -SkipHttpErrorCheck and throws on a redirect it may not follow).
+    param([Parameter(Mandatory)][string]$BaseUrl, [int]$TimeoutSec = 30)
+    Add-Type -AssemblyName System.Net.Http
+    $handler = New-Object System.Net.Http.HttpClientHandler
+    $handler.CookieContainer = New-Object System.Net.CookieContainer
+    $handler.AllowAutoRedirect = $false
+    $handler.UseProxy = $false
+    $client = New-Object System.Net.Http.HttpClient($handler)
+    $client.Timeout = [TimeSpan]::FromSeconds($TimeoutSec)
+    return [pscustomobject]@{ BaseUrl = $BaseUrl.TrimEnd('/'); Client = $client }
+}
+
+function Invoke-LaiResearchRequest {
+    # One request; returns status, redirect target and body (never throws for an HTTP status).
+    param([Parameter(Mandatory)]$Session, [string]$Method = 'GET', [Parameter(Mandatory)][string]$Path,
+        [hashtable]$Form, $Json, [string]$Csrf = '')
+    $req = New-Object System.Net.Http.HttpRequestMessage((New-Object System.Net.Http.HttpMethod($Method)), ($Session.BaseUrl + $Path))
+    if ($Form) {
+        $pairs = New-Object 'System.Collections.Generic.List[System.Collections.Generic.KeyValuePair[string,string]]'
+        foreach ($k in $Form.Keys) { $pairs.Add((New-Object 'System.Collections.Generic.KeyValuePair[string,string]'([string]$k, [string]$Form[$k]))) }
+        # ::new, not New-Object: New-Object would pass the list's items as separate arguments.
+        $req.Content = [System.Net.Http.FormUrlEncodedContent]::new($pairs)
+    } elseif ($null -ne $Json) {
+        $req.Content = New-Object System.Net.Http.StringContent((ConvertTo-Json -InputObject $Json -Depth 10 -Compress), [Text.Encoding]::UTF8, 'application/json')
+    }
+    if ($Csrf) { [void]$req.Headers.TryAddWithoutValidation('X-CSRFToken', $Csrf) }
+    # A .NET exception is only statement-terminating: without this catch, try/finally lets the
+    # function carry on with no response (and the caller sees 'HTTP ' with nothing after it).
+    try {
+        $resp = $Session.Client.SendAsync($req).GetAwaiter().GetResult()
+        $body = $resp.Content.ReadAsStringAsync().GetAwaiter().GetResult()
+    } catch {
+        $e = $_.Exception
+        while ($e.InnerException) { $e = $e.InnerException }
+        $what = $e.Message
+        if ($e -is [System.Threading.Tasks.TaskCanceledException] -or $e -is [System.TimeoutException]) { $what = "no answer within $([int]$Session.Client.Timeout.TotalSeconds) s" }
+        throw "Local Deep Research at $($Session.BaseUrl) could not be reached ($what)."
+    } finally { $req.Dispose() }
+    $loc = ''; if ($resp.Headers.Location) { $loc = [string]$resp.Headers.Location }
+    return [pscustomobject]@{ Status = [int]$resp.StatusCode; Location = $loc; Body = $body }
+}
+
+function Get-LaiResearchCsrf {
+    param([Parameter(Mandatory)]$Session)
+    $r = Invoke-LaiResearchRequest -Session $Session -Path '/auth/csrf-token'
+    $t = ''
+    if ($r.Status -eq 200) { try { $t = [string](ConvertFrom-Json -InputObject $r.Body).csrf_token } catch { $t = '' } }
+    if (-not $t) { throw "Local Deep Research at $($Session.BaseUrl) gave no sign-in token (HTTP $($r.Status)); is it a different program on that port?" }
+    return $t
+}
+
+function Get-LaiResearchFormError([string]$Html) {
+    # The message a refused form shows (Flask flash), for a readable error.
+    $m = [regex]::Match([string]$Html, '(?is)class="[^"]*(alert|flash|error)[^"]*"[^>]*>\s*([^<]{3,200})')
+    if ($m.Success) { return ($m.Groups[2].Value -replace '\s+', ' ').Trim() }
+    return ''
+}
+
+function Register-LaiResearchUser {
+    # Creates the account (Local Deep Research keeps one encrypted database per account; there is no
+    # headless way except its own sign-up form). Throws with the reason when it is refused.
+    param([Parameter(Mandatory)][string]$BaseUrl, [Parameter(Mandatory)][string]$Account, [Parameter(Mandatory)][string]$Password)
+    $s = New-LaiResearchSession -BaseUrl $BaseUrl -TimeoutSec 120
+    try {
+        $t = Get-LaiResearchCsrf $s
+        $r = Invoke-LaiResearchRequest -Session $s -Method POST -Path '/auth/register' -Form @{
+            username = $Account; password = $Password; confirm_password = $Password; acknowledge = 'true'; csrf_token = $t
+        }
+        if ($r.Status -ge 300 -and $r.Status -lt 400 -and $r.Location -notmatch '/auth/') { return }
+        $why = Get-LaiResearchFormError $r.Body
+        if (-not $why -and $r.Location -match '/auth/login') { $why = 'new accounts are turned off' }
+        if (-not $why) { $why = "HTTP $($r.Status)" }
+        throw "Local Deep Research did not create the account '$Account' ($why)."
+    } finally { $s.Client.Dispose() }
+}
+
+function Connect-LaiResearch {
+    # A signed-in session (check with /auth/check, not the redirect: both outcomes of a sign-in
+    # redirect somewhere).
+    param([Parameter(Mandatory)][string]$BaseUrl, [Parameter(Mandatory)][string]$Account, [Parameter(Mandatory)][string]$Password, [int]$TimeoutSec = 30)
+    $s = New-LaiResearchSession -BaseUrl $BaseUrl -TimeoutSec $TimeoutSec
+    $t = Get-LaiResearchCsrf $s
+    $r = Invoke-LaiResearchRequest -Session $s -Method POST -Path '/auth/login' -Form @{ username = $Account; password = $Password; csrf_token = $t }
+    if ($r.Status -eq 429) {
+        $s.Client.Dispose()
+        # 5 sign-ins per 15 minutes: say so, a 'wrong password' guess would send the user the wrong way.
+        throw 'Local Deep Research refused the sign-in: too many sign-ins in the last 15 minutes. Wait 15 minutes and try again.'
+    }
+    $chk = Invoke-LaiResearchRequest -Session $s -Path '/auth/check'
+    if ($chk.Status -ne 200) {
+        $why = Get-LaiResearchFormError $r.Body
+        $s.Client.Dispose()
+        if ($why) { throw "Local Deep Research refused the sign-in for '$Account' ($why)." }
+        throw "Local Deep Research refused the sign-in for '$Account' (HTTP $($r.Status))."
+    }
+    return $s
+}
+
+function Test-LaiResearchModel {
+    # Whether Local Deep Research reaches Ollama and finds its model: Available plus its message.
+    # The model is passed: this endpoint does not fall back to LDR_LLM_MODEL (only research runs do).
+    # Its check compares the name exactly with Ollama's list, which always has the tag ('x:latest').
+    param([Parameter(Mandatory)]$Session, [Parameter(Mandatory)][string]$Model)
+    if ($Model -notmatch ':[^/]+$') { $Model += ':latest' }
+    $path = '/research/api/check/ollama_model?model=' + [uri]::EscapeDataString($Model)
+    $r = Invoke-LaiResearchRequest -Session $Session -Path $path
+    $o = $null; try { $o = ConvertFrom-Json -InputObject $r.Body } catch { $o = $null }
+    if ($r.Status -ne 200 -or -not $o) { return [pscustomobject]@{ Available = $false; Message = "HTTP $($r.Status)" } }
+    $msg = ''; if ($o.PSObject.Properties['message']) { $msg = [string]$o.message }
+    return [pscustomobject]@{ Available = [bool]$o.available; Message = $msg }
+}
+
+function Invoke-LaiResearchQuick {
+    # One quick research run (search, read, summarise) through the API; Summary, Sources and Findings.
+    # A run takes minutes, so give the session a long time limit (Connect-LaiResearch -TimeoutSec).
+    param([Parameter(Mandatory)]$Session, [Parameter(Mandatory)][string]$Query, [int]$Iterations = 1)
+    $t = Get-LaiResearchCsrf $Session
+    $r = Invoke-LaiResearchRequest -Session $Session -Method POST -Path '/api/v1/quick_summary' -Csrf $t -Json @{
+        query = $Query; search_tool = 'searxng'; iterations = $Iterations; questions_per_iteration = 1
+    }
+    $o = $null; try { $o = ConvertFrom-Json -InputObject $r.Body } catch { $o = $null }
+    if ($r.Status -ne 200 -or -not $o) {
+        $err = ''; if ($o -and $o.PSObject.Properties['error']) { $err = [string]$o.error }
+        throw "Local Deep Research research run failed (HTTP $($r.Status)$(if ($err) { ': ' + $err }))."
+    }
+    return [pscustomobject]@{ Summary = [string]$o.summary; Sources = @($o.sources | Where-Object { $_ }).Count; Findings = @($o.findings).Count }
 }
 
 #endregion
@@ -2168,7 +2331,7 @@ function Set-LaiScriptPolicy {
 function Get-LaiShortcutSpecs {
     # What goes into the "Local AI" Start-menu folder. Script shortcuts keep their window open
     # after the script ends (also after an error) so the result can be read.
-    param([Parameter(Mandatory)][string]$AIRoot, [int]$WebUIPort = 3000)
+    param([Parameter(Mandatory)][string]$AIRoot, [int]$WebUIPort = 3000, [int]$DeepResearchPort = 0)
     # Plain string building (Windows paths), so this also works when tested on Linux.
     $scripts = $AIRoot.TrimEnd('\') + '\Scripts'
     # ConvertTo-LaiPsQuoted, not a plain '' doubling: a typographic apostrophe in the path also ends the string.
@@ -2182,6 +2345,7 @@ function Get-LaiShortcutSpecs {
         @{ Name = 'Local AI - Update toolkit'; Script = 'Get-LocalAI.ps1'; Extra = ''; Env = 'LOCALAI_ROOT' }
     )
     $specs = @([pscustomobject]@{ Name = 'Local AI (Open WebUI)'; Kind = 'url'; Script = ''; Target = "http://localhost:$WebUIPort/"; Arguments = ''; TooLong = $false })
+    if ($DeepResearchPort -gt 0) { $specs += [pscustomobject]@{ Name = 'Local AI - Deep Research'; Kind = 'url'; Script = ''; Target = "http://localhost:$DeepResearchPort/"; Arguments = ''; TooLong = $false } }
     foreach ($i in $items) {
         $path = $scripts + '\' + $i.Script
         if ($i.Env) { $call = "`$env:$($i.Env) = $(& $q $AIRoot.TrimEnd('\')); & $(& $q $path)" }   # bootstrap reads the root from the environment

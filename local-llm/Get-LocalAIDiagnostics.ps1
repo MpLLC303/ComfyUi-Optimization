@@ -176,7 +176,7 @@ Add-Summary "Docker engine: $(($dockerVer -split "`n")[0])"
 $states = Invoke-Capture 'docker' @('ps', '-a', '--filter', 'label=com.docker.compose.project=localai', '--format', '{{.Names}}: {{.Status}} ({{.Image}})')
 Add-Summary "Containers: $(($states -split "`n" | Where-Object { $_ }) -join '; ')"
 Save-Part 'docker.txt' (@("engine: $dockerVer", '', $states, '', (Invoke-Capture 'docker' @('volume', 'ls'))) -join "`n")
-foreach ($c in @('open-webui', 'searxng', 'render-guard')) { Save-Part "logs-$c.txt" (Invoke-Capture 'docker' @('logs', '--tail', '200', $c)) }
+foreach ($c in @('open-webui', 'searxng', 'render-guard', 'deep-research')) { Save-Part "logs-$c.txt" (Invoke-Capture 'docker' @('logs', '--tail', '200', $c)) }
 $guard = Invoke-Capture 'docker' @('exec', 'render-guard', 'python3', '-c', "import urllib.request;print(urllib.request.urlopen('http://127.0.0.1:11434/render-guard/status',timeout=5).read().decode())")
 Save-Part 'render-guard-status.json' $guard
 $health = Invoke-Safely { (Invoke-LaiApi -Uri "http://127.0.0.1:$webPort/health" -TimeoutSec 10) | ConvertTo-Json -Compress }

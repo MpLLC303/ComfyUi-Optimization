@@ -141,5 +141,23 @@
             Parameters      = @{ temperature = 0.6; top_p = 0.95; top_k = 20; min_p = 0.0 }
             Description     = 'Trial: Qwen3.6 27B abliterated (dense, 2026). Quality-first coding and reasoning at roughly a fifth of Local Code speed.'
         }
+        @{
+            Key             = 'trial-research'
+            Order           = 8
+            Display         = 'Trial: Tongyi DeepResearch 30B'
+            Preset          = 'trial-tongyi-research'
+            Alias           = 'localai-trial-tongyi-research'
+            Source          = 'huihui_ai/tongyi-deepresearch-abliterated:30b'
+            Optional        = $true
+            Trial           = $true
+            DownloadGB      = 19
+            MaxContext      = 65536
+            Vision          = $false
+            Think           = $null
+            MinTokensPerSec = 90
+            # Alibaba's own research runs: temperature 0.6, top_p 0.95, presence_penalty 1.1.
+            Parameters      = @{ temperature = 0.6; top_p = 0.95; top_k = 20; min_p = 0.0; presence_penalty = 1.1 }
+            Description     = 'Trial: Tongyi DeepResearch 30B-A3B abliterated (Alibaba, mixture of experts like Local Main, trained for long web research). With -DeepResearch it becomes the research agent''s model.'
+        }
     )
 }

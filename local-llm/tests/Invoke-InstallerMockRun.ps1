@@ -558,9 +558,54 @@ Assert-That ($c7e -ne 0 -and $log7e -match 'A container named searxng from anoth
 Assert-That ($ow7e -eq 'running|always' -and @(& /usr/bin/docker ps -a --filter 'name=^/open-webui-legacy-' --format '{{.Names}}').Count -eq $legacy7e) "the existing Open WebUI keeps running under its name, restart=always ($ow7e)"
 & /usr/bin/docker rm -f searxng open-webui 2>$null | Out-Null
 
+Write-Host "`n=== PHASE 8: -DeepResearch (Local Deep Research), then -DeepResearch:`$false ===" -ForegroundColor Cyan
+# compose is mocked: a real Local Deep Research container stands in for the one compose would start
+# (same image, the installer's port), on the host network so it reaches the sandbox's real Ollama.
+$ldrImage = 'localdeepresearch/local-deep-research:1.10.7'
+if ((& /usr/bin/docker image inspect $ldrImage 2>$null) -and $LASTEXITCODE -eq 0) {
+    & /usr/bin/docker rm -f deep-research 2>$null | Out-Null
+    & /usr/bin/docker run -d --name deep-research --label lai-test=1 --network host -e LDR_WEB_HOST=127.0.0.1 -e LDR_WEB_PORT=5055 -e LDR_DATA_DIR=/data `
+        -e LDR_LLM_PROVIDER=ollama -e LDR_LLM_OLLAMA_URL=http://127.0.0.1:11434 -e LDR_LLM_MODEL=localai-main -e LDR_SEARCH_TOOL=searxng `
+        -e LDR_SEARCH_ENGINE_WEB_SEARXNG_DEFAULT_PARAMS_INSTANCE_URL=http://127.0.0.1:8888 `
+        --cap-drop ALL --cap-add CHOWN --cap-add FOWNER --cap-add DAC_OVERRIDE --cap-add SETUID --cap-add SETGID $ldrImage | Out-Null
+    # Phase 7e left the simulated PC without the Open WebUI volume; the first backup needs one.
+    & /usr/bin/docker volume create open-webui | Out-Null
+    & /usr/bin/docker run --rm -v open-webui:/data alpine:3.20 sh -c 'test -f /data/webui.db || head -c 65536 /dev/urandom > /data/webui.db' | Out-Null
+    $before8 = @($global:Calls).Count
+    & (Join-Path $aiRoot 'Scripts/Install-LocalAI.ps1') -AIRoot $aiRoot -SkipTests -TrialModels none -DeepResearch
+    $c8 = $LASTEXITCODE
+    $env8 = @(Get-Content -Encoding UTF8 (Join-Path $aiRoot 'Stack/.env'))
+    $st8 = Read-LaiState -Path (Join-Path $aiRoot 'install-state.json')
+    $cfg8 = Read-LaiState -Path (Join-Path $aiRoot 'localai-config.json')
+    $mainCtx = [int]$st8['tuning']['main']['Context']
+    Assert-That ($c8 -eq 0 -and @($st8['flags']['configureWarnings']).Count -eq 0) "the install with -DeepResearch completes without warnings (exit $c8; $(@($st8['flags']['configureWarnings']) -join ' | '))"
+    Assert-That ($env8 -contains 'COMPOSE_PROFILES=research' -and $env8 -contains 'DEEP_RESEARCH_MODEL=localai-main:latest' -and $env8 -contains "DEEP_RESEARCH_CONTEXT=$mainCtx" -and $env8 -contains 'DEEP_RESEARCH_PORT=5055') "Stack\.env turns the service on with Local Main at its tuned context ($mainCtx), port 5055"
+    Assert-That ($env8 -contains 'DEEP_RESEARCH_ALLOW_REGISTRATIONS=false' -and @($global:Calls[$before8..($global:Calls.Count - 1)] | Where-Object { $_ -like 'docker compose*up -d deep-research*' }).Count -ge 1) 'after the account is made, sign-up is turned off and the service recreated with that'
+    $rcFile = Join-Path $aiRoot 'Secrets/deep-research.json'
+    $rc8 = $null; if (Test-Path -LiteralPath $rcFile) { $rc8 = Get-Content -Raw -Encoding UTF8 -LiteralPath $rcFile | ConvertFrom-Json }
+    $login8 = ''
+    if ($rc8) { try { $s8 = Connect-LaiResearch -BaseUrl 'http://127.0.0.1:5055' -Account $rc8.username -Password $rc8.password; $login8 = 'ok'; $s8.Client.Dispose() } catch { $login8 = $_.Exception.Message } }
+    Assert-That ($login8 -eq 'ok') "the stored research account signs in to the real Local Deep Research ($login8)"
+    Assert-That ([int]$cfg8['DeepResearchPort'] -eq 5055 -and @(Get-ChildItem -Path (Join-Path $Work 'ProgramData') -Recurse -Filter 'Local AI - Deep Research.url' -ErrorAction SilentlyContinue).Count -eq 1) 'the config records the port and the Start menu has a Deep Research shortcut'
+    Assert-That ((Get-Content -Raw -Encoding UTF8 (Join-Path $aiRoot 'install-report.md')) -match 'Deep research: http://localhost:5055') 'the install report names the research address'
+    # A re-run with the account in place signs in instead of making another one.
+    & (Join-Path $aiRoot 'Scripts/Install-LocalAI.ps1') -AIRoot $aiRoot -SkipTests
+    $rc8b = Get-Content -Raw -Encoding UTF8 -LiteralPath $rcFile | ConvertFrom-Json
+    Assert-That ($LASTEXITCODE -eq 0 -and $rc8b.password -eq $rc8.password -and @((Read-LaiState -Path (Join-Path $aiRoot 'install-state.json'))['flags']['configureWarnings']).Count -eq 0) 're-run without the switch keeps deep research on and reuses the account'
+    & /usr/bin/docker volume create localai-deep-research 2>$null | Out-Null
+    & (Join-Path $aiRoot 'Scripts/Install-LocalAI.ps1') -AIRoot $aiRoot -SkipTests -DeepResearch:$false
+    $env8c = @(Get-Content -Encoding UTF8 (Join-Path $aiRoot 'Stack/.env'))
+    $gone = -not ((& /usr/bin/docker container inspect deep-research 2>$null) -and $LASTEXITCODE -eq 0)
+    $volKept = [bool](& /usr/bin/docker volume inspect localai-deep-research 2>$null) -and $LASTEXITCODE -eq 0
+    Assert-That ($env8c -contains 'COMPOSE_PROFILES=' -and $gone -and $volKept -and [int](Read-LaiState -Path (Join-Path $aiRoot 'localai-config.json'))['DeepResearchPort'] -eq 0) '-DeepResearch:$false turns the profile off and removes the container, the data volume stays'
+    Assert-That (@(Get-ChildItem -Path (Join-Path $Work 'ProgramData') -Recurse -Filter 'Local AI - Deep Research.url' -ErrorAction SilentlyContinue).Count -eq 0) 'and its Start-menu shortcut is removed'
+    & /usr/bin/docker rm -f deep-research 2>$null | Out-Null
+    & /usr/bin/docker volume rm localai-deep-research 2>$null | Out-Null
+} else { Write-Host "  SKIP        $ldrImage is not on this machine (docker pull it to run this phase)" -ForegroundColor DarkGray }
+
 } finally {
     $env:LOCALAI_TEST_FAIL_STAGE = ''
-    & /usr/bin/docker rm -f open-webui lai-test-elsewhere 2>$null | Out-Null
+    & /usr/bin/docker rm -f open-webui lai-test-elsewhere deep-research 2>$null | Out-Null
     # A 'searxng' that phase 7e made as another setup's goes; the sandbox's own comes back.
     foreach ($id in @(& /usr/bin/docker ps -aq --filter 'name=^/searxng$' --filter 'label=lai-test=1')) { if ($id) { & /usr/bin/docker rm -f $id 2>$null | Out-Null } }
     if ($parkedSearxng) { & /usr/bin/docker rename searxng-uninstall-test-keep searxng 2>$null | Out-Null }

@@ -112,6 +112,59 @@ services:
       # This is the bind address inside the container; exposure is still decided by "ports".
       GRANIAN_HOST: 0.0.0.0
 
+  # Optional (Install-LocalAI.ps1 -DeepResearch): Local Deep Research, an agent that plans searches,
+  # reads the pages through the private SearXNG above and writes a report with sources, using the
+  # local models (through the render guard, so a ComfyUI render keeps the GPU). Started only when
+  # COMPOSE_PROFILES in .env includes "research". No paid search API or key: the searches go through
+  # SearXNG; the pages it reads are fetched directly (as a browser would), and it downloads public
+  # journal lists (OpenAlex, DOAJ) for its source ratings. Port bound to 127.0.0.1.
+  deep-research:
+    image: localdeepresearch/local-deep-research:${DEEP_RESEARCH_VERSION:-1.10.7}
+    container_name: deep-research
+    profiles: ["research"]
+    logging: *logging
+    restart: always
+    ports:
+      - "127.0.0.1:${DEEP_RESEARCH_PORT:-5055}:5000"
+    volumes:
+      - deep-research:/data
+    # Its entrypoint starts as root to fix the volume's owner, then drops to its own user: these
+    # are the capabilities it needs for that, nothing else.
+    cap_drop: [ALL]
+    cap_add: [CHOWN, FOWNER, DAC_OVERRIDE, SETUID, SETGID]
+    security_opt: ["no-new-privileges:true"]
+    ulimits:
+      memlock: { soft: -1, hard: -1 }
+    environment:
+      LDR_WEB_HOST: 0.0.0.0
+      LDR_WEB_PORT: "5000"
+      LDR_DATA_DIR: /data
+      LDR_LLM_PROVIDER: ollama
+      LDR_LLM_OLLAMA_URL: http://render-guard:11434
+      # The tuned alias and its tuned context: another num_ctx would make Ollama reload the model.
+      LDR_LLM_MODEL: ${DEEP_RESEARCH_MODEL:-localai-main:latest}
+      LDR_LLM_LOCAL_CONTEXT_WINDOW_SIZE: ${DEEP_RESEARCH_CONTEXT:-32768}
+      LDR_SEARCH_TOOL: searxng
+      # Set here, not in its settings page: that is what lets it use a private address.
+      LDR_SEARCH_ENGINE_WEB_SEARXNG_DEFAULT_PARAMS_INSTANCE_URL: http://searxng:8080
+      LDR_SEARCH_ENGINE_WEB_SEARXNG_DEFAULT_PARAMS_RESULT_FORMAT: json
+      # A research run sends dozens of searches; spaced out, the sites SearXNG asks are less likely
+      # to answer with a CAPTCHA (which looks like 'no results').
+      LDR_SEARCH_ENGINE_WEB_SEARXNG_DEFAULT_PARAMS_DELAY_BETWEEN_REQUESTS: "3"
+      LDR_RATE_LIMITING_PROFILE: conservative
+      # The installer creates the one account, then turns sign-up off.
+      LDR_APP_ALLOW_REGISTRATIONS: ${DEEP_RESEARCH_ALLOW_REGISTRATIONS:-true}
+    depends_on:
+      - searxng
+      - render-guard
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request;urllib.request.urlopen('http://127.0.0.1:5000/api/v1/health',timeout=5)"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+
 volumes:
   open-webui:
     name: open-webui
+  deep-research:
+    name: localai-deep-research

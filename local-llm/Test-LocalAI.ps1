@@ -55,6 +55,8 @@ $ollamaUrl = 'http://127.0.0.1:11434'
 if ($config.ContainsKey('OllamaUrl') -and $config['OllamaUrl']) { $ollamaUrl = $config['OllamaUrl'] }
 $webPort = 3000; if ($config.ContainsKey('WebUIPort')) { $webPort = [int]$config['WebUIPort'] }
 $searxPort = 8888; if ($config.ContainsKey('SearxngPort')) { $searxPort = [int]$config['SearxngPort'] }
+# Optional research agent (Install-LocalAI.ps1 -DeepResearch); 0 = not installed.
+$researchPort = 0; if ($config.ContainsKey('DeepResearchPort') -and $config['DeepResearchPort']) { $researchPort = [int]$config['DeepResearchPort'] }
 $webUrl = "http://127.0.0.1:$webPort"
 
 $results = New-Object System.Collections.ArrayList
@@ -190,6 +192,7 @@ if ($NoContainers) {
         Pass "engine $v"
     }
     $containers = @('open-webui', 'searxng')
+    if ($researchPort -gt 0) { $containers += 'deep-research' }
     if (-not ($config.ContainsKey('WebUIOllamaUrl') -and $config['WebUIOllamaUrl'] -and $config['WebUIOllamaUrl'] -notlike '*render-guard*')) { $containers += 'render-guard' }
     foreach ($c in $containers) {
         Add-Check "Container $c" {
@@ -217,6 +220,39 @@ Add-Check 'SearXNG search' {
     catch { return (Fail "no search answer on http://127.0.0.1:$searxPort ($((Get-LaiHttpErrorText $_))) - $startAgain; if it persists: docker logs --tail 50 searxng") }
     if ($p.Count -gt 0) { return (Pass $p.Summary) }
     Warn $p.Summary
+}
+
+if ($researchPort -gt 0) {
+    # One sign-in for both checks: Local Deep Research allows 5 per 15 minutes.
+    $script:research = $null
+    Add-Check 'Deep research signs in and sees its model' {
+        if (-not $script:engineUp) { return (Skip 'Docker engine down') }
+        $rUrl = "http://127.0.0.1:$researchPort"
+        try { Wait-LaiHttp -Uri "$rUrl/api/v1/health" -TimeoutSec 30 | Out-Null }
+        catch { return (Fail "no answer on http://localhost:$researchPort - $startAgain; if it persists: docker logs --tail 50 deep-research") }
+        $rCredFile = Join-Path (Join-Path $AIRoot 'Secrets') 'deep-research.json'
+        if (-not (Test-Path -LiteralPath $rCredFile)) { return (Fail "missing $rCredFile - run the installer again (it creates the account)") }
+        $rc = Get-Content -Encoding UTF8 -Raw -LiteralPath $rCredFile | ConvertFrom-Json
+        $rModel = 'localai-main'
+        $envFile = Join-Path (Join-Path $AIRoot 'Stack') '.env'
+        if (Test-Path -LiteralPath $envFile) { foreach ($l in (Get-Content -Encoding UTF8 -LiteralPath $envFile)) { if ($l -like 'DEEP_RESEARCH_MODEL=*') { $rModel = $l.Substring(20) } } }
+        try { $script:research = Connect-LaiResearch -BaseUrl $rUrl -Account $rc.username -Password $rc.password -TimeoutSec 900 }
+        catch { return (Fail "$($_.Exception.Message) (account in $rCredFile)") }
+        $m = Test-LaiResearchModel -Session $script:research -Model $rModel
+        if (-not $m.Available) { return (Fail "signed in, but it cannot use $rModel ($($m.Message)) - is Ollama running?") }
+        Pass "http://localhost:$researchPort, model $rModel"
+    }
+    if (-not $Quick) {
+        Add-Check 'Deep research answers a question' {
+            if (-not $script:research) { return (Skip 'deep research not signed in') }
+            try { $q = Invoke-LaiResearchQuick -Session $script:research -Query 'What is the capital of France? Answer in one sentence.' }
+            catch { return (Fail "$($_.Exception.Message) - docker logs --tail 80 deep-research") }
+            if (-not $q.Summary.Trim()) { return (Fail 'the run finished without an answer - docker logs --tail 80 deep-research') }
+            # It answers only from sources; none = the sites SearXNG asks returned nothing (see the SearXNG search check).
+            if ($q.Sources -eq 0) { return (Warn 'it ran, but the searches found no pages (see SearXNG search above); it answers only from sources') }
+            Pass ("{0} sources, {1} findings" -f $q.Sources, $q.Findings)
+        }
+    }
 }
 
 Add-Check 'Open WebUI reachable' {

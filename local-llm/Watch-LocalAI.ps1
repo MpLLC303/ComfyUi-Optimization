@@ -184,8 +184,13 @@ if ($engine -eq 'down' -or $engine -eq 'hung') {
     if ($engine -eq 'hung') { $details['Docker'] = "not responding (no answer within $dockerLimit s) - restart Docker Desktop (whale icon > Restart)" }
     else { $details['Docker'] = 'engine not running - start Docker Desktop' }
 } else {
-    foreach ($c in @(@{ Name = 'open-webui'; Url = "http://127.0.0.1:$webPort/health"; Key = 'Open WebUI' },
-                     @{ Name = 'searxng'; Url = "http://127.0.0.1:$searxPort/healthz"; Key = 'SearXNG' })) {
+    $watched = @(@{ Name = 'open-webui'; Url = "http://127.0.0.1:$webPort/health"; Key = 'Open WebUI' },
+                 @{ Name = 'searxng'; Url = "http://127.0.0.1:$searxPort/healthz"; Key = 'SearXNG' })
+    # The optional research agent (Install-LocalAI.ps1 -DeepResearch), healed like the others.
+    if ($config.ContainsKey('DeepResearchPort') -and [int]$config['DeepResearchPort'] -gt 0) {
+        $watched += @{ Name = 'deep-research'; Url = "http://127.0.0.1:$([int]$config['DeepResearchPort'])/api/v1/health"; Key = 'Deep research' }
+    }
+    foreach ($c in $watched) {
         $ok = Test-Url $c.Url
         $hold = $null; if ($c.Name -eq 'open-webui') { $hold = Get-LaiWebUIHold -AIRoot $AIRoot }
         if (-not $ok -and $c.Name -eq 'open-webui' -and (Test-LaiVolumeLockBusy)) {

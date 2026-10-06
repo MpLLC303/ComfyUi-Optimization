@@ -199,6 +199,42 @@ $leftFiles = @(Get-LaiWebUISelfTestLeftover -BaseUrl $WebUIUrl -Token $token | W
 if ($leftover.Count -gt 0 -or $leftFiles.Count -gt 0) { Write-LaiLog FAIL "self-test collection or file was not cleaned up ($($leftover.Count) collection(s), $($leftFiles.Count) file(s))"; $failures++ }
 else { Write-LaiLog OK "the self-test removed an interrupted run's collection and file and its own, and kept the user's similar collection" }
 
+# The optional research agent (-DeepResearch): the real Local Deep Research image against the
+# sandbox's Ollama, through the module functions the installer and Test-LocalAI use. A research run
+# itself takes minutes on this CPU and is left to Test-LocalAI on the real PC.
+$ldrImage = 'localdeepresearch/local-deep-research:1.10.7'
+$prevEap = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
+& docker image inspect $ldrImage 2>$null | Out-Null; $haveLdr = ($LASTEXITCODE -eq 0)
+$ErrorActionPreference = $prevEap
+if ($haveLdr) {
+    $ldrUrl = 'http://127.0.0.1:5057'
+    try {
+        & docker rm -f lai-ldr-integration 2>$null | Out-Null
+        & docker run -d --name lai-ldr-integration --label lai-test=1 --network host -e LDR_WEB_HOST=127.0.0.1 -e LDR_WEB_PORT=5057 -e LDR_DATA_DIR=/data `
+            -e LDR_LLM_PROVIDER=ollama -e "LDR_LLM_OLLAMA_URL=$OllamaUrl" -e "LDR_LLM_MODEL=$(@($catalog.Models)[0].Alias)" -e LDR_SEARCH_TOOL=searxng `
+            --cap-drop ALL --cap-add CHOWN --cap-add FOWNER --cap-add DAC_OVERRIDE --cap-add SETUID --cap-add SETGID $ldrImage | Out-Null
+        Wait-LaiHttp -Uri "$ldrUrl/api/v1/health" -TimeoutSec 180 | Out-Null
+        $ldrPw = New-LaiPassword
+        Register-LaiResearchUser -BaseUrl $ldrUrl -Account 'localai' -Password $ldrPw
+        $dup = ''; try { Register-LaiResearchUser -BaseUrl $ldrUrl -Account 'localai' -Password $ldrPw } catch { $dup = $_.Exception.Message }
+        $bad = ''; try { Connect-LaiResearch -BaseUrl $ldrUrl -Account 'localai' -Password 'Not-The-Password-1' | Out-Null } catch { $bad = $_.Exception.Message }
+        $rs = Connect-LaiResearch -BaseUrl $ldrUrl -Account 'localai' -Password $ldrPw
+        $mOk = Test-LaiResearchModel -Session $rs -Model (@($catalog.Models)[0].Alias)
+        $mNo = Test-LaiResearchModel -Session $rs -Model 'no-such-model:1b'
+        $rs.Client.Dispose()
+        if ($dup -notmatch "did not create the account 'localai'") { Write-LaiLog FAIL "a second sign-up with the same name was not reported as refused ($dup)"; $failures++ }
+        elseif ($bad -notmatch 'refused the sign-in') { Write-LaiLog FAIL "a wrong password was not reported as a refused sign-in ($bad)"; $failures++ }
+        elseif (-not $mOk.Available -or $mNo.Available) { Write-LaiLog FAIL "model check: alias available=$($mOk.Available) ($($mOk.Message)), bogus available=$($mNo.Available)"; $failures++ }
+        else { Write-LaiLog OK 'deep research: account made, duplicate and wrong password refused with reasons, signed in, sees the tuned alias (and not a missing model)' }
+    } catch {
+        Write-LaiLog FAIL "deep research against the real Local Deep Research: $($_.Exception.Message)"; $failures++
+    } finally {
+        $prevEap = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
+        & docker rm -f lai-ldr-integration 2>$null | Out-Null
+        $ErrorActionPreference = $prevEap
+    }
+} else { Write-LaiLog WARN "SKIP deep research: $ldrImage is not on this machine (docker pull it to run this check)" }
+
 # The harness must see such a leftover too (a killed suite would otherwise fail the next one).
 $probeKb = Invoke-LaiApi -Method POST -Uri "$WebUIUrl/api/v1/knowledge/create" -Token $token -Body @{ name = 'LocalAI Self-Test (temporary)'; description = 'reset-sandbox probe' }
 $resetOut = (& pwsh -NoProfile -File (Join-Path $PSScriptRoot 'Reset-Sandbox.ps1') -Check -WebUIUrl $WebUIUrl -Email $Email -Password $Password 2>&1 | ForEach-Object { "$_" }) -join "`n"
