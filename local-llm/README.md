@@ -190,14 +190,19 @@ prompt processing before the first token appears. Both are normal.
   so skills written for other assistants can be dropped in as they are. After adding or editing one,
   run Start menu → Local AI → *Sync skills* (or `C:\AI\Scripts\Sync-LocalAISkills.ps1`): every
   preset then sees each skill's name and description and reads the full instructions only when a
-  question needs them. A deleted folder switches its skill off; skills you make in Workspace → Skills
-  are left alone. The first install puts three starter skills there (*Research with sources*,
-  *Troubleshoot step by step*, *Remember and improve*).
+  question needs them. A deleted folder switches its skill off and it comes back on with the folder;
+  renaming a folder carries the skill over; a skill you switch off in Workspace → Skills stays off, and
+  skills you make there are left alone. A SKILL.md with a problem (over 100 KB, no instructions) is
+  reported and its last synced version kept. The first install puts three starter skills there
+  (*Research with sources*, *Troubleshoot step by step*, *Remember and improve*). A preset that uses
+  prompt-based (legacy) tool calling, because its model has no native tool template, gets no skills:
+  there Open WebUI would paste every skill in full into every message.
 - **It improves itself, with your approval.** When the assistant works out a method you are likely to
   need again, it can save it with the *skill notebook* tool as a draft ("Learned: ..."). **Drafts start
   switched off**: open Workspace → Skills, read it, and switch it on; from then on every preset offers
-  it. It can improve its own drafts, but never changes a skill you switched on (a new version arrives
-  as a separate "(proposed update)" draft) and never touches skills it did not make. The approval step
+  it. It can improve a draft until you touch it; once you switch it on (or off again) or edit it, it is
+  yours and is never changed (a new version arrives as a separate "(proposed update)" draft). It never
+  touches skills it did not make. The approval step
   is deliberate: a skill is read in every later chat, so a web page or document the assistant read
   must never be able to plant one by itself.
 - **Deep research** (installed with `-DeepResearch`): Start menu → Local AI → *Deep Research*, or

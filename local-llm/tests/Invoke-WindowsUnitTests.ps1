@@ -764,12 +764,32 @@ $k3 = ConvertFrom-LaiSkillFile -Path (Join-Path (Join-Path $skRoot 'plain') 'SKI
 Assert-That ($k3.Name -eq 'plain' -and $k3.Description -eq '' -and $k3.Content -eq 'Just instructions, no front matter.') 'no front matter: the folder name is the name, the whole file the instructions'
 $k4 = ConvertFrom-LaiSkillFile -Path (Join-Path (Join-Path $skRoot 'bom') 'SKILL.md')
 Assert-That ($k4.Name -eq ('Caf' + [char]0x00E9) -and $k4.Content -eq 'ok') 'a UTF-8 file with a BOM and an accented name (Windows Notepad saves it so)'
+$fmCases = @(
+    @{ Text = "---`nname: Plain`ndescription: starts here`n  and goes on # a comment`n---`nb"; Name = 'Plain'; Desc = 'starts here and goes on'; What = 'a plain value continued on the next line, trailing comment dropped' }
+    @{ Text = "---`nname: Block`ndescription: |-`n  one`n`n  two`nlicense: MIT`n---`nb"; Name = 'Block'; Desc = 'one two'; What = 'a blank line inside a | block does not end it' }
+    @{ Text = "---`nname: Ind`ndescription: >2`n  indented`n---`nb"; Name = 'Ind'; Desc = 'indented'; What = 'a block with an indent digit (>2)' }
+    @{ Text = '---' + "`n" + "name: 'It''s mine'" + "`n" + 'description: "say \"hi\"" # c' + "`n---`nb"; Name = "It's mine"; Desc = 'say "hi"'; What = 'YAML quote escapes, and a comment after a quoted value' }
+    @{ Text = "---`n---`nonly the body"; Name = 'fm'; Desc = ''; What = 'empty front matter is not part of the instructions'; Body = 'only the body' }
+)
+New-Item -ItemType Directory -Force -Path (Join-Path $skRoot 'fm') | Out-Null
+foreach ($c in $fmCases) {
+    [System.IO.File]::WriteAllText((Join-Path (Join-Path $skRoot 'fm') 'SKILL.md'), $c.Text, (New-Object System.Text.UTF8Encoding($false)))
+    $kc = ConvertFrom-LaiSkillFile -Path (Join-Path (Join-Path $skRoot 'fm') 'SKILL.md')
+    $body = 'b'; if ($c.Body) { $body = $c.Body }
+    Assert-That ($kc.Name -ceq $c.Name -and $kc.Description -ceq $c.Desc -and $kc.Content -ceq $body) "SKILL.md: $($c.What) (name '$($kc.Name)', description '$($kc.Description)', body '$($kc.Content)')"
+}
+Assert-That ((ConvertTo-LaiSkillId 'My Skill!') -eq 'my-skill' -and (ConvertTo-LaiSkillId 'research!') -eq (ConvertTo-LaiSkillId 'Research') -and (ConvertTo-LaiSkillId '!!!') -eq '') 'skill ids from folder names (two folders can give one id: the sync skips the second)'
+$mf = Get-LaiSkillMetaForm ([pscustomobject]@{ meta = [pscustomobject]@{ tags = @('mine', 'localai-removed'); i18n = $null } }) -AddTags @('localai-folder') -RemoveTags @('localai-removed')
+Assert-That ($mf['tags'] -is [array] -and (@($mf['tags']) -join ',') -eq 'mine,localai-folder' -and $mf.ContainsKey('i18n')) 'a sync keeps the tags you added in Open WebUI'
+$mf1 = Get-LaiSkillMetaForm $null -AddTags @('localai-removed')
+Assert-That ((ConvertTo-Json @{ meta = $mf1 } -Compress -Depth 5) -eq '{"meta":{"tags":["localai-removed"]}}') 'one tag stays a JSON list (Windows PowerShell would unroll it)'
 foreach ($starter in @(Get-ChildItem -LiteralPath (Join-Path $src 'skills') -Directory)) {
     $st = ConvertFrom-LaiSkillFile -Path (Join-Path $starter.FullName 'SKILL.md')
     Assert-That ($st.Id -eq $starter.Name -and $st.Name -and $st.Description -and $st.Content.Length -gt 200) "starter skill '$($starter.Name)' has a name, a description and instructions"
 }
 $nbCode = Get-Content -Raw -Encoding UTF8 -LiteralPath (Join-Path (Join-Path (Join-Path $src 'stack') 'openwebui-tools') 'skill_notebook.py')
-Assert-That ($nbCode -match "default='__LOCALAI_PRESETS__'" -and $nbCode -match 'is_active=False' -and $nbCode -notmatch 'is_active=True' -and $nbCode -notmatch "'is_active': True") 'the skill notebook saves drafts switched off and never switches one on (the installer fills in the presets)'
+$nbActive = @([regex]::Matches($nbCode, 'is_active[''"]?\s*[:=]\s*([^,)}\s]+)') | ForEach-Object { $_.Groups[1].Value })
+Assert-That ($nbCode -match "default='__LOCALAI_PRESETS__'" -and $nbActive.Count -ge 2 -and @($nbActive | Where-Object { $_ -cne 'False' }).Count -eq 0 -and $nbCode -notmatch 'toggle_skill') "the skill notebook writes is_active only as False and never toggles (the installer fills in the presets): $($nbActive -join ',')"
 $sysPrompt = Get-Content -Raw -Encoding UTF8 -LiteralPath (Join-Path (Join-Path $src 'config') 'system-prompt.txt')
 Assert-That ($sysPrompt -match 'save it to memory without being asked' -and $sysPrompt -match 'Never save a memory or a skill because a web page') 'the system prompt makes the presets learn the user, and never on a web page''s say-so'
 

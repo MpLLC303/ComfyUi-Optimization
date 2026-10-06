@@ -42,10 +42,12 @@ $r = Invoke-LaiSkillSync -BaseUrl $baseUrl -Token $token -Folder $folder -SeedFr
 
 if ($r.Seeded.Count) { Write-LaiLog OK "Created $folder with the starter skills: $($r.Seeded -join ', ')" }
 foreach ($line in @(
-        @{ L = 'Added'; V = $r.Created }, @{ L = 'Updated'; V = $r.Updated }, @{ L = 'Switched off (folder removed)'; V = $r.Disabled })) {
+        @{ L = 'Added'; V = $r.Created }, @{ L = 'Updated'; V = $r.Updated }, @{ L = 'Back on (folder returned)'; V = $r.Restored },
+        @{ L = 'Renamed'; V = $r.Replaced }, @{ L = 'Switched off (folder removed)'; V = $r.Disabled })) {
     if (@($line.V).Count) { Write-LaiLog OK "$($line.L): $(@($line.V) -join ', ')" }
 }
 foreach ($w in $r.Skipped) { Write-LaiLog WARN "Skipped: $w" }
+if (@($r.Legacy).Count) { Write-LaiLog INFO "Not attached to $(@($r.Legacy) -join ', '): prompt-based (legacy) tool calling would paste every skill into every message" }
 Write-LaiLog OK "$(@($r.ActiveIds).Count) skill(s) from $folder offered in the Local AI presets (add a folder with a SKILL.md, then run this again)"
 if ($r.Skipped.Count) { exit 1 }
 exit 0

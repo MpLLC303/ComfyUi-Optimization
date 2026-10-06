@@ -656,6 +656,7 @@ function Invoke-SkillsSetup {
         $r = Invoke-LaiSkillSync -BaseUrl $WebUIUrl -Token $Token -Folder (Join-Path $AIRoot 'Skills') -SeedFrom (Join-Path $SourceRoot 'skills') -PresetIds $presetIds
         if ($r.Seeded.Count) { Write-LaiLog OK "Created $(Join-Path $AIRoot 'Skills') with the starter skills: $($r.Seeded -join ', ')" }
         Write-LaiLog OK ("Skills: {0} offered ({1} added, {2} updated, {3} switched off)" -f @($r.ActiveIds).Count, @($r.Created).Count, @($r.Updated).Count, @($r.Disabled).Count)
+        if (@($r.Legacy).Count) { Write-LaiLog INFO "Skills not attached to $(@($r.Legacy) -join ', '): prompt-based (legacy) tool calling would paste every skill into every message" }
         foreach ($sk in $r.Skipped) { $warn += "Skill skipped: $sk" }
     } catch {
         $why = $_.Exception.Message -replace '\s+', ' '

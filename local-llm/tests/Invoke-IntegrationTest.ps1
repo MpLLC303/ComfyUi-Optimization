@@ -229,6 +229,52 @@ try {
     )
     foreach ($c in $checks) { if (-not $c.Ok) { Write-LaiLog FAIL "skills sync: $($c.What)"; $failures++ } }
     Invoke-LaiApi -Method DELETE -Uri "$WebUIUrl/api/v1/skills/id/made-in-webui/delete" -Token $token | Out-Null
+    Remove-Item -LiteralPath (Join-Path $skDir 'made-in-webui') -Recurse -Force
+
+    # Nothing changed: nothing written. Then a removed folder returns, a folder is renamed (same name
+    # inside), two folders give one id, a tag added in Open WebUI, and a legacy (prompt-based) preset.
+    $r3 = Invoke-LaiSkillSync -BaseUrl $WebUIUrl -Token $token -Folder $skDir -PresetIds $presetIds
+    if ((@($r3.Created) + @($r3.Updated) + @($r3.Restored) + @($r3.Replaced) + @($r3.Disabled) + @($r3.Skipped) + @($r3.Attached)).Count) { Write-LaiLog FAIL "skills sync: a second sync with nothing changed still wrote: $($r3 | ConvertTo-Json -Compress)"; $failures++ }
+    Copy-Item -LiteralPath (Join-Path (Join-Path $root 'skills') 'remember-and-improve') -Destination (Join-Path $skDir 'remember-and-improve') -Recurse
+    Rename-Item -LiteralPath (Join-Path $skDir 'research-with-sources') -NewName 'research'
+    New-Item -ItemType Directory -Force -Path (Join-Path $skDir 'research!') | Out-Null
+    Set-Content -LiteralPath (Join-Path (Join-Path $skDir 'research!') 'SKILL.md') -Value "---`nname: Twin`n---`nsame id as research"
+    $ts = (Get-LaiWebUISkills -BaseUrl $WebUIUrl -Token $token)['troubleshoot-step-by-step']
+    Invoke-LaiApi -Method POST -Uri "$WebUIUrl/api/v1/skills/id/troubleshoot-step-by-step/update" -Token $token -Body @{ id = 'troubleshoot-step-by-step'; name = [string]$ts.name; description = [string]$ts.description; content = [string]$ts.content; meta = @{ tags = @('localai-folder', 'mine') }; is_active = $false } | Out-Null
+    Add-Content -LiteralPath (Join-Path (Join-Path $skDir 'troubleshoot-step-by-step') 'SKILL.md') -Value "`nAnother line."
+    $legacyId = $null; $legacyOld = $null
+    if (@($presetIds).Count -gt 1) {
+        $legacyId = @($presetIds | Where-Object { $_ -ne $catalog.DefaultPreset })[0]
+        $lf = ConvertTo-LaiHashtable (Get-LaiWebUIModel -BaseUrl $WebUIUrl -Token $token -Id $legacyId)
+        $legacyOld = [string]$lf['params']['function_calling']; $lf['params']['function_calling'] = 'legacy'
+        Invoke-LaiApi -Method POST -Uri "$WebUIUrl/api/v1/models/model/update" -Body $lf -Token $token | Out-Null
+    }
+    try {
+        $r4 = Invoke-LaiSkillSync -BaseUrl $WebUIUrl -Token $token -Folder $skDir -PresetIds $presetIds
+        $all4 = Get-LaiWebUISkills -BaseUrl $WebUIUrl -Token $token
+        $lp = $null; $lpSkills = @()
+        if ($legacyId) { $lp = Get-LaiWebUIModel -BaseUrl $WebUIUrl -Token $token -Id $legacyId; if ($lp.meta.PSObject.Properties['skillIds']) { $lpSkills = @($lp.meta.skillIds) } }
+    } finally {
+        if ($legacyId) {
+            $lf = ConvertTo-LaiHashtable (Get-LaiWebUIModel -BaseUrl $WebUIUrl -Token $token -Id $legacyId)
+            if ($legacyOld) { $lf['params']['function_calling'] = $legacyOld } else { $lf['params'].Remove('function_calling') }
+            Invoke-LaiApi -Method POST -Uri "$WebUIUrl/api/v1/models/model/update" -Body $lf -Token $token | Out-Null
+        }
+    }
+    $tsTags = @(); if ($all4['troubleshoot-step-by-step'].meta.tags) { $tsTags = @($all4['troubleshoot-step-by-step'].meta.tags) }
+    $checks = @(
+        @{ Ok = (@($r4.Restored) -contains 'remember-and-improve' -and $all4['remember-and-improve'].is_active -and -not (Test-LaiSkillTag $all4['remember-and-improve'] 'localai-removed')); What = 'a folder that comes back switches its skill on again' }
+        @{ Ok = (@($r4.Replaced) -contains 'research-with-sources -> research' -and $all4['research'].is_active -and -not $all4.ContainsKey('research-with-sources')); What = 'a renamed folder (same name inside) replaces its old skill instead of clashing on the name' }
+        @{ Ok = (@($r4.Skipped | Where-Object { $_ -match "research! gives the id 'research'" }).Count -eq 1 -and [string]$all4['research'].content -notmatch 'same id as research'); What = 'a second folder with the same id is skipped, not taking turns with the first' }
+        @{ Ok = (@($r4.Updated) -contains 'troubleshoot-step-by-step' -and -not $all4['troubleshoot-step-by-step'].is_active -and $tsTags -contains 'mine' -and $tsTags -contains 'localai-folder'); What = 'an update keeps a tag added in Open WebUI and a skill switched off there stays off' }
+        @{ Ok = (-not $legacyId -or (@($r4.Legacy) -contains $legacyId -and @($lpSkills | Where-Object { $all4.ContainsKey($_) -and ((Test-LaiSkillTag $all4[$_] 'localai-folder') -or (Test-LaiSkillTag $all4[$_] 'learned')) }).Count -eq 0)); What = "a legacy preset ($legacyId) gets no skills attached and loses ours: $($lpSkills -join ',')" }
+    )
+    foreach ($c in $checks) { if (-not $c.Ok) { Write-LaiLog FAIL "skills sync: $($c.What)"; $failures++ } }
+    # A SKILL.md that grows too big keeps its last synced version (switched on), with a warning.
+    Set-Content -LiteralPath (Join-Path (Join-Path $skDir 'research') 'SKILL.md') -Value ('x' * 110000)
+    $r5 = Invoke-LaiSkillSync -BaseUrl $WebUIUrl -Token $token -Folder $skDir -PresetIds $presetIds
+    $all5 = Get-LaiWebUISkills -BaseUrl $WebUIUrl -Token $token
+    if (@($r5.Skipped | Where-Object { $_ -match 'over 100 KB' }).Count -ne 1 -or @($r5.Disabled).Count -or -not $all5['research'].is_active) { Write-LaiLog FAIL "skills sync: an oversized SKILL.md switched its skill off or was not reported: $($r5 | ConvertTo-Json -Compress)"; $failures++ }
 
     # The notebook tool: created, unchanged, updated through the API; then its functions in Open WebUI's Python.
     $nbCode = (Get-Content -Encoding UTF8 -Raw -LiteralPath (Join-Path $root 'stack/openwebui-tools/skill_notebook.py')).Replace('__LOCALAI_PRESETS__', ($presetIds -join ','))
@@ -245,32 +291,66 @@ try {
     $drv = Join-Path $skDir 'notebook_driver.py'
     $nbFile = Join-Path $skDir 'skill_notebook.py'
     [System.IO.File]::WriteAllText($nbFile, $nbCode, (New-Object System.Text.UTF8Encoding($false)))
-    Set-Content -LiteralPath $drv -Encoding ascii -Value @(
-        'import asyncio, importlib.util, json, sys'
-        'spec = importlib.util.spec_from_file_location("nb", sys.argv[1]); nb = importlib.util.module_from_spec(spec); spec.loader.exec_module(nb)'
-        'from open_webui.models.users import Users'
-        'async def main():'
-        '    users = await Users.get_users(); lst = users["users"] if isinstance(users, dict) else users'
-        '    a = [u for u in lst if u.role == "admin"][0]; ud = {"id": a.id, "role": "admin"}'
-        '    t = nb.Tools(); out = []'
-        '    out.append(await t.save_skill_draft("Integration check", "When testing", "1. step one", __user__=ud))'
-        '    out.append(await t.save_skill_draft("Integration check", "When testing", "1. step one, improved", __user__=ud))'
-        '    out.append(await t.save_skill_draft("x", "y", "z", __user__={"id": "u", "role": "user"}))'
-        '    out.append(await t.list_skill_drafts(__user__=ud))'
-        '    print(json.dumps(out))'
-        'asyncio.run(main())'
-    )
+    Set-Content -LiteralPath $drv -Encoding ascii -Value @'
+import asyncio, importlib.util, json, sys
+spec = importlib.util.spec_from_file_location("nb", sys.argv[1]); nb = importlib.util.module_from_spec(spec); spec.loader.exec_module(nb)
+from open_webui.models.users import Users
+from open_webui.models.skills import Skills, SkillForm, SkillMeta
+async def content(i):
+    s = await Skills.get_skill_by_id(i)
+    return s.content if s else None
+async def main():
+    users = await Users.get_users(); lst = users["users"] if isinstance(users, dict) else users
+    a = [u for u in lst if u.role == "admin"][0]; ud = {"id": a.id, "role": "admin"}
+    t = nb.Tools(); r = {}
+    r["save"] = await t.save_skill_draft("Integration check", "When testing", "1. step one", __user__=ud)
+    r["improve"] = await t.save_skill_draft("Integration check", "When testing", "1. step one, improved", __user__=ud)
+    r["nonadmin"] = await t.save_skill_draft("x", "y", "z", __user__={"id": "u", "role": "user"})
+    r["after_improve"] = await content("learned-integration-check")
+    await asyncio.sleep(2.2)
+    await Skills.toggle_skill_by_id("learned-integration-check")
+    r["approved_save"] = await t.save_skill_draft("Integration check", "When testing", "2. proposed", __user__=ud)
+    r["orig_after_approved"] = await content("learned-integration-check")
+    r["upd_1"] = await content("learned-integration-check-update")
+    await asyncio.sleep(2.2)
+    await Skills.toggle_skill_by_id("learned-integration-check")
+    r["off_save"] = await t.save_skill_draft("Integration check", "When testing", "3. injected", __user__=ud)
+    r["orig_after_off"] = await content("learned-integration-check")
+    r["upd_2"] = await content("learned-integration-check-update")
+    await Skills.insert_new_skill(a.id, SkillForm(id="learned-foreign", name="Foreign", content="theirs", meta=SkillMeta(tags=[]), is_active=False))
+    r["foreign"] = await t.save_skill_draft("Foreign", "d", "mine now", __user__=ud)
+    r["foreign_content"] = await content("learned-foreign")
+    await Skills.insert_new_skill(a.id, SkillForm(id="learned-clash", name="Learned: Clash", content="approved", meta=SkillMeta(tags=["learned"]), is_active=True))
+    await Skills.insert_new_skill(a.id, SkillForm(id="learned-clash-update", name="Clash theirs", content="theirs", meta=SkillMeta(tags=[]), is_active=False))
+    r["clash"] = await t.save_skill_draft("Clash", "d", "new", __user__=ud)
+    r["clash_upd"] = await content("learned-clash-update")
+    for i in ("learned-foreign", "learned-clash", "learned-clash-update"):
+        await Skills.delete_skill_by_id(i)
+    r["list"] = await t.list_skill_drafts(__user__=ud)
+    print(json.dumps(r))
+asyncio.run(main())
+'@
     $saved = @{}; foreach ($k in $owuiEnv.Keys) { $saved[$k] = [Environment]::GetEnvironmentVariable($k); Set-LaiProcessEnv -Name $k -Value $owuiEnv[$k] }
     $prevEap = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
     try { $nbOut = @(& $owuiPy $drv $nbFile 2>$null) } finally { $ErrorActionPreference = $prevEap; foreach ($k in $saved.Keys) { Set-LaiProcessEnv -Name $k -Value $saved[$k] } }
-    $nbRes = @(); try { $nbRes = @(($nbOut | Where-Object { $_ -like '[[]*' } | Select-Object -Last 1) | ConvertFrom-Json) } catch { $nbRes = @() }
+    $nb = $null; try { $nb = ($nbOut | Where-Object { $_ -like '{*' } | Select-Object -Last 1) | ConvertFrom-Json } catch { $nb = $null }
     $draft = (Get-LaiWebUISkills -BaseUrl $WebUIUrl -Token $token)['learned-integration-check']
     $pMain = Get-LaiWebUIModel -BaseUrl $WebUIUrl -Token $token -Id $catalog.DefaultPreset
     $mainSkills = @(); if ($pMain.meta.PSObject.Properties['skillIds']) { $mainSkills = @($pMain.meta.skillIds) }
-    if ($nbRes.Count -ne 4 -or -not $draft -or $draft.is_active -or [string]$draft.content -ne '1. step one, improved' -or $mainSkills -notcontains 'learned-integration-check' -or [string]$nbRes[2] -notmatch 'Only the admin') {
-        Write-LaiLog FAIL "skill notebook in Open WebUI's Python: results $($nbRes -join ' | '); draft active=$($draft.is_active) content=$($draft.content); in $($catalog.DefaultPreset): $($mainSkills -contains 'learned-integration-check')"; $failures++
+    if (-not $nb) { Write-LaiLog FAIL "skill notebook in Open WebUI's Python gave no result: $($nbOut -join ' ')"; $failures++ }
+    else {
+        $checks = @(
+            @{ Ok = ([string]$nb.after_improve -eq '1. step one, improved' -and $mainSkills -contains 'learned-integration-check'); What = "a draft is saved, improved while untouched, and attached to $($catalog.DefaultPreset)" }
+            @{ Ok = ([string]$nb.nonadmin -match 'Only the admin'); What = 'a non-admin is refused' }
+            @{ Ok = ([string]$nb.orig_after_approved -eq '1. step one, improved' -and [string]$nb.upd_1 -eq '2. proposed'); What = 'an approved skill is never changed: the new text is a separate proposed update' }
+            @{ Ok = ([string]$nb.orig_after_off -eq '1. step one, improved' -and [string]$nb.upd_2 -eq '3. injected'); What = 'an approved skill switched off again is still never changed (a later call cannot slip text into it)' }
+            @{ Ok = ([string]$nb.foreign -match 'not one of my drafts' -and [string]$nb.foreign_content -eq 'theirs'); What = 'a skill not made by the notebook is refused' }
+            @{ Ok = ([string]$nb.clash -match 'not one of my drafts' -and [string]$nb.clash_upd -eq 'theirs'); What = 'a proposed-update id held by another skill is refused too' }
+            @{ Ok = ($draft -and -not $draft.is_active -and [string]$nb.list -match 'learned-integration-check-update'); What = 'drafts stay off and are listed' }
+        )
+        foreach ($c in $checks) { if (-not $c.Ok) { Write-LaiLog FAIL "skill notebook: $($c.What) ($($nb | ConvertTo-Json -Compress))"; $failures++ } }
     }
-    if ($failures -eq $skFail) { Write-LaiLog OK 'skills: seeded, offered in the presets, edits/removals/switched-off/name clashes handled; the notebook saves an off draft, improves it, refuses non-admins' }
+    if ($failures -eq $skFail) { Write-LaiLog OK 'skills: seeded, offered in the presets, edits/removals/returns/renames/twins/switched-off/name clashes/legacy presets/oversized files handled, a sync with nothing changed writes nothing; the notebook saves an off draft, improves it, never changes an approved or foreign skill, refuses non-admins' }
 } catch {
     Write-LaiLog FAIL "skills: $($_.Exception.Message)"; $failures++
 } finally {

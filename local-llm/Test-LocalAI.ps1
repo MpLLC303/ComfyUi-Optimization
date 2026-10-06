@@ -296,8 +296,12 @@ if ($script:token) {
         $all = Get-LaiWebUISkills -BaseUrl $webUrl -Token $token
         $files = @()
         if (Test-Path -LiteralPath $skillDir) { $files = @(Get-ChildItem -LiteralPath $skillDir -Directory | Where-Object { Test-Path -LiteralPath (Join-Path $_.FullName 'SKILL.md') }) }
-        # A folder whose skill is not in Open WebUI at all (switched off there is the user's choice and counts).
-        $notLoaded = @($files | Where-Object { $id = ($_.Name.ToLowerInvariant() -replace '[^a-z0-9_-]+', '-').Trim('-'); -not $all.ContainsKey($id) } | ForEach-Object { $_.Name })
+        # A folder whose skill is not in Open WebUI as a folder skill (a skill made there with the same id
+        # does not count), or that the sync still has switched off as removed. Switched off by you counts.
+        $notLoaded = @($files | Where-Object {
+                $sk = $all[(ConvertTo-LaiSkillId $_.Name)]
+                -not (Test-LaiSkillTag $sk 'localai-folder') -or (Test-LaiSkillTag $sk 'localai-removed')
+            } | ForEach-Object { $_.Name })
         $drafts = @($all.Values | Where-Object { (Test-LaiSkillTag $_ 'learned') -and -not $_.is_active })
         $on = @($all.Values | Where-Object { $_.is_active }).Count
         $main = Get-LaiWebUIModel -BaseUrl $webUrl -Token $token -Id $catalog.DefaultPreset
