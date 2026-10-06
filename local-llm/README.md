@@ -181,6 +181,25 @@ prompt processing before the first token appears. Both are normal.
   message, and Main, Fast and Code can't take images. The render guard drops them for those presets
   and leaves a note in the message ("image omitted"), so the chat keeps working, but the model can't
   see the screenshot any more. Only what Local Vision already wrote about it stays in the chat.
+- **It learns you (memory).** Every preset saves lasting things you tell it (preferences, projects,
+  your setup, standing instructions) without being asked, says so in one line ("Noted: ..."), and
+  updates rather than duplicates. It never keeps passwords, keys, account or ID numbers. See, edit or
+  delete what it remembers in Settings → Personalization → Memory (or just tell it to forget something).
+- **Skills.** A skill is a folder in `C:\AI\Skills` with a `SKILL.md`: a short front matter block
+  (`name:` and `description:`) and then the instructions in Markdown. That is the Agent Skills layout,
+  so skills written for other assistants can be dropped in as they are. After adding or editing one,
+  run Start menu → Local AI → *Sync skills* (or `C:\AI\Scripts\Sync-LocalAISkills.ps1`): every
+  preset then sees each skill's name and description and reads the full instructions only when a
+  question needs them. A deleted folder switches its skill off; skills you make in Workspace → Skills
+  are left alone. The first install puts three starter skills there (*Research with sources*,
+  *Troubleshoot step by step*, *Remember and improve*).
+- **It improves itself, with your approval.** When the assistant works out a method you are likely to
+  need again, it can save it with the *skill notebook* tool as a draft ("Learned: ..."). **Drafts start
+  switched off**: open Workspace → Skills, read it, and switch it on; from then on every preset offers
+  it. It can improve its own drafts, but never changes a skill you switched on (a new version arrives
+  as a separate "(proposed update)" draft) and never touches skills it did not make. The approval step
+  is deliberate: a skill is read in every later chat, so a web page or document the assistant read
+  must never be able to plant one by itself.
 - **Deep research** (installed with `-DeepResearch`): Start menu → Local AI → *Deep Research*, or
   `http://localhost:5055`. Sign in as `localai` with the password in `C:\AI\Secrets\deep-research.json`
   (the installer made the account and then turned sign-up off). Ask a question and pick *Quick
@@ -192,7 +211,7 @@ prompt processing before the first token appears. Both are normal.
   answer a burst with CAPTCHAs, which looks like "no sources found"; if that happens, wait a while and
   run it again. During a ComfyUI render it runs on the CPU like chats do, so it is much slower then.
   Its saved research is not in the nightly backup (only Open WebUI's data is). With the Tongyi model, research and Local Main (both about 19 GB) take turns on the GPU, so the first message after switching reloads the model.
-- **Start menu → Local AI:** opens Open WebUI, has *Gaming mode (free GPU)*, *Start again*, *Health check*, *ComfyUI (free GPU first)*, *Diagnostics (redacted zip)* and *Update toolkit*. Each script window stays open until you press Enter, so you can read the result.
+- **Start menu → Local AI:** opens Open WebUI, has *Gaming mode (free GPU)*, *Start again*, *Health check*, *ComfyUI (free GPU first)*, *Sync skills*, *Diagnostics (redacted zip)* and *Update toolkit*. Each script window stays open until you press Enter, so you can read the result.
 - **Before ComfyUI/Forge:** start ComfyUI with `C:\AI\Scripts\Start-ComfyUI.ps1` (add `-CreateShortcut` once for a desktop icon). It unloads Ollama, shows free VRAM and launches Comfy Desktop or the portable build. If ComfyUI is installed somewhere unusual, run it once as `C:\AI\Scripts\Start-ComfyUI.ps1 -Path <...\run_nvidia_gpu.bat or Comfy Desktop.exe>`; the path is remembered. For Forge or anything else, run `C:\AI\Scripts\Release-GPU.ps1`. Ollama keeps the last model in
   VRAM for 15 minutes, and a resident 19 GB model plus Wan 2.2 doesn't fit in 24 GB. On Windows, the
   driver then spills into system RAM instead of failing, so renders slow to a crawl without any error.

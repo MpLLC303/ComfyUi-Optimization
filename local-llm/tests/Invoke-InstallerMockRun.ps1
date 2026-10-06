@@ -232,6 +232,13 @@ $envFile = Get-Content -Encoding UTF8 (Join-Path $aiRoot 'Stack/.env')
 Assert-That ($code2 -eq 0) "phase 2 completes (exit $code2)"
 foreach ($s in 'Preflight', 'Ollama', 'Models', 'Tuning', 'WSL', 'Docker', 'Stack', 'Configure', 'Backup') { Assert-That ($null -ne $state.stages.$s) "stage $s recorded" }
 Assert-That (-not $global:Tasks.ContainsKey('LocalAI-Install-Resume')) 'resume task removed at the end'
+$seededSkills = @(Get-ChildItem -LiteralPath (Join-Path $aiRoot 'Skills') -Directory -ErrorAction SilentlyContinue | ForEach-Object { $_.Name })
+Assert-That ($seededSkills.Count -eq 3 -and $seededSkills -contains 'remember-and-improve') "the first install creates AI\Skills with the starter skills ($($seededSkills -join ', '))"
+Import-Module (Join-Path $copy 'lib/LocalAI.psm1') -Force
+$tok2 = Connect-LaiWebUI -BaseUrl 'http://127.0.0.1:3000' -Email $Email -Password $Password
+$nbTool = $null; try { $nbTool = Invoke-LaiApi -Uri 'http://127.0.0.1:3000/api/v1/tools/id/localai_skill_notebook' -Token $tok2 } catch { $nbTool = $null }
+$mainP = Get-LaiWebUIModel -BaseUrl 'http://127.0.0.1:3000' -Token $tok2 -Id 'local-main'
+Assert-That ($nbTool -and [string]$nbTool.content -notmatch '__LOCALAI_PRESETS__' -and @($mainP.meta.toolIds) -contains 'localai_skill_notebook' -and @($mainP.meta.skillIds) -contains 'research-with-sources') 'the skill notebook is installed with the presets filled in, and it and the starter skills are offered in Local Main'
 Assert-That ($state.flags.PSObject.Properties['configureWarnings'] -and @($state.flags.configureWarnings).Count -eq 0) "Configure read every setting back from the real Open WebUI: no warnings ($(@($state.flags.configureWarnings) -join ' | '))"
 Assert-That (-not (Select-String -LiteralPath (Join-Path $aiRoot 'install-report.md') -Pattern 'need attention' -Encoding UTF8 -Quiet)) 'a clean install report has no attention section'
 $sel = @($state.flags.selectedModels)
@@ -624,6 +631,8 @@ if ((& /usr/bin/docker image inspect $ldrImage 2>$null) -and $LASTEXITCODE -eq 0
         Invoke-LaiApi -Method POST -Uri 'http://127.0.0.1:3000/ollama/config/update' -Token $tok -Body @{ ENABLE_OLLAMA_API = $true; OLLAMA_BASE_URLS = [object[]]@('http://127.0.0.1:11434'); OLLAMA_API_CONFIGS = $cfgs } | Out-Null
     } catch { Write-Host "  could not point Open WebUI back at Ollama: $($_.Exception.Message)" -ForegroundColor Yellow }
     if ($guardProc -and -not $guardProc.HasExited) { $guardProc.Kill() }
+    # What the installer's skills step put into the shared Open WebUI (skills, the notebook, preset links).
+    & pwsh -NoProfile -File (Join-Path $PSScriptRoot 'Reset-Sandbox.ps1') -SkillsOnly -Email $Email -Password $Password | Out-Null
 }
 if ($failures -eq 0) { Write-Host "`nMOCK RUN PASSED" -ForegroundColor Green } else { Write-Host "`nMOCK RUN FAILED ($failures)" -ForegroundColor Red }
 exit $failures

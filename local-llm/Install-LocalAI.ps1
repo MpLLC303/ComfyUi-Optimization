@@ -199,7 +199,7 @@ $OllamaDir = Find-LaiOllamaDir -OrDefault
 $DockerExe = Find-LaiDockerDesktopExe -OrDefault
 $DockerBin = Join-Path (Split-Path -Parent $DockerExe) 'resources\bin'
 $ResumeTask = 'LocalAI-Install-Resume'
-$ToolkitItems = @('Install-LocalAI.ps1', 'Install-LocalAI.cmd', 'Test-LocalAI.ps1', 'Backup-OpenWebUI.ps1', 'Update-OpenWebUI.ps1', 'Release-GPU.ps1', 'Set-OpenWebUIPassword.ps1', 'Restore-OpenWebUI.ps1', 'Update-Models.ps1', 'Start-ComfyUI.ps1', 'Enable-TailscaleAccess.ps1', 'Watch-LocalAI.ps1', 'Uninstall-LocalAI.ps1', 'Stop-LocalAI.ps1', 'Start-LocalAI.ps1', 'Get-LocalAIDiagnostics.ps1', 'Get-LocalAI.ps1', 'VERSION', 'README.md', 'lib', 'config', 'stack')
+$ToolkitItems = @('Install-LocalAI.ps1', 'Install-LocalAI.cmd', 'Test-LocalAI.ps1', 'Backup-OpenWebUI.ps1', 'Update-OpenWebUI.ps1', 'Release-GPU.ps1', 'Set-OpenWebUIPassword.ps1', 'Restore-OpenWebUI.ps1', 'Update-Models.ps1', 'Start-ComfyUI.ps1', 'Enable-TailscaleAccess.ps1', 'Watch-LocalAI.ps1', 'Uninstall-LocalAI.ps1', 'Stop-LocalAI.ps1', 'Start-LocalAI.ps1', 'Get-LocalAIDiagnostics.ps1', 'Get-LocalAI.ps1', 'Sync-LocalAISkills.ps1', 'VERSION', 'README.md', 'lib', 'config', 'stack', 'skills')
 # After a reboot the resume task (not elevated) starts this copy, which asks for admin rights with a
 # UAC prompt. The prompt names powershell.exe, not the script, so the script it runs must be one
 # only Administrators can change: not C:\AI\Scripts (the user has full control of C:\AI and can
@@ -632,6 +632,37 @@ function Get-StackEnvValue([string]$Name) {
     if (-not (Test-Path -LiteralPath $envPath)) { return '' }
     foreach ($line in (Get-Content -Encoding UTF8 -LiteralPath $envPath)) { if ($line -like "$Name=*") { return $line.Substring($Name.Length + 1) } }
     return ''
+}
+
+function Invoke-SkillsSetup {
+    # Skills (<AIRoot>\Skills, synced into Open WebUI and offered in every preset) and the skill
+    # notebook, the tool the assistant saves what worked with (as drafts you switch on). Optional
+    # like the RAG settings: returns warnings instead of stopping the install before the backup.
+    param([Parameter(Mandatory)][string]$Token)
+    Write-LaiLog STEP "Skills: $(Join-Path $AIRoot 'Skills') and the skill notebook"
+    $presetIds = @($Catalog.Models | ForEach-Object { $_.Preset })
+    $warn = @()
+    try {
+        $code = (Get-Content -Encoding UTF8 -Raw -LiteralPath (Join-Path $SourceRoot 'stack\openwebui-tools\skill_notebook.py')).Replace('__LOCALAI_PRESETS__', ($presetIds -join ','))
+        $act = Set-LaiWebUITool -BaseUrl $WebUIUrl -Token $Token -Id 'localai_skill_notebook' -Name 'Skill notebook (Local AI)' -Content $code `
+            -Description 'Saves a procedure that worked as a skill draft; drafts stay off until you switch them on in Workspace > Skills.'
+        foreach ($presetId in $presetIds) { Add-LaiPresetSkills -BaseUrl $WebUIUrl -Token $Token -PresetId $presetId -ToolIds @('localai_skill_notebook') | Out-Null }
+        Write-LaiLog OK "Skill notebook tool $act and offered in the presets"
+    } catch {
+        $why = $_.Exception.Message -replace '\s+', ' '
+        $warn += "The skill notebook (drafts the assistant saves) was not installed ($why); run the installer again"
+    }
+    try {
+        $r = Invoke-LaiSkillSync -BaseUrl $WebUIUrl -Token $Token -Folder (Join-Path $AIRoot 'Skills') -SeedFrom (Join-Path $SourceRoot 'skills') -PresetIds $presetIds
+        if ($r.Seeded.Count) { Write-LaiLog OK "Created $(Join-Path $AIRoot 'Skills') with the starter skills: $($r.Seeded -join ', ')" }
+        Write-LaiLog OK ("Skills: {0} offered ({1} added, {2} updated, {3} switched off)" -f @($r.ActiveIds).Count, @($r.Created).Count, @($r.Updated).Count, @($r.Disabled).Count)
+        foreach ($sk in $r.Skipped) { $warn += "Skill skipped: $sk" }
+    } catch {
+        $why = $_.Exception.Message -replace '\s+', ' '
+        $warn += "Skills were not synced ($why); run Start menu > Local AI > Sync skills"
+    }
+    foreach ($w in $warn) { Write-LaiLog WARN $w }
+    return $warn
 }
 
 function Invoke-DeepResearchSetup {
@@ -1580,6 +1611,7 @@ Invoke-Stage 'Configure' {
     # before the Backup stage; they are repeated in the report and at the end.
     $State.flags['configureWarnings'] = @(Invoke-LaiWebUISetup -BaseUrl $WebUIUrl -Token $token -Models $Catalog.Models -ModelResults $State.tuning `
         -SystemPrompt $SystemPrompt -DefaultPreset $Catalog.DefaultPreset -Collections $KnowledgeCollections)
+    $State.flags['configureWarnings'] = @($State.flags['configureWarnings']) + @(Invoke-SkillsSetup -Token $token)
     if ($DeepResearch) {
         Write-LaiLog STEP 'Deep research: account and model check'
         $State.flags['configureWarnings'] = @($State.flags['configureWarnings']) + @(Invoke-DeepResearchSetup)

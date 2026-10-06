@@ -199,6 +199,85 @@ $leftFiles = @(Get-LaiWebUISelfTestLeftover -BaseUrl $WebUIUrl -Token $token | W
 if ($leftover.Count -gt 0 -or $leftFiles.Count -gt 0) { Write-LaiLog FAIL "self-test collection or file was not cleaned up ($($leftover.Count) collection(s), $($leftFiles.Count) file(s))"; $failures++ }
 else { Write-LaiLog OK "the self-test removed an interrupted run's collection and file and its own, and kept the user's similar collection" }
 
+# Skills: <AIRoot>\Skills synced into the real Open WebUI, and the skill notebook tool run in Open
+# WebUI's own Python against its own database (as Open WebUI runs it when the model calls it).
+$skFail = $failures
+& pwsh -NoProfile -File (Join-Path $PSScriptRoot 'Reset-Sandbox.ps1') -SkillsOnly -WebUIUrl $WebUIUrl -Email $Email -Password $Password | Out-Null
+$skDir = Join-Path ([System.IO.Path]::GetTempPath()) ('lai-skills-' + [guid]::NewGuid().ToString('N'))
+$presetIds = @($catalog.Models | ForEach-Object { $_.Preset })
+try {
+    $r1 = Invoke-LaiSkillSync -BaseUrl $WebUIUrl -Token $token -Folder $skDir -SeedFrom (Join-Path $root 'skills') -PresetIds $presetIds
+    $starters = @(Get-ChildItem -LiteralPath (Join-Path $root 'skills') -Directory | ForEach-Object { $_.Name })
+    $p1 = Get-LaiWebUIModel -BaseUrl $WebUIUrl -Token $token -Id $catalog.DefaultPreset
+    $att = @(); if ($p1.meta.PSObject.Properties['skillIds']) { $att = @($p1.meta.skillIds) }
+    if (@($r1.Seeded).Count -ne $starters.Count -or @($r1.Created).Count -ne $starters.Count -or @($starters | Where-Object { $att -notcontains $_ }).Count) { Write-LaiLog FAIL "first sync: seeded $(@($r1.Seeded) -join ',') created $(@($r1.Created) -join ',') attached $($att -join ',')"; $failures++ }
+    # Edited, switched off in Open WebUI, removed, and a name already taken by a skill made in Open WebUI.
+    Add-Content -LiteralPath (Join-Path (Join-Path $skDir 'research-with-sources') 'SKILL.md') -Value "`nExtra line from the integration test."
+    Invoke-LaiApi -Method POST -Uri "$WebUIUrl/api/v1/skills/id/troubleshoot-step-by-step/toggle" -Token $token | Out-Null
+    Remove-Item -LiteralPath (Join-Path $skDir 'remember-and-improve') -Recurse -Force
+    Invoke-LaiApi -Method POST -Uri "$WebUIUrl/api/v1/skills/create" -Token $token -Body @{ id = 'made-in-webui'; name = 'Made in Open WebUI'; description = 'd'; content = 'mine'; meta = @{ tags = @() }; is_active = $true } | Out-Null
+    New-Item -ItemType Directory -Force -Path (Join-Path $skDir 'made-in-webui') | Out-Null
+    Set-Content -LiteralPath (Join-Path (Join-Path $skDir 'made-in-webui') 'SKILL.md') -Value "---`nname: Clash`ndescription: x`n---`nfrom the folder"
+    $r2 = Invoke-LaiSkillSync -BaseUrl $WebUIUrl -Token $token -Folder $skDir -SeedFrom (Join-Path $root 'skills') -PresetIds $presetIds
+    $all2 = Get-LaiWebUISkills -BaseUrl $WebUIUrl -Token $token
+    $checks = @(
+        @{ Ok = (@($r2.Seeded).Count -eq 0); What = 'an existing folder is not seeded again (a deleted starter skill stays deleted)' }
+        @{ Ok = (@($r2.Updated) -contains 'research-with-sources' -and [string]$all2['research-with-sources'].content -match 'Extra line from the integration test'); What = 'an edited SKILL.md updates its skill' }
+        @{ Ok = ($all2['troubleshoot-step-by-step'] -and -not $all2['troubleshoot-step-by-step'].is_active -and @($r2.Updated) -notcontains 'troubleshoot-step-by-step'); What = 'a skill switched off in Open WebUI stays off' }
+        @{ Ok = (@($r2.Disabled) -contains 'remember-and-improve' -and -not $all2['remember-and-improve'].is_active); What = 'a removed folder switches its skill off' }
+        @{ Ok = (@($r2.Skipped | Where-Object { $_ -match "'made-in-webui' already exists" }).Count -eq 1 -and [string]$all2['made-in-webui'].content -eq 'mine'); What = 'a skill made in Open WebUI is never overwritten by a folder of the same name' }
+    )
+    foreach ($c in $checks) { if (-not $c.Ok) { Write-LaiLog FAIL "skills sync: $($c.What)"; $failures++ } }
+    Invoke-LaiApi -Method DELETE -Uri "$WebUIUrl/api/v1/skills/id/made-in-webui/delete" -Token $token | Out-Null
+
+    # The notebook tool: created, unchanged, updated through the API; then its functions in Open WebUI's Python.
+    $nbCode = (Get-Content -Encoding UTF8 -Raw -LiteralPath (Join-Path $root 'stack/openwebui-tools/skill_notebook.py')).Replace('__LOCALAI_PRESETS__', ($presetIds -join ','))
+    $t1 = Set-LaiWebUITool -BaseUrl $WebUIUrl -Token $token -Id 'localai_skill_notebook' -Name 'Skill notebook (Local AI)' -Content $nbCode
+    $t2 = Set-LaiWebUITool -BaseUrl $WebUIUrl -Token $token -Id 'localai_skill_notebook' -Name 'Skill notebook (Local AI)' -Content $nbCode
+    $t3 = Set-LaiWebUITool -BaseUrl $WebUIUrl -Token $token -Id 'localai_skill_notebook' -Name 'Skill notebook (Local AI)' -Content ($nbCode + "`n")
+    if ("$t1/$t2/$t3" -ne 'created/unchanged/updated') { Write-LaiLog FAIL "notebook tool via the API: $t1/$t2/$t3"; $failures++ }
+    $owuiPid = @(& pgrep -f 'open-webui serve' | Where-Object { $_ }) | Select-Object -First 1
+    # The interpreter as started (its venv path), not /proc/<pid>/exe: that resolves to the system
+    # Python, which does not see the venv's packages.
+    $owuiPy = @([System.IO.File]::ReadAllText("/proc/$owuiPid/cmdline") -split [char]0)[0]
+    $owuiEnv = @{}
+    foreach ($kv in ([System.IO.File]::ReadAllText("/proc/$owuiPid/environ") -split [char]0)) { if ($kv -match '^(DATA_DIR|WEBUI_SECRET_KEY|DATABASE_URL)=(.*)$') { $owuiEnv[$Matches[1]] = $Matches[2] } }
+    $drv = Join-Path $skDir 'notebook_driver.py'
+    $nbFile = Join-Path $skDir 'skill_notebook.py'
+    [System.IO.File]::WriteAllText($nbFile, $nbCode, (New-Object System.Text.UTF8Encoding($false)))
+    Set-Content -LiteralPath $drv -Encoding ascii -Value @(
+        'import asyncio, importlib.util, json, sys'
+        'spec = importlib.util.spec_from_file_location("nb", sys.argv[1]); nb = importlib.util.module_from_spec(spec); spec.loader.exec_module(nb)'
+        'from open_webui.models.users import Users'
+        'async def main():'
+        '    users = await Users.get_users(); lst = users["users"] if isinstance(users, dict) else users'
+        '    a = [u for u in lst if u.role == "admin"][0]; ud = {"id": a.id, "role": "admin"}'
+        '    t = nb.Tools(); out = []'
+        '    out.append(await t.save_skill_draft("Integration check", "When testing", "1. step one", __user__=ud))'
+        '    out.append(await t.save_skill_draft("Integration check", "When testing", "1. step one, improved", __user__=ud))'
+        '    out.append(await t.save_skill_draft("x", "y", "z", __user__={"id": "u", "role": "user"}))'
+        '    out.append(await t.list_skill_drafts(__user__=ud))'
+        '    print(json.dumps(out))'
+        'asyncio.run(main())'
+    )
+    $saved = @{}; foreach ($k in $owuiEnv.Keys) { $saved[$k] = [Environment]::GetEnvironmentVariable($k); Set-LaiProcessEnv -Name $k -Value $owuiEnv[$k] }
+    $prevEap = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
+    try { $nbOut = @(& $owuiPy $drv $nbFile 2>$null) } finally { $ErrorActionPreference = $prevEap; foreach ($k in $saved.Keys) { Set-LaiProcessEnv -Name $k -Value $saved[$k] } }
+    $nbRes = @(); try { $nbRes = @(($nbOut | Where-Object { $_ -like '[[]*' } | Select-Object -Last 1) | ConvertFrom-Json) } catch { $nbRes = @() }
+    $draft = (Get-LaiWebUISkills -BaseUrl $WebUIUrl -Token $token)['learned-integration-check']
+    $pMain = Get-LaiWebUIModel -BaseUrl $WebUIUrl -Token $token -Id $catalog.DefaultPreset
+    $mainSkills = @(); if ($pMain.meta.PSObject.Properties['skillIds']) { $mainSkills = @($pMain.meta.skillIds) }
+    if ($nbRes.Count -ne 4 -or -not $draft -or $draft.is_active -or [string]$draft.content -ne '1. step one, improved' -or $mainSkills -notcontains 'learned-integration-check' -or [string]$nbRes[2] -notmatch 'Only the admin') {
+        Write-LaiLog FAIL "skill notebook in Open WebUI's Python: results $($nbRes -join ' | '); draft active=$($draft.is_active) content=$($draft.content); in $($catalog.DefaultPreset): $($mainSkills -contains 'learned-integration-check')"; $failures++
+    }
+    if ($failures -eq $skFail) { Write-LaiLog OK 'skills: seeded, offered in the presets, edits/removals/switched-off/name clashes handled; the notebook saves an off draft, improves it, refuses non-admins' }
+} catch {
+    Write-LaiLog FAIL "skills: $($_.Exception.Message)"; $failures++
+} finally {
+    Remove-Item -LiteralPath $skDir -Recurse -Force -ErrorAction SilentlyContinue
+    & pwsh -NoProfile -File (Join-Path $PSScriptRoot 'Reset-Sandbox.ps1') -SkillsOnly -WebUIUrl $WebUIUrl -Email $Email -Password $Password | Out-Null
+}
+
 # The optional research agent (-DeepResearch): the real Local Deep Research image against the
 # sandbox's Ollama, through the module functions the installer and Test-LocalAI use. A research run
 # itself takes minutes on this CPU and is left to Test-LocalAI on the real PC.

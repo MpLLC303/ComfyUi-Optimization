@@ -28,6 +28,9 @@ param(
     [switch]$Check,
     [switch]$SkipWebUI,
     [switch]$LeftoversOnly,
+    # Only remove what the skills feature put into the shared Open WebUI (the installer mock run and
+    # the integration test call this when they finish).
+    [switch]$SkillsOnly,
     # The sandbox services and the admin login every suite expects.
     [string]$WebUIUrl = 'http://127.0.0.1:3000',
     [string]$OllamaUrl = 'http://127.0.0.1:11434',
@@ -73,6 +76,39 @@ $real = @((Invoke-DockerCli @('ps', '-a', '--format', '{{.Names}} {{.Image}}')).
 if ($real.Count) {
     Write-Host "  Refusing: this Docker engine runs a real Open WebUI ($($real -join ', ')). Run the tests on a sandbox only." -ForegroundColor Red
     exit 1
+}
+
+function Invoke-SkillsCleanup([string]$Token) {
+    # The skills feature (installer Configure stage, integration test): folder skills, learned
+    # drafts, the skill notebook tool, and the presets' references to them.
+    $all = Get-LaiWebUISkills -BaseUrl $WebUIUrl -Token $Token
+    $ours = @($all.Values | Where-Object { (Test-LaiSkillTag $_ 'localai-folder') -or (Test-LaiSkillTag $_ 'learned') } | ForEach-Object { [string]$_.id })
+    foreach ($sid in $ours) {
+        Invoke-Repair "skill $sid (made by a test)" { Invoke-LaiApi -Method DELETE -Uri "$WebUIUrl/api/v1/skills/id/$sid/delete" -Token $Token | Out-Null }
+    }
+    $nb = $null; try { $nb = Invoke-LaiApi -Uri "$WebUIUrl/api/v1/tools/id/localai_skill_notebook" -Token $Token } catch { $nb = $null }
+    if ($nb) { Invoke-Repair 'the skill notebook tool (made by a test)' { Invoke-LaiApi -Method DELETE -Uri "$WebUIUrl/api/v1/tools/id/localai_skill_notebook/delete" -Token $Token | Out-Null } }
+    foreach ($pm in @(Invoke-LaiApi -Uri "$WebUIUrl/api/v1/models/export" -Token $Token | ForEach-Object { $_ })) {
+        if (-not $pm -or -not $pm.meta) { continue }
+        $sk = @(); if ($pm.meta.PSObject.Properties['skillIds']) { $sk = @($pm.meta.skillIds) }
+        $tl = @(); if ($pm.meta.PSObject.Properties['toolIds']) { $tl = @($pm.meta.toolIds) }
+        $stale = @($sk | Where-Object { $ours -contains $_ -or $_ -like 'learned-*' }) + @($tl | Where-Object { $_ -eq 'localai_skill_notebook' })
+        if (-not $stale.Count) { continue }
+        Invoke-Repair "preset $([string]$pm.id) still offers $($stale -join ', ')" {
+            $form = ConvertTo-LaiHashtable $pm
+            $form['meta']['skillIds'] = [object[]]@($sk | Where-Object { $stale -notcontains $_ })
+            $form['meta']['toolIds'] = [object[]]@($tl | Where-Object { $stale -notcontains $_ })
+            if ($null -eq $form['params']) { $form['params'] = @{} }
+            Invoke-LaiApi -Method POST -Uri "$WebUIUrl/api/v1/models/model/update" -Body $form -Token $Token | Out-Null
+        }
+    }
+}
+
+if ($SkillsOnly) {
+    $token = Connect-LaiWebUI -BaseUrl $WebUIUrl -Email $Email -Password $Password
+    Invoke-SkillsCleanup -Token $token
+    Write-Host ("Skills cleanup: {0} item(s) found, {1} could not be removed" -f $script:found, $script:unfixed)
+    exit $script:unfixed
 }
 
 # ---- containers -----------------------------------------------------------------------------------
@@ -184,6 +220,7 @@ if (-not $SkipWebUI) {
         }
     }
     if ($token) {
+        Invoke-SkillsCleanup -Token $token
         # A run killed during a RAG self-test leaves its collection and file; the next suite's
         # leftover check would fail for that reason.
         foreach ($left in @(Get-LaiWebUISelfTestLeftover -BaseUrl $WebUIUrl -Token $token)) {

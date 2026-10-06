@@ -1744,6 +1744,190 @@ function Get-LaiSearxngProbe {
 
 #endregion
 
+#region Skills (<AIRoot>\Skills -> Open WebUI Skills) and the skill notebook (drafts the model writes) ---
+
+# Folder skills carry this tag: the sync only ever changes or switches off skills it made itself.
+$script:LaiFolderSkillTag = 'localai-folder'
+# Drafts the skill notebook tool writes carry this one (it never touches any other skill).
+$script:LaiLearnedSkillTag = 'learned'
+
+function ConvertFrom-LaiSkillFile {
+    <#
+    .SYNOPSIS
+        Reads one SKILL.md in the Agent Skills layout: YAML front matter with name and description,
+        then the instructions. The id is the folder name, reduced to what Open WebUI ids allow.
+    #>
+    param([Parameter(Mandatory)][string]$Path)
+    $text = [System.IO.File]::ReadAllText($Path, [System.Text.Encoding]::UTF8)
+    $folder = Split-Path -Leaf (Split-Path -Parent $Path)
+    $id = ($folder.ToLowerInvariant() -replace '[^a-z0-9_-]+', '-').Trim('-')
+    $name = $folder; $desc = ''; $body = $text
+    $fm = [regex]::Match($text, '(?s)\A\s*---[ \t]*\r?\n(.*?)\r?\n---[ \t]*(\r?\n|\z)(.*)\z')
+    if ($fm.Success) {
+        $body = $fm.Groups[3].Value
+        $lines = @($fm.Groups[1].Value -split '\r?\n')
+        for ($i = 0; $i -lt $lines.Count; $i++) {
+            $kv = [regex]::Match($lines[$i], '^(name|description)\s*:\s*(.*?)\s*$')
+            if (-not $kv.Success) { continue }
+            $key = $kv.Groups[1].Value; $val = $kv.Groups[2].Value
+            # 'description: >' or '|': the indented lines below are the value.
+            if ($val -eq '>' -or $val -eq '|' -or $val -eq '>-' -or $val -eq '|-') {
+                $more = @()
+                while ($i + 1 -lt $lines.Count -and $lines[$i + 1] -match '^\s+\S') { $i++; $more += $lines[$i].Trim() }
+                $val = $more -join ' '
+            }
+            $val = $val.Trim().Trim('"').Trim("'")
+            if ($key -eq 'name' -and $val) { $name = $val } elseif ($key -eq 'description') { $desc = $val }
+        }
+    }
+    return [pscustomobject]@{ Id = $id; Name = $name; Description = $desc; Content = $body.Trim() }
+}
+
+function Get-LaiWebUISkills {
+    # Every skill with its content (admin), keyed by id.
+    param([string]$BaseUrl = 'http://127.0.0.1:3000', [Parameter(Mandatory)][string]$Token)
+    $all = @{}
+    foreach ($sk in @(Invoke-LaiApi -Uri "$BaseUrl/api/v1/skills/export" -Token $Token | ForEach-Object { $_ })) {
+        if ($sk -and $sk.PSObject.Properties['id']) { $all[[string]$sk.id] = $sk }
+    }
+    return $all
+}
+
+function Test-LaiSkillTag($Skill, [string]$Tag) {
+    if (-not $Skill -or -not $Skill.PSObject.Properties['meta'] -or -not $Skill.meta) { return $false }
+    if (-not $Skill.meta.PSObject.Properties['tags']) { return $false }
+    return (@($Skill.meta.tags) -contains $Tag)
+}
+
+function Sync-LaiWebUISkills {
+    <#
+    .SYNOPSIS
+        Makes Open WebUI's skills match <AIRoot>\Skills: one skill per <folder>\SKILL.md, created or
+        updated in place, and switched off when its folder is gone. Skills made in Open WebUI itself
+        and the notebook's drafts are never changed. A skill you switched off in Open WebUI stays off
+        while its file is unchanged. Returns Created/Updated/Disabled/Skipped and the ids now active.
+    #>
+    param([string]$BaseUrl = 'http://127.0.0.1:3000', [Parameter(Mandatory)][string]$Token, [Parameter(Mandatory)][string]$Folder)
+    $result = [pscustomobject]@{ Created = @(); Updated = @(); Disabled = @(); Skipped = @(); ActiveIds = @() }
+    $existing = Get-LaiWebUISkills -BaseUrl $BaseUrl -Token $Token
+    $seen = @()
+    $files = @()
+    if (Test-Path -LiteralPath $Folder) {
+        $files = @(Get-ChildItem -LiteralPath $Folder -Directory -ErrorAction SilentlyContinue | Sort-Object Name |  # lai-ok: objects
+            ForEach-Object { Join-Path $_.FullName 'SKILL.md' } | Where-Object { Test-Path -LiteralPath $_ })
+    }
+    foreach ($f in $files) {
+        $folderName = Split-Path -Leaf (Split-Path -Parent $f)
+        if ((Get-Item -LiteralPath $f).Length -gt 102400) { $result.Skipped += "$folderName\SKILL.md is over 100 KB (each chat that uses it would carry all of it)"; continue }
+        $sk = ConvertFrom-LaiSkillFile -Path $f
+        if (-not $sk.Id) { $result.Skipped += "$folderName has no letters or digits to make an id from; rename the folder"; continue }
+        if (-not $sk.Content) { $result.Skipped += "$folderName\SKILL.md has no instructions after its front matter"; continue }
+        $seen += $sk.Id
+        $e = $null; if ($existing.ContainsKey($sk.Id)) { $e = $existing[$sk.Id] }
+        if ($e -and -not (Test-LaiSkillTag $e $script:LaiFolderSkillTag)) {
+            $result.Skipped += "'$($sk.Id)' already exists in Open WebUI (made there or by the notebook); rename the folder $folderName to keep both"
+            continue
+        }
+        $form = @{ id = $sk.Id; name = $sk.Name; description = $sk.Description; content = $sk.Content; meta = @{ tags = @($script:LaiFolderSkillTag) }; is_active = $true }
+        try {
+            if (-not $e) {
+                Invoke-LaiApi -Method POST -Uri "$BaseUrl/api/v1/skills/create" -Body $form -Token $Token | Out-Null
+                $result.Created += $sk.Id
+                $result.ActiveIds += $sk.Id
+            } else {
+                $form['is_active'] = [bool]$e.is_active   # an update form without it would switch the skill back on
+                if ([string]$e.content -cne $sk.Content -or [string]$e.name -cne $sk.Name -or [string]$e.description -cne $sk.Description) {
+                    Invoke-LaiApi -Method POST -Uri "$BaseUrl/api/v1/skills/id/$($sk.Id)/update" -Body $form -Token $Token | Out-Null
+                    $result.Updated += $sk.Id
+                }
+                if ($e.is_active) { $result.ActiveIds += $sk.Id }
+            }
+        } catch {
+            # Most often: another skill already has this name (names are unique in Open WebUI).
+            $result.Skipped += "'$($sk.Id)': $((Get-LaiHttpErrorText $_) -replace '\s+', ' ')"
+        }
+    }
+    foreach ($id in @($existing.Keys)) {
+        $e = $existing[$id]
+        if ((Test-LaiSkillTag $e $script:LaiFolderSkillTag) -and $seen -notcontains $id -and $e.is_active) {
+            Invoke-LaiApi -Method POST -Uri "$BaseUrl/api/v1/skills/id/$id/toggle" -Token $Token | Out-Null
+            $result.Disabled += $id
+        }
+    }
+    return $result
+}
+
+function Add-LaiPresetSkills {
+    # Offers skills (and tools) in a preset: Open WebUI lists attached skills to the model, which
+    # loads one's full instructions only when it needs them. Ids already there stay; returns whether
+    # anything was added.
+    param([string]$BaseUrl = 'http://127.0.0.1:3000', [Parameter(Mandatory)][string]$Token, [Parameter(Mandatory)][string]$PresetId,
+        [string[]]$SkillIds = @(), [string[]]$ToolIds = @())
+    $existing = Get-LaiWebUIModel -BaseUrl $BaseUrl -Token $Token -Id $PresetId
+    if (-not $existing) { return $false }
+    $form = ConvertTo-LaiHashtable $existing
+    if (-not $form.ContainsKey('meta') -or $null -eq $form['meta']) { $form['meta'] = @{} }
+    $changed = $false
+    foreach ($pair in @(@{ Key = 'skillIds'; Add = $SkillIds }, @{ Key = 'toolIds'; Add = $ToolIds })) {
+        $have = @(); if ($form['meta'].ContainsKey($pair.Key) -and $form['meta'][$pair.Key]) { $have = @($form['meta'][$pair.Key]) }
+        $new = @($have + @($pair.Add | Where-Object { $_ -and $have -notcontains $_ }))
+        if ($new.Count -ne $have.Count) { $form['meta'][$pair.Key] = [object[]]$new; $changed = $true }
+    }
+    if (-not $changed) { return $false }
+    $form['id'] = $PresetId
+    if ($null -eq $form['params']) { $form['params'] = @{} }
+    Invoke-LaiApi -Method POST -Uri "$BaseUrl/api/v1/models/model/update" -Body $form -Token $Token | Out-Null
+    return $true
+}
+
+function Invoke-LaiSkillSync {
+    <#
+    .SYNOPSIS
+        The whole skills step, shared by Sync-LocalAISkills.ps1 and the installer: makes the folder (with
+        the toolkit's starter skills) the first time, syncs it, and offers every active skill in the given
+        presets. Returns the result of Sync-LaiWebUISkills plus Seeded and Attached.
+    #>
+    param([string]$BaseUrl = 'http://127.0.0.1:3000', [Parameter(Mandatory)][string]$Token, [Parameter(Mandatory)][string]$Folder,
+        [string]$SeedFrom = '', [string[]]$PresetIds = @())
+    $seeded = @()
+    if (-not (Test-Path -LiteralPath $Folder)) {
+        New-Item -ItemType Directory -Force -Path $Folder | Out-Null
+        # Only when the folder does not exist yet: skills you deleted from it are not brought back.
+        if ($SeedFrom -and (Test-Path -LiteralPath $SeedFrom)) {
+            foreach ($d in @(Get-ChildItem -LiteralPath $SeedFrom -Directory)) {
+                Copy-Item -LiteralPath $d.FullName -Destination (Join-Path $Folder $d.Name) -Recurse -Force
+                $seeded += $d.Name
+            }
+        }
+    }
+    $r = Sync-LaiWebUISkills -BaseUrl $BaseUrl -Token $Token -Folder $Folder
+    $attached = @()
+    foreach ($presetId in $PresetIds) {
+        if (Add-LaiPresetSkills -BaseUrl $BaseUrl -Token $Token -PresetId $presetId -SkillIds @($r.ActiveIds)) { $attached += $presetId }
+    }
+    $r | Add-Member -NotePropertyName Seeded -NotePropertyValue $seeded
+    $r | Add-Member -NotePropertyName Attached -NotePropertyValue $attached
+    return $r
+}
+
+function Set-LaiWebUITool {
+    # Creates or updates a workspace tool from Python source (admin). Returns 'created' / 'updated' / 'unchanged'.
+    param([string]$BaseUrl = 'http://127.0.0.1:3000', [Parameter(Mandatory)][string]$Token, [Parameter(Mandatory)][string]$Id,
+        [Parameter(Mandatory)][string]$Name, [Parameter(Mandatory)][string]$Content, [string]$Description = '')
+    $current = $null
+    try { $current = Invoke-LaiApi -Uri "$BaseUrl/api/v1/tools/id/$Id" -Token $Token } catch { if ((Get-LaiHttpStatus $_) -notin 401, 404) { throw } }
+    $form = @{ id = $Id; name = $Name; content = $Content; meta = @{ description = $Description; manifest = @{} } }
+    if (-not $current) {
+        Invoke-LaiApi -Method POST -Uri "$BaseUrl/api/v1/tools/create" -Body $form -Token $Token | Out-Null
+        return 'created'
+    }
+    if ([string]$current.content -ceq $Content) { return 'unchanged' }
+    Invoke-LaiApi -Method POST -Uri "$BaseUrl/api/v1/tools/id/$Id/update" -Body $form -Token $Token | Out-Null
+    return 'updated'
+}
+
+#endregion
+
 #region Deep research (Local Deep Research, optional: Install-LocalAI.ps1 -DeepResearch) ---------
 
 function Get-LaiDeepResearchEnv {
@@ -2382,6 +2566,7 @@ function Get-LaiShortcutSpecs {
         @{ Name = 'Local AI - Health check'; Script = 'Test-LocalAI.ps1'; Extra = ' -Quick'; Log = $true }
         @{ Name = 'ComfyUI (free GPU first)'; Script = 'Start-ComfyUI.ps1'; Extra = ''; Log = $true }
         @{ Name = 'Local AI - Diagnostics (redacted zip)'; Script = 'Get-LocalAIDiagnostics.ps1'; Extra = ' -RunTests' }
+        @{ Name = 'Local AI - Sync skills'; Script = 'Sync-LocalAISkills.ps1'; Extra = ''; Log = $true }
         @{ Name = 'Local AI - Update toolkit'; Script = 'Get-LocalAI.ps1'; Extra = ''; Env = 'LOCALAI_ROOT' }
     )
     $specs = @([pscustomobject]@{ Name = 'Local AI (Open WebUI)'; Kind = 'url'; Script = ''; Target = "http://localhost:$WebUIPort/"; Arguments = ''; TooLong = $false })

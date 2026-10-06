@@ -291,6 +291,22 @@ Add-Check 'Open WebUI admin login' {
 
 if ($script:token) {
     $token = $script:token
+    Add-Check 'Skills and the skill notebook' {
+        $skillDir = Join-Path $AIRoot 'Skills'
+        $all = Get-LaiWebUISkills -BaseUrl $webUrl -Token $token
+        $files = @()
+        if (Test-Path -LiteralPath $skillDir) { $files = @(Get-ChildItem -LiteralPath $skillDir -Directory | Where-Object { Test-Path -LiteralPath (Join-Path $_.FullName 'SKILL.md') }) }
+        # A folder whose skill is not in Open WebUI at all (switched off there is the user's choice and counts).
+        $notLoaded = @($files | Where-Object { $id = ($_.Name.ToLowerInvariant() -replace '[^a-z0-9_-]+', '-').Trim('-'); -not $all.ContainsKey($id) } | ForEach-Object { $_.Name })
+        $drafts = @($all.Values | Where-Object { (Test-LaiSkillTag $_ 'learned') -and -not $_.is_active })
+        $on = @($all.Values | Where-Object { $_.is_active }).Count
+        $main = Get-LaiWebUIModel -BaseUrl $webUrl -Token $token -Id $catalog.DefaultPreset
+        $hasNotebook = $main -and $main.meta -and $main.meta.PSObject.Properties['toolIds'] -and (@($main.meta.toolIds) -contains 'localai_skill_notebook')
+        $draftNote = ''; if ($drafts.Count) { $draftNote = "; $($drafts.Count) learned draft(s) waiting for you in Workspace > Skills" }
+        if (-not $hasNotebook) { return (Warn "the skill notebook is not offered in $($catalog.DefaultPreset) - run the installer again$draftNote") }
+        if ($notLoaded.Count) { return (Warn "not loaded yet: $($notLoaded -join ', ') - Start menu > Local AI > Sync skills$draftNote") }
+        Pass "$on skill(s) on, notebook offered$draftNote"
+    }
     Add-Check 'Open WebUI sees Ollama models' {
         $ids = Get-LaiWebUIModelIds -BaseUrl $webUrl -Token $token
         $missing = @($catalog.Models | Where-Object { $ids -notcontains "$($_.Alias):latest" } | ForEach-Object { $_.Alias })
