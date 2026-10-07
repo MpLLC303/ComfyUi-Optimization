@@ -322,15 +322,19 @@ Assert-That ((& $restartCalls) -eq 0) 'fresh install: no render-guard restart ne
 $stG = Get-Content -Encoding UTF8 -Raw (Join-Path $aiRoot 'install-state.json') | ConvertFrom-Json
 Assert-That ([string]$stG.flags.guardHash -ne '') 'the started render-guard code is recorded'
 $stG.flags.guardHash = 'hash-of-an-older-version'
+# As after a first install that stopped before its end screen: the password it made is still to be shown.
+$stG.flags | Add-Member -NotePropertyName adminPasswordToShow -NotePropertyValue $true -Force
 $stG | ConvertTo-Json -Depth 20 | Set-Content (Join-Path $aiRoot 'install-state.json')
 $sw = [Diagnostics.Stopwatch]::StartNew()
 # One optional step fails (a rejected knowledge collection): a warning in the report, not a failed install.
 $env:LOCALAI_TEST_KNOWLEDGE_FAIL = 'PC & Electronics'
-& (Join-Path $aiRoot 'Scripts/Install-LocalAI.ps1') -AIRoot $aiRoot -SkipTests
+# The end screen is captured (and still shown) to check what it says about the password.
+$screen3 = @(& (Join-Path $aiRoot 'Scripts/Install-LocalAI.ps1') -AIRoot $aiRoot -SkipTests 6>&1 | ForEach-Object { $l = "$_"; Write-Host $l; $l })
 $code3 = $LASTEXITCODE
 $env:LOCALAI_TEST_KNOWLEDGE_FAIL = ''
 $st3 = Get-Content -Encoding UTF8 -Raw (Join-Path $aiRoot 'install-state.json') | ConvertFrom-Json
 $rep3 = Get-Content -Encoding UTF8 -Raw (Join-Path $aiRoot 'install-report.md')
+Assert-That (@($screen3 | Where-Object { $_ -like "*Password:*$Password*shown this once*" }).Count -eq 1 -and -not ($st3.flags.PSObject.Properties.Name -contains 'adminPasswordToShow')) 'a password not shown yet is shown once at the end, then marked as shown'
 Assert-That (@($st3.flags.configureWarnings).Count -eq 1 -and $null -ne $st3.stages.Backup -and $rep3 -match '## Settings that need attention' -and $rep3 -match "Knowledge collection 'PC & Electronics' was not created") 'a failed optional step is listed under Settings that need attention, and the install still reaches Backup'
 Assert-That ((& $restartCalls) -eq 1) 'changed render_guard.py: the guard is restarted to load it'
 Assert-That ($code3 -eq 0) "re-run completes (exit $code3) in $([int]$sw.Elapsed.TotalSeconds) s"
@@ -364,8 +368,9 @@ $st.flags.PSObject.Properties.Remove('params')
 $st | ConvertTo-Json -Depth 20 | Set-Content (Join-Path $aiRoot 'install-state.json')
 # This run: a standard account signed in, an administrator's password typed at the UAC prompt.
 $global:ConsoleUser = 'MOCKPC\kid'
-& (Join-Path $aiRoot 'Scripts/Install-LocalAI.ps1') -AIRoot $aiRoot -SkipTests -TrialModels none -OfficialModels none
+$screen4 = @(& (Join-Path $aiRoot 'Scripts/Install-LocalAI.ps1') -AIRoot $aiRoot -SkipTests -TrialModels none -OfficialModels none 6>&1 | ForEach-Object { $l = "$_"; Write-Host $l; $l })
 Assert-That ($LASTEXITCODE -eq 0) "phase 4 completes (exit $LASTEXITCODE)"
+Assert-That (@($screen4 | Where-Object { $_ -like '*Password:*openwebui-admin.json*' }).Count -eq 1 -and @($screen4 | Where-Object { $_ -like "*$Password*" }).Count -eq 0) 'a later run says where the password is, without showing it'
 $global:ConsoleUser = 'MOCKPC\testuser'
 $lastLog = Get-ChildItem (Join-Path $aiRoot 'Logs') -Filter 'install-*.log' | Sort-Object LastWriteTime | Select-Object -Last 1  # lai-ok: objects
 Assert-That ($lastLog -and (Get-Content -Raw $lastLog.FullName) -match 'signed in as MOCKPC\\kid, but the installer runs as MOCKPC\\testuser') 'warns when UAC was approved with another account'

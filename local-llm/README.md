@@ -34,6 +34,10 @@ prompt after each reboot it needs). The one exception: if Open WebUI already has
 the installer doesn't know, it asks once for that account's e-mail and password. Only one installer
 run (or model update) can run at a time; a second one says so and stops.
 
+The admin password it creates is shown once, at the end of the run that finishes the install, and
+kept in `C:\AI\Secrets\openwebui-admin.json`. Later runs only say where it is, so a screenshot or
+a pasted log of an update does not give it away.
+
 Alternative: download https://github.com/MpLLC303/ComfyUi-Optimization/archive/refs/heads/main.zip,
 **Extract All**, and double-click `local-llm\Install-LocalAI.cmd`. Running it from inside the ZIP
 fails. The first window then says it continues in the Administrator window, and you can close it.

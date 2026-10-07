@@ -673,11 +673,16 @@ function Get-AdminCredential {
 }
 
 function Save-AdminCredential {
-    param([string]$Email, [string]$Password)
+    # -Generated: a password the owner has not seen yet. The end of this run (or of the run that
+    # finishes the install, after a restart or a failure) shows it once; later runs only say where
+    # it is, so a re-run's screen, a screenshot or a pasted log does not carry it.
+    param([string]$Email, [string]$Password, [switch]$Generated)
     $file = Join-Path $P.Secrets 'openwebui-admin.json'
     ConvertTo-Json -InputObject @{ email = $Email; password = $Password; url = "http://localhost:$($script:WebUIPortEffective)" } |
         Set-Content -LiteralPath $file -Encoding UTF8
     Protect-Path -Path $file
+    if ($Generated) { $State.flags['adminPasswordToShow'] = $true } else { $State.flags.Remove('adminPasswordToShow') }
+    Save-State
 }
 
 function Get-ResearchModel {
@@ -1607,7 +1612,7 @@ Invoke-Stage 'Stack' {
     Protect-Path -Path $secretFile
     $cred = Get-AdminCredential
     if (-not $cred) {
-        Save-AdminCredential -Email $AdminEmail -Password (New-LaiPassword)
+        Save-AdminCredential -Email $AdminEmail -Password (New-LaiPassword) -Generated
         $cred = Get-AdminCredential
     }
 
@@ -1994,7 +1999,12 @@ Write-Host ''
 Write-Host "Open WebUI:  http://localhost:$($script:WebUIPortEffective)" -ForegroundColor Green
 Write-Host "Login:       $($cred.email)" -ForegroundColor Green
 if ($DeepResearch) { Write-Host "Research:    http://localhost:$($script:ResearchPortEffective) (sign in as localai; password in $($P.Secrets)\deep-research.json)" -ForegroundColor Green }
-Write-Host "Password:    $($cred.password)   (also in $($P.Secrets)\openwebui-admin.json)" -ForegroundColor Green
+if ($State.flags['adminPasswordToShow']) {
+    Write-Host "Password:    $($cred.password)   (shown this once; also in $($P.Secrets)\openwebui-admin.json)" -ForegroundColor Green
+    $State.flags.Remove('adminPasswordToShow'); Save-State
+} else {
+    Write-Host "Password:    in $($P.Secrets)\openwebui-admin.json (Set-OpenWebUIPassword.ps1 sets a new one)" -ForegroundColor Green
+}
 foreach ($a in $attention) { Write-Host "Needs attention: $a" -ForegroundColor Yellow }
 Write-Host 'Open a NEW terminal to use the ollama command (windows opened before the install do not see the PATH change).' -ForegroundColor Gray
 Start-AsUser "http://localhost:$($script:WebUIPortEffective)"
