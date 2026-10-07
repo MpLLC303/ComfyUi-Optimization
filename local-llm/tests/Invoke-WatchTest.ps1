@@ -554,6 +554,12 @@ services:
         # The owner accepts the current state.
         $acc10 = Invoke-Watch @('-AcceptBaseline')
         Assert-That ($acc10 -match 'integrity baseline accepted' -and $acc10 -match 'accepted: "Stack\\extra\.yml" is new' -and $acc10 -match 'confirms this with a notification' -and [string](Read-LaiIntegrityBaseline -AIRoot $aiRoot)['id'] -ne [string]$ig0['id']) "-AcceptBaseline records the current state as the new baseline and lists what it accepted ($(($acc10 -split "`n" | Select-Object -Last 2) -join ' / '))"
+        # More than 200 changes at once: the command prints the first 50 and counts the rest, while
+        # the baseline keeps every name (the next baseline carries on what nobody has settled, and
+        # cannot carry what was cut from the list).
+        $igAccLines = @($acc10 -split "`n" | Where-Object { $_ -match 'accepted: "' })
+        $igAccKept = @((Read-LaiIntegrityBaseline -AIRoot $aiRoot)['accepted'] | Where-Object { $_ -is [hashtable] }).Count
+        Assert-That ($igAccLines.Count -eq 50 -and $acc10 -match 'accepted: and \d+ more' -and $igAccKept -gt 200) "it prints 50 of them by name and says how many more; the baseline lists them all ($($igAccLines.Count) printed, $igAccKept listed)"
         Invoke-Watch $w9 | Out-Null
         Invoke-Watch $w9 | Out-Null
         Assert-That (@(& $igFound).Count -eq 0 -and [string](& $igView)['checkedAt'] -and @(& $igBanner).Count -eq 0 -and @(& $igChanged).Count -eq 7) 'after that nothing differs any more, and the banner is gone'
@@ -582,12 +588,78 @@ services:
         $ig2 = Save-LaiIntegrityBaseline -AIRoot $aiRoot -Reason 'install' -SourceRoot $igSource
         $igKept = @($ig2['accepted'] | ForEach-Object { [string]$_['Text'] })
         Assert-That ($igKept.Count -eq 1 -and $igKept[0] -eq '"Stack\planted.yml" is new') "a baseline recorded by an install lists what it took in that the installer did not put there, and none of the installer's own files ($($igKept -join '; '))"
+        # The first run that sees the new baseline says what it kept, starts the comparison, and is
+        # ended in the middle of it (Task Scheduler ends the task after ten minutes). The mark it
+        # leaves has to sit in the record of the baseline it compares with, together with what was
+        # just announced: left in the record of the baseline before, the next run would drop it with
+        # that record, announce the same things again and start the same comparison again.
+        # The hook that ends the run is an environment variable, which any program running as the
+        # owner could set for good: it works only with the id of the baseline being compared, and
+        # the mark names it as what ended the run.
+        $igOldId = [string](& $igView)['baseline']
+        $env:LOCALAI_TEST_INTEGRITY_END = [string]$ig2['id']
+        try { Invoke-Watch $w9 | Out-Null } finally { $env:LOCALAI_TEST_INTEGRITY_END = '' }
+        $igEnded = & $igView
+        Assert-That ($igOldId -and $igOldId -ne [string]$ig2['id'] -and [string]$igEnded['baseline'] -eq [string]$ig2['id'] -and [string]$igEnded['startedAt'] -and [string]$igEnded['announced'] -eq [string]$ig2['id'] -and -not $igEnded['checkedAt']) "a run ended in the middle of the first comparison with a new baseline leaves its mark under that baseline, with what it had announced (baseline $([string]$igEnded['baseline']), started $([string]$igEnded['startedAt']))"
+        Assert-That ([string]$igEnded['tried'] -eq [string]$ig2['id']) "and with the word that the watch has had its turn with that baseline's list (tried $([string]$igEnded['tried']))"
         Invoke-Watch $w9 | Out-Null
+        Invoke-Watch $w9 | Out-Null
+        $igAfterEnd = & $igView
+        $igEndLines = @(& $igLog | Where-Object { $_ -match 'INTEGRITY not compared: [^\n]*LOCALAI_TEST_INTEGRITY_END' })
+        Assert-That (-not $igAfterEnd['checkedAt'] -and [string]$igAfterEnd['startedAt'] -eq [string]$igEnded['startedAt'] -and [string]$igAfterEnd['announced'] -eq [string]$ig2['id'] -and @(& $igNotices 'the update kept changes it did not make').Count -eq 1) "the two runs after it do not start that comparison again and do not announce again what the update kept ($(@(& $igNotices 'the update kept changes it did not make').Count) notice(s))"
+        Assert-That ([string]$igAfterEnd['skippedWhy'] -match 'LOCALAI_TEST_INTEGRITY_END' -and [string]$igAfterEnd['skippedWhy'] -match 'remove that variable' -and $igEndLines.Count -eq 1) "what ended it is named, for the health check and the notice after hours, and once in watch.log over two runs: the variable, not an installer window ($($igEndLines.Count) line(s): $([string]$igAfterEnd['skippedWhy']))"
+        # An hour after it was started the comparison is tried again, and this time it finishes: also
+        # with the variable still set to the id of the baseline before, as one set for good would be
+        # after the next update. A value that is not the id of the baseline in use ends nothing.
+        $s10 = Read-LaiState -Path $statePath; $s10['integrity']['startedAt'] = (Get-Date).AddMinutes(-61).ToString('s'); Save-LaiState -State $s10 -Path $statePath
+        $env:LOCALAI_TEST_INTEGRITY_END = $igOldId
+        try { Invoke-Watch $w9 | Out-Null } finally { $env:LOCALAI_TEST_INTEGRITY_END = '' }
+        Assert-That ([string](& $igView)['checkedAt'] -and -not (& $igView)['startedAt'] -and -not (& $igView)['skippedWhy']) 'an hour later it is started again, and finishes; the variable left at the id of the baseline before does not end it'
         Invoke-Watch $w9 | Out-Null
         $igKeptNotice = @(& $igNotices 'the update kept changes it did not make')
         Assert-That ($igKeptNotice.Count -eq 1 -and $igKeptNotice[0] -match '"Stack\\planted\.yml" is new' -and $igKeptNotice[0] -match 'If you did not add them' -and @(& $igFound).Count -eq 0) "the watch says so once: an addition does not drop out of every report because an update ran ($($igKeptNotice -join ' | '))"
         $hc10 = & $igHealth
         Assert-That ($hc10 -match 'WARN Integrity watch: [^\n]*kept 1 thing\(s\) it did not install, which now count as normal: "Stack\\planted\.yml" is new[^\n]*first remove what was added') 'and the health check keeps warning, with the order that works: remove it first, because Update toolkit keeps what it finds'
+        # The mark of an ended run once more, for a baseline recorded by hand. -AcceptBaseline itself
+        # puts the new baseline's id into the watch's record, so the first run after it writes its
+        # mark into a record that already carries that id. What the run had just announced has to go
+        # into the mark there as well, or the next run sends the same notification a second time.
+        Set-Content -LiteralPath (Join-Path $igStack 'mine.yml') -Value 'x'
+        Invoke-Watch @('-AcceptBaseline') | Out-Null
+        $ig3Id = [string](Read-LaiIntegrityBaseline -AIRoot $aiRoot)['id']
+        $igAccBefore = @(& $igNotices 'integrity baseline accepted').Count
+        $env:LOCALAI_TEST_INTEGRITY_END = $ig3Id
+        try { Invoke-Watch $w9 | Out-Null } finally { $env:LOCALAI_TEST_INTEGRITY_END = '' }
+        $igEndedHand = & $igView
+        Invoke-Watch $w9 | Out-Null
+        $igAccNow = @(& $igNotices 'integrity baseline accepted')
+        Assert-That ($ig3Id -and [string]$igEndedHand['baseline'] -eq $ig3Id -and [string]$igEndedHand['startedAt'] -and -not $igEndedHand['checkedAt'] -and [string]$igEndedHand['announced'] -eq $ig3Id) "the first run after -AcceptBaseline, ended in the middle of its comparison, leaves what it had announced in its mark (announced $([string]$igEndedHand['announced']))"
+        Assert-That ($igAccNow.Count -eq $igAccBefore + 1 -and $igAccNow[-1] -match '"Stack\\mine\.yml" is new') "so the run after it does not send 'integrity baseline accepted' a second time ($($igAccNow.Count - $igAccBefore) notice(s))"
+        # An update keeps another planted file, and before the watch's next run the acceptance command
+        # runs twice (anything running as the owner can paste it). The first acceptance settles what
+        # the update had kept; the second must still list it, or it records an empty list, the watch
+        # has nothing to announce, and the file has left every report without being in a notice.
+        Set-Content -LiteralPath (Join-Path $igStack 'planted2.yml') -Value 'x'
+        $ig4 = Save-LaiIntegrityBaseline -AIRoot $aiRoot -Reason 'install' -SourceRoot $igSource
+        $igTwice1 = Invoke-Watch @('-AcceptBaseline')
+        $igTwice2 = Invoke-Watch @('-AcceptBaseline')
+        $ig5 = Read-LaiIntegrityBaseline -AIRoot $aiRoot
+        $igTwiceKept = @($ig5['accepted'] | Where-Object { $_ -is [hashtable] -and [string]$_['Id'] -eq 'file+|Stack\planted2.yml' })
+        Assert-That (@($ig4['accepted']).Count -eq 1 -and $igTwice1 -match 'accepted: "Stack\\planted2\.yml" is new' -and $igTwice2 -match 'accepted: "Stack\\planted2\.yml" is new' -and $igTwiceKept.Count -eq 1 -and $igTwiceKept[0]['Settled']) "-AcceptBaseline run twice before the watch's next run: the second baseline still lists what the update had kept, marked as settled ($(@($ig5['accepted'] | ForEach-Object { [string]$_['Text'] }) -join '; '))"
+        # The watch has its turn with that baseline: the list goes to watch.log and into a
+        # notification. Here the notification fails, as on a PC where none ever goes out.
+        $env:LOCALAI_TEST_TOAST_FAIL = '1'
+        try { Invoke-Watch $w9 | Out-Null } finally { $env:LOCALAI_TEST_TOAST_FAIL = '' }
+        $igTurn = & $igView
+        $igTurnFailed = @((Get-WatchLog) -split "`n" | Where-Object { $_ -match 'NOTIFY \(toast failed\) Local AI: integrity baseline accepted' })
+        $igTurnLog = @(& $igLog | Where-Object { $_ -match 'INTEGRITY the baseline[^\n]* took in 1: "Stack\\planted2\.yml" is new' })
+        Assert-That ($igTurnFailed.Count -eq 1 -and $igTurnFailed[0] -match '"Stack\\planted2\.yml" is new' -and $igTurnLog.Count -eq 1) "the watch's notice of that baseline names the planted file, and so does watch.log ($($igTurnFailed.Count) notice(s) tried, $($igTurnLog.Count) line(s))"
+        Assert-That ([string]$igTurn['tried'] -eq [string]$ig5['id'] -and [string]$igTurn['announced'] -ne [string]$ig5['id'] -and [string]$igTurn['checkedAt']) "the notification failed: the watch records that it has had its turn with that baseline, not that the owner was told (tried $([string]$igTurn['tried']), announced '$([string]$igTurn['announced'])')"
+        # After that turn the settled entry is done with: a PC where no notification ever goes out
+        # does not list it at every acceptance and every update for good.
+        $igThrice = Invoke-Watch @('-AcceptBaseline')
+        $ig6 = Read-LaiIntegrityBaseline -AIRoot $aiRoot
+        Assert-That ([string]$ig6['id'] -ne [string]$ig5['id'] -and @($ig6['accepted'] | Where-Object { $_ -is [hashtable] }).Count -eq 0 -and $igThrice -notmatch 'accepted: "') "the next acceptance does not list it again, although no notification went out ($(@($ig6['accepted'] | ForEach-Object { [string]$_['Text'] }) -join '; '))"
         # The baseline itself removed: that is a change, too.
         Remove-Item -LiteralPath (Get-LaiIntegrityPath -AIRoot $aiRoot) -Force
         & $igTwoLooks

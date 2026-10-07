@@ -1480,16 +1480,144 @@ if (Test-Path -LiteralPath $igWatchState) { Remove-Item -LiteralPath $igWatchSta
 $igThird = Save-LaiIntegrityBaseline -AIRoot $igRoot -Reason 'install' -TaskPattern 'LaiNoSuchTask-*' -SourceRoot $igScripts
 $igThirdIds = @(& $igIds $igThird)
 Assert-That ($igThirdIds -contains 'file|Scripts\lib\helper.psm1' -and $igThirdIds -contains 'file|Scripts\tool.ps1' -and @($igThirdIds | Where-Object { $_ -like '*planted.yml' }).Count -eq 0) "a third install carries them on, but not the added file that was removed in between ($($igThirdIds -join '; '))"
-# Recorded by hand twice in a row, before the watch has said so: the second one still names it all.
+# The owner records a baseline by hand, with an edit of their own, and the watch has not run since
+# the update (there is no watch-state.json). The acceptance names the edit and, once more, what the
+# updates before it had kept: accepting is what settles that.
+$igSettledIds = { param($Baseline) @($Baseline['accepted'] | Where-Object { $_ -is [hashtable] -and $_['Settled'] } | ForEach-Object { [string]$_['Id'] }) }
+Set-Content -LiteralPath $igHelper -Value 'edited once more, by the owner'
 $igOnce = Save-LaiIntegrityBaseline -AIRoot $igRoot -Reason 'accepted by the owner' -TaskPattern 'LaiNoSuchTask-*'
+$igOnceIds = @(& $igIds $igOnce); $igOnceSettled = @(& $igSettledIds $igOnce)
+Assert-That ($igOnceIds -contains 'file|Scripts\lib\helper.psm1' -and $igOnceIds -contains 'file|Scripts\tool.ps1' -and $igOnceIds -contains 'env+|OLLAMA_UPSTREAM') "a baseline recorded by hand names what it takes in itself and what the update before it had kept ($($igOnceIds -join '; '))"
+Assert-That ($igOnceSettled -contains 'file|Scripts\tool.ps1' -and $igOnceSettled -contains 'env+|OLLAMA_UPSTREAM' -and $igOnceSettled -notcontains 'file|Scripts\lib\helper.psm1') "what the update had kept is marked as settled by this acceptance; the owner's own edit is not ($($igOnceSettled -join '; '))"
+# Recorded by hand again, still before the watch has had its turn with the first: all of it is
+# named again, also what the first acceptance settled. Anything running as the owner can record a
+# baseline, and the watch's notice is what shows one the owner did not make: a second acceptance
+# that recorded an empty list would leave the watch nothing to say about what the update had kept.
 $igAgain = Save-LaiIntegrityBaseline -AIRoot $igRoot -Reason 'accepted by the owner' -TaskPattern 'LaiNoSuchTask-*'
-$igAgainIds = @(& $igIds $igAgain)
-Assert-That (@(& $igIds $igOnce) -contains 'file|Scripts\lib\helper.psm1' -and $igAgainIds -contains 'file|Scripts\lib\helper.psm1' -and $igAgainIds -contains 'env+|OLLAMA_UPSTREAM') "the acceptance command run twice before the watch has announced the first still lists what was taken in ($($igAgainIds -join '; '))"
+$igAgainIds = @(& $igIds $igAgain); $igAgainSettled = @(& $igSettledIds $igAgain)
+Assert-That ($igAgainIds -contains 'file|Scripts\lib\helper.psm1' -and $igAgainIds -contains 'file|Scripts\tool.ps1' -and $igAgainIds -contains 'env+|OLLAMA_UPSTREAM') "the acceptance command run twice before the watch has announced the first still lists what was taken in ($($igAgainIds -join '; '))"
+Assert-That ($igAgainSettled -contains 'file|Scripts\tool.ps1' -and $igAgainSettled -contains 'env+|OLLAMA_UPSTREAM' -and $igAgainSettled -notcontains 'file|Scripts\lib\helper.psm1') "what the first acceptance settled is still marked as settled there, and nothing else is ($($igAgainSettled -join '; '))"
+# The watch has had its turn with that baseline: it wrote the list to watch.log and tried to announce
+# it, and the notification failed ('tried' and no 'announced': on a PC where none ever goes out that
+# is all there will ever be). What an acceptance settled is done with then, or it would be listed
+# by every acceptance and every update for good. What the acceptance took in itself still waits
+# for a notification that went out.
+Save-LaiState -State @{ integrity = @{ baseline = [string]$igAgain['id']; tried = [string]$igAgain['id'] } } -Path $igWatchState
+$igTried = Save-LaiIntegrityBaseline -AIRoot $igRoot -Reason 'accepted by the owner' -TaskPattern 'LaiNoSuchTask-*'
+$igTriedIds = @(& $igIds $igTried)
+Assert-That ($igTriedIds -notcontains 'file|Scripts\tool.ps1' -and $igTriedIds -notcontains 'env+|OLLAMA_UPSTREAM') "once the watch has tried to announce a baseline, the next one no longer lists what an acceptance had settled, although no notification went out ($($igTriedIds -join '; '))"
+Assert-That ($igTriedIds -contains 'file|Scripts\lib\helper.psm1') "what the acceptance took in itself is still listed: that waits for a notification that went out ($($igTriedIds -join '; '))"
 # Once the watch has announced a baseline recorded by hand, the owner has been told: settled.
-Save-LaiState -State @{ integrity = @{ baseline = [string]$igAgain['id']; announced = [string]$igAgain['id'] } } -Path $igWatchState
+Save-LaiState -State @{ integrity = @{ baseline = [string]$igTried['id']; announced = [string]$igTried['id'] } } -Path $igWatchState
 $igSettled = Save-LaiIntegrityBaseline -AIRoot $igRoot -Reason 'install' -TaskPattern 'LaiNoSuchTask-*' -SourceRoot $igScripts
 Assert-That (@(& $igIds $igSettled).Count -eq 0) "an install after an acceptance the watch has announced does not list it again ($(@(& $igIds $igSettled) -join '; '))"
 foreach ($f in $igWatchState, "$igWatchState.bak") { if (Test-Path -LiteralPath $f) { Remove-Item -LiteralPath $f -Force } }
+# More kept than any report shows. An update keeps 60 added files, and the update after it must
+# still list every one of them: a list cut to what is shown lost the last ten right there, with
+# nobody having looked, and with them a planted file behind fifty decoy names.
+$igMany = Join-Path $igStack 'many'
+New-Item -ItemType Directory -Force -Path $igMany | Out-Null
+foreach ($i in 1..60) { Set-Content -LiteralPath (Join-Path $igMany ('added{0:D2}.yml' -f $i)) -Value "added $i" }
+$igManyIds = { param($Baseline) @($Baseline['accepted'] | Where-Object { $_ -is [hashtable] -and [string]$_['Id'] -like 'file*|Stack\many\*' } | ForEach-Object { [string]$_['Id'] }) }
+$igSixty = Save-LaiIntegrityBaseline -AIRoot $igRoot -Reason 'install' -TaskPattern 'LaiNoSuchTask-*' -SourceRoot $igScripts
+$igSixtyNext = Save-LaiIntegrityBaseline -AIRoot $igRoot -Reason 'install' -TaskPattern 'LaiNoSuchTask-*' -SourceRoot $igScripts
+$igSixtyIds = @(& $igManyIds $igSixty); $igSixtyNextIds = @(& $igManyIds $igSixtyNext)
+Assert-That ($igSixtyIds.Count -eq 60 -and [int]$igSixty['acceptedCount'] -ge 60) "an update that keeps 60 added files lists every one of them by name ($($igSixtyIds.Count) listed, $([int]$igSixty['acceptedCount']) counted)"
+Assert-That ($igSixtyNextIds.Count -eq 60 -and $igSixtyNextIds -contains 'file+|Stack\many\added60.yml' -and [int]$igSixtyNext['acceptedCount'] -ge 60) "the update after it carries all 60, the last one too: none leaves the reports with nobody having looked ($($igSixtyNextIds.Count) listed, $([int]$igSixtyNext['acceptedCount']) counted)"
+# The owner accepts them by hand before the watch has run (no watch-state.json). The acceptance
+# names what it settles, all 60. The acceptance run again, and an update after that, still list
+# every one, still marked: an empty list there, before the watch's next run, and a planted file
+# among them would have left every report without being in any notice. The watch's word about a
+# baseline other than the one before does not count either.
+$igManySettled = { param($Baseline) @(& $igSettledIds $Baseline | Where-Object { $_ -like 'file*|Stack\many\*' }) }
+$igByHand = Save-LaiIntegrityBaseline -AIRoot $igRoot -Reason 'accepted by the owner' -TaskPattern 'LaiNoSuchTask-*'
+$igHandAgain = Save-LaiIntegrityBaseline -AIRoot $igRoot -Reason 'accepted by the owner' -TaskPattern 'LaiNoSuchTask-*'
+Save-LaiState -State @{ integrity = @{ baseline = [string]$igByHand['id']; tried = [string]$igByHand['id'] } } -Path $igWatchState
+$igHandUpdate = Save-LaiIntegrityBaseline -AIRoot $igRoot -Reason 'install' -TaskPattern 'LaiNoSuchTask-*' -SourceRoot $igScripts
+# The watch has had its turn with that last baseline, and no notification went out. Settled is
+# settled then: the next update lists none of them. Before, they were listed at every acceptance
+# and every update on a PC where no notification ever goes out.
+Save-LaiState -State @{ integrity = @{ baseline = [string]$igHandUpdate['id']; tried = [string]$igHandUpdate['id'] } } -Path $igWatchState
+$igAfterHand = Save-LaiIntegrityBaseline -AIRoot $igRoot -Reason 'install' -TaskPattern 'LaiNoSuchTask-*' -SourceRoot $igScripts
+foreach ($f in $igWatchState, "$igWatchState.bak") { if (Test-Path -LiteralPath $f) { Remove-Item -LiteralPath $f -Force } }
+$igByHandIds = @(& $igManyIds $igByHand); $igByHandSettled = @(& $igManySettled $igByHand)
+$igHandAgainIds = @(& $igManyIds $igHandAgain); $igHandUpdateIds = @(& $igManyIds $igHandUpdate); $igAfterHandIds = @(& $igManyIds $igAfterHand)
+Assert-That ($igByHandIds.Count -eq 60 -and $igByHandSettled.Count -eq 60) "accepting by hand names what the update had kept, marked as settled by that ($($igByHandSettled.Count) of $($igByHandIds.Count) listed)"
+Assert-That ($igHandAgainIds.Count -eq 60 -and @(& $igManySettled $igHandAgain).Count -eq 60 -and [int]$igHandAgain['acceptedCount'] -ge 60) "the acceptance run again before the watch has had its turn still lists all 60, still marked as settled ($($igHandAgainIds.Count) listed, $([int]$igHandAgain['acceptedCount']) counted)"
+Assert-That ($igHandUpdateIds.Count -eq 60 -and @(& $igManySettled $igHandUpdate).Count -eq 60) "and so does an update after it, when the watch has only had its turn with a baseline before that one ($($igHandUpdateIds.Count) listed)"
+Assert-That ($igAfterHandIds.Count -eq 0) "once the watch has had its turn with a baseline that lists them as settled, the next update lists none of them, without any notification having gone out ($($igAfterHandIds.Count) listed)"
+# No list is without end. With room for five names (-MaxListed: a thousand unless told otherwise),
+# what does not fit is one entry that stands for the rest, and the count still has all of it.
+foreach ($i in 1..8) { Set-Content -LiteralPath (Join-Path $igMany "late$i.yml") -Value "late $i" }
+$igNamedOf = { param($Baseline) @($Baseline['accepted'] | Where-Object { $_ -is [hashtable] -and [string]$_['Id'] -notlike 'more|*' }) }
+$igMoreOf = { param($Baseline) @($Baseline['accepted'] | Where-Object { $_ -is [hashtable] -and [string]$_['Id'] -like 'more|*' }) }
+$igFew = $null; $igFewNext = $null; $igFewThird = $null; $igFewHand = $null; $igFewHandAgain = $null; $igFewAfter = $null; $igFewErr = ''
+try {
+    $igFew = Save-LaiIntegrityBaseline -AIRoot $igRoot -Reason 'install' -TaskPattern 'LaiNoSuchTask-*' -SourceRoot $igScripts -MaxListed 5
+    # That baseline as one was recorded when the list was cut at 50: some names, the true count,
+    # and nothing that stands for the rest.
+    $igOldStyle = Read-LaiIntegrityBaseline -AIRoot $igRoot
+    $igOldStyle['accepted'] = @($igOldStyle['accepted'] | Where-Object { $_ -is [hashtable] -and [string]$_['Id'] -notlike 'more|*' })
+    Save-LaiState -State $igOldStyle -Path (Get-LaiIntegrityPath -AIRoot $igRoot)
+    $igFewNext = Save-LaiIntegrityBaseline -AIRoot $igRoot -Reason 'install' -TaskPattern 'LaiNoSuchTask-*' -SourceRoot $igScripts -MaxListed 5
+    $igFewThird = Save-LaiIntegrityBaseline -AIRoot $igRoot -Reason 'install' -TaskPattern 'LaiNoSuchTask-*' -SourceRoot $igScripts -MaxListed 5
+    $igFewHand = Save-LaiIntegrityBaseline -AIRoot $igRoot -Reason 'accepted by the owner' -TaskPattern 'LaiNoSuchTask-*' -MaxListed 5
+    # Accepted again before the watch has had its turn (no watch-state.json), then the watch has
+    # it (tried, no notification went out), then an update.
+    $igFewHandAgain = Save-LaiIntegrityBaseline -AIRoot $igRoot -Reason 'accepted by the owner' -TaskPattern 'LaiNoSuchTask-*' -MaxListed 5
+    Save-LaiState -State @{ integrity = @{ baseline = [string]$igFewHandAgain['id']; tried = [string]$igFewHandAgain['id'] } } -Path $igWatchState
+    $igFewAfter = Save-LaiIntegrityBaseline -AIRoot $igRoot -Reason 'install' -TaskPattern 'LaiNoSuchTask-*' -SourceRoot $igScripts
+} catch { $igFewErr = $_.Exception.Message }
+foreach ($f in $igWatchState, "$igWatchState.bak") { if (Test-Path -LiteralPath $f) { Remove-Item -LiteralPath $f -Force } }
+$igFewMore = @(); $igNextMore = @(); $igThirdMore = @(); $igHandMore = @(); $igHandAgainMore = @(); $igFewCount = 0; $igHandAgainCount = 0
+if (-not $igFewErr) { $igFewMore = @(& $igMoreOf $igFew); $igNextMore = @(& $igMoreOf $igFewNext); $igThirdMore = @(& $igMoreOf $igFewThird); $igHandMore = @(& $igMoreOf $igFewHand); $igHandAgainMore = @(& $igMoreOf $igFewHandAgain); $igFewCount = [int]$igFew['acceptedCount']; $igHandAgainCount = [int]$igFewHandAgain['acceptedCount'] }
+Assert-That (-not $igFewErr -and @(& $igNamedOf $igFew).Count -eq 5 -and $igFewMore.Count -eq 1 -and [string]$igFewMore[0]['Id'] -eq 'more|other' -and [string]$igFewMore[0]['Text'] -eq ('{0} more than are listed here' -f ($igFewCount - 5)) -and $igFewCount -ge 8) "eight kept and room for five names: five are named, one entry stands for the rest, and the count has them all ($igFewCount counted) $igFewErr"
+Assert-That (-not $igFewErr -and $igNextMore.Count -eq 1 -and [string]$igNextMore[0]['Id'] -eq 'more|Scripts' -and [int]$igFewNext['acceptedCount'] -ge 8 -and [string]$igNextMore[0]['Text'] -eq ('{0} more than are listed here' -f ([int]$igFewNext['acceptedCount'] - @(& $igNamedOf $igFewNext).Count))) "a baseline that counted more than it named: the next update carries the rest on as a number, and cannot rule out that a script is among it $igFewErr"
+Assert-That (-not $igFewErr -and $igThirdMore.Count -eq 1 -and [string]$igThirdMore[0]['Id'] -eq 'more|Scripts' -and -not $igThirdMore[0]['Settled'] -and [int]$igFewThird['acceptedCount'] -ge 8) "update after update that number stays: the count does not shrink while nobody has accepted what it stands for $igFewErr"
+Assert-That (-not $igFewErr -and $igHandMore.Count -eq 1 -and $igHandMore[0]['Settled'] -and [int]$igFewHand['acceptedCount'] -ge 8) "the owner's acceptance names it once more and settles it, the unnamed rest as well $igFewErr"
+Assert-That (-not $igFewErr -and $igHandAgainMore.Count -eq 1 -and $igHandAgainMore[0]['Settled'] -and [string]$igHandAgainMore[0]['Id'] -eq 'more|Scripts' -and $igHandAgainCount -ge 8 -and @(& $igManyIds $igFewHandAgain).Count -ge 1 -and @(& $igManySettled $igFewHandAgain).Count -eq @(& $igManyIds $igFewHandAgain).Count) "accepted again before the watch has had its turn, the count has not shrunk: the names and the unnamed rest are still listed, still marked as settled ($igHandAgainCount counted) $igFewErr"
+Assert-That (-not $igFewErr -and @(& $igMoreOf $igFewAfter).Count -eq 0 -and @(& $igManyIds $igFewAfter).Count -eq 0) "once the watch has had its turn the update after that lists none of it, names or number $igFewErr"
+# Whether the watch has announced a baseline is read from watch-state.json, which the watch replaces
+# every few minutes. A read that fails must not keep the baseline from being recorded (the watch
+# would then report the whole update as changes), and counts as 'not announced': carried.
+Set-Content -LiteralPath (Join-Path $igMany 'added01.yml') -Value 'changed by the owner'
+$igMine = Save-LaiIntegrityBaseline -AIRoot $igRoot -Reason 'accepted by the owner' -TaskPattern 'LaiNoSuchTask-*'
+# Something of that name that cannot be read as a file.
+New-Item -ItemType Directory -Force -Path $igWatchState | Out-Null
+$igUnread = $null; $igUnreadErr = ''
+try { $igUnread = Save-LaiIntegrityBaseline -AIRoot $igRoot -Reason 'accepted by the owner' -TaskPattern 'LaiNoSuchTask-*' } catch { $igUnreadErr = $_.Exception.Message }
+Remove-Item -LiteralPath $igWatchState -Force
+Assert-That (@(& $igManyIds $igMine) -contains 'file|Stack\many\added01.yml' -and -not $igUnreadErr -and $igUnread -and @(& $igManyIds $igUnread) -contains 'file|Stack\many\added01.yml') "a watch-state.json that cannot be read does not stop the baseline from being recorded, and what the one before it took in is carried ($igUnreadErr)"
+if ($onWindows) {
+    # The file itself, saying that the baseline in use was announced, held by another handle the way
+    # it is while the watch replaces it. Unreadable is not 'announced'; read again, it is.
+    $igOnDisk = [string](Read-LaiIntegrityBaseline -AIRoot $igRoot)['id']
+    Save-LaiState -State @{ integrity = @{ baseline = $igOnDisk; announced = $igOnDisk } } -Path $igWatchState
+    $igHeld = [System.IO.File]::Open($igWatchState, [System.IO.FileMode]::Open, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
+    $igHeldSave = $null; $igHeldErr = ''; $igReadSave = $null
+    try { $igHeldSave = Save-LaiIntegrityBaseline -AIRoot $igRoot -Reason 'accepted by the owner' -TaskPattern 'LaiNoSuchTask-*' } catch { $igHeldErr = $_.Exception.Message } finally { $igHeld.Dispose() }
+    if ($igHeldSave) {
+        Save-LaiState -State @{ integrity = @{ baseline = [string]$igHeldSave['id']; announced = [string]$igHeldSave['id'] } } -Path $igWatchState
+        $igReadSave = Save-LaiIntegrityBaseline -AIRoot $igRoot -Reason 'accepted by the owner' -TaskPattern 'LaiNoSuchTask-*'
+    }
+    Assert-That (-not $igHeldErr -and $igHeldSave -and @(& $igManyIds $igHeldSave) -contains 'file|Stack\many\added01.yml') "held open by another handle, a watch-state.json that says 'announced' is not taken for that: the baseline is recorded, and carries ($igHeldErr)"
+    Assert-That ($igReadSave -and @(& $igManyIds $igReadSave) -notcontains 'file|Stack\many\added01.yml') 'readable again and saying so, it is: what the watch has announced is not carried'
+    foreach ($f in $igWatchState, "$igWatchState.bak") { if (Test-Path -LiteralPath $f) { Remove-Item -LiteralPath $f -Force } }
+} else { Skip 'a watch-state.json held open by another handle (the read fails with a sharing violation) is a Windows case' }
+# A baseline recorded by hand while the folders hold more than is read says that the rest was not
+# compared. That names no single thing that could be gone again: a second acceptance, before the
+# watch has announced the first, still says it.
+$igWalk1 = $null; $igWalk2 = $null; $igWalkErr = ''
+try {
+    $igWalk1 = Save-LaiIntegrityBaseline -AIRoot $igRoot -Reason 'accepted by the owner' -TaskPattern 'LaiNoSuchTask-*' -Budget (New-LaiIntegrityBudget -MaxEntries 4)
+    $igWalk2 = Save-LaiIntegrityBaseline -AIRoot $igRoot -Reason 'accepted by the owner' -TaskPattern 'LaiNoSuchTask-*' -Budget (New-LaiIntegrityBudget -MaxEntries 4)
+} catch { $igWalkErr = $_.Exception.Message }
+$igWalkText = { param($Baseline) (@($Baseline['accepted'] | Where-Object { $_ -is [hashtable] -and [string]$_['Id'] -eq 'walk|Stack' } | ForEach-Object { [string]$_['Text'] }) -join ' | ') }
+$igWalkOne = ''; $igWalkTwo = ''
+if (-not $igWalkErr) { $igWalkOne = [string](& $igWalkText $igWalk1); $igWalkTwo = [string](& $igWalkText $igWalk2) }
+Assert-That (-not $igWalkErr -and [string]$igWalk1['filesStopped'] -eq 'Stack' -and $igWalkOne -like 'reading "Stack" stopped at*the rest was not compared') "a baseline recorded by hand while the walk stops says that the rest was not compared ($igWalkOne) $igWalkErr"
+Assert-That (-not $igWalkErr -and $igWalkTwo -and $igWalkTwo -eq $igWalkOne) "and the acceptance run again still says it ($igWalkTwo) $igWalkErr"
+Remove-Item -LiteralPath $igMany -Recurse -Force
 $igStillSnap = @{ files = @{ 'Stack\a.yml' = 'x'; 'Stack\sub\b.yml' = 'x' }; filesStopped = ''; env = @{ OLLAMA_UPSTREAM = 'x' }; tasks = $null; listeners = @(@{ Program = 'python'; Port = 8000; Network = $true }, @{ Program = 'ollama'; Port = 11434; Network = $false }) }
 Assert-That ((Test-LaiIntegrityStill -Id 'file+|Stack\a.yml' -Snapshot $igStillSnap) -and (Test-LaiIntegrityStill -Id 'files+|Stack\sub' -Snapshot $igStillSnap) -and (Test-LaiIntegrityStill -Id 'file-|Stack\gone.yml' -Snapshot $igStillSnap) -and (Test-LaiIntegrityStill -Id 'env|OLLAMA_UPSTREAM' -Snapshot $igStillSnap) -and (Test-LaiIntegrityStill -Id 'net|python|8000' -Snapshot $igStillSnap) -and (Test-LaiIntegrityStill -Id 'port|11434|ollama' -Snapshot $igStillSnap)) 'still so: a file and a folder that are there, a file that is still gone, a setting that is set, a program that still listens'
 Assert-That (-not (Test-LaiIntegrityStill -Id 'file+|Stack\removed.yml' -Snapshot $igStillSnap) -and -not (Test-LaiIntegrityStill -Id 'file-|Stack\a.yml' -Snapshot $igStillSnap) -and -not (Test-LaiIntegrityStill -Id 'env+|OTHER_URL' -Snapshot $igStillSnap) -and -not (Test-LaiIntegrityStill -Id 'net|ollama|11434' -Snapshot $igStillSnap) -and -not (Test-LaiIntegrityStill -Id 'net|steam|27036' -Snapshot $igStillSnap) -and -not (Test-LaiIntegrityStill -Id 'walk|Stack' -Snapshot $igStillSnap) -and -not (Test-LaiIntegrityStill -Id 'more|other' -Snapshot $igStillSnap)) 'no longer so: a removed file, a file that came back, a removed setting, a program that listens on this PC only or not at all; and nothing that names no single thing'
@@ -1611,6 +1739,9 @@ if ($onWindows) {
         # Anything running as the owner can run that command, so the acceptance is itself announced.
         $igAccepted = @(& $igWatchLog | Where-Object { $_ -like '* NOTIFY Local AI: integrity baseline accepted*' })
         Assert-That ($igAccepted.Count -eq 1 -and $igAccepted[0] -like '*"Scripts\tool.ps1" was changed*' -and $igAccepted[0] -like '*If that was not you*') "the next scheduled run names what was accepted, once over two runs ($($igAccepted -join ' | '))"
+        # What the next baseline goes by (Save-LaiIntegrityBaseline): the watch has had its turn with
+        # this one's list, and the owner was told.
+        Assert-That ([string]$igS['baseline'] -and [string]$igS['tried'] -eq [string]$igS['baseline'] -and [string]$igS['announced'] -eq [string]$igS['baseline']) "and the watch keeps both under that baseline's id (tried $([string]$igS['tried']), announced $([string]$igS['announced']))"
         # Listeners, both ways of recording a baseline. The accepted one holds the open port.
         $igHas = { @((Read-LaiIntegrityBaseline -AIRoot $igRoot)['listeners'] | Where-Object { $_ -is [hashtable] -and [int]$_['Port'] -eq 39871 -and [string]$_['Program'] -eq $igMe -and $_['Network'] }).Count }
         $igWhileOpen = & $igHas
