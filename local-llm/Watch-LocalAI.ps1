@@ -137,11 +137,13 @@ function Send-Notification {
         # nothing is lost), but retrying would not help until the switch is turned back on, so the
         # run goes on as if told; the Open WebUI banner below and the health check (which reports
         # the switch) carry the news instead.
-        $setting = 'Enabled'
+        # Only a value that says so counts as off: Windows PowerShell 5.1 can read the setting as empty
+        # (seen on the Windows CI runner), and that is not known to be off.
+        $setting = ''
         try { $setting = [string]$notifier.Setting } catch { Write-Verbose "toast setting unknown: $($_.Exception.Message)" }
-        $script:toastSetting = $setting
         $notifier.Show([Windows.UI.Notifications.ToastNotification]::new($xml))
-        if ($setting -ne 'Enabled') { $why = "notifications are off: $setting" } else { $shown = $true }
+        if ($setting -like 'Disabled*') { $why = "notifications are off: $setting"; $script:toastSetting = $setting }
+        else { $shown = $true; if ($setting -eq 'Enabled') { $script:toastSetting = $setting } }
     } catch {
         $why = $_.Exception.Message
         Write-Verbose "toast failed: $why"
