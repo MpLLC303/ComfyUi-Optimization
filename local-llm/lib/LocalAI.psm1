@@ -983,7 +983,9 @@ function Compare-LaiIntegrity {
     if ($null -ne $Baseline['listeners'] -and $null -ne $Current['listeners']) {
         # Port 0 in a baseline row stands for 'a temporary port' (ConvertTo-LaiListenerBaseline). One of
         # the stack's own ports is never a temporary one, wherever it was put.
-        $slotOf = { param([int]$Port) if ($Port -le 0 -or ($Port -ge $DynamicPortFrom -and $WatchedPorts -notcontains $Port)) { return 'temporary' }; return [string]$Port }
+        # Read here, outside the scriptblock: the analyzer cannot see a parameter used only inside one.
+        $dynamicFrom = $DynamicPortFrom
+        $slotOf = { param([int]$Port) if ($Port -le 0 -or ($Port -ge $dynamicFrom -and $WatchedPorts -notcontains $Port)) { return 'temporary' }; return [string]$Port }
         $net = @{}; $owners = @{}
         foreach ($l in @($Baseline['listeners'])) {
             $port = 0
@@ -1077,10 +1079,12 @@ function ConvertTo-LaiListenerBaseline {
     # Callers assign the result, never wrap the call in @().
     param([object[]]$Current = @(), [object[]]$Known = @(), [switch]$Carry, [datetime]$Now = (Get-Date), [int]$KeepDays = 90, [int[]]$WatchedPorts = @(), [int]$DynamicPortFrom = 49152, [string]$KnownSeen = '')
     $rows = @{}
+    # Read here, outside the scriptblock: the analyzer cannot see a parameter used only inside one.
+    $dynamicFrom = $DynamicPortFrom; $watched = $WatchedPorts
     $put = { param($Row, [string]$Seen)
         $port = 0
         if (-not ($Row -is [hashtable]) -or -not $Row['Program'] -or -not [int]::TryParse([string]$Row['Port'], [ref]$port)) { return }
-        if ($port -lt 0 -or ($port -ge $DynamicPortFrom -and $WatchedPorts -notcontains $port)) { $port = 0 }
+        if ($port -lt 0 -or ($port -ge $dynamicFrom -and $watched -notcontains $port)) { $port = 0 }
         $rowKey = '{0}|{1:D5}|{2}' -f ([string]$Row['Program']), $port, [bool]$Row['Network']
         if (-not $rows.ContainsKey($rowKey)) { $rows[$rowKey] = @{ Program = [string]$Row['Program']; Port = $port; Network = [bool]$Row['Network']; Seen = $Seen } }
     }
