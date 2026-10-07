@@ -1,0 +1,21 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pwsh:*)",
+      "Bash(git:*)",
+      "Bash(docker:*)",
+      "Bash(python3:*)",
+      "Bash(curl:*)",
+      "Bash(bash /home/user/lai-test/start-sandbox.sh)",
+      "Bash(bash /home/user/lai-test/restart-owui.sh)",
+      "Bash(ls:*)",
+      "Bash(grep:*)",
+      "Bash(sed -n:*)",
+      "Bash(tail:*)",
+      "Bash(pgrep:*)",
+      "Bash(kill:*)",
+      "Bash(timeout:*)",
+      "Bash(mkdir:*)"
+    ]
+  }
+}
