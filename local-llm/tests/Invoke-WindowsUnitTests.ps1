@@ -13,8 +13,11 @@
     - Uninstall-LocalAI -WhatIf and Stop-LocalAI on an empty AI root must not throw.
     - Scheduled tasks: the no-window launch (conhost --headless), the daily-time math, and native
       calls with a time limit (a CLI that never answers is stopped, not waited on).
-    - Test-PCSecurity: its helpers (driver matcher, redaction, ACL/port verdicts, ComfyUI scan), that
-      it runs no changing command, and a full read-only run in a child process.
+    - Test-PCSecurity: its helpers (driver matcher, redaction, ACL/port verdicts, ComfyUI scan), the
+      judges for what a real PC audit found (a snoozed or expired antivirus behind a passive Defender,
+      a hardware-access driver any program can open, firewall openings for script runners, a stopped
+      cloud-sync program the backups lie in) on canned input, their readers on Windows, that it runs
+      no changing command, and a full read-only run in a child process.
     Exit code = number of failed assertions.
 #>
 param([string]$Work = (Join-Path ([System.IO.Path]::GetTempPath()) 'lai-wintest'))
@@ -2089,6 +2092,108 @@ $leafs = @($scan.Files | ForEach-Object { Split-Path -Leaf $_ } | Sort-Object)
 Assert-That (($leafs -join ',') -eq 'old.ckpt,style.PT,x4.pth' -and $scan.Truncated) "pickle files found (any case), .safetensors and look-alikes not, the depth limit holds and is reported ($($leafs -join ','))"
 Assert-That ((Get-PcsPickleFile -Root $mRoot -MaxEntries 1).Truncated -and @((Get-PcsPickleFile -Root (Join-Path $cfRoot 'missing')).Files).Count -eq 0) 'the entry limit stops the scan; a missing folder is no error'
 
+# What a real PC audit found and the check had not noticed (backlog 91). Each judge gets canned
+# input: one that must be flagged, one that must not be, one that could not be read (SKIP, never PASS).
+# Product, program and folder names below are made up.
+$sz = ConvertFrom-PcsAvState 0x062000; $sx = ConvertFrom-PcsAvState 0x063000; $su = ConvertFrom-PcsAvState 0x064000
+Assert-That ($s1.State -eq 'On' -and $s2.State -eq 'Off' -and $sz.State -eq 'Snoozed' -and -not $sz.Enabled -and $sx.State -eq 'Expired' -and -not $sx.Enabled -and $su.State -eq 'Unknown' -and -not $su.Enabled) "antivirus state nibble: 0x1000 on, 0 off; 0x2000 snoozed and 0x3000 expired are not on (0x3000 carries the 0x1000 bit); any other nibble is unknown ($($sz.State) $($sx.State) $($su.State))"
+
+$avPassive = [pscustomobject]@{ AntivirusEnabled = $true; RealTimeProtectionEnabled = $false; AMRunningMode = 'Passive Mode' }
+$avOff = [pscustomobject]@{ AntivirusEnabled = $false; RealTimeProtectionEnabled = $false; AMRunningMode = 'Not running' }
+$avNoRtp = [pscustomobject]@{ AntivirusEnabled = $true; RealTimeProtectionEnabled = $false; AMRunningMode = 'Normal' }
+$avOddMode = [pscustomobject]@{ AntivirusEnabled = $true; RealTimeProtectionEnabled = $true; AMRunningMode = 'Some Later Mode' }
+$avOwn = [pscustomobject]@{ displayName = 'Windows Defender'; productState = 397568; pathToSignedProductExe = 'windowsdefender://' }
+$avOther = { param([long]$State) [pscustomobject]@{ displayName = 'Example Antivirus'; productState = $State; pathToSignedProductExe = 'C:\Program Files\Example\av.exe' } }
+$avA = Get-PcsAvVerdict -Defender $avPassive -Products @($avOwn, (& $avOther 0x062000))
+Assert-That ($avA.Status -eq 'FAIL' -and $avA.Detail -match 'passive mode' -and $avA.Detail -match 'Example Antivirus reports itself snoozed' -and $avA.Fix -match 'uninstall it completely') "antivirus flagged: Defender passive behind a snoozed antivirus is FAIL although Defender's own Security Center entry reads on ($($avA.Status): $($avA.Detail))"
+$avB = Get-PcsAvVerdict -Defender $avOff -Products @((& $avOther 0x063000))
+$avC = Get-PcsAvVerdict -Defender $avPassive -Products @($avOwn)
+$avD = Get-PcsAvVerdict -Defender $avNoRtp -Products @()
+Assert-That ($avB.Status -eq 'FAIL' -and $avB.Detail -match 'reports itself expired' -and $avC.Status -eq 'FAIL' -and $avC.Detail -match 'no other antivirus' -and $avD.Status -eq 'FAIL' -and $avD.Detail -match 'real-time protection is off') "antivirus flagged: an expired antivirus with Defender off, Defender passive with no other antivirus, Defender's real-time protection off with no other antivirus ($($avB.Status) $($avC.Status) $($avD.Status))"
+$avE = Get-PcsAvVerdict -Defender $avPassive -Products @($avOwn, (& $avOther 397584))
+Assert-That ($avE.Status -eq 'WARN' -and $avE.Detail -match 'Example Antivirus is on, but .* out of date') "antivirus flagged: an antivirus that is on but out of date is WARN ($($avE.Status))"
+$avF = Get-PcsAvVerdict -Defender $avPassive -Products @($avOwn, (& $avOther 397568))
+$avG = Get-PcsAvVerdict -Defender $null -Products @($avOwn)
+Assert-That ($avF.Status -eq 'PASS' -and $avF.Detail -match '^Example Antivirus on' -and $avG.Status -eq 'PASS' -and $avG.Detail -match '^Windows Defender on') "antivirus not flagged: Defender passive next to an antivirus that is on; Defender's Security Center entry counts when Defender itself gave no answer ($($avF.Status) $($avG.Status))"
+$avH = Get-PcsAvVerdict -Defender $avPassive -Products @() -ProductsRead $false
+$avI = Get-PcsAvVerdict -Defender $avPassive -Products @($avOwn, (& $avOther 0x064000))
+$avJ = Get-PcsAvVerdict -Defender $avOddMode -Products @((& $avOther 397568))
+$avK = Get-PcsAvVerdict -Defender $null -Products @() -ProductsRead $false
+Assert-That ($avH.Status -eq 'SKIP' -and $avI.Status -eq 'SKIP' -and $avI.Detail -match 'Example Antivirus \(productState' -and $avJ.Status -eq 'SKIP' -and $avK.Status -eq 'SKIP') "antivirus could not be read: Security Center unreadable, an unknown state nibble, a running mode this check does not know, nothing readable at all ($($avH.Status) $($avI.Status) $($avJ.Status) $($avK.Status))"
+
+$syClient = { param([string]$Entry, [bool]$Read) [pscustomobject]@{ Name = 'OneDrive'; Process = 'OneDrive'; Folders = @('C:\Users\JohnDoe\OneDrive\'); StartEntry = $Entry; StartRead = $Read } }
+$syEntry = '"C:\Program Files\Microsoft OneDrive\OneDrive.exe" /background'
+$syInside = @('C:\AI\Backups', 'C:\Users\JohnDoe\OneDrive\AI-Backups\')
+$syBeside = @('C:\AI\Backups', 'C:\Users\JohnDoe\OneDrive - Work\AI-Backups')
+$syA = Get-PcsSyncVerdict -BackupFolders $syInside -Clients @(& $syClient $syEntry $true) -Processes @('explorer', 'svchost')
+Assert-That ($syA.Status -eq 'WARN' -and $syA.Detail -match 'OneDrive has a start-with-Windows entry but is not running' -and $syA.Detail -match 'OneDrive\\AI-Backups' -and $syA.Detail -notmatch 'JohnDoe' -and $syA.Fix -match 'start OneDrive') "cloud sync flagged: OneDrive has its start entry, no OneDrive process, and the backup copy lies in its folder; the text shows no profile path ($($syA.Status): $($syA.Detail))"
+$syB = Get-PcsSyncVerdict -BackupFolders $syInside -Clients @(& $syClient $syEntry $true) -Processes @('explorer', 'onedrive.exe')
+$syC = Get-PcsSyncVerdict -BackupFolders $syBeside -Clients @(& $syClient $syEntry $true) -Processes @('explorer')
+$syD = Get-PcsSyncVerdict -BackupFolders $syInside -Clients @(& $syClient '' $true) -Processes @('explorer')
+Assert-That ($syB.Status -eq 'PASS' -and $syC.Status -eq 'PASS' -and $syC.Detail -match 'not inside' -and $syD.Status -eq 'PASS' -and $syD.Detail -match 'no start-with-Windows entry') "cloud sync not flagged: OneDrive running; a backup folder in the sibling 'OneDrive - Work' folder; no start entry ($($syB.Status) $($syC.Status) $($syD.Status))"
+$syE = Get-PcsSyncVerdict -BackupFolders $syInside -Clients @(& $syClient $syEntry $true) -Processes @() -ProcessesRead $false
+$syF = Get-PcsSyncVerdict -BackupFolders $syInside -Clients @(& $syClient '' $false) -Processes @('explorer')
+Assert-That ($syE.Status -eq 'SKIP' -and $syF.Status -eq 'SKIP') "cloud sync could not be read: the running programs or the start entry unreadable while the backups lie in the OneDrive folder ($($syE.Status) $($syF.Status))"
+
+$odApps = @(
+    [pscustomobject]@{ Name = 'Example Lighting Suite'; Version = '2.1'; InstallLocation = 'C:\Program Files\ExampleLighting\' }
+    [pscustomobject]@{ Name = 'Example Lighting Suite Two'; Version = '1.0'; InstallLocation = 'C:\Program Files\ExampleLighting2' }
+    [pscustomobject]@{ Name = 'Example Tool In The Drive Root'; Version = '1.0'; InstallLocation = 'C:\' }
+)
+$odEne = [pscustomobject]@{ Name = 'EneIo'; PathName = '\??\C:\Program Files\ExampleLighting\drivers\EneIo64.sys'; State = 'Running' }
+$odIdle = [pscustomobject]@{ Name = 'MsIo64'; PathName = 'C:\Windows\system32\drivers\MsIo64.sys'; State = 'Stopped' }
+$odLoaded = @($odEne, $drvIn[3], $drvIn[5])
+$script:odAsked = @()
+$odProbe = { param($Device) $script:odAsked += [string]$Device; 'opened' }
+$odA = Find-PcsOpenDriver -Drivers $odLoaded -Apps $odApps -Probe $odProbe
+Assert-That ($odA.Status -eq 'WARN' -and @($odA.Hits).Count -eq 1 -and $odA.Detail -match 'EneIo64\.sys \(loaded, installed by Example Lighting Suite\)' -and $odA.Detail -match 'without administrator rights' -and $odA.Fix -match 'if you do not use Example Lighting Suite, uninstall it' -and ($script:odAsked -join ',') -eq 'EneIo') "open driver flagged: probe 'opened' is WARN, names the program whose folder holds the driver and says it can be uninstalled; only the listed driver was probed ($($odA.Status); asked: $($script:odAsked -join ','))"
+$odB = Find-PcsOpenDriver -Drivers $odLoaded -Apps $odApps -Probe { 'denied' }
+$odC = Find-PcsOpenDriver -Drivers @($drvIn[3], $drvIn[5]) -Apps $odApps -Probe $odProbe
+$odD = Find-PcsOpenDriver -Drivers @($odIdle) -Apps $odApps -Probe $odProbe
+Assert-That ($odB.Status -eq 'PASS' -and $odB.Detail -match 'refused' -and $odC.Status -eq 'PASS' -and @($odC.Hits).Count -eq 0 -and $odD.Status -eq 'PASS' -and $odD.Detail -match 'not loaded' -and ($script:odAsked -join ',') -eq 'EneIo') "open driver not flagged: probe 'denied'; no listed driver (AsIO3 and the GPU driver are not on this list); a listed one that is not loaded is not probed ($($odB.Status) $($odC.Status) $($odD.Status))"
+$odE = Find-PcsOpenDriver -Drivers $odLoaded -Apps $odApps -Elevated $true -Probe $odProbe
+$odF = Find-PcsOpenDriver -Drivers $odLoaded -Apps $odApps -Probe { 'absent' }
+$odG = Find-PcsOpenDriver -Drivers $odLoaded -Apps $odApps -Probe { 'error 31' }
+$odH = Find-PcsOpenDriver -Drivers $odLoaded -Apps $odApps -Probe { throw 'the probe broke' }
+$odI = Find-PcsOpenDriver -Drivers @() -DriversRead $false -Probe $odProbe
+Assert-That ($odE.Status -eq 'SKIP' -and $odE.Detail -match 'without Run as administrator' -and $odE.Detail -notmatch 'elevated window' -and ($script:odAsked -join ',') -eq 'EneIo' -and $odF.Status -eq 'SKIP' -and $odG.Status -eq 'SKIP' -and $odH.Status -eq 'SKIP' -and $odI.Status -eq 'SKIP') "open driver could not be read: elevated is SKIP and the probe is never asked; no such device, another error, a probe that throws, an unreadable driver list ($($odE.Status) $($odF.Status) $($odG.Status) $($odH.Status) $($odI.Status))"
+$odJ = Find-PcsOpenDriver -Drivers $drvIn -Apps @([pscustomobject]@{ Name = 'Armoury Crate Service'; Version = '5.0'; InstallLocation = '' }) -Probe { 'opened' }
+Assert-That (@($odJ.Hits).Count -eq 1 -and $odJ.Hits[0].Driver -eq 'AsIO.sys' -and $odJ.Hits[0].Device -eq 'Asusgio' -and $odJ.Hits[0].From -match 'installed here: Armoury Crate Service') "open driver: of the vulnerable-driver fixture only AsIO.sys is on this list; a driver in the Windows folder gets its program by name ($(@($odJ.Hits | ForEach-Object { $_.Driver }) -join ', '))"
+
+$fwPy = 'v2.30|Action=Allow|Active=TRUE|Dir=In|Protocol=6|Profile=Private|Profile=Public|App=C:\Python312\python.exe|Name=python.exe|Desc=python.exe|Defer=User|'
+$fwQuiet = @(
+    ($fwPy -replace 'Action=Allow', 'Action=Block')
+    ($fwPy -replace 'Dir=In', 'Dir=Out')
+    ($fwPy -replace 'Active=TRUE', 'Active=FALSE')
+    'v2.30|Action=Allow|Active=TRUE|Dir=In|Protocol=6|App=C:\Program Files\Example\notpython.exe|Name=a look-alike name|'
+    'v2.30|Action=Allow|Active=TRUE|Dir=In|Protocol=6|LPort=3389|Name=a rule without a program|'
+)
+$fwLoud = @($fwPy, ($fwPy -replace 'Protocol=6', 'Protocol=17'), 'v2.31|Action=Allow|Active=TRUE|Dir=In|App=%SystemRoot%\System32\WindowsPowerShell\v1.0\PowerShell.EXE|Name=no profile named|')
+$fwA = Find-PcsInterpreterRule -Rules ($fwLoud + $fwQuiet)
+Assert-That ($fwA.Status -eq 'WARN' -and @($fwA.Hits).Count -eq 2 -and $fwA.Detail.Contains('python.exe (C:\Python312\python.exe; Private, Public networks)') -and $fwA.Detail -match 'powershell\.exe \(.*; every network\)' -and $fwA.Detail -notmatch 'notpython' -and $fwA.Fix -match 'Allow an app through firewall') "firewall flagged: an inbound allow rule for python.exe (its TCP and UDP rules listed once, with its networks) and for PowerShell.EXE under an environment-variable path ($($fwA.Status): $(@($fwA.Hits | ForEach-Object { $_.Text }) -join ' | '))"
+$fwB = Find-PcsInterpreterRule -Rules $fwQuiet
+Assert-That ($fwB.Status -eq 'PASS' -and @($fwB.Hits).Count -eq 0 -and $fwB.Detail -match '5 firewall rules read') "firewall not flagged: a Block, a Dir=Out and an Active=FALSE python.exe rule, a look-alike program name, a rule without a program ($($fwB.Status))"
+$fwC = Find-PcsInterpreterRule -Rules @() -RulesRead $false
+$fwD = Find-PcsInterpreterRule -Rules @($fwQuiet[4], ($fwPy -replace 'Action=Allow', 'Action=ByPass'))
+$fwE = Find-PcsInterpreterRule -Rules @($fwQuiet[4], 'v2.30|Action=Allow|Active=TRUE|App=C:\Java\bin\java.exe|Name=no direction given|')
+$fwF = Find-PcsInterpreterRule -Rules @()
+Assert-That ($fwC.Status -eq 'SKIP' -and $fwD.Status -eq 'SKIP' -and $fwD.Detail -match 'python\.exe' -and $fwE.Status -eq 'SKIP' -and $fwF.Status -eq 'SKIP') "firewall could not be read: an unreadable rule list, an action this check does not judge (ByPass), a rule without a direction, an empty rule list ($($fwC.Status) $($fwD.Status) $($fwE.Status) $($fwF.Status))"
+
+if ($onWindows) {
+    # The readers against this Windows itself. NUL is a device every program may open.
+    $devNul = Test-PcsDeviceOpen -Device 'NUL'
+    $devNone = Test-PcsDeviceOpen -Device ('LaiNoSuchDevice' + (Get-Random -Minimum 100000 -Maximum 999999))
+    $devFile = Test-PcsDeviceOpen -Device 'C:\Windows\win.ini'
+    Assert-That ($devNul -eq 'opened' -and $devNone -eq 'absent' -and $devFile -like 'error*') "the device-open reader: NUL opens, a made-up device name does not (absent), a file path is turned away unopened ($devNul / $devNone / $devFile)"
+    $fwReal = Get-PcsFirewallRuleText
+    $fwShaped = @($fwReal.Rules | Where-Object { $_ -match '^v\d+\.\d+\|' } | Where-Object { $_ -match '\|Action=(Allow|Block)\|' } | Where-Object { $_ -match '\|Dir=(In|Out)\|' } | Where-Object { $_ -match '\|Active=(TRUE|FALSE)\|' })
+    $fwRealVerdict = Find-PcsInterpreterRule -Rules $fwReal.Rules -RulesRead $fwReal.Read
+    Assert-That ($fwReal.Read -and $fwShaped.Count -ge 10 -and @('PASS', 'WARN') -contains $fwRealVerdict.Status) "this Windows keeps its firewall rules in the form the check reads ($(@($fwReal.Rules).Count) rules, $($fwShaped.Count) with Action, Dir and Active; verdict $($fwRealVerdict.Status): $($fwRealVerdict.Detail))"
+    $avReal = Get-PcsAvProduct
+    $syReal = @(Get-PcsSyncClient)
+    Assert-That ($avReal.Read -is [bool] -and $syReal.Count -eq 1 -and $syReal[0].Name -eq 'OneDrive' -and $syReal[0].StartRead -is [bool]) "the Security Center and cloud-sync readers answer without an error (Security Center read: $($avReal.Read); OneDrive folders: $(@($syReal[0].Folders).Count))"
+} else { Skip 'device-open, firewall, Security Center and cloud-sync readers: Windows only (the judges above ran on canned input)' }
+
 # Every command the script runs reads: none that sets, removes, starts or stops anything.
 $changeVerbs = @('Set', 'Remove', 'Enable', 'Disable', 'Clear', 'Start', 'Stop', 'Restart', 'Install', 'Uninstall', 'Register', 'Unregister', 'Update', 'Suspend', 'Resume',
     'Rename', 'Move', 'Copy', 'Grant', 'Revoke', 'Reset', 'Repair', 'Mount', 'Dismount', 'Lock', 'Unlock', 'Invoke', 'Send', 'Publish', 'Initialize', 'Block', 'Unblock')
@@ -2108,6 +2213,15 @@ $pcsSecs = [int]$pcsSw.Elapsed.TotalSeconds
 $checkLines = @($r.Text -split "`n" | Where-Object { $_ -match '\[(OK|WARN|FAIL|INFO) *\] (PASS|WARN|FAIL|SKIP) ' })
 $failLines = @($checkLines | Where-Object { $_ -match '\] FAIL ' })
 Assert-That ($r.Text -match 'PC SECURITY CHECK COMPLETE: \d+ checks, \d+ warnings, \d+ failures' -and $checkLines.Count -ge 20) "the security check runs to its summary line ($($checkLines.Count) checks, $pcsSecs s)"
+$pcsNewRows = @('Hardware-access drivers any program can open', 'Firewall openings for script runners', 'Cloud sync the backups rely on')
+$pcsMissing = @($pcsNewRows | Where-Object { $r.Text -notmatch ('\] (PASS|WARN|FAIL|SKIP) ' + [regex]::Escape($_) + ': ') })
+$pcsAvRows = @($checkLines | Where-Object { $_ -match '\] (PASS|WARN|FAIL|SKIP) Antivirus: ' })
+Assert-That ($pcsMissing.Count -eq 0 -and $pcsAvRows.Count -eq 1) "the run has the three new rows and still one Antivirus row (missing: $($pcsMissing -join ', '); Antivirus rows: $($pcsAvRows.Count))"
+# A row whose own code throws is caught by the script and reported as 'could not be read (<error>)': the
+# rows changed here read through their own readers, so that text on one of them is a bug in the row.
+$pcsRowRx = 'Antivirus: |' + (@($pcsNewRows | ForEach-Object { [regex]::Escape($_) + ': ' }) -join '|')
+$pcsBroken = @($checkLines | Where-Object { $_ -match $pcsRowRx } | Where-Object { $_ -match 'could not be read \(' })
+Assert-That ($pcsBroken.Count -eq 0) "and none of these four rows ends in an error of its own ($($pcsBroken -join ' | '))"
 Assert-That ($r.Text -notmatch 'FullyQualifiedErrorId|ParentContainsErrorRecordException') 'and never throws'
 Assert-That ($r.Code -is [int] -and $r.Code -ge 0 -and $r.Code -eq $failLines.Count) "exit code = number of FAILs (exit $($r.Code), $($failLines.Count) FAIL line(s))"
 $pcsText = ''; if (Test-Path -LiteralPath $pcsReport) { $pcsText = [System.IO.File]::ReadAllText($pcsReport) }

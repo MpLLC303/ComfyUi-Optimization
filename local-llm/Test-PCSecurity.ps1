@@ -8,18 +8,24 @@
     Checks what matters for a home PC that runs Ollama, Open WebUI, SearXNG, ComfyUI and RGB/fan
     tools, and says for every problem one next step you can follow yourself:
 
-      antivirus (Microsoft Defender or the product Windows Security knows), Windows Update and a
-      pending restart, the firewall, User Account Control, Core isolation (memory integrity) and the
+      antivirus (Microsoft Defender or the product Windows Security knows; an antivirus that is
+      registered but snoozed or expired while Defender stands back counts as none), Windows Update and
+      a pending restart, the firewall, User Account Control, Core isolation (memory integrity) and the
       Microsoft vulnerable driver blocklist, Secure Boot and the TPM, drive encryption (system drive,
       the install folder's drive, the Ollama models' drive), Smart App Control and SmartScreen, known
-      vulnerable kernel drivers that RGB/fan/overclocking tools install, Remote Desktop, SMBv1, programs
-      listening beyond this PC (the AI ports must not), Docker Desktop's version and its unprotected
-      API setting, ComfyUI custom nodes and pickle-format model files, the toolkit's Secrets folder
-      permissions, and whether you use an administrator account day to day.
+      vulnerable kernel drivers that RGB/fan/overclocking tools install, hardware-access drivers of
+      such tools that any program can open, Remote Desktop, SMBv1, programs listening beyond this PC
+      (the AI ports must not), firewall rules that let other computers reach a script runner (python,
+      node, PowerShell and the like), Docker Desktop's version and its unprotected API setting, ComfyUI
+      custom nodes and pickle-format model files, the toolkit's Secrets folder permissions, a
+      cloud-sync program (OneDrive) that holds the backups but is not running, and whether you use an
+      administrator account day to day.
 
-    Only reads: registry values, CIM/WMI queries, Get-* cmdlets, folder listings and permissions. It
-    never changes a setting, starts or stops anything, or contacts the internet. Every check is
-    wrapped: a query that fails becomes SKIP, never an error that stops the run.
+    Only reads: registry values, CIM/WMI queries, Get-* cmdlets, folder listings and permissions. One
+    check goes a step further and is still look-only: for a listed hardware-access driver that is
+    loaded, it opens the driver's device without read or write access and closes it at once (in a
+    normal window only). It never changes a setting, starts or stops anything, or contacts the
+    internet. Every check is wrapped: a query that fails becomes SKIP, never an error that stops the run.
 
     Works in a normal window; some checks (TPM, Secure Boot on some PCs, drive encryption, SMBv1)
     need an elevated one and say so. For the full check: right-click Start menu > Local AI - Security
@@ -135,8 +141,113 @@ function ConvertFrom-PcsAvState {
     # Windows Security Center's productState for an antivirus product. Microsoft does not document
     # it; the widely used reading: bit 0x1000 = real-time scanning on, bit 0x10 = definitions out of date.
     # https://jdhitsolutions.com/blog/powershell/5187/get-antivirus-product-status-with-powershell/
+    # State is an unofficial reading too, the one community scripts share: the 0xF000 nibble as a
+    # whole is 0x0000 off, 0x1000 on, 0x2000 snoozed, 0x3000 expired. The four names are the documented
+    # ones (WSC_SECURITY_PRODUCT_STATE in the Windows SDK's iwscapi.h: on, off, snoozed, expired); that
+    # the number carries them in these values is not documented. So any other nibble is 'Unknown',
+    # and whoever asks must count such a product as not checked, neither as on nor as off.
+    # Enabled is true for 'On' alone: 0x3000 (expired) has the 0x1000 bit set as well, and the bit
+    # test used to read an expired antivirus as on.
     param([long]$State)
-    return [pscustomobject]@{ Enabled = (($State -band 0x1000) -ne 0); UpToDate = (($State -band 0x10) -eq 0) }
+    $nibble = $State -band 0xF000
+    if ($nibble -eq 0x1000) { $name = 'On' }
+    elseif ($nibble -eq 0x0000) { $name = 'Off' }
+    elseif ($nibble -eq 0x2000) { $name = 'Snoozed' }
+    elseif ($nibble -eq 0x3000) { $name = 'Expired' }
+    else { $name = 'Unknown' }
+    return [pscustomobject]@{ State = $name; Enabled = ($name -eq 'On'); UpToDate = (($State -band 0x10) -eq 0) }
+}
+
+function Get-PcsAvVerdict {
+    <#
+    Who protects this PC when Microsoft Defender is not plainly the antivirus in charge.
+    Defender: what Defender's own status report answered (AntivirusEnabled,
+    RealTimeProtectionEnabled, AMRunningMode), or $null when it gave no answer. Products: Windows
+    Security Center's antivirus list (displayName, productState, pathToSignedProductExe);
+    ProductsRead = $false when that list could not be read. Output: Status, Detail, Fix.
+    When Defender's own report answered, it alone decides Defender, and Defender's entry in the
+    Security Center list is left out. Counted, an entry that still reads "on" makes a passive
+    Defender behind a snoozed, expired or half-removed antivirus look like a protected PC.
+    AMRunningMode: Normal, Passive Mode, SxS Passive Mode and EDR Block Mode are the documented
+    values ("Microsoft Defender Antivirus compatibility with other security products",
+    https://learn.microsoft.com/en-us/defender-endpoint/microsoft-defender-antivirus-compatibility).
+    "Not running" is not on that list (unofficial: what Defender answers while it is switched off).
+    EDR Block Mode (a managed PC) and any text not named here are not judged: not checked.
+    #>
+    param($Defender = $null, [object[]]$Products = @(), [bool]$ProductsRead = $true)
+    $defOn = $false; $defText = ''; $defWhy = ''
+    if ($null -ne $Defender) {
+        $mode = ([string]$Defender.AMRunningMode).Trim()
+        if ($mode -match '(?i)^(sxs )?passive( mode)?$') {
+            $defText = 'Microsoft Defender is in passive mode'
+            $defWhy = "$defText (it leaves the protecting to another antivirus)"
+        } elseif ($mode -match '(?i)^not running$') {
+            $defText = 'Microsoft Defender is not running'
+        } elseif (-not $Defender.AntivirusEnabled) {
+            $defText = 'Microsoft Defender is switched off'
+        } elseif ($mode -eq '' -or $mode -match '(?i)^normal$') {
+            # No mode at all: an older Defender that does not report one. Its two switches decide.
+            if ($Defender.RealTimeProtectionEnabled) { $defOn = $true } else { $defText = 'Microsoft Defender''s real-time protection is off' }
+        } else {
+            return [pscustomobject]@{ Status = 'SKIP'; Detail = "Microsoft Defender reports the running mode '$mode', which this check does not judge"; Fix = '' }
+        }
+        if (-not $defWhy) { $defWhy = $defText }
+    }
+    $on = @(); $stale = @(); $idle = @(); $idleNames = @(); $unknown = @()
+    foreach ($p in @($Products)) {
+        if ($null -eq $p) { continue }
+        $name = [string]$p.displayName
+        if (-not $name) { $name = 'an antivirus without a name' }
+        $own = ($name -match '(?i)^(windows|microsoft) defender') -or ([string]$p.pathToSignedProductExe -match '(?i)^windowsdefender:')
+        if ($own -and $null -ne $Defender) { continue }
+        $raw = [string]$p.productState
+        $state = 'Unknown'; $current = $true
+        if ($raw -match '^\d+$') {
+            $st = ConvertFrom-PcsAvState -State ([long]$raw)
+            $state = $st.State; $current = $st.UpToDate
+        }
+        if ($state -eq 'On') {
+            $on += $name
+            if (-not $current) { $stale += $name }
+        } elseif ($state -eq 'Snoozed' -or $state -eq 'Expired' -or $state -eq 'Off') {
+            $said = "$name is switched off"
+            if ($state -eq 'Snoozed') { $said = "$name reports itself snoozed (its protection is paused)" }
+            if ($state -eq 'Expired') { $said = "$name reports itself expired" }
+            $idle += $said
+            if (-not $own) { $idleNames += $name }
+        } else {
+            $unknown += "$name (productState $raw)"
+        }
+    }
+    $also = ''
+    if ($idle.Count) { $also = "; also registered with Windows but not protecting: $($idle -join '; ')" }
+    if ($unknown.Count) { $also += "; state not readable for $($unknown -join ', ')" }
+    if ($defOn) { return [pscustomobject]@{ Status = 'PASS'; Detail = "Microsoft Defender on (real-time protection)$also"; Fix = '' } }
+    if (-not $ProductsRead) {
+        $lead = 'Microsoft Defender''s status gave no answer'
+        if ($defText) { $lead = $defText }
+        return [pscustomobject]@{ Status = 'SKIP'; Detail = "$lead, and Windows Security Center could not be asked whether another antivirus is on"; Fix = '' }
+    }
+    if ($on.Count) {
+        if ($stale.Count) { return [pscustomobject]@{ Status = 'WARN'; Detail = "$($stale -join ', ') is on, but Windows reports its definitions out of date"; Fix = 'open that antivirus and run its update' } }
+        $note = ''
+        if ($defText) { $note = " ($defText)" }
+        return [pscustomobject]@{ Status = 'PASS'; Detail = "$($on -join ', ') on$note$also"; Fix = '' }
+    }
+    if ($unknown.Count) {
+        return [pscustomobject]@{ Status = 'SKIP'; Detail = "Windows Security Center reports a state this check cannot read for $($unknown -join ', '), and no other antivirus reports itself on"; Fix = '' }
+    }
+    $parts = @()
+    if ($defWhy) { $parts += $defWhy }
+    $parts += $idle
+    if ($idle.Count -eq 0) {
+        if ($null -ne $Defender) { $parts += 'Windows Security Center lists no other antivirus' } else { $parts += 'Windows Security Center lists no antivirus' }
+    }
+    $fix = 'Windows Security > Virus & threat protection: turn Microsoft Defender on, or open your own antivirus and switch its protection on'
+    if ($idleNames.Count) {
+        $fix = "open $($idleNames -join ', ') and switch the protection back on (renew it if it has expired). If you no longer use it, uninstall it completely (Settings > Apps > Installed apps; if it stays listed, use its maker's removal tool) and restart: Microsoft Defender then takes over by itself. Afterwards Windows Security > Virus & threat protection must show the protection on"
+    }
+    return [pscustomobject]@{ Status = 'FAIL'; Detail = "no antivirus is protecting this PC: $($parts -join '; ')"; Fix = $fix }
 }
 
 function Get-PcsAclVerdict {
@@ -305,6 +416,256 @@ function Protect-PcsText {
     return $Text
 }
 
+function Find-PcsOpenDriver {
+    <#
+    Kernel drivers made to give one utility direct access to the hardware (I/O ports, processor
+    registers, memory). When every program may open such a driver's device, every program on the PC
+    has that access, not only the utility. A short list of known ones from vendor fan, lighting and
+    tuning tools that Find-PcsRiskyDriver does not carry; for these the name alone settles nothing,
+    so the one thing that makes them dangerous is tried.
+    Input: Win32_SystemDriver-like objects (Name, PathName, State); installed apps (Name,
+    InstallLocation); Elevated; DriversRead = $false when the driver list was not readable; Probe, a
+    scriptblock that is handed a device name and answers 'opened', 'denied', 'absent' or 'error ...'
+    (Test-PcsDeviceOpen, or a canned answer in the tests). The probe is asked only for a listed
+    driver that is loaded (State Running), and never when Elevated: an administrator may open every
+    device, so the answer would say nothing. Output: Status, Detail, Fix and Hits (one per match).
+    opened = WARN; denied = fine; anything else for a loaded driver (not asked, no such device, any
+    other answer) = not checked, never fine.
+    Sources. Each names the driver, what it hands out, and that an unprivileged user reaches it:
+      AsIO.sys, the first ASUS one (Aura Sync, AI Suite, older Armoury Crate): CVE-2018-18535 (processor
+        registers) https://nvd.nist.gov/vuln/detail/CVE-2018-18535 and CVE-2018-18536 (I/O ports)
+        https://nvd.nist.gov/vuln/detail/CVE-2018-18536 name "the Asusgio low-level driver" of Aura
+        Sync 1.07.22 and earlier. That Asusgio is the file AsIO.sys is not in the CVE text
+        (unofficial), which is why it is tested here and not listed by name in Find-PcsRiskyDriver.
+      GLCKIo.sys (ASUS Aura Sync): CVE-2018-18536 and CVE-2018-18537
+        https://nvd.nist.gov/vuln/detail/CVE-2018-18537
+      ene.sys / EneIo64.sys (lighting tools for ENE controllers, e.g. G.SKILL Trident Z Lighting
+        Control): CVE-2020-12446 https://nvd.nist.gov/vuln/detail/CVE-2020-12446
+      MsIo64.sys / MsIo32.sys (Patriot Viper RGB and other lighting tools): CVE-2019-18845
+        https://nvd.nist.gov/vuln/detail/CVE-2019-18845
+    Device is the name the driver's device answers to (\\.\<Device>). The advisories do not all
+    spell it out, so these names are unofficial: where one is wrong the probe finds no such device,
+    and the driver counts as not checked.
+    #>
+    param([object[]]$Drivers = @(), [object[]]$Apps = @(), [bool]$Elevated = $false, [scriptblock]$Probe = $null, [bool]$DriversRead = $true)
+    $known = @(
+        @{ File = '^asio(32|64)?\.sys$'; Service = '^(asusgio|asio)$'; Device = 'Asusgio'; App = 'an ASUS utility such as Aura Sync, AI Suite or Armoury Crate'; AppMatch = '(?i)\b(aura sync|ai suite|armoury crate)\b' }
+        @{ File = '^glckio\.sys$'; Service = '^glckio$'; Device = 'GLCKIo'; App = 'ASUS Aura Sync'; AppMatch = '(?i)\baura sync\b' }
+        @{ File = '^(ene|eneio(32|64)?)\.sys$'; Service = '^(ene|eneio)$'; Device = 'EneIo'; App = 'a lighting utility for ENE controllers such as G.SKILL Trident Z Lighting Control'; AppMatch = '(?i)trident z lighting' }
+        @{ File = '^msio(32|64)\.sys$'; Service = '^msio(32|64)?$'; Device = 'MsIo'; App = 'a lighting utility such as Patriot Viper RGB'; AppMatch = '(?i)viper rgb' }
+    )
+    if (-not $DriversRead) { return [pscustomobject]@{ Status = 'SKIP'; Detail = 'the list of drivers was not readable (see the check above)'; Fix = ''; Hits = @() } }
+    $ic = [System.StringComparison]::OrdinalIgnoreCase
+    # Paths are compared as text (this also runs on the non-Windows test job): quotes, a leading \??\
+    # and a closing backslash off, forward slashes turned.
+    $clean = { param([string]$p) ((([string]$p).Trim().Trim('"') -replace '^\\\?\?\\', '') -replace '/', '\').TrimEnd([char]'\') }
+    $hits = @()
+    foreach ($d in @($Drivers)) {
+        if ($null -eq $d) { continue }
+        $name = [string]$d.Name
+        $path = & $clean ([string]$d.PathName)
+        $leaf = $path; $folder = ''
+        if ($path -match '^(.*)\\([^\\]+)$') { $folder = $Matches[1]; $leaf = $Matches[2] }
+        foreach ($k in $known) {
+            if (-not (($leaf -and $leaf -match $k.File) -or ($name -and $name -match $k.Service))) { continue }
+            # The program that installed it: the one whose install folder holds the driver, else
+            # the installed programs that usually bring it, else only what usually brings it.
+            $owner = ''; $best = 0
+            foreach ($a in @($Apps)) {
+                if ($null -eq $a -or -not $folder) { continue }
+                $loc = & $clean ([string]$a.InstallLocation)
+                # Not a drive root or the Windows folder: every driver would belong to that program.
+                if ($loc.Length -lt 4 -or $loc.Length -le $best -or $loc -match '(?i)^[a-z]:\\windows(\\|$)') { continue }
+                if ($folder.Equals($loc, $ic) -or $folder.StartsWith($loc + '\', $ic)) { $owner = [string]$a.Name; $best = $loc.Length }
+            }
+            $from = "usually from $($k.App)"
+            $remove = "the program it came with ($($k.App))"
+            if ($owner) {
+                $from = "installed by $owner"; $remove = $owner
+            } else {
+                $present = @($Apps | Where-Object { $_ -and ([string]$_.Name) -match $k.AppMatch } | ForEach-Object { [string]$_.Name } | Select-Object -Unique | Select-Object -First 3)
+                if ($present.Count) { $from = "$from; installed here: $($present -join ', ')"; $remove = $present -join ' / ' }
+            }
+            $running = ([string]$d.State -eq 'Running')
+            $result = 'not loaded'
+            if ($running -and $Elevated) {
+                $result = 'not asked'
+            } elseif ($running) {
+                $result = 'error (no answer)'
+                if ($null -ne $Probe) {
+                    try {
+                        $answer = @(& $Probe $k.Device)
+                        if ($answer.Count) { $result = [string]$answer[$answer.Count - 1] }
+                    } catch { $result = "error ($($_.Exception.Message))" }
+                }
+            }
+            $file = $leaf; if (-not $file) { $file = $name }
+            $hits += [pscustomobject]@{ Driver = $file; Service = $name; State = [string]$d.State; Running = $running; Device = $k.Device; From = $from; Remove = $remove; Result = $result }
+            break
+        }
+    }
+    if ($hits.Count -eq 0) {
+        return [pscustomobject]@{ Status = 'PASS'; Detail = 'none of the ones this check knows is installed (ASUS AsIO and GLCKIo, ENE EneIo, MsIo)'; Fix = ''; Hits = @() }
+    }
+    $opened = @($hits | Where-Object { $_.Result -eq 'opened' })
+    $untested = @($hits | Where-Object { $_.Running -and $_.Result -ne 'opened' -and $_.Result -ne 'denied' })
+    $notes = @()
+    foreach ($h in $untested) {
+        if ($h.Result -eq 'absent') { $notes += "$($h.Driver) is loaded, but no device named $($h.Device) was found, which is the name this check knows for it" }
+        elseif ($h.Result -ne 'not asked') { $notes += "$($h.Driver) is loaded, but the test ended with: $($h.Result)" }
+    }
+    $unasked = @($untested | Where-Object { $_.Result -eq 'not asked' } | ForEach-Object { "$($_.Driver) ($($_.From))" })
+    if ($unasked.Count) { $notes += "$($unasked -join ', ') is loaded, but this window runs as administrator, and an administrator may open every device. Run the check again without Run as administrator (Start menu > Local AI - Security check)" }
+    if ($opened.Count) {
+        $what = @($opened | ForEach-Object { "$($_.Driver) (loaded, $($_.From))" }) -join ', '
+        $detail = "$what can be opened by any program on this PC without administrator rights. Such a driver gives its own utility direct access to the hardware (I/O ports, processor registers, memory), so every program you run, a malicious one too, can use that access to take over Windows or switch off the antivirus"
+        if ($notes.Count) { $detail += ". Not tested: $($notes -join '; ')" }
+        $fix = @($opened | ForEach-Object { "$($_.Driver): if you do not use $($_.Remove), uninstall it (Settings > Apps > Installed apps) and restart; the driver goes with it. If you use it, install its newest version and run this check again" }) -join '. '
+        return [pscustomobject]@{ Status = 'WARN'; Detail = $detail; Fix = $fix; Hits = $hits }
+    }
+    if ($untested.Count) {
+        return [pscustomobject]@{ Status = 'SKIP'; Detail = "not tested: $($notes -join '; ')"; Fix = ''; Hits = $hits }
+    }
+    $fine = @()
+    foreach ($h in $hits) {
+        if ($h.Running) { $fine += "$($h.Driver) is loaded ($($h.From)), but its device refused this program, which has no administrator rights, as it should" }
+        else { $fine += "$($h.Driver) is installed but not loaded ($($h.From))" }
+    }
+    return [pscustomobject]@{ Status = 'PASS'; Detail = ($fine -join '; '); Fix = ''; Hits = $hits }
+}
+
+function Find-PcsInterpreterRule {
+    <#
+    Firewall rules that let other computers connect to a program that runs any script handed to it.
+    Such a rule is not an opening for one app: every script started with that program can be
+    reached. Windows writes one when you answer Allow to its "firewall has blocked some features"
+    question while a script is listening.
+    Rules: the rule strings as Windows keeps them, one per rule, for example
+      v2.30|Action=Allow|Active=TRUE|Dir=In|Protocol=6|Profile=Private|App=C:\Python312\python.exe|Name=python.exe|
+    RulesRead = $false when the list was not readable. Output: Status, Detail, Fix and Hits.
+    Grammar: [MS-GPFAS] "Group Policy: Firewall and Advanced Security Data Structure", section
+    "Firewall Rule and the Firewall Rule Grammar Rule": fields joined by '|'; Action = Allow | Block |
+    ByPass; Dir = In | Out; Active = TRUE | FALSE; Profile = Domain | Private | Public, none meaning
+    every network; App = the program's path.
+    Flagged: Allow + In + TRUE. Not flagged: a rule that says Block, Out or FALSE. Anything else for
+    a listed program (ByPass, a missing field, a value not named here) is not judged: not checked.
+    #>
+    param([string[]]$Rules = @(), [bool]$RulesRead = $true)
+    $programs = @('python.exe', 'pythonw.exe', 'node.exe', 'powershell.exe', 'pwsh.exe', 'wscript.exe', 'cscript.exe', 'java.exe')
+    if (-not $RulesRead) { return [pscustomobject]@{ Status = 'SKIP'; Detail = 'the firewall''s rule list was not readable'; Fix = ''; Hits = @() } }
+    $seen = 0; $byApp = @{}; $order = @(); $unclear = @()
+    foreach ($text in @($Rules)) {
+        if (-not $text) { continue }
+        $seen++
+        $field = @{}; $nets = @()
+        foreach ($part in ($text -split '\|')) {
+            if ($part -notmatch '^([A-Za-z0-9_]+)=(.*)$') { continue }
+            $key = $Matches[1].ToLowerInvariant(); $value = $Matches[2].Trim()
+            if ($key -eq 'profile') { if ($nets -notcontains $value) { $nets += $value } }
+            elseif (-not $field.ContainsKey($key)) { $field[$key] = $value }
+        }
+        if (-not $field.ContainsKey('app')) { continue }
+        $app = [string]$field['app']
+        $leaf = ''
+        if ($app -match '([^\\/]+)$') { $leaf = $Matches[1].ToLowerInvariant() }
+        if ($programs -notcontains $leaf) { continue }
+        $action = [string]$field['action']; $dir = [string]$field['dir']; $active = [string]$field['active']
+        if ($action -eq 'Block' -or $dir -eq 'Out' -or $active -eq 'FALSE') { continue }
+        if ($action -eq 'Allow' -and $dir -eq 'In' -and $active -eq 'TRUE') {
+            # One program usually has two rules (TCP and UDP): listed once, its networks joined.
+            $id = $app.ToLowerInvariant()
+            if (-not $byApp.ContainsKey($id)) { $byApp[$id] = @{ Program = $leaf; App = $app; Nets = @(); Every = $false }; $order += $id }
+            if ($nets.Count -eq 0) { $byApp[$id]['Every'] = $true }
+            foreach ($n in $nets) { if ($byApp[$id]['Nets'] -notcontains $n) { $byApp[$id]['Nets'] = @($byApp[$id]['Nets']) + $n } }
+        } elseif ($unclear -notcontains $leaf) {
+            $unclear += $leaf
+        }
+    }
+    $hits = @()
+    foreach ($id in $order) {
+        $h = $byApp[$id]
+        $netText = 'every network'
+        if (-not $h['Every'] -and @($h['Nets']).Count) { $netText = "$(@($h['Nets']) -join ', ') networks" }
+        $hits += [pscustomobject]@{ Program = $h['Program']; App = $h['App']; Networks = $netText; Text = ('{0} ({1}; {2})' -f $h['Program'], $h['App'], $netText) }
+    }
+    $odd = ''
+    if ($unclear.Count) { $odd = "a firewall rule for $($unclear -join ', ') is written in a way this check does not know, so it was not judged" }
+    if ($hits.Count) {
+        $shown = @($hits | Select-Object -First 6 | ForEach-Object { $_.Text }) -join '; '
+        if ($hits.Count -gt 6) { $shown += " and $($hits.Count - 6) more (see the report)" }
+        $detail = "the firewall lets other computers connect to $shown. These programs run whatever script they are given, so the opening is not for one app: every script started with them can be reached from the network"
+        if ($odd) { $detail += ". Also: $odd" }
+        $fix = 'Windows Security > Firewall & network protection > Allow an app through firewall > Change settings: untick these entries (or select one and Remove) unless you run a server with that program on purpose; if you do, leave only Private ticked. The toolkit needs none of them'
+        return [pscustomobject]@{ Status = 'WARN'; Detail = $detail; Fix = $fix; Hits = $hits }
+    }
+    if ($odd) { return [pscustomobject]@{ Status = 'SKIP'; Detail = $odd; Fix = ''; Hits = @() } }
+    if ($seen -eq 0) { return [pscustomobject]@{ Status = 'SKIP'; Detail = 'Windows lists no firewall rules in the place this check reads them'; Fix = ''; Hits = @() } }
+    return [pscustomobject]@{ Status = 'PASS'; Detail = "no rule lets other computers connect to $($programs[0..6] -join ', ') or $($programs[7]) ($seen firewall rules read)"; Fix = ''; Hits = @() }
+}
+
+function Get-PcsSyncVerdict {
+    <#
+    Backups kept inside a cloud-sync folder leave this PC only while that sync program runs. One
+    that has a start-with-Windows entry but is not running (signed out, crashed or half-removed)
+    uploads nothing, and nothing says so.
+    BackupFolders: the folders the toolkit writes backups to. Clients: one object per sync program
+    with Name, Process (its process name, without .exe), Folders (its sync folders), StartEntry (its
+    start-with-Windows command, '' when it has none) and StartRead ($false when that was not
+    readable). Processes: the names of the running processes; ProcessesRead = $false when unknown.
+    Output: Status, Detail, Fix.
+    Reported only for a client whose folder holds a backup folder. "Inside" compares whole folder
+    names, so a folder next to it that only starts with the same letters ("OneDrive - Work" beside
+    "OneDrive") does not count. Paths are compared as text (this also runs on the non-Windows test
+    job). The text names the place below the sync folder only, not the profile path above it.
+    #>
+    param([string[]]$BackupFolders = @(), [object[]]$Clients = @(), [string[]]$Processes = @(), [bool]$ProcessesRead = $true)
+    $ic = [System.StringComparison]::OrdinalIgnoreCase
+    $clean = { param([string]$p) ((([string]$p).Trim().Trim('"')) -replace '/', '\').TrimEnd([char]'\') }
+    $running = @($Processes | Where-Object { $_ } | ForEach-Object { ([string]$_).Trim() -replace '(?i)\.exe$', '' })
+    $known = @(); $stopped = @(); $fixes = @(); $unread = @(); $fine = @()
+    foreach ($c in @($Clients)) {
+        if ($null -eq $c) { continue }
+        $name = [string]$c.Name
+        $known += $name
+        $places = @()
+        foreach ($b in @($BackupFolders)) {
+            $bp = & $clean $b
+            if (-not $bp) { continue }
+            foreach ($f in @($c.Folders)) {
+                $fp = & $clean ([string]$f)
+                if ($fp.Length -lt 3) { continue }
+                $same = $bp.Equals($fp, $ic)
+                if (-not ($same -or $bp.StartsWith($fp + '\', $ic))) { continue }
+                $place = "the $name folder itself"
+                if (-not $same) { $place = $name + '\' + $bp.Substring($fp.Length + 1) }
+                if ($places -notcontains $place) { $places += $place }
+                break
+            }
+        }
+        if ($places.Count -eq 0) { continue }
+        $inside = $places -join ', '
+        if (-not $ProcessesRead) { $unread += "the backups lie in $inside, but the list of running programs was not readable"; continue }
+        if ($running -contains [string]$c.Process) { $fine += "$name is running, and the backups lie in its folder ($inside)"; continue }
+        if (-not $c.StartRead) { $unread += "the backups lie in $inside and $name is not running, but whether it is set to start with Windows was not readable"; continue }
+        if ([string]$c.StartEntry) {
+            $stopped += "$name has a start-with-Windows entry but is not running, and the backups lie in its folder ($inside): nothing uploads them, so they exist on this PC only"
+            $fixes += "start $name (Start menu > $name) and wait until its icon near the clock shows it signed in and up to date. If it does not start or asks to be set up again, reinstall it and sign in. If you no longer want $name, keep the backups in a folder outside it (another drive is best)"
+        } else {
+            $fine += "the backups lie in $inside; $name has no start-with-Windows entry, so it is not expected to run (it uploads them only while you run it)"
+        }
+    }
+    if ($stopped.Count) {
+        $detail = $stopped -join '; '
+        if ($unread.Count) { $detail += ". Not checked: $($unread -join '; ')" }
+        return [pscustomobject]@{ Status = 'WARN'; Detail = $detail; Fix = ($fixes -join '. ') }
+    }
+    if ($unread.Count) { return [pscustomobject]@{ Status = 'SKIP'; Detail = "not checked: $($unread -join '; ')"; Fix = '' } }
+    if ($fine.Count) { return [pscustomobject]@{ Status = 'PASS'; Detail = ($fine -join '; '); Fix = '' } }
+    $which = 'a cloud-sync folder'
+    if ($known.Count) { $which = "a cloud-sync folder this check knows ($($known -join ', '))" }
+    return [pscustomobject]@{ Status = 'PASS'; Detail = "the backup folders are not inside $which, so no sync program has to run for them"; Fix = '' }
+}
+
 #endregion
 
 #region PC queries (read-only) ---------------------------------------------------------------------
@@ -319,7 +680,8 @@ function Get-PcsRegValue {
 }
 
 function Get-PcsInstalledApp {
-    # DisplayName / DisplayVersion of installed programs (machine-wide, 32-bit and per-user entries).
+    # DisplayName / DisplayVersion / InstallLocation of installed programs (machine-wide, 32-bit and
+    # per-user entries). InstallLocation is '' where the program's installer did not record one.
     $apps = @()
     foreach ($k in @('HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall', 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall', 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall')) {
         if (-not (Test-Path -LiteralPath $k)) { continue }
@@ -328,7 +690,9 @@ function Get-PcsInstalledApp {
             if (-not ($p.PSObject.Properties['DisplayName'] -and $p.DisplayName)) { continue }
             $ver = ''
             if ($p.PSObject.Properties['DisplayVersion'] -and $p.DisplayVersion) { $ver = [string]$p.DisplayVersion }
-            $apps += [pscustomobject]@{ Name = [string]$p.DisplayName; Version = $ver }
+            $loc = ''
+            if ($p.PSObject.Properties['InstallLocation'] -and $p.InstallLocation) { $loc = [string]$p.InstallLocation }
+            $apps += [pscustomobject]@{ Name = [string]$p.DisplayName; Version = $ver; InstallLocation = $loc }
         }
     }
     return $apps
@@ -339,6 +703,104 @@ function Get-PcsDriveOf {
     param([string]$Path)
     if ($Path -match '^([A-Za-z]):') { return ($Matches[1].ToUpperInvariant() + ':') }
     return ''
+}
+
+function Get-PcsAvProduct {
+    # Windows Security Center's antivirus list, as Get-PcsAvVerdict wants it (displayName,
+    # productState, pathToSignedProductExe). Read = $false when it could not be asked (Windows Server
+    # has no Security Center). A standard account may read it.
+    try {
+        $list = @(Get-CimInstance -Namespace 'root/SecurityCenter2' -ClassName AntiVirusProduct -OperationTimeoutSec 30 -ErrorAction Stop |
+                ForEach-Object { [pscustomobject]@{ displayName = [string]$_.displayName; productState = $_.productState; pathToSignedProductExe = [string]$_.pathToSignedProductExe } })
+        return [pscustomobject]@{ Read = $true; Products = $list }
+    } catch {
+        return [pscustomobject]@{ Read = $false; Products = @() }
+    }
+}
+
+function Test-PcsDeviceOpen {
+    <#
+    Can this program open a driver's device? Answers 'opened', 'denied', 'absent' (no device of
+    that name) or 'error ...'. It opens \\.\<Device> asking for neither read nor write access and
+    closes the handle at once, in one call: nothing is sent to the driver and nothing is changed.
+    Takes a bare device name only, so it cannot be pointed at a file or a folder. The answer means
+    something only in a window without administrator rights; the caller sees to that.
+    CreateFileW (fileapi.h), https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-createfilew :
+      dwDesiredAccess 0 = neither GENERIC_READ nor GENERIC_WRITE (the open still has to pass the
+      device's own access check); dwShareMode 3 = FILE_SHARE_READ | FILE_SHARE_WRITE;
+      dwCreationDisposition 3 = OPEN_EXISTING; a failed open returns INVALID_HANDLE_VALUE (-1).
+    System error codes (winerror.h), https://learn.microsoft.com/en-us/windows/win32/debug/system-error-codes--0-499- :
+      2 ERROR_FILE_NOT_FOUND and 3 ERROR_PATH_NOT_FOUND = no such device; 5 ERROR_ACCESS_DENIED.
+      Any other code is handed on as 'error <code>' and not interpreted: not checked.
+    #>
+    param([string]$Device)
+    if ($env:OS -ne 'Windows_NT') { return 'error (not Windows)' }
+    if ($Device -notmatch '^[A-Za-z0-9_]{1,64}$') { return 'error (not a device name)' }
+    try {
+        if (-not ('PcsDevice' -as [type])) {
+            $members = @(
+                '[System.Runtime.InteropServices.DllImport("kernel32.dll", CharSet = System.Runtime.InteropServices.CharSet.Unicode, SetLastError = true)]'
+                'static extern System.IntPtr CreateFileW(string lpFileName, uint dwDesiredAccess, uint dwShareMode, System.IntPtr lpSecurityAttributes, uint dwCreationDisposition, uint dwFlagsAndAttributes, System.IntPtr hTemplateFile);'
+                '[System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError = true)]'
+                'static extern bool CloseHandle(System.IntPtr hObject);'
+                '// 0 = opened, and closed again here; otherwise the error code of the failed open (-1: none given).'
+                'public static int TryOpen(string name) {'
+                '    System.IntPtr handle = CreateFileW(name, 0, 3, System.IntPtr.Zero, 3, 0, System.IntPtr.Zero);'
+                '    if (handle == new System.IntPtr(-1)) { int code = System.Runtime.InteropServices.Marshal.GetLastWin32Error(); return code == 0 ? -1 : code; }'
+                '    CloseHandle(handle);'
+                '    return 0;'
+                '}'
+            ) -join "`n"
+            Add-Type -Namespace '' -Name 'PcsDevice' -MemberDefinition $members
+        }
+        $code = [PcsDevice]::TryOpen('\\.\' + $Device)
+    } catch {
+        return "error ($($_.Exception.Message))"
+    }
+    if ($code -eq 0) { return 'opened' }
+    if ($code -eq 5) { return 'denied' }
+    if ($code -eq 2 -or $code -eq 3) { return 'absent' }
+    return "error $code"
+}
+
+function Get-PcsFirewallRuleText {
+    # Every firewall rule as Windows keeps it, one string per rule: this PC's own rules, then the
+    # ones a policy sets ([MS-GPFAS] describes the policy key; the PC's own store keeps the same
+    # strings). One registry read, not a query per rule. Read = $false when no rule store could be
+    # read. A standard account may read both keys.
+    $list = New-Object System.Collections.Generic.List[string]
+    $read = $false
+    try {
+        foreach ($k in @('HKLM:\SYSTEM\CurrentControlSet\Services\SharedAccess\Parameters\FirewallPolicy\FirewallRules', 'HKLM:\SOFTWARE\Policies\Microsoft\WindowsFirewall\FirewallRules')) {
+            if (-not (Test-Path -LiteralPath $k)) { continue }
+            $key = Get-Item -LiteralPath $k -ErrorAction Stop
+            foreach ($n in @($key.GetValueNames())) { $list.Add([string]$key.GetValue($n)) }
+            $read = $true
+        }
+    } catch {
+        $read = $false
+    }
+    return [pscustomobject]@{ Read = $read; Rules = $list.ToArray() }
+}
+
+function Get-PcsSyncClient {
+    # The cloud-sync programs this check knows, as Get-PcsSyncVerdict wants them. OneDrive: its
+    # folders are the ones its client puts into the OneDrive, OneDriveConsumer and OneDriveCommercial
+    # environment variables of this account; its start-with-Windows entry is the value OneDrive under
+    # this account's Run key. Task Manager's Startup apps page can switch such an entry off and leave
+    # it in place, so the verdict says "has a start-with-Windows entry", not "starts with Windows".
+    $folders = @(@($env:OneDrive, $env:OneDriveConsumer, $env:OneDriveCommercial) | Where-Object { $_ } | Select-Object -Unique)
+    $entry = ''; $read = $true
+    $runKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
+    try {
+        if (Test-Path -LiteralPath $runKey) {
+            $run = Get-ItemProperty -LiteralPath $runKey -ErrorAction Stop
+            if ($run -and $run.PSObject.Properties['OneDrive']) { $entry = [string]$run.OneDrive }
+        }
+    } catch {
+        $read = $false
+    }
+    return [pscustomobject]@{ Name = 'OneDrive'; Process = 'OneDrive'; Folders = $folders; StartEntry = $entry; StartRead = $read }
 }
 
 #endregion
@@ -392,6 +854,17 @@ function Pass([string]$d) { @{ Status = 'PASS'; Detail = $d; Fix = '' } }
 function Fail([string]$d, [string]$f) { @{ Status = 'FAIL'; Detail = $d; Fix = $f } }
 function Warn([string]$d, [string]$f) { @{ Status = 'WARN'; Detail = $d; Fix = $f } }
 function Skip([string]$d) { @{ Status = 'SKIP'; Detail = $d; Fix = '' } }
+function Convert-Verdict($Verdict) {
+    # A judge's answer (an object with Status, Detail, Fix) as the hashtable Add-Check keeps. Add-Check
+    # reads anything else as PASS, so a status that is none of the four ends here as not checked.
+    switch ([string]$Verdict.Status) {
+        'PASS' { return (Pass ([string]$Verdict.Detail)) }
+        'WARN' { return (Warn ([string]$Verdict.Detail) ([string]$Verdict.Fix)) }
+        'FAIL' { return (Fail ([string]$Verdict.Detail) ([string]$Verdict.Fix)) }
+        'SKIP' { return (Skip ([string]$Verdict.Detail)) }
+    }
+    Skip 'the check gave no answer this script understands'
+}
 
 Write-LaiLog STEP 'PC security check (read-only: nothing on this PC is changed)'
 if ($onWindows -and -not $isElevated) { Write-LaiLog INFO "Not elevated: a few checks are skipped. For all of them: $needAdmin." }
@@ -415,18 +888,14 @@ Add-Check 'Antivirus' {
         if ($issues.Count) { return (Warn ('Microsoft Defender real-time protection is on, but ' + ($issues -join '; ')) ($fixes -join '; then ')) }
         return (Pass "Microsoft Defender on (real-time protection, Tamper Protection, definitions $age day(s) old)")
     }
-    # Defender passive (another antivirus took over) or absent: ask Windows Security Center.
-    $products = @(Get-CimInstance -Namespace 'root/SecurityCenter2' -ClassName AntiVirusProduct -OperationTimeoutSec 30 -ErrorAction Stop)
-    $active = @(); $stale = @()
-    foreach ($p in $products) {
-        $st = ConvertFrom-PcsAvState -State ([long]$p.productState)
-        if ($st.Enabled) { $active += [string]$p.displayName; if (-not $st.UpToDate) { $stale += [string]$p.displayName } }
-    }
-    if ($active.Count -eq 0) {
-        return (Fail "no antivirus with real-time protection on (registered: $(if ($products.Count) { @($products | ForEach-Object { [string]$_.displayName }) -join ', ' } else { 'none' }))" 'Windows Security > Virus & threat protection: turn Microsoft Defender on, or open your own antivirus and switch its protection on')
-    }
-    if ($stale.Count) { return (Warn "$($stale -join ', ') is on, but Windows reports its definitions out of date" 'open that antivirus and run its update') }
-    Pass "$($active -join ', ') on (Microsoft Defender is passive: $mode)"
+    # Defender is not the antivirus in charge (passive, switched off, or its status gave no answer):
+    # Windows Security Center knows the others. This only reads; Get-PcsAvVerdict judges. What
+    # Defender itself answered goes along, so that its own Security Center entry is not counted: a
+    # passive Defender behind a snoozed or expired antivirus used to pass here as "Windows Defender on".
+    $seen = $null
+    if ($mp) { $seen = [pscustomobject]@{ AntivirusEnabled = [bool]$mp.AntivirusEnabled; RealTimeProtectionEnabled = [bool]$mp.RealTimeProtectionEnabled; AMRunningMode = $mode } }
+    $wsc = Get-PcsAvProduct
+    Convert-Verdict (Get-PcsAvVerdict -Defender $seen -Products $wsc.Products -ProductsRead $wsc.Read)
 }
 
 # ---- 2. Windows Update ------------------------------------------------------------------------------
@@ -606,10 +1075,14 @@ Add-Check 'SmartScreen for apps and files' {
 }
 
 # ---- 9. vulnerable kernel drivers -----------------------------------------------------------------
+$script:drivers = $null
+$script:apps = @()
 Add-Check 'Known-vulnerable drivers (RGB, fan, overclocking tools)' {
     if (-not $onWindows) { return (Skip $winOnly) }
     $drv = @(Get-CimInstance -ClassName Win32_SystemDriver -OperationTimeoutSec 60 -ErrorAction Stop | ForEach-Object { [pscustomobject]@{ Name = [string]$_.Name; PathName = [string]$_.PathName; State = [string]$_.State } })
     $apps = @(); try { $apps = @(Get-PcsInstalledApp) } catch { $apps = @() }
+    # The next check works on the same two lists.
+    $script:drivers = $drv; $script:apps = $apps
     $hits = @(Find-PcsRiskyDriver -Drivers $drv -Apps $apps)
     $open = @($hits | Where-Object { -not $_.Fixed })
     $done = @($hits | Where-Object { $_.Fixed })
@@ -623,6 +1096,15 @@ Add-Check 'Known-vulnerable drivers (RGB, fan, overclocking tools)' {
         return (Warn "$txt$fixedNote. Any program on this PC can use such a driver to take over Windows" $fx)
     }
     Pass "none of WinRing0, RTCore64, CorsairLLAccess, AsIO2/AsIO3 or gdrv is installed$fixedNote"
+}
+# Drivers of the same kind that the list above cannot name by a flaw of their own: the device of each
+# loaded one is opened and closed (no read, no write access) to see whether any program may.
+Add-Check 'Hardware-access drivers any program can open' {
+    if (-not $onWindows) { return (Skip $winOnly) }
+    # Never in an elevated window: an administrator may open every device. Find-PcsOpenDriver does
+    # not ask the probe then, nor for a driver that is not on its list or not loaded.
+    $v = Find-PcsOpenDriver -Drivers @($script:drivers) -Apps @($script:apps) -Elevated $isElevated -DriversRead ($null -ne $script:drivers) -Probe { param($Device) Test-PcsDeviceOpen -Device $Device }
+    Convert-Verdict $v
 }
 
 # ---- 10. remote access surface ----------------------------------------------------------------------
@@ -679,6 +1161,13 @@ Add-Check 'Other programs reachable from the network' {
     $shown = @($exp.Other | Select-Object -First 12) -join ', '
     if ($exp.Other.Count -gt 12) { $shown += " and $($exp.Other.Count - 12) more (see the report)" }
     Warn "these programs accept connections from other computers (the firewall still decides who gets through): $shown" 'look for programs you do not recognise; Windows Security > Firewall & network protection > Allow an app through firewall shows which ones the firewall lets in: untick any you do not need'
+}
+Add-Check 'Firewall openings for script runners' {
+    if (-not $onWindows) { return (Skip $winOnly) }
+    $fw = Get-PcsFirewallRuleText
+    $v = Find-PcsInterpreterRule -Rules $fw.Rules -RulesRead $fw.Read
+    if (@($v.Hits).Count) { Add-ReportSection 'Firewall rules that let other computers reach a script runner (program (path; networks))' @($v.Hits | ForEach-Object { [string]$_.Text }) }
+    Convert-Verdict $v
 }
 
 # ---- 11. Docker Desktop -----------------------------------------------------------------------------
@@ -772,6 +1261,16 @@ Add-Check 'Toolkit Secrets folder private' {
     if ($v.Status -eq 'WARN') { return (Warn "$dir is limited to another account ($($v.Bad -join ', ')); run this check from the account that installed the toolkit" $fix) }
     Pass "$dir only for your account, Administrators and SYSTEM"
 }
+# The backups, and the second copy the installer's -BackupMirror names, are off this PC only while
+# the sync program whose folder they lie in is running.
+Add-Check 'Cloud sync the backups rely on' {
+    if (-not $onWindows) { return (Skip $winOnly) }
+    $folders = @((Join-Path $AIRoot 'Backups'))
+    if ($config.ContainsKey('BackupMirror') -and $config['BackupMirror']) { $folders += [string]$config['BackupMirror'] }
+    $procs = @(); $procsRead = $true
+    try { $procs = @(Get-Process -ErrorAction Stop | ForEach-Object { [string]$_.ProcessName }) } catch { $procsRead = $false }
+    Convert-Verdict (Get-PcsSyncVerdict -BackupFolders $folders -Clients @(Get-PcsSyncClient) -Processes $procs -ProcessesRead $procsRead)
+}
 
 # ---- 14. account --------------------------------------------------------------------------------------
 Add-Check 'Daily account type' {
@@ -789,7 +1288,12 @@ Add-Check 'Daily account type' {
 Add-Check 'This window' {
     if (-not $onWindows) { return (Skip $winOnly) }
     $n = @($results | Where-Object { $_.Status -eq 'SKIP' -and $_.Detail -like '*elevated window*' }).Count
-    if ($isElevated) { return (Pass 'elevated: every check ran') }
+    if ($isElevated) {
+        # One check works the other way round: it tells nothing in an elevated window and asks for a normal one.
+        $normalOnly = @($results | Where-Object { $_.Status -eq 'SKIP' -and $_.Detail -like '*without Run as administrator*' }).Count
+        if ($normalOnly -gt 0) { return (Pass "elevated: every check that needs it ran; $normalOnly check(s) above can only be made in a normal window") }
+        return (Pass 'elevated: every check ran')
+    }
     if ($n -gt 0) { return (Skip "not elevated: $n check(s) above were skipped; for all of them: $needAdmin") }
     Pass 'not elevated (nothing needed it)'
 }
