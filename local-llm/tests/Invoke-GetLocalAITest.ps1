@@ -232,7 +232,7 @@ if ($haveFunctions) {
     Assert-That ($dictCommit -and $dictCommit.Sha -eq $shaNew -and $dictCommit.Date -eq '2026-10-06' -and $dictCommit.Subject -eq 'Incoming subject line') 'a commit read into dictionaries gives id, date and subject line'
     Assert-That ((Get-ReviewText $asObjects) -match '3 commit\(s\), 3 file\(s\) differ' -and (Get-ReviewText $asObjects) -match 'Was-There\.ps1 -> local-llm/Moved-Here\.ps1' -and (Get-ReviewText $asDictionaries) -ceq (Get-ReviewText $asObjects) -and $asDictionaries.Kind -eq 'update' -and $asDictionaries.NeedsOk) 'a comparison read into dictionaries and arrays gives the same review as one read into objects'
     $dictProbe = ConvertTo-TestDictionary @{ a = @{ b = 'deep' }; list = @(1, 2) }
-    Assert-That ((Get-ReviewField -Object $dictProbe -Path 'a', 'b') -eq 'deep' -and $null -eq (Get-ReviewField -Object $dictProbe -Path 'a', 'missing') -and $null -eq (Get-ReviewField -Object $dictProbe -Path 'Count') -and @(Get-ReviewField -Object $dictProbe -Path 'list').Count -eq 2) "a dictionary is read by its keys only: a missing key is nothing, and its own members (Count) are no answer"
+    Assert-That ((Get-ReviewField -Object $dictProbe -Path 'a', 'b') -eq 'deep' -and $null -eq (Get-ReviewField -Object $dictProbe -Path 'a', 'missing') -and $null -eq (Get-ReviewField -Object $dictProbe -Path 'Count') -and @((Get-ReviewField -Object $dictProbe -Path 'list')).Count -eq 2) "a dictionary is read by its keys only: a missing key is nothing, and its own members (Count) are no answer"
     if ($PSVersionTable.PSEdition -eq 'Desktop') {
         # The reader itself, as ConvertFrom-ReviewJson falls back to it on Windows PowerShell 5.1.
         Add-Type -AssemblyName System.Web.Extensions
