@@ -560,6 +560,13 @@ try {
                 $next['startedAt'] = $startedNow
                 $mark = Read-LaiState -Path $statePath
                 $markIg = @{}; if ($mark['integrity'] -is [hashtable]) { $markIg = $mark['integrity'] }
+                # Under the baseline this run compares with: a mark left in the record of the one before
+                # it (the first comparison after an install, an update or -AcceptBaseline) would be
+                # dropped by the next run together with that record, and the comparison started again.
+                if ([string]$markIg['baseline'] -ne $baseId) {
+                    $markIg = @{ baseline = $baseId }
+                    if ($next['announced']) { $markIg['announced'] = $next['announced'] }
+                }
                 $markIg['startedAt'] = $startedNow
                 $mark['integrity'] = $markIg
                 Save-LaiState -State $mark -Path $statePath

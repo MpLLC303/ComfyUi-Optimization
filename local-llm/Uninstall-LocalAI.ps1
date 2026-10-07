@@ -263,7 +263,7 @@ if ($env:ProgramData) {
 if ($RemoveData) {
     $here = (Resolve-Path -LiteralPath $PSScriptRoot).Path
     $stateFiles = @()
-    foreach ($j in 'install-state.json', 'localai-config.json', 'watch-state.json', 'backup-state.json', 'model-recheck.json') { $stateFiles += @($j, "$j.bak", "$j.bad", "$j.tmp") }
+    foreach ($j in 'install-state.json', 'localai-config.json', 'watch-state.json', 'backup-state.json', 'model-recheck.json', 'integrity-baseline.json') { $stateFiles += @($j, "$j.bak", "$j.bad", "$j.tmp") }
     foreach ($item in (@('Stack', 'Secrets', 'Logs', 'Downloads', 'install-report.md', 'open-webui-hold.json') + $stateFiles)) {
         $path = Join-Path $AIRoot $item
         if (-not (Test-Path -LiteralPath $path)) { continue }

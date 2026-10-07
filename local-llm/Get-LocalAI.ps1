@@ -17,10 +17,11 @@
 # does not count). A first install has nothing to compare and is not asked. An install that is found
 # on this PC but not in the AI folder named here is asked about as well.
 # When GitHub's API does not answer (its hourly limit, a proxy), the commit is read from its page on
-# github.com instead, which is not counted against that limit: it is shown and asked about as usual,
-# and the file list is said to be missing. Only an update whose commit neither of the two can name
-# (offline) is not offered at all: nothing is shown as agreed that could not be shown. Try again
-# later, or set LOCALAI_REF to a full commit id.
+# github.com instead, which the API does not serve (whether that page has a limit of its own is not
+# known here): it is shown and asked about as usual, and the file list is said to be missing. Only an
+# update whose commit neither of the two can name (offline, or both refuse) is not offered at all:
+# nothing is shown as agreed that could not be shown. Try again later, or set LOCALAI_REF to a full
+# commit id.
 # The one way to skip the question, for a run nobody watches: name the commit you reviewed, in full:
 #
 #   $env:LOCALAI_REVIEWED_COMMIT = '<its 40-character id>'
@@ -167,7 +168,8 @@
     function Get-PatchCommit {
         # Id, date and subject line from the head of a commit's page in patch form
         # (github.com/<repository>/commit/<ref>.patch): 'From <id> ...', then 'Date:' and 'Subject:'
-        # before the first empty line. $null when the text does not start with a full commit id.
+        # (with the lines a long subject is folded onto) before the first empty line. $null when the
+        # text does not start with a full commit id.
         # The date is the day its author wrote down, not turned into UTC.
         param([string]$Text)
         $head = $Text
@@ -184,7 +186,10 @@
                 $day = [int]$Matches[1]; $month = $Matches[2]; $year = $Matches[3]
                 if ($months.ContainsKey($month) -and $day -ge 1 -and $day -le 31) { $date = $year + '-' + $months[$month] + '-' + $day.ToString('00') }
             } elseif (-not $subject -and $line -match '^Subject:\s*(.*)\z') {
-                $subject = $Matches[1] -replace '^\[PATCH[^\]]*\]\s*', ''
+                $subject = $Matches[1]
+                # A long subject line is folded: its continuation lines start with a space or a tab.
+                while ($i + 1 -lt $lines.Count -and $lines[$i + 1] -match '^[ \t]+(\S.*)\z') { $i++; $subject += ' ' + $Matches[1] }
+                $subject = $subject -replace '^\[PATCH[^\]]*\]\s*', ''
             }
         }
         return [pscustomobject]@{ Sha = $sha; Date = $date; Subject = (ConvertTo-ReviewText -Text $subject -Max 100) }
@@ -540,7 +545,9 @@
     try { $lookup = ConvertFrom-ReviewJson -Text (Get-GitHubText -Uri "https://api.github.com/repos/$repo/commits/$ref" -Accept 'application/vnd.github+json') }
     catch { $incomingError = $_.Exception.Message; if (-not $incomingError) { $incomingError = 'no answer' } }
     if (-not $incomingError -and $null -eq (Get-CommitSummary -Commit $lookup)) { $incomingError = 'its answer holds no commit id' }
-    # The API's hourly limit (60 questions for everyone behind one address) does not count for pages.
+    # The page is not served by the API, so the API's hourly limit (60 questions for everyone behind
+    # one address) is not what decides here. Whether pages have a limit of their own is not known: a
+    # page that does not answer either leaves the commit unnamed, and an update then stops below.
     $patchText = ''
     if ($incomingError) { try { $patchText = Get-GitHubText -Uri "https://github.com/$repo/commit/$($ref).patch" } catch { $patchText = '' } }
     $incoming = Get-IncomingCommit -Ref $ref -Answer $lookup -PatchText $patchText

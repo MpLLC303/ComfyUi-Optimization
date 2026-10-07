@@ -76,6 +76,25 @@ scheduled tasks run without administrator rights, and removes the old `C:\AI\Ins
   administrator rights, and that commit is what gets installed (a re-run after a failure, or the
   resume after a restart, installs the same code). An older toolkit refuses to run over a newer
   install (`-AllowDowngrade` if you really mean to go back).
+- **You see what changes before anything is downloaded:** when Local AI is already installed, the
+  update first shows the version and commit installed now, the commit about to be installed (id,
+  date, subject line) and the files that differ between the two, the scripts that run as
+  administrator first. It goes on only after you type `OK` at the keyboard. Anything else, or a
+  window without a keyboard, stops with nothing downloaded or changed. A first install has nothing
+  to compare and is not asked. The list names the files, not what changed inside them: the review
+  prints the address of the full comparison for that.
+  - *When GitHub's API does not answer* (its hourly limit, a proxy), the commit is read from its
+    page on github.com instead. It is shown and asked about as usual, and the file list is said to
+    be missing. Only when neither of the two names the commit does the update stop: try again
+    later, or set `$env:LOCALAI_REF` to a full commit id.
+  - *For a run nobody watches,* set `$env:LOCALAI_REVIEWED_COMMIT` to the full 40-character id of
+    the commit you reviewed. It counts for exactly that commit: when the branch has moved on, the
+    question is asked as usual, and without a typed OK nothing is installed.
+  - `$env:LOCALAI_REF` may name a branch, a tag or a commit id (4 or more hex characters count as
+    an id). A commit id is not checked to be on a branch of this repository, and the review says so.
+  - The first update that brings this review is not reviewed when you start it from the Start
+    menu, because that shortcut runs the copy already on the PC. The one-liner fetches the new
+    copy and reviews at once.
 - **A backup comes first:** before the update changes anything, the chats are backed up once
   (`C:\AI\Backups\open-webui-<time>-before-toolkit-<version>.tar.gz`;
   `Restore-OpenWebUI.ps1 -Archive <that file>` goes back to it).
@@ -289,9 +308,12 @@ prompt processing before the first token appears. Both are normal.
   render starts while a chat model sits idle in VRAM, the model is unloaded. If ComfyUI is idle but
   still caches models in VRAM, the guard asks ComfyUI to free them before a chat loads. If something
   answers on 8188/8000 but the guard can't read a ComfyUI queue there, `docker logs render-guard`
-  says so once and chats stay on the GPU. Expect roughly 15-25 tok/s for Uncensored Main
-  on the CPU, and a slow first token with long web or RAG context. That's an estimate, not measured
-  on your PC. Measure it with `C:\AI\Scripts\Test-LocalAI.ps1 -Quick -CpuCheck` (close ComfyUI first; it reports CPU tok/s, prompt speed and the VRAM the CPU mode still takes), and see the guard's decisions in `docker logs render-guard`.
+  says so once and chats stay on the GPU. Measured on the RTX 3090 PC this toolkit
+  was built for, on 2026-10-07 with the GPU idle (`Test-LocalAI.ps1 -Quick -CpuCheck`): Uncensored
+  Main on the CPU generates 18.8 tok/s and reads the prompt at 117 tok/s (a 1889-token prompt),
+  loads in 20.2 s and takes 1 MiB of VRAM. So a chat stays usable during a render, but a long web
+  or RAG context makes the first token slow (those 1889 tokens take about 16 s to read). Another
+  CPU gives other numbers: measure yours with `C:\AI\Scripts\Test-LocalAI.ps1 -Quick -CpuCheck` (close ComfyUI first; it reports CPU tok/s, prompt speed and the VRAM the CPU mode still takes), and see the guard's decisions in `docker logs render-guard`.
   On the CPU the whole model sits in RAM: a preset needs about its download size plus 12 GB of RAM
   (Uncensored Main about 31 GB). On a PC with less, the installer warns which presets would page to
   disk during a render (and slow the render too); wait for the render before chatting with those. Turn it off
@@ -334,6 +356,7 @@ Every item on the guide's V1 list is a real test. It checks:
 - that a SearXNG search returns results
 - that the backup task is scheduled (a newest backup older than about two days is a warning)
 - that the health watch is still running (no check for two hours is a warning) and that Windows shows its notifications
+- what the health watch found when it last compared the installed scripts, the Stack folder, the `LocalAI-*` tasks and the listening programs with the baseline of the last install or update (a difference is a warning, not a failure; see *Integrity watch* under Maintain)
 - that ports 11434/3000/8888 listen on loopback only
 
 The exit code is the number of failures.
@@ -350,6 +373,7 @@ The exit code is the number of failures.
 | Re-tune after a driver/GPU change | Happens by itself on the next re-run when the driver version changed; force it with `C:\AI\Scripts\Install-LocalAI.ps1 -Retune` |
 | Add or swap a model | Try newer ones with `-TrialModels` first. To change the catalog for good, edit `config\models.psd1` in a downloaded copy (the copy in `C:\AI\Scripts` is replaced by the next Update toolkit) and run `Install-LocalAI.cmd` from there |
 | Health watch | Task `LocalAI-Watch` runs `C:\AI\Scripts\Watch-LocalAI.ps1` every 15 minutes while you're signed in: checks Ollama, the Docker engine (one that stopped answering, as Docker Desktop can after sleep, is reported instead of hanging the check), Open WebUI, SearXNG, the render guard, whether Open WebUI can actually reach Ollama (the path chats take), backup freshness, the backup mirror (when you set one) and free disk space (models, backups, Docker data; warns under 10 GB), restarts a stopped container or Ollama (never Docker Desktop itself, in case you quit it on purpose), and shows a Windows notification only when a problem persists for two checks in a row, again every 24 hours while it lasts, and once when it's fixed. A problem that persists is also shown as a banner at the top of Open WebUI (so you see it on the phone too, and when Windows has notifications switched off for PowerShell), and the banner goes away when it's fixed; banners you add yourself are kept. The health check warns when the watch has not run for two hours or Windows is dropping its notifications. When Ollama has updated itself since the presets were tuned, it only notes in its log that the nightly re-check will measure them; it notifies only when that re-check could not put a preset back fully on the GPU, or could not run for 3 days (then close ComfyUI and games and use Start menu → Local AI → Re-check models). On an install without that task it notifies once per new Ollama version instead. History in `C:\AI\Logs\watch.log`; run it by hand with `-NoHeal -Verbose`; silence it with `-PauseMinutes 240` (gaming, stack stopped on purpose) and `-Unpause` |
+| Changes outside an update | About once an hour the health watch also compares the installed scripts, the Stack folder, the `LocalAI-*` tasks and the listening programs with what the last install or update recorded, and names what differs; see *Integrity watch* below. Accept changes you made yourself with `C:\AI\Scripts\Watch-LocalAI.ps1 -AcceptBaseline` |
 | Gaming / long render: free everything | `C:\AI\Scripts\Stop-LocalAI.ps1` unloads the models, stops the containers (data kept) and pauses the health watch for 12 h. Add `-QuitDocker` to also release the WSL VM's RAM (up to 16 GB), or `-QuitOllama`. `Start-LocalAI.ps1` brings it all back and resumes the watch |
 | Something's wrong / asking for help | `C:\AI\Scripts\Get-LocalAIDiagnostics.ps1 -RunTests` (or Start menu → Local AI → Diagnostics) writes `C:\AI\Logs\diagnostics-<time>.zip` and copies a short summary to the clipboard. It covers versions, GPU/VRAM, Ollama, containers, logs and test results. The admin password, secret keys, tokens, your Windows user name and the admin e-mail are redacted. Nothing is uploaded. The last run of each Start-menu shortcut (Gaming mode, Start again, Health check, Re-check models, ComfyUI) is kept in `C:\AI\Logs\shortcut-<script>.log` and included, and so are the nightly re-check's `model-recheck.json` and `model-recheck.log`, so an error from a window you already closed can still be read |
 | Security check | Start menu → Local AI → *Security check* (or `C:\AI\Scripts\Test-PCSecurity.ps1`) checks this PC's own security and changes nothing; see [Keeping the PC safe](#keeping-the-pc-safe). For every check: right-click the shortcut > More > Run as administrator. The report is `C:\AI\Logs\pc-security-<time>.md` (`-ReportPath` to put it elsewhere) |
@@ -363,6 +387,49 @@ Every nightly backup is also opened with SQLite in a throwaway volume (with the 
 
 Keep a copy of `C:\AI\Secrets` (session key and admin login) in your password manager. It's
 deliberately not inside the backup archives.
+
+### Integrity watch
+
+At the end of every successful install or update the installer records a baseline in
+`C:\AI\integrity-baseline.json`: the SHA-256 of every file under `C:\AI\Scripts` and `C:\AI\Stack`,
+what each `LocalAI-*` scheduled task runs, as whom and at what privilege, and which programs listen
+on which TCP ports. About once an hour the health watch compares the PC with it and names what
+differs.
+
+- **Two looks, one notice.** A difference is announced when two runs in a row saw it, so a file
+  being saved or a port open for a minute raises nothing. It is announced once, as "Local AI:
+  changed outside an update", and again at most once a day when the same thing is changed again.
+  It also shows on the Open WebUI banner and in the health check's **Integrity watch** line. The
+  whole list is in `C:\AI\Logs\watch.log`.
+- **What is left out:** logs, the `.tmp`/`.bak`/`.bad` leftovers of a save, anything in a folder
+  called `Secrets`, and `Stack\.env` except the settings that say where chats and searches are sent
+  (names ending in `_URL`, `_URLS` or `_UPSTREAM`; a fingerprint of each value is kept, never the
+  value). Of the listeners only additions that matter are reported: a program that newly accepts
+  connections from other devices, and one of the stack's own ports held by another program.
+  Listeners on this PC only, and ones that went away, are not.
+- **An update is never reported as a change, but it is no undo.** The installer puts its own files
+  and its three scheduled tasks back and removes nothing else, and the new baseline takes in
+  whatever is there. What it takes in that the installer did not put there is a warning in the
+  installer's log, is named once by the watch ("Local AI: the update kept changes it did not
+  make") and stays a warning in the health check. Updating again does not clear that list: it is
+  carried on until you accept it or remove what was added. So remove additions first, then update.
+- **Changes you made yourself:** `C:\AI\Scripts\Watch-LocalAI.ps1 -AcceptBaseline` records the
+  current state as the new baseline (the health check prints the exact line to paste). Any program
+  running under your account could run that as well, so the next watch run confirms it with a
+  notification ("Local AI: integrity baseline accepted") that names what was accepted.
+- **When a script changed,** or the baseline itself is gone, the advice names no Start-menu
+  shortcut: every shortcut starts a script from that folder, and Update toolkit then asks for
+  administrator rights. Delete what was added and install from a fresh copy of the toolkit (the
+  one-line command under *Run it*, or a new download).
+- **When it cannot compare:** while an install or a model update runs, nothing is compared (files
+  are being replaced). If that lasts 6 hours, or a comparison keeps failing, you get "Local AI:
+  changes are not being checked", and the health check says that its result is an old one.
+- **What it is not:** the baseline sits in the install folder, which your Windows account can
+  write. It catches accidents, other software and clumsy tampering. It does not stop, or even
+  notice, someone who already runs as you and rewrites the baseline together with the change, and
+  a program name is only a name.
+
+`Uninstall-LocalAI.ps1 -RemoveData` removes the baseline together with the other state files.
 
 ## Troubleshooting
 
@@ -475,6 +542,10 @@ failures.
   authentication on the GitHub account. To install a reviewed version instead, set
   `$env:LOCALAI_REF` to a tag or commit before running the command, and replace `refs/heads/main`
   in its URL with the same tag or commit (otherwise the downloader itself still comes from `main`).
+  An update shows the incoming commit and the names of the files that differ and waits for a typed
+  OK (see *Update the toolkit*). That lists file names, not their contents, so it does not replace
+  reading the comparison whose address it prints, and it is only as trustworthy as the copy of the
+  downloader that runs it.
   - Ollama and Docker Desktop installers come from winget (hash-checked). The direct-download
     fallback refuses files that aren't signed by Ollama or Docker.
 - **Passwords on the command line** end up in PowerShell history. Use `Set-OpenWebUIPassword.ps1 -Prompt`

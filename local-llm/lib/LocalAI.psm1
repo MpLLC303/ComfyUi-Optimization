@@ -1126,6 +1126,43 @@ function Test-LaiIntegrityOwn {
     try { return ([string](Get-FileHash -LiteralPath $own -Algorithm SHA256 -ErrorAction Stop).Hash -eq $now) } catch { return $false }
 }
 
+function Test-LaiIntegrityStill {
+    # Pure (unit-tested). $true while what a recorded difference is about (by its Id, as
+    # Compare-LaiIntegrity gives it) is still so in -Snapshot (Get-LaiIntegritySnapshot, before its
+    # listeners are turned into baseline rows): the file, setting or task that was new or changed is
+    # still there, the one that was gone is still gone, the program still listens (for a 'now reachable
+    # from other devices' entry: still on an address other devices reach). Where the snapshot
+    # could not tell (settings, tasks or listeners not read; a file missing from a walk that stopped
+    # early) it counts as still so: saying less would hide it. $false for everything that names no
+    # single thing (a walk that stopped, the count that stands for a cut list).
+    param([Parameter(Mandatory)][string]$Id, [Parameter(Mandatory)][hashtable]$Snapshot)
+    $kind, $name = $Id -split '\|', 2
+    if (-not $kind -or -not $name) { return $false }
+    $gone = $kind.EndsWith('-')
+    $what = $kind.TrimEnd('+', '-')
+    if ($what -eq 'net' -or $what -eq 'port') {
+        if ($null -eq $Snapshot['listeners']) { return $true }
+        # 'net|program|port' and 'port|port|program'.
+        $parts = @($name -split '\|')
+        $prog = $parts[0]; if ($what -eq 'port') { $prog = $parts[-1] }
+        return (@($Snapshot['listeners'] | Where-Object { $_ -is [hashtable] -and [string]$_['Program'] -eq $prog -and ($what -eq 'port' -or $_['Network']) }).Count -gt 0)
+    }
+    $there = $null
+    if ($what -eq 'file' -or $what -eq 'files') {
+        if ($Snapshot['files'] -is [hashtable]) {
+            if ($what -eq 'file') { $there = $Snapshot['files'].ContainsKey($name) }
+            else { $below = $name + '\'; $there = (@($Snapshot['files'].Keys | Where-Object { ([string]$_).StartsWith($below, [StringComparison]::OrdinalIgnoreCase) }).Count -gt 0) }
+            if (-not $there -and $Snapshot['filesStopped']) { $there = $null }
+        }
+    }
+    elseif ($what -eq 'env') { if ($Snapshot['env'] -is [hashtable]) { $there = $Snapshot['env'].ContainsKey($name) } }
+    elseif ($what -eq 'task') { if ($Snapshot['tasks'] -is [hashtable]) { $there = $Snapshot['tasks'].ContainsKey($name) } }
+    else { return $false }
+    if ($null -eq $there) { return $true }
+    if ($gone) { return (-not $there) }
+    return [bool]$there
+}
+
 function Save-LaiIntegrityBaseline {
     # Records the state right now as the baseline and returns it. Called where an install or update
     # ends successfully (-Reason 'install', so an update is never reported as a change) and by
@@ -1136,6 +1173,13 @@ function Save-LaiIntegrityBaseline {
     # watch and the health check to show: for the owner's acceptance all of it, for an install only
     # what the installer did not put there itself (Test-LaiIntegrityOwn; -SourceRoot, -OwnTasks and
     # -OwnSettings say what it did).
+    # What the baseline before this one took in is carried on for as long as nobody has settled it
+    # and it is still so (Test-LaiIntegrityStill): without that a second update minutes after the
+    # first, or the acceptance command run twice, would record an empty list, and the addition would
+    # drop out of every report with nobody having looked. Settled means the owner accepted it: an
+    # install does not carry what a by-hand baseline listed once the watch has announced that
+    # baseline, and a by-hand baseline does not carry what the watch has announced. One install
+    # after another always carries (minus what the installer has since put there itself).
     # Listeners: ConvertTo-LaiListenerBaseline (an install carries known ones for a while, the
     # owner's acceptance records exactly what listens now).
     # 'id' is what the watch remembers the baseline by: PowerShell 7 reads a saved time back as a
@@ -1150,6 +1194,27 @@ function Save-LaiIntegrityBaseline {
         # Every new file by its own name here (no 'N new files in ...'): each is judged on its own.
         $taken = @(Compare-LaiIntegrity -Baseline $old -Current $snap -WatchedPorts $ports -MaxNewPerFolder ([int]::MaxValue))
         if ($install) { $taken = @($taken | Where-Object { -not (Test-LaiIntegrityOwn -Difference $_ -Snapshot $snap -AIRoot $AIRoot -SourceRoot $SourceRoot -OwnTasks $OwnTasks -OwnSettings $OwnSettings) }) }
+    }
+    if ($old) {
+        $oldAccepted = @($old['accepted'] | Where-Object { $_ -is [hashtable] -and $_['Id'] })
+        $announced = ''
+        $watchIg = (Read-LaiState -Path (Join-Path $AIRoot 'watch-state.json'))['integrity']
+        if ($watchIg -is [hashtable]) { $announced = [string]$watchIg['announced'] }
+        $bothInstalls = ($install -and [string]$old['reason'] -eq 'install')
+        if ($oldAccepted.Count -and ($bothInstalls -or $announced -ne [string]$old['id'])) {
+            # 'is new' and 'was changed' are about the same thing: listed once.
+            $have = @{}
+            foreach ($d in $taken) { $have[([string]$d.Id -replace '^([a-z]+)\+\|', '$1|')] = $true }
+            foreach ($a in $oldAccepted) {
+                $d = [pscustomobject]@{ Id = [string]$a['Id']; Key = [string]$a['Id']; Text = [string]$a['Text'] }
+                $same = $d.Id -replace '^([a-z]+)\+\|', '$1|'
+                if ($have.ContainsKey($same)) { continue }
+                if (-not (Test-LaiIntegrityStill -Id $d.Id -Snapshot $snap)) { continue }
+                if ($install -and (Test-LaiIntegrityOwn -Difference $d -Snapshot $snap -AIRoot $AIRoot -SourceRoot $SourceRoot -OwnTasks $OwnTasks -OwnSettings $OwnSettings)) { continue }
+                $have[$same] = $true
+                $taken += $d
+            }
+        }
     }
     if ($null -ne $snap['listeners']) {
         $known = @(); $knownSeen = ''

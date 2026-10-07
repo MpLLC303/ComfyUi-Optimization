@@ -45,3 +45,11 @@ jobs:
         run: |
           & .\local-llm\tests\Invoke-WindowsUnitTests.ps1
           exit $LASTEXITCODE
+
+      # Needs administrator rights (the runner has them): its end-to-end block creates the empty
+      # all-users Start-menu folder 'Local AI' for one run and removes it again.
+      - name: Bootstrap update review (Get-LocalAI.ps1)
+        shell: powershell
+        run: |
+          & .\local-llm\tests\Invoke-GetLocalAITest.ps1
+          exit $LASTEXITCODE

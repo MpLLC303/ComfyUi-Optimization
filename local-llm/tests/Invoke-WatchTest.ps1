@@ -562,6 +562,16 @@ services:
         Assert-That ($igAcc.Count -eq 1 -and $igAcc[0] -match 'recorded by hand \(Watch-LocalAI\.ps1 -AcceptBaseline\), so \d+ change\(s\) now count as normal: "Scripts\\tool\.ps1" was changed' -and $igAcc[0] -match 'If that was not you') "the next scheduled run names what was accepted in a notification, once over two runs: an acceptance the owner did not make is seen ($($igAcc -join ' | '))"
         $hc10 = & $igHealth
         Assert-That ($hc10 -match 'PASS Integrity watch: nothing changed since the baseline of [^\n]*recorded by hand \(-AcceptBaseline\), which made \d+ change\(s\) count as normal: "Scripts\\tool\.ps1" was changed') 'and the health check keeps showing how that baseline came about'
+        # A comparison that was started and did not finish (Task Scheduler ends the run after ten
+        # minutes) leaves its mark, and the next runs do not start it again for an hour.
+        & $igHourLater
+        $s10 = Read-LaiState -Path $statePath; $s10['integrity']['startedAt'] = (Get-Date).AddMinutes(-5).ToString('s'); Save-LaiState -State $s10 -Path $statePath
+        $igBeforeStuck = & $igView
+        Invoke-Watch $w9 | Out-Null
+        Invoke-Watch $w9 | Out-Null
+        $igStuck = & $igView
+        $igStuckLines = @(& $igLog | Where-Object { $_ -match 'INTEGRITY not compared: the comparison started at \d\d:\d\d did not finish' })
+        Assert-That ([string]$igStuck['checkedAt'] -eq [string]$igBeforeStuck['checkedAt'] -and [string]$igStuck['startedAt'] -and [string]$igStuck['skippedWhy'] -match 'did not finish' -and $igStuckLines.Count -eq 1) "a comparison that was started minutes ago and did not finish is not started again on every run, and watch.log says so once over two runs ($($igStuckLines.Count) line(s))"
         # An update records a new baseline too, and with it whatever else is there. What the installer
         # did not put there itself is named: its own copy of tool.ps1 is not, a file next to it is.
         $igSource = Join-Path $Work 'ig-source'

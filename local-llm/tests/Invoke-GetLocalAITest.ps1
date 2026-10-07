@@ -181,6 +181,8 @@ if ($haveFunctions) {
     Assert-That ($page -and $page.Sha -eq $shaNew -and $page.Date -eq '2026-10-06' -and $page.Subject -eq 'Incoming subject line') "id, date and subject line are read from the head of the patch ($($page.Sha) $($page.Date) '$($page.Subject)')"
     $pageCrLf = Get-PatchCommit -Text (($patchText -replace "`n", "`r`n") + ('x' * 50000))
     Assert-That ($pageCrLf -and $pageCrLf.Sha -eq $shaNew -and $pageCrLf.Date -eq '2026-10-06' -and $pageCrLf.Subject -eq 'Incoming subject line') 'the same with Windows line ends and a long patch after it'
+    $foldedPage = Get-PatchCommit -Text "From $shaNew Mon Sep 17 00:00:00 2001`nDate: Tue, 6 Oct 2026 23:30:00 +0000`nSubject: [PATCH] A subject line that is long enough`n to be folded onto`n`ta third line`nX-Other: 1`n`n not part of the subject"
+    Assert-That ($foldedPage -and $foldedPage.Subject -eq 'A subject line that is long enough to be folded onto a third line' -and $foldedPage.Date -eq '2026-10-06') "a long subject line folded onto further lines is read whole, and nothing after the empty line is ('$($foldedPage.Subject)')"
     $notPatches = @('', 'Not Found', '<!DOCTYPE html><html><body>Sign in</body></html>', "From: A Committer`nDate: Tue, 6 Oct 2026 23:30:00 +0000", "`nFrom $shaNew Mon Sep 17 00:00:00 2001", "Subject: x`nFrom $shaNew Mon Sep 17 00:00:00 2001", ('From ' + $shaNew.Substring(0, 39) + ' Mon Sep 17 00:00:00 2001'), "From $($shaNew)0 Mon Sep 17 00:00:00 2001", '{"message": "API rate limit exceeded"}')
     Assert-That (@($notPatches | Where-Object { $null -ne (Get-PatchCommit -Text $_) }).Count -eq 0) 'a text that does not start with "From <full commit id>" (a sign-in page, an error, an id further down) names no commit'
     $hostilePage = Get-PatchCommit -Text ("From $shaNew Mon Sep 17 00:00:00 2001`nDate: Tue, 31 Foo 2026 23:30:00 +0000`nSubject: [PATCH 1/2] Harmless" + $esc + '[2J' + [char]0x202E + ('x' * 300) + "`n`n")
@@ -793,15 +795,17 @@ Invoke-Expression ([System.IO.File]::ReadAllText($StandInBootstrap))
     # folder exists. With the command from the README (no LOCALAI_ROOT) that is an update, not a first
     # install. The folder is the real one of this (throwaway) machine: created empty here unless it
     # is there already, and removed again only when it was created here.
+    # ProgramData pointed at an empty folder, as a session could do it: the bootstrap must not take
+    # the Start menu's place from there and call this a first install. Made before the Start-menu
+    # folder is, so that nothing that can fail stands between creating that folder and the try
+    # whose finally removes it.
+    $emptyProgramData = Join-Path $e2e 'programdata-empty'
+    New-Item -ItemType Directory -Force -Path $emptyProgramData | Out-Null
     $menuMade = $false
     if ($realMenu -and -not $menuWasThere) {
         try { New-Item -ItemType Directory -Path $realMenu -ErrorAction Stop | Out-Null; $menuMade = $true } catch { $menuMade = $false }
     }
     if ($menuWasThere -or $menuMade) {
-        # ProgramData pointed at an empty folder, as a session could do it: the bootstrap must not
-        # take the Start menu's place from there and call this a first install.
-        $emptyProgramData = Join-Path $e2e 'programdata-empty'
-        New-Item -ItemType Directory -Force -Path $emptyProgramData | Out-Null
         try { $r = Invoke-Bootstrap -Root $rootEmpty -ApiDir $apiFull -ProgramData $emptyProgramData }
         finally { if ($menuMade) { Remove-Item -LiteralPath $realMenu -Force -ErrorAction SilentlyContinue } }
         Assert-That ($r.Text -notmatch 'First install' -and $r.Text -match 'installed on this PC' -and $r.Text -match 'but not in' -and $r.Text -match 'set LOCALAI_ROOT to that folder' -and $r.Text -match "To install\s+: commit $shaNew" -and $r.Text -match 'Stopped: ' -and $r.Get.Count -eq 0 -and -not $r.Ran) "an empty AI folder on a PC that has the installer's Start-menu folder, with ProgramData pointed elsewhere in the session: still not a first install; said so with LOCALAI_ROOT, asked, nothing downloaded (downloads $($r.Get.Count), installer '$($r.Ran)'; $($r.Tail))"

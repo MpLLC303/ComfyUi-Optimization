@@ -25,7 +25,7 @@
     check while working; the full run still decides before main moves.
 #>
 param(
-    # Harness, Static, Unit, RenderGuard, Mock, ModelUpdate, UpdateWebUI, Uninstall, Watch, Integration, Acceptance
+    # Harness, Static, Unit, Bootstrap, RenderGuard, Mock, ModelUpdate, UpdateWebUI, Uninstall, Watch, Integration, Acceptance
     [string[]]$Only = @(),
     # A git ref (e.g. origin/main): run only the suites the changes since then can affect.
     [string]$Since = '',
@@ -87,6 +87,7 @@ $suites = @(
     @{ Name = 'Harness'; File = $PSCommandPath; Args = @('-SelfTest'); Pass = 'HARNESS SELF-TEST PASSED' }
     @{ Name = 'Static'; File = (Join-Path $t 'Invoke-StaticChecks.ps1'); Args = @(); Pass = 'Static checks: \d+ files, 0 problem' }
     @{ Name = 'Unit'; File = (Join-Path $t 'Invoke-WindowsUnitTests.ps1'); Args = @(); Pass = 'WINDOWS UNIT TESTS PASSED' }
+    @{ Name = 'Bootstrap'; File = (Join-Path $t 'Invoke-GetLocalAITest.ps1'); Args = @(); Pass = 'GET-LOCALAI TEST PASSED' }
     @{ Name = 'RenderGuard'; Exe = 'python3'; File = (Join-Path $t 'test_render_guard.py'); Args = @(); Pass = 'RENDER GUARD TEST PASSED' }
     @{ Name = 'Mock'; File = (Join-Path $t 'Invoke-InstallerMockRun.ps1'); Args = @(); Pass = 'MOCK RUN PASSED' }
     @{ Name = 'ModelUpdate'; File = (Join-Path $t 'Invoke-ModelUpdateTest.ps1'); Args = @(); Pass = 'MODEL UPDATE TEST PASSED' }
@@ -226,7 +227,7 @@ Get-ChildItem -LiteralPath (Join-Path $acc 'Backups') -Filter 'open-webui-*' | R
 Set-Content -LiteralPath (Join-Path $acc ('Backups/open-webui-{0}.tar.gz' -f (Get-Date -Format 'yyyyMMdd-HHmmss'))) -Value 'stand-in'
 
 $reset = Join-Path $t 'Reset-Sandbox.ps1'
-$needsSandbox = @($suites | Where-Object { @('Harness', 'Static', 'Unit', 'RenderGuard') -notcontains $_.Name }).Count -gt 0
+$needsSandbox = @($suites | Where-Object { @('Harness', 'Static', 'Unit', 'Bootstrap', 'RenderGuard') -notcontains $_.Name }).Count -gt 0
 $results = @()
 try {
     if ($needsSandbox) {

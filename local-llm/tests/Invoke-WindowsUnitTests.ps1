@@ -1468,6 +1468,32 @@ Assert-That (@($igKeptText | Where-Object { $_ -match 'tool\.ps1|docker-compose|
 Set-Content -LiteralPath $igTool -Value 'changed, and the installer was started from the installed copy'
 $igSelf = Save-LaiIntegrityBaseline -AIRoot $igRoot -Reason 'install' -TaskPattern 'LaiNoSuchTask-*' -SourceRoot $igScripts
 Assert-That (@($igSelf['accepted'] | Where-Object { [string]$_['Id'] -eq 'file|Scripts\tool.ps1' }).Count -eq 1) 'an installer run from the installed folder copies no scripts, so a changed script is not its own work'
+# What one baseline took in is still listed by the next one until somebody has looked: a second
+# update minutes after the first must not record an empty list and so clear every report.
+$igIds = { param($Baseline) @($Baseline['accepted'] | Where-Object { $_ -is [hashtable] -and [string]$_['Id'] -notmatch '^(net|port)\|' } | ForEach-Object { [string]$_['Id'] }) }
+$igSelfIds = @(& $igIds $igSelf)
+Assert-That ($igSelfIds -contains 'file+|Stack\planted.yml' -and $igSelfIds -contains 'file|Scripts\lib\helper.psm1' -and $igSelfIds -contains 'env+|OLLAMA_UPSTREAM' -and [int]$igSelf['acceptedCount'] -ge 4) "a second install right after the first still lists what the first one kept ($($igSelfIds -join '; '))"
+Assert-That (@($igSelfIds | Group-Object | Where-Object { $_.Count -gt 1 }).Count -eq 0) 'each of them once'
+Remove-Item -LiteralPath (Join-Path $igStack 'planted.yml') -Force
+$igWatchState = Join-Path $igRoot 'watch-state.json'
+if (Test-Path -LiteralPath $igWatchState) { Remove-Item -LiteralPath $igWatchState -Force }
+$igThird = Save-LaiIntegrityBaseline -AIRoot $igRoot -Reason 'install' -TaskPattern 'LaiNoSuchTask-*' -SourceRoot $igScripts
+$igThirdIds = @(& $igIds $igThird)
+Assert-That ($igThirdIds -contains 'file|Scripts\lib\helper.psm1' -and $igThirdIds -contains 'file|Scripts\tool.ps1' -and @($igThirdIds | Where-Object { $_ -like '*planted.yml' }).Count -eq 0) "a third install carries them on, but not the added file that was removed in between ($($igThirdIds -join '; '))"
+# Recorded by hand twice in a row, before the watch has said so: the second one still names it all.
+$igOnce = Save-LaiIntegrityBaseline -AIRoot $igRoot -Reason 'accepted by the owner' -TaskPattern 'LaiNoSuchTask-*'
+$igAgain = Save-LaiIntegrityBaseline -AIRoot $igRoot -Reason 'accepted by the owner' -TaskPattern 'LaiNoSuchTask-*'
+$igAgainIds = @(& $igIds $igAgain)
+Assert-That (@(& $igIds $igOnce) -contains 'file|Scripts\lib\helper.psm1' -and $igAgainIds -contains 'file|Scripts\lib\helper.psm1' -and $igAgainIds -contains 'env+|OLLAMA_UPSTREAM') "the acceptance command run twice before the watch has announced the first still lists what was taken in ($($igAgainIds -join '; '))"
+# Once the watch has announced a baseline recorded by hand, the owner has been told: settled.
+Save-LaiState -State @{ integrity = @{ baseline = [string]$igAgain['id']; announced = [string]$igAgain['id'] } } -Path $igWatchState
+$igSettled = Save-LaiIntegrityBaseline -AIRoot $igRoot -Reason 'install' -TaskPattern 'LaiNoSuchTask-*' -SourceRoot $igScripts
+Assert-That (@(& $igIds $igSettled).Count -eq 0) "an install after an acceptance the watch has announced does not list it again ($(@(& $igIds $igSettled) -join '; '))"
+foreach ($f in $igWatchState, "$igWatchState.bak") { if (Test-Path -LiteralPath $f) { Remove-Item -LiteralPath $f -Force } }
+$igStillSnap = @{ files = @{ 'Stack\a.yml' = 'x'; 'Stack\sub\b.yml' = 'x' }; filesStopped = ''; env = @{ OLLAMA_UPSTREAM = 'x' }; tasks = $null; listeners = @(@{ Program = 'python'; Port = 8000; Network = $true }, @{ Program = 'ollama'; Port = 11434; Network = $false }) }
+Assert-That ((Test-LaiIntegrityStill -Id 'file+|Stack\a.yml' -Snapshot $igStillSnap) -and (Test-LaiIntegrityStill -Id 'files+|Stack\sub' -Snapshot $igStillSnap) -and (Test-LaiIntegrityStill -Id 'file-|Stack\gone.yml' -Snapshot $igStillSnap) -and (Test-LaiIntegrityStill -Id 'env|OLLAMA_UPSTREAM' -Snapshot $igStillSnap) -and (Test-LaiIntegrityStill -Id 'net|python|8000' -Snapshot $igStillSnap) -and (Test-LaiIntegrityStill -Id 'port|11434|ollama' -Snapshot $igStillSnap)) 'still so: a file and a folder that are there, a file that is still gone, a setting that is set, a program that still listens'
+Assert-That (-not (Test-LaiIntegrityStill -Id 'file+|Stack\removed.yml' -Snapshot $igStillSnap) -and -not (Test-LaiIntegrityStill -Id 'file-|Stack\a.yml' -Snapshot $igStillSnap) -and -not (Test-LaiIntegrityStill -Id 'env+|OTHER_URL' -Snapshot $igStillSnap) -and -not (Test-LaiIntegrityStill -Id 'net|ollama|11434' -Snapshot $igStillSnap) -and -not (Test-LaiIntegrityStill -Id 'net|steam|27036' -Snapshot $igStillSnap) -and -not (Test-LaiIntegrityStill -Id 'walk|Stack' -Snapshot $igStillSnap) -and -not (Test-LaiIntegrityStill -Id 'more|other' -Snapshot $igStillSnap)) 'no longer so: a removed file, a file that came back, a removed setting, a program that listens on this PC only or not at all; and nothing that names no single thing'
+Assert-That ((Test-LaiIntegrityStill -Id 'task+|LocalAI-Other' -Snapshot $igStillSnap) -and (Test-LaiIntegrityStill -Id 'file+|Stack\z.yml' -Snapshot @{ files = @{}; filesStopped = 'Stack\m' })) 'what could not be read (tasks here, files after a walk that stopped early) counts as still so'
 $igOwn = { param($Id) Test-LaiIntegrityOwn -Difference ([pscustomobject]@{ Id = $Id }) -Snapshot @{ files = @{} } -AIRoot $igRoot -SourceRoot $igSource -OwnTasks @('LocalAI-Watch') -OwnSettings @('OLLAMA_BASE_URL') }
 Assert-That ((& $igOwn 'task|LocalAI-Watch') -and (& $igOwn 'env|OLLAMA_BASE_URL') -and (& $igOwn 'file-|Stack\gone.yml') -and (& $igOwn 'task-|LocalAI-Old')) 'its own: a task it registers, a setting it writes, and whatever is gone (nothing is taken in)'
 Assert-That (-not (& $igOwn 'task+|LocalAI-Helper') -and -not (& $igOwn 'task|LocalAI-Other') -and -not (& $igOwn 'env+|OLLAMA_UPSTREAM') -and -not (& $igOwn 'net|x|4444') -and -not (& $igOwn 'port|3000|x') -and -not (& $igOwn 'walk|Stack') -and -not (& $igOwn 'file+|Stack\nowhere.yml')) 'not its own: another LocalAI-* task, another setting, a new listener, a file it has no copy of'

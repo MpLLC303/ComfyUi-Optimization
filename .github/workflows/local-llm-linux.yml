@@ -7,8 +7,8 @@
 # Ollama, one Open WebUI and one Docker engine, so they cannot run side by side on one machine; here
 # each job is its own machine with only the services its suites need, and the jobs run in parallel
 # (none should take more than about 30 minutes):
-#   gate         Static checks, runner self-test, render guard behaviour, cross-platform unit tests
-#                (the four suites Invoke-AllTests.ps1 runs without a sandbox)
+#   gate         Static checks, runner self-test, render guard behaviour, cross-platform unit tests,
+#                bootstrap update review (the five suites Invoke-AllTests.ps1 runs without a sandbox)
 #   integration  Integration test, then the health watch test
 #   installer    Installer mock run, then the Open WebUI update / rollback test
 #   models       Model update test, then the uninstall test (Ollama and Docker only)
@@ -36,7 +36,7 @@ env:
   LAI_SANDBOX: '1'
 
 jobs:
-  # No sandbox services: none of these four suites touches Ollama, Open WebUI or the containers.
+  # No sandbox services: none of these five suites touches Ollama, Open WebUI or the containers.
   gate:
     name: Static checks and unit tests
     runs-on: ubuntu-latest
@@ -72,6 +72,13 @@ jobs:
         shell: pwsh
         run: |
           & ./local-llm/tests/Invoke-WindowsUnitTests.ps1
+          exit $LASTEXITCODE
+
+      # The pure and syntax-tree parts; the end-to-end block needs Windows and prints SKIP here.
+      - name: Bootstrap update review (Get-LocalAI.ps1)
+        shell: pwsh
+        run: |
+          & ./local-llm/tests/Invoke-GetLocalAITest.ps1
           exit $LASTEXITCODE
 
   integration:

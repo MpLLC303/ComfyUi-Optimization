@@ -243,7 +243,33 @@ Assert-That (-not $global:Tasks.ContainsKey('LocalAI-Install-Resume')) 'resume t
 $seededSkills = @(Get-ChildItem -LiteralPath (Join-Path $aiRoot 'Skills') -Directory -ErrorAction SilentlyContinue | ForEach-Object { $_.Name })
 Assert-That ($seededSkills.Count -eq 3 -and $seededSkills -contains 'remember-and-improve') "the first install creates AI\Skills with the starter skills ($($seededSkills -join ', '))"
 Import-Module (Join-Path $copy 'lib/LocalAI.psm1') -Force
-$tok2 = Connect-LaiWebUI -BaseUrl 'http://127.0.0.1:3000' -Email $Email -Password $Password
+# The finished install recorded the baseline the health watch compares with, and nothing differs
+# from it right afterwards: an install is never reported as a change. (Scheduled tasks cannot be
+# read on this machine and are skipped on both sides; the Windows unit tests read real ones.)
+$igDiffs = {
+    $b = Read-LaiIntegrityBaseline -AIRoot $aiRoot
+    if (-not $b) { return @('no baseline') }
+    @(Compare-LaiIntegrity -Baseline $b -Current (Get-LaiIntegritySnapshot -AIRoot $aiRoot) -WatchedPorts (Get-LaiIntegrityPorts -AIRoot $aiRoot) | Where-Object { [string]$_.Id -match '^(files?[+-]?|env[+-]?|task[+-]?|walk)\|' } | ForEach-Object { [string]$_.Text })
+}
+$base2 = Read-LaiIntegrityBaseline -AIRoot $aiRoot
+$base2Files = @(); if ($base2 -and $base2['files'] -is [hashtable]) { $base2Files = @($base2['files'].Keys) }
+Assert-That ($base2 -and [string]$base2['reason'] -eq 'install' -and [string]$base2['id'] -and $base2Files -contains 'Scripts\lib\LocalAI.psm1' -and $base2Files -contains 'Stack\docker-compose.yml' -and -not [string]$base2['filesStopped']) "the finished install recorded an integrity baseline with reason 'install' that lists the installed scripts and the stack files ($($base2Files.Count) files)"
+Assert-That (@($base2Files | Where-Object { $_ -match '(^|\\)\.env$|\\Secrets\\|\.log$' }).Count -eq 0 -and $base2 -and @($base2['accepted'] | Where-Object { $_ -is [hashtable] }).Count -eq 0) 'not .env, logs or anything under a Secrets folder; and a first install took nothing in that it did not put there'
+$igNow = @(& $igDiffs)
+Assert-That ($igNow.Count -eq 0) "right after the install no file, setting or task differs from that baseline ($($igNow -join '; '))"
+# Every phase here passes -SkipTests, so the installer's Verify stage (the health check, which then
+# prints 'SKIP Integrity watch: an install, update or model update is running') never runs in this
+# suite; Invoke-WatchTest.ps1 section 10 runs that case with a stand-in for the installer. What
+# makes it true is read from the installer instead: it takes the setup lock into $script:SetupLock,
+# runs the health check in its own process (not a child, which could not see that lock as its own)
+# and records the baseline only after it.
+$igLockAt = $text.IndexOf('$script:SetupLock = Enter-LaiSetupLock')
+$igVerifyAt = $text.IndexOf("& (Join-Path `$SourceRoot 'Test-LocalAI.ps1') -AIRoot `$AIRoot")
+$igSaveAt = $text.IndexOf('Save-LaiIntegrityBaseline -AIRoot $AIRoot -Reason ''install''')
+$igHealth = Get-Content -Raw -Encoding UTF8 (Join-Path $copy 'Test-LocalAI.ps1')
+Assert-That ($igLockAt -ge 0 -and $igVerifyAt -gt $igLockAt -and $igSaveAt -gt $igVerifyAt) 'the installer holds the setup lock, runs the health check in its own process and records the baseline only after it'
+Assert-That ($igHealth -match 'Get-Variable -Name SetupLock' -and $igHealth -match "Skip 'an install, update or model update is running") 'and the health check, called by an installer that holds the lock, skips the integrity line instead of advising on findings against the old baseline'
+$tok2 =Connect-LaiWebUI -BaseUrl 'http://127.0.0.1:3000' -Email $Email -Password $Password
 $nbTool = $null; try { $nbTool = Invoke-LaiApi -Uri 'http://127.0.0.1:3000/api/v1/tools/id/localai_skill_notebook' -Token $tok2 } catch { $nbTool = $null }
 $mainP = Get-LaiWebUIModel -BaseUrl 'http://127.0.0.1:3000' -Token $tok2 -Id 'local-main'
 Assert-That ($nbTool -and [string]$nbTool.content -notmatch '__LOCALAI_PRESETS__' -and @($mainP.meta.toolIds) -contains 'localai_skill_notebook' -and @($mainP.meta.skillIds) -contains 'research-with-sources') 'the skill notebook is installed with the presets filled in, and it and the starter skills are offered in Local Main'
@@ -346,6 +372,13 @@ $env:LOCALAI_TEST_KNOWLEDGE_FAIL = 'PC & Electronics'
 $screen3 = @(& (Join-Path $aiRoot 'Scripts/Install-LocalAI.ps1') -AIRoot $aiRoot -SkipTests 6>&1 | ForEach-Object { $l = "$_"; Write-Host $l; $l })
 $code3 = $LASTEXITCODE
 $env:LOCALAI_TEST_KNOWLEDGE_FAIL = ''
+# An update records a new baseline as well, and says what it kept that it did not put there itself:
+# here the routing setting added to .env by hand above.
+$base3 = Read-LaiIntegrityBaseline -AIRoot $aiRoot
+$kept3 = @(); if ($base3) { $kept3 = @($base3['accepted'] | Where-Object { $_ -is [hashtable] } | ForEach-Object { [string]$_['Id'] }) }
+$igNow = @(& $igDiffs)
+Assert-That ($base3 -and $base2 -and [string]$base3['id'] -ne [string]$base2['id'] -and [string]$base3['reason'] -eq 'install' -and $igNow.Count -eq 0) "the re-run records a new integrity baseline, and no file, setting or task differs from it right afterwards ($($igNow -join '; '))"
+Assert-That ($kept3 -contains 'env+|COMFYUI_URLS' -and @($kept3 | Where-Object { $_ -match '^files?[+]?\|Scripts\\' }).Count -eq 0) "it lists the custom setting it kept and did not write itself, and none of its own scripts ($($kept3 -join '; '))"
 $st3 = Get-Content -Encoding UTF8 -Raw (Join-Path $aiRoot 'install-state.json') | ConvertFrom-Json
 $rep3 = Get-Content -Encoding UTF8 -Raw (Join-Path $aiRoot 'install-report.md')
 Assert-That (@($screen3 | Where-Object { $_ -like "*Password:*$Password*shown this once*" }).Count -eq 1 -and -not ($st3.flags.PSObject.Properties.Name -contains 'adminPasswordToShow')) 'a password not shown yet is shown once at the end, then marked as shown'
