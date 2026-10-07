@@ -18,12 +18,32 @@ x-logging: &logging
     max-size: "10m"
     max-file: "3"
 
+# Container hardening. Every service: no capabilities beyond the ones it is shown to need
+# (cap_drop ALL), no way to gain any (no-new-privileges), a memory limit and a limit on processes
+# and threads (pids_limit), so a runaway or taken-over container cannot starve the PC. Where the
+# image allows it, also an unprivileged user and a read-only root filesystem.
+# In the toolkit's repository: docs/CONTAINER-HARDENING-PLAN.md has the reasons, service by service;
+# tests/Invoke-StaticChecks.ps1 (rule COMPOSESEC) refuses a service without the first four or with
+# a published port that is not on 127.0.0.1; tests/Invoke-StackSmokeTest.ps1 reads all of it back
+# from the running containers.
+# Left out on purpose: CPU limits (a 'cpus' value above what the Docker VM has stops the container
+# from being created), internal-only networks (every service needs the host or the internet) and
+# image digests in the image lines (the update and rollback scripts work with repo:tag).
+
 services:
   open-webui:
     image: ghcr.io/open-webui/open-webui:${OPEN_WEBUI_VERSION:-v0.11.4}
     container_name: open-webui
     logging: *logging
     restart: always
+    # Root inside the container (the image's own user) but without a single capability: its start
+    # script and code need none. Not read-only: it rewrites its static files at every start and
+    # installs the requirements of tools with pip. 16g leaves room for the embedder and the
+    # reranker, which run on the CPU.
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: 16g
+    pids_limit: 4096
     ports:
       - "127.0.0.1:${WEBUI_PORT:-3000}:8080"
     extra_hosts:
@@ -84,6 +104,13 @@ services:
     read_only: true
     cap_drop: [ALL]
     security_opt: ["no-new-privileges:true"]
+    # The memory limit is for the requests, not for the code: the guard holds every request it
+    # passes on whole in memory (a chat about three times over while it reads it), and a chat with
+    # pictures sends all of them again at every turn. A request too big for the limit ends the
+    # guard: Docker restarts it and the chats running through it are cut off.
+    # One thread per request plus a watcher; it writes no files.
+    mem_limit: 2g
+    pids_limit: 512
     extra_hosts:
       - "host.docker.internal:host-gateway"
     volumes:
@@ -105,11 +132,29 @@ services:
     container_name: searxng
     logging: *logging
     restart: always
+    # The image starts as root; 977 is its own 'searxng' user. As that user its entrypoint skips
+    # the change of owner on /etc/searxng (it says so in the log: expected) and the CA update. The
+    # installer always writes settings.yml first, so the entrypoint has none to create and the
+    # folder is mounted read-only.
+    # read_only covers the image's own files. A folder an image declares as a volume would still
+    # get a writable volume from Docker, without a size limit and kept across restarts, unless
+    # something else is mounted there: /etc/searxng is the mount below, and the image's data
+    # folder /var/cache/searxng (not used with these settings) gets a small tmpfs. So does /tmp,
+    # where SearXNG keeps its SQLite caches. Nothing can be run from either of them (noexec).
+    user: "977:977"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: 2g
+    pids_limit: 512
+    tmpfs:
+      - "/tmp:size=256m,mode=1777,noexec,nosuid,nodev"
+      - "/var/cache/searxng:size=64m,mode=0700,uid=977,gid=977,noexec,nosuid,nodev"
     ports:
       # Optional: lets you use http://localhost:8888 as a private search engine in your browser.
       - "127.0.0.1:${SEARXNG_PORT:-8888}:8080"
     volumes:
-      - ./searxng:/etc/searxng
+      - ./searxng:/etc/searxng:ro
     environment:
       SEARXNG_BASE_URL: http://localhost:${SEARXNG_PORT:-8888}/
       # The image listens on "::" by default, which fails on hosts without IPv6.
@@ -137,6 +182,9 @@ services:
     cap_drop: [ALL]
     cap_add: [CHOWN, FOWNER, DAC_OVERRIDE, SETUID, SETGID]
     security_opt: ["no-new-privileges:true"]
+    # Not read-only: where it writes outside /data has not been checked.
+    mem_limit: 8g
+    pids_limit: 2048
     ulimits:
       memlock: { soft: -1, hard: -1 }
     environment:

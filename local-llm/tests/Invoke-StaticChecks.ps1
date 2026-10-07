@@ -82,6 +82,13 @@ $files = Get-ChildItem -Path $Root -Recurse -File -Include *.ps1, *.psm1, *.psd1
 #            its notice must be exactly the list Update-Models re-checks (else it never clears).
 #   DEPSKIP  Test-LocalAI's 'SearXNG search' not skipping when the searxng container check failed
 #            (one cause reported as two FAILs).
+# One more rule, COMPOSESEC, is described at its function (Find-ComposeSecGap) instead of here: a
+# service in stack/docker-compose.yml without no-new-privileges, cap_drop ALL, a memory limit or a
+# pids limit, with a published port not bound to 127.0.0.1, or with a line that hands it all back
+# (privileged, ALL under cap_add, a '<<' merge at the service's own level). To do: list it above
+# like the others once Invoke-AllTests.ps1's VerdictPattern names it (the check near the end of this
+# file fails for a listed rule the runner does not know; until then a hit still fails the run, by
+# its exit code, but the runner's summary does not quote it).
 function Find-Pitfall([System.Management.Automation.Language.Ast]$Ast, [string[]]$Lines, [string]$FileName = '', [switch]$UserFacing) {
     $found = New-Object System.Collections.Generic.List[object]
     $add = { param($Rule, $Node, $Msg) $found.Add([pscustomobject]@{ Rule = $Rule; Line = $Node.Extent.StartLineNumber; Message = $Msg }) }
@@ -426,6 +433,101 @@ function Find-ComposeLogGap([string]$Text) {
     return , $missing
 }
 
+function Find-ComposeSecGap([string]$Text) {
+    # Rule COMPOSESEC: what a service in stack/docker-compose.yml lacks of the hardening every
+    # service of the stack carries (docs/CONTAINER-HARDENING-PLAN.md): 'no-new-privileges:true'
+    # under security_opt, ALL under cap_drop, a mem_limit, a pids_limit, and every published port
+    # bound to 127.0.0.1. One sentence per gap. Without them a container that is taken over keeps
+    # every default capability, may use all the memory and processes of the PC, or is reachable
+    # from the LAN.
+    # Also a gap: what hands all of it back in one line. 'privileged' (anything but false) makes
+    # Docker ignore cap_drop and give every capability, and ALL under cap_add does the same beside
+    # cap_drop ALL.
+    # Only what is written out in the service's own block counts: a flow mapping or a ${VARIABLE}
+    # for a limit cannot be read here, so it does not satisfy the rule. A '<<' merge at the
+    # service's own level is a gap by itself: it can bring in any key ('privileged', 'ports') from
+    # an anchor this check does not follow.
+    $gaps = New-Object System.Collections.Generic.List[string]
+    $bodies = [ordered]@{}
+    $inServices = $false; $svc = $null; $ind = $null
+    foreach ($raw in ($Text -split "`n")) {
+        $l = $raw.TrimEnd("`r")
+        if ($l -match '^\s*(#|$)') { continue }
+        if ($l -match '^\S') { $svc = $null; $ind = $null; $inServices = ($l -match '^services:\s*(#.*)?$'); continue }
+        if (-not $inServices) { continue }
+        $lead = $l.Length - $l.TrimStart(' ').Length
+        if ($null -eq $ind) { $ind = $lead }
+        if ($lead -eq $ind) { $svc = ($l.Trim() -split ':')[0]; $bodies[$svc] = New-Object System.Collections.Generic.List[string]; continue }
+        if ($svc) { $bodies[$svc].Add($l) }
+    }
+    if ($bodies.Count -eq 0) { $gaps.Add("no service found under 'services:'") }
+    # A YAML list as written, one string per item: inline '[a, "b"]' or one '- item' per line (the
+    # further lines of a mapping item are joined to it). Comments and the quotes around an item go.
+    $items = {
+        param($Lines)
+        $out = New-Object System.Collections.Generic.List[string]
+        if ($null -eq $Lines) { return }
+        $inline = ($Lines[0] -replace '(^|\s+)#.*$', '').Trim()
+        if ($inline -match '^\[(.*)\]$') { foreach ($p in ($Matches[1] -split ',')) { if ($p.Trim()) { $out.Add($p.Trim().Trim([char]34, [char]39)) } } }
+        elseif ($inline) { $out.Add($inline.Trim([char]34, [char]39)) }
+        for ($i = 1; $i -lt $Lines.Count; $i++) {
+            $t = ($Lines[$i] -replace '(^|\s+)#.*$', '').Trim()
+            if ($t -match '^-\s*(.*)$') { $out.Add($Matches[1].Trim().Trim([char]34, [char]39)) }
+            elseif ($t -and $out.Count) { $out[$out.Count - 1] = $out[$out.Count - 1] + '; ' + $t }
+        }
+        return $out
+    }
+    foreach ($name in $bodies.Keys) {
+        # The service's own keys (the indent of its first line), each with its value: what follows
+        # the colon, then the lines below it that are deeper or are list items ('- x' may stand at
+        # the indent of its key).
+        $keys = @{}; $key = $null; $kInd = $null
+        foreach ($l in $bodies[$name]) {
+            $lead = $l.Length - $l.TrimStart(' ').Length
+            if ($null -eq $kInd) { $kInd = $lead }
+            if ($lead -gt $kInd -or $l.Trim() -match '^-(\s|$)') { if ($key) { $keys[$key].Add($l.Trim()) }; continue }
+            $key = $null
+            # '<<' is read as a key like any other, so that a merge at this level is seen below.
+            if ($l -match '^\s*([A-Za-z0-9_.-]+|<<):(\s.*)?$') {
+                $key = $Matches[1]
+                $keys[$key] = New-Object System.Collections.Generic.List[string]
+                $keys[$key].Add(([string]$Matches[2]).Trim())
+            }
+        }
+        if (-not @(& $items $keys['security_opt'] | Where-Object { $_ -match '^no-new-privileges([:=]true)?$' }).Count) {
+            $gaps.Add("service '$name' has no 'no-new-privileges:true' under security_opt")
+        }
+        if (-not @(& $items $keys['cap_drop'] | Where-Object { $_ -eq 'ALL' }).Count) {
+            $gaps.Add("service '$name' has no ALL under cap_drop")
+        }
+        if (@(& $items $keys['cap_add'] | Where-Object { $_ -match '^(CAP_)?ALL$' }).Count) {
+            $gaps.Add("service '$name' has ALL under cap_add (that gives back every capability cap_drop took away)")
+        }
+        if ($keys.ContainsKey('privileged')) {
+            $priv = (@(& $items $keys['privileged']) -join ' ')
+            if ($priv -ne 'false') { $gaps.Add("service '$name' has 'privileged: $priv' (a privileged container gets every capability, whatever cap_drop says; only false or no such line will do)") }
+        }
+        if ($keys.ContainsKey('<<')) {
+            $gaps.Add("service '$name' takes keys from a '<<' merge (this check reads only what is written out in the service itself: write the keys out)")
+        }
+        $mem = (@(& $items $keys['mem_limit']) -join ' ')
+        if ($mem -notmatch '^[0-9]' -or $mem -match '^0+(\.0+)?[A-Za-z]*$') {
+            $gaps.Add("service '$name' has no mem_limit (a size above zero, written out)")
+        }
+        $pids = (@(& $items $keys['pids_limit']) -join ' ')
+        if ($pids -notmatch '^[1-9][0-9]*$') {
+            $gaps.Add("service '$name' has no pids_limit (a number above zero, written out)")
+        }
+        foreach ($p in @(& $items $keys['ports'])) {
+            # Long syntax (a mapping with host_ip) or short syntax ('127.0.0.1:3000:8080').
+            $bound = $p -match '^127\.0\.0\.1:'
+            if ($p -match '(^|[{;,\s])[a-z_]+:(\s|$)') { $bound = $p -match '(^|[{;,\s])host_ip:\s*["'']?127\.0\.0\.1["'']?\s*([;,}]|$)' }
+            if (-not $bound) { $gaps.Add("service '$name' publishes a port that is not bound to 127.0.0.1 ($p)") }
+        }
+    }
+    return , $gaps.ToArray()
+}
+
 # ---- canaries: every rule must fire on its bad snippet and stay quiet on the fixed one ---------
 $canaries = @(
     @{ Rule = 'PS51'; Fire = $true; Code = '$h | Measure-Object -Property Size -Sum' }
@@ -548,6 +650,40 @@ $composeCanaries = @(
     @{ Fire = $true; Text = "services:`n    a:`n        image: x`n    b:`n        logging: *l" }
     @{ Fire = $true; Text = "services:`n  a:   # first`n    image: x`n  b:`n    logging: *l" }
     @{ Fire = $false; Text = "services:`n  a:`n    <<: *common`n  b:   # second`n    logging: *l" })
+# COMPOSESEC: one hardened service, then the same service with one thing taken away, weakened or
+# written another way. A canary that fires must report exactly the gap it names (Says) and no
+# other (Gaps, 1 unless given): a rule that fires for the wrong reason proves nothing.
+$secPort = '      - "127.0.0.1:${P:-3000}:8080"'
+$secOk = @('services:', '  a:', '    image: x', '    ports:', $secPort, '    cap_drop: [ALL]', '    security_opt: ["no-new-privileges:true"]', '    mem_limit: 2g', '    pids_limit: 512') -join "`n"
+$composeSecCanaries = @(
+    @{ Fire = $false; Text = $secOk }
+    @{ Fire = $true; Says = 'no-new-privileges'; Text = $secOk.Replace('    security_opt: ["no-new-privileges:true"]', '    restart: always') }
+    @{ Fire = $true; Says = 'no-new-privileges'; Text = $secOk.Replace('privileges:true', 'privileges:false') }
+    @{ Fire = $true; Gaps = 2; Says = 'has no ALL under cap_drop.* has ALL under cap_add'; Text = $secOk.Replace('cap_drop: [ALL]', 'cap_add: [ALL]') }
+    @{ Fire = $true; Says = 'cap_drop'; Text = $secOk.Replace('[ALL]', '[NET_RAW]') }
+    # What hands everything back while the four keys are all still there.
+    @{ Fire = $true; Says = 'has ALL under cap_add'; Text = ($secOk + "`n    cap_add: [ALL]") }
+    @{ Fire = $true; Says = 'has ALL under cap_add'; Text = ($secOk + "`n    cap_add:`n      - CHOWN`n      - all   # every one") }
+    @{ Fire = $true; Says = "has 'privileged: true'"; Text = ($secOk + "`n    privileged: true") }
+    @{ Fire = $true; Says = "has 'privileged: yes'"; Text = $secOk.Replace('    image: x', "    image: x`n    privileged: 'yes'   # for a test") }
+    @{ Fire = $false; Text = ($secOk + "`n    privileged: false") }
+    @{ Fire = $true; Says = "takes keys from a '<<' merge"; Text = ($secOk + "`n    <<: *wide") }
+    @{ Fire = $true; Says = "takes keys from a '<<' merge"; Text = $secOk.Replace('    image: x', "    <<: [*wide, *open]`n    image: x") }
+    @{ Fire = $false; Text = ($secOk + "`n    environment:`n      <<: *env`n      A: b") }
+    @{ Fire = $true; Says = 'mem_limit'; Text = $secOk.Replace('    mem_limit: 2g', '    # mem_limit: 2g') }
+    @{ Fire = $true; Says = 'mem_limit'; Text = $secOk.Replace('mem_limit: 2g', 'mem_limit: 0') }
+    @{ Fire = $true; Says = 'pids_limit'; Text = $secOk.Replace('    pids_limit: 512', "    environment:`n      pids_limit: 512") }
+    @{ Fire = $true; Says = 'pids_limit'; Text = $secOk.Replace('pids_limit: 512', 'pids_limit: -1') }
+    @{ Fire = $true; Says = 'not bound to 127'; Text = $secOk.Replace('127.0.0.1:', '') }
+    @{ Fire = $true; Says = 'not bound to 127'; Text = $secOk.Replace('127.0.0.1:', '0.0.0.0:') }
+    @{ Fire = $true; Says = 'not bound to 127'; Text = $secOk.Replace($secPort, "    - 8080`n    - '127.0.0.1:3000:8080'") }
+    @{ Fire = $true; Says = 'not bound to 127'; Text = $secOk.Replace($secPort, "      - target: 8080`n        published: 3000") }
+    @{ Fire = $false; Text = $secOk.Replace($secPort, "      - target: 8080`n        published: 3000`n        host_ip: 127.0.0.1") }
+    @{ Fire = $false; Text = $secOk.Replace("    ports:`n$secPort`n", '') }
+    @{ Fire = $false; Text = $secOk.Replace('cap_drop: [ALL]', "cap_drop:`n    - ALL   # every one`n    cap_add: [CHOWN]").Replace('security_opt: ["no-new-privileges:true"]', "security_opt:`n      - 'no-new-privileges:true'").Replace('mem_limit: 2g', 'mem_limit: "512m"   # enough') }
+    @{ Fire = $true; Gaps = 3; Says = "service 'b' has no mem_limit"; Text = ($secOk + "`n  b:`n    image: y`n    cap_drop: [ALL]`nvolumes:`n  mem_limit: 2g") }
+    @{ Fire = $true; Gaps = 4; Says = "service 'a' has no ALL under cap_drop"; Text = "services:`n  a: { image: x, cap_drop: [ALL] }" }
+    @{ Fire = $true; Says = 'no service found'; Text = "volumes:`n  v:" })
 $mdCanaries = @(
     @{ Fire = $true; Text = "| A | B |`n|---|---|`n| a1 | b1 || a2 | b2 |" }
     @{ Fire = $true; Text = "| A | B |`n|---|---|`n| a1 | b1 | | a2 | b2 |" }
@@ -563,6 +699,15 @@ foreach ($k in $composeCanaries) {
     if (((Find-ComposeLogGap $k.Text).Count -gt 0) -ne $k.Fire) {
         $canaryFail++; $problems++
         Write-Host ("CANARY   rule COMPOSELOG {0}" -f $(if ($k.Fire) { 'did not fire' } else { 'fired wrongly' })) -ForegroundColor Red
+    }
+}
+foreach ($k in $composeSecCanaries) {
+    $got = Find-ComposeSecGap $k.Text
+    $want = 0; $says = ''
+    if ($k.Fire) { $want = 1; $says = $k.Says; if ($k.ContainsKey('Gaps')) { $want = $k.Gaps } }
+    if ($got.Count -ne $want -or ($says -and ($got -join ' | ') -notmatch $says)) {
+        $canaryFail++; $problems++
+        Write-Host ("CANARY   rule COMPOSESEC wanted {0} gap(s) [{1}], found {2} [{3}] on: {4}" -f $want, $says, $got.Count, ($got -join ' | '), ($k.Text -replace "`n", ' / ')) -ForegroundColor Red
     }
 }
 foreach ($k in $docCanaries) {
@@ -583,7 +728,8 @@ foreach ($k in $canaries) {
         Write-Host ("CANARY   rule {0} {1} on: {2}" -f $k.Rule, $(if ($k.Fire) { 'did not fire' } else { 'fired wrongly' }), $k.Code) -ForegroundColor Red
     }
 }
-Write-Host ("Pitfall-rule canaries: {0}/{1} OK" -f ($canaries.Count + $docCanaries.Count + $composeCanaries.Count + $mdCanaries.Count - $canaryFail), ($canaries.Count + $docCanaries.Count + $composeCanaries.Count + $mdCanaries.Count)) -ForegroundColor $(if ($canaryFail) { 'Red' } else { 'Green' })
+$canaryCount = $canaries.Count + $docCanaries.Count + $composeCanaries.Count + $composeSecCanaries.Count + $mdCanaries.Count
+Write-Host ("Pitfall-rule canaries: {0}/{1} OK" -f ($canaryCount - $canaryFail), $canaryCount) -ForegroundColor $(if ($canaryFail) { 'Red' } else { 'Green' })
 
 foreach ($f in $files) {
     $tokens = $null; $errs = $null
@@ -616,8 +762,12 @@ foreach ($f in ($files | Where-Object { $_.DirectoryName -eq $Root -and $_.Exten
 }
 $composeFile = Join-Path (Join-Path $Root 'stack') 'docker-compose.yml'
 if (Test-Path -LiteralPath $composeFile) {
-    foreach ($svc in (Find-ComposeLogGap (Get-Content -LiteralPath $composeFile -Raw -Encoding UTF8))) {
+    $composeText = Get-Content -LiteralPath $composeFile -Raw -Encoding UTF8
+    foreach ($svc in (Find-ComposeLogGap $composeText)) {
         $problems++; Write-Host "COMPOSELOG docker-compose.yml: service '$svc' has no logging limits (add 'logging: *logging')" -ForegroundColor Red
+    }
+    foreach ($gap in (Find-ComposeSecGap $composeText)) {
+        $problems++; Write-Host "COMPOSESEC docker-compose.yml: $gap (see docs/CONTAINER-HARDENING-PLAN.md)" -ForegroundColor Red
     }
 }
 
