@@ -84,9 +84,11 @@ $files = Get-ChildItem -Path $Root -Recurse -File -Include *.ps1, *.psm1, *.psd1
 #            (one cause reported as two FAILs).
 # One more rule, COMPOSESEC, is described at its function (Find-ComposeSecGap) instead of here: a
 # service in stack/docker-compose.yml without no-new-privileges, cap_drop ALL, a memory limit or a
-# pids limit, or with a published port not bound to 127.0.0.1. To do: list it above like the others
-# once Invoke-AllTests.ps1's VerdictPattern names it (the check near the end of this file fails for
-# a listed rule the runner does not know; until then a hit still fails the run, by its exit code).
+# pids limit, with a published port not bound to 127.0.0.1, or with a line that hands it all back
+# (privileged, ALL under cap_add, a '<<' merge at the service's own level). To do: list it above
+# like the others once Invoke-AllTests.ps1's VerdictPattern names it (the check near the end of this
+# file fails for a listed rule the runner does not know; until then a hit still fails the run, by
+# its exit code, but the runner's summary does not quote it).
 function Find-Pitfall([System.Management.Automation.Language.Ast]$Ast, [string[]]$Lines, [string]$FileName = '', [switch]$UserFacing) {
     $found = New-Object System.Collections.Generic.List[object]
     $add = { param($Rule, $Node, $Msg) $found.Add([pscustomobject]@{ Rule = $Rule; Line = $Node.Extent.StartLineNumber; Message = $Msg }) }
@@ -438,8 +440,13 @@ function Find-ComposeSecGap([string]$Text) {
     # bound to 127.0.0.1. One sentence per gap. Without them a container that is taken over keeps
     # every default capability, may use all the memory and processes of the PC, or is reachable
     # from the LAN.
-    # Only what is written out in the service's own block counts: a '<<:' merge, a flow mapping or
-    # a ${VARIABLE} for a limit cannot be read here, so it does not satisfy the rule.
+    # Also a gap: what hands all of it back in one line. 'privileged' (anything but false) makes
+    # Docker ignore cap_drop and give every capability, and ALL under cap_add does the same beside
+    # cap_drop ALL.
+    # Only what is written out in the service's own block counts: a flow mapping or a ${VARIABLE}
+    # for a limit cannot be read here, so it does not satisfy the rule. A '<<' merge at the
+    # service's own level is a gap by itself: it can bring in any key ('privileged', 'ports') from
+    # an anchor this check does not follow.
     $gaps = New-Object System.Collections.Generic.List[string]
     $bodies = [ordered]@{}
     $inServices = $false; $svc = $null; $ind = $null
@@ -480,7 +487,8 @@ function Find-ComposeSecGap([string]$Text) {
             if ($null -eq $kInd) { $kInd = $lead }
             if ($lead -gt $kInd -or $l.Trim() -match '^-(\s|$)') { if ($key) { $keys[$key].Add($l.Trim()) }; continue }
             $key = $null
-            if ($l -match '^\s*([A-Za-z0-9_.-]+):(\s.*)?$') {
+            # '<<' is read as a key like any other, so that a merge at this level is seen below.
+            if ($l -match '^\s*([A-Za-z0-9_.-]+|<<):(\s.*)?$') {
                 $key = $Matches[1]
                 $keys[$key] = New-Object System.Collections.Generic.List[string]
                 $keys[$key].Add(([string]$Matches[2]).Trim())
@@ -491,6 +499,16 @@ function Find-ComposeSecGap([string]$Text) {
         }
         if (-not @(& $items $keys['cap_drop'] | Where-Object { $_ -eq 'ALL' }).Count) {
             $gaps.Add("service '$name' has no ALL under cap_drop")
+        }
+        if (@(& $items $keys['cap_add'] | Where-Object { $_ -match '^(CAP_)?ALL$' }).Count) {
+            $gaps.Add("service '$name' has ALL under cap_add (that gives back every capability cap_drop took away)")
+        }
+        if ($keys.ContainsKey('privileged')) {
+            $priv = (@(& $items $keys['privileged']) -join ' ')
+            if ($priv -ne 'false') { $gaps.Add("service '$name' has 'privileged: $priv' (a privileged container gets every capability, whatever cap_drop says; only false or no such line will do)") }
+        }
+        if ($keys.ContainsKey('<<')) {
+            $gaps.Add("service '$name' takes keys from a '<<' merge (this check reads only what is written out in the service itself: write the keys out)")
         }
         $mem = (@(& $items $keys['mem_limit']) -join ' ')
         if ($mem -notmatch '^[0-9]' -or $mem -match '^0+(\.0+)?[A-Za-z]*$') {
@@ -641,8 +659,17 @@ $composeSecCanaries = @(
     @{ Fire = $false; Text = $secOk }
     @{ Fire = $true; Says = 'no-new-privileges'; Text = $secOk.Replace('    security_opt: ["no-new-privileges:true"]', '    restart: always') }
     @{ Fire = $true; Says = 'no-new-privileges'; Text = $secOk.Replace('privileges:true', 'privileges:false') }
-    @{ Fire = $true; Says = 'cap_drop'; Text = $secOk.Replace('cap_drop: [ALL]', 'cap_add: [ALL]') }
+    @{ Fire = $true; Gaps = 2; Says = 'has no ALL under cap_drop.* has ALL under cap_add'; Text = $secOk.Replace('cap_drop: [ALL]', 'cap_add: [ALL]') }
     @{ Fire = $true; Says = 'cap_drop'; Text = $secOk.Replace('[ALL]', '[NET_RAW]') }
+    # What hands everything back while the four keys are all still there.
+    @{ Fire = $true; Says = 'has ALL under cap_add'; Text = ($secOk + "`n    cap_add: [ALL]") }
+    @{ Fire = $true; Says = 'has ALL under cap_add'; Text = ($secOk + "`n    cap_add:`n      - CHOWN`n      - all   # every one") }
+    @{ Fire = $true; Says = "has 'privileged: true'"; Text = ($secOk + "`n    privileged: true") }
+    @{ Fire = $true; Says = "has 'privileged: yes'"; Text = $secOk.Replace('    image: x', "    image: x`n    privileged: 'yes'   # for a test") }
+    @{ Fire = $false; Text = ($secOk + "`n    privileged: false") }
+    @{ Fire = $true; Says = "takes keys from a '<<' merge"; Text = ($secOk + "`n    <<: *wide") }
+    @{ Fire = $true; Says = "takes keys from a '<<' merge"; Text = $secOk.Replace('    image: x', "    <<: [*wide, *open]`n    image: x") }
+    @{ Fire = $false; Text = ($secOk + "`n    environment:`n      <<: *env`n      A: b") }
     @{ Fire = $true; Says = 'mem_limit'; Text = $secOk.Replace('    mem_limit: 2g', '    # mem_limit: 2g') }
     @{ Fire = $true; Says = 'mem_limit'; Text = $secOk.Replace('mem_limit: 2g', 'mem_limit: 0') }
     @{ Fire = $true; Says = 'pids_limit'; Text = $secOk.Replace('    pids_limit: 512', "    environment:`n      pids_limit: 512") }

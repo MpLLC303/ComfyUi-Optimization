@@ -104,8 +104,12 @@ services:
     read_only: true
     cap_drop: [ALL]
     security_opt: ["no-new-privileges:true"]
-    # One thread per request plus a watcher, and it writes no files.
-    mem_limit: 512m
+    # The memory limit is for the requests, not for the code: the guard holds every request it
+    # passes on whole in memory (a chat about three times over while it reads it), and a chat with
+    # pictures sends all of them again at every turn. A request too big for the limit ends the
+    # guard: Docker restarts it and the chats running through it are cut off.
+    # One thread per request plus a watcher; it writes no files.
+    mem_limit: 2g
     pids_limit: 512
     extra_hosts:
       - "host.docker.internal:host-gateway"
@@ -129,9 +133,14 @@ services:
     logging: *logging
     restart: always
     # The image starts as root; 977 is its own 'searxng' user. As that user its entrypoint skips
-    # the change of owner on /etc/searxng (it says so in the log: expected) and the CA update, and
-    # copies no settings: settings.yml is always written by the installer first, so the folder is
-    # mounted read-only. At run time SearXNG writes only its SQLite caches, in /tmp.
+    # the change of owner on /etc/searxng (it says so in the log: expected) and the CA update. The
+    # installer always writes settings.yml first, so the entrypoint has none to create and the
+    # folder is mounted read-only.
+    # read_only covers the image's own files. A folder an image declares as a volume would still
+    # get a writable volume from Docker, without a size limit and kept across restarts, unless
+    # something else is mounted there: /etc/searxng is the mount below, and the image's data
+    # folder /var/cache/searxng (not used with these settings) gets a small tmpfs. So does /tmp,
+    # where SearXNG keeps its SQLite caches. Nothing can be run from either of them (noexec).
     user: "977:977"
     read_only: true
     cap_drop: [ALL]
@@ -139,7 +148,8 @@ services:
     mem_limit: 2g
     pids_limit: 512
     tmpfs:
-      - "/tmp:size=256m,mode=1777"
+      - "/tmp:size=256m,mode=1777,noexec,nosuid,nodev"
+      - "/var/cache/searxng:size=64m,mode=0700,uid=977,gid=977,noexec,nosuid,nodev"
     ports:
       # Optional: lets you use http://localhost:8888 as a private search engine in your browser.
       - "127.0.0.1:${SEARXNG_PORT:-8888}:8080"
