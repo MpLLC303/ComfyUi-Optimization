@@ -71,19 +71,29 @@ CONFIG = {
     # A list without 'vision' is re-read sooner: kept stale, it would strip a vision model's images.
     'caps_no_vision_ttl_sec': float(os.environ.get('CAPS_NO_VISION_TTL_SEC', '60')),
     # Largest chat or generate request the guard takes; a larger one gets HTTP 413. These are
-    # the requests it holds whole, several times over at the worst: the bytes, the decoded text,
-    # the parsed request and, when it rewrites, the new text and its bytes. 256 MiB keeps those
-    # five copies (1280 MiB) well inside the container's 2 GB. It still fits (six copies, 1536
-    # MiB) when the body holds a character beyond U+FFFF that is not written as an escape: Python
-    # then keeps the decoded text at four bytes per character. The limit is per request: it does
-    # not add up the chats that arrive at the same moment.
+    # the requests it holds whole, several times over: the bytes, the decoded text, the parsed
+    # request and, when it rewrites, the new text and its bytes. The default is sized for the
+    # large chat there is in practice, one with pictures (long base64 texts): 256 MiB keeps those
+    # five copies (1280 MiB) well inside the container's 2 GB, and six (1536 MiB) when a message
+    # beside the pictures holds a character beyond U+FFFF that is not written as an escape
+    # (Python then keeps the decoded text at four bytes per character).
+    # It does not bound what a request costs to parse, so it is no promise that no request can
+    # end the guard. Measured with json.loads: a request that is one long text with such a
+    # character in it costs 9 to 12 times its size (the parsed text is four bytes per character
+    # as well), one made of millions of empty lists or objects more than 20 times. Neither is a
+    # chat with pictures, but a program that reaches the guard (it has no port on the host: a
+    # program in one of the stack's containers) can write one below this limit, and the guard
+    # is ended as it was before there was a limit. The limit is also per request: it does not
+    # add up the chats that arrive at the same moment.
     'max_body_bytes': int(os.environ.get('RENDER_GUARD_MAX_BODY_MIB', '256')) * 1048576,
+    # Longest the guard goes on reading from a client that is still sending a request it has
+    # already answered itself (a 413 or a 502), see Handler._drain.
+    'drain_sec': float(os.environ.get('DRAIN_SEC', '30')),
 }
 GUARDED_PATHS = ('/api/chat', '/api/generate')
 BODY_PIECE = 65536           # most bytes of a request body read from the client in one go
 BODY_LINE_MAX = 4096         # longest chunk-size or trailer line taken from a chunked request body
 BODY_TRAILER_MAX = 64        # most trailer lines taken after a chunked request body
-DRAIN_SEC = 30               # longest a client may go on sending a request the guard has answered
 MODEL_CHANGE_PATHS = ('/api/pull', '/api/create', '/api/delete', '/api/copy')
 IMAGE_NOTE = '[image omitted: this model cannot see images; switch this chat to a preset that sees images (Uncensored Vision, or an Official one if installed) or start a new chat]'
 HOP_BY_HOP = {'connection', 'keep-alive', 'proxy-authenticate', 'proxy-authorization', 'te',
@@ -561,11 +571,12 @@ class Handler(BaseHTTPRequestHandler):
         client can send one (a Content-Length, or chunked). A piece is read from the client only
         when the caller asks for the next one, and none is kept here: whoever passes each piece
         on before asking again never holds more than one. Raises BodyError when the body cannot
-        be read to its end."""
+        be read to its end. Keeps self._unread (see _proxy) at what the client has still to send."""
         if not chunked:
             while length > 0:
                 piece = self._body_bytes(min(BODY_PIECE, length))
                 length -= len(piece)
+                self._unread = length
                 yield piece
             return
         while True:
@@ -583,33 +594,44 @@ class Handler(BaseHTTPRequestHandler):
                 raise BodyError('the chunked request body has a chunk that does not end where its size says')
         for _ in range(BODY_TRAILER_MAX):   # trailers are not passed on; the empty line ends the body
             if self._body_line() in (b'\r\n', b'\n'):
+                self._unread = 0
                 return
         raise BodyError('the chunked request body has more than %d trailer lines' % BODY_TRAILER_MAX)
 
-    def _drain(self, pieces):
+    def _drain(self):
         """Read and drop what the client is still sending of a request the guard has already
-        answered, for DRAIN_SEC at most. Closing the connection on a client that is still
-        sending resets it, and the client then never gets to read the answer."""
-        deadline = time.time() + DRAIN_SEC
+        answered, for CONFIG['drain_sec'] at most. Closing the connection on a client that is
+        still sending resets it, and the client then never gets to read the answer.
+        The body's framing is not followed here. One line of a chunked body can take thousands
+        of reads, each with a wait of its own, so a client sending it a byte at a time would be
+        kept for hours. Instead every pass is one read of the socket, with the time that is left
+        as its timeout: until the Content-Length is used up or, for a chunked body (self._unread
+        is None), until the client closes the connection. A client does that once it has read
+        the answer, which says 'Connection: close'."""
+        deadline = time.time() + CONFIG['drain_sec']
         try:
-            self.connection.settimeout(DRAIN_SEC)
-            for _ in pieces:
+            while self._unread is None or self._unread > 0:
                 left = deadline - time.time()
                 if left <= 0:
                     break
                 self.connection.settimeout(left)
+                data = self.rfile.read1(BODY_PIECE if self._unread is None else min(BODY_PIECE, self._unread))
+                if not data:
+                    break       # the client has closed the connection
+                if self._unread is not None:
+                    self._unread -= len(data)
         except OSError:
             pass    # the client is gone, or has stopped sending
 
-    def _refuse(self, path, code, why, pieces):
+    def _refuse(self, path, code, why):
         """Answer a request the guard does not pass on to Ollama, then let the client finish
-        sending it (pieces: what is left of its body)."""
+        sending it."""
         log('%s %s refused with HTTP %d: %s' % (self.command, path, code, why))
         try:
             self._send_json(code, {'error': 'render-guard: ' + why})
         except OSError:
             return      # the client is gone
-        self._drain(pieces)
+        self._drain()
 
     def _send_json(self, code, obj):
         data = json.dumps(obj).encode('utf-8')
@@ -659,11 +681,16 @@ class Handler(BaseHTTPRequestHandler):
                                   'holding_cpu': recently_busy(), 'inflight': inflight, 'on_cpu': on_cpu})
             return
         chunked = 'chunked' in (self.headers.get('Transfer-Encoding') or '').lower()
+        # What the client has still to send of its request body, for _drain: a number of bytes,
+        # or None for a chunked body, which says only at its end that it is over. _body_pieces
+        # counts it down as it reads. 0 until the length is known: there is nothing to go by.
+        self._unread = 0
         try:
             length = 0 if chunked else max(int(self.headers.get('Content-Length') or 0), 0)
         except ValueError:
-            self._refuse(path_only, 400, 'the Content-Length of this request is not a number', ())
+            self._refuse(path_only, 400, 'the Content-Length of this request is not a number')
             return
+        self._unread = None if chunked else length
         # Nothing is read yet: the generator reads from the client only as it is asked for pieces.
         pieces = self._body_pieces(chunked, length)
         guarded = self.command == 'POST' and path_only in GUARDED_PATHS
@@ -671,30 +698,33 @@ class Handler(BaseHTTPRequestHandler):
         if guarded:
             # Only these requests are held whole (the guard may have to rewrite them), so only
             # these have a size limit. A Content-Length says before a byte is read that the body
-            # is too large; a chunked body has no length to go by and is read until it passes
-            # the limit. A body of exactly the limit passes.
+            # is too large; a chunked body has no length to go by and is read until the next piece
+            # would take it past the limit. A body of exactly the limit passes.
+            # The pieces go into one buffer that grows in place, so the limit counts what the
+            # guard holds. Kept as a list they would not be: every piece is an object of its own,
+            # as small as the client cares to send it (one per chunk at most), and a chat sent
+            # two bytes to the chunk would cost about thirty times the bytes the limit counted.
             cap = CONFIG['max_body_bytes']
             too_large = length > cap
-            parts, held = [], 0
+            buf = bytearray()
             try:
                 if not too_large:
                     for piece in pieces:
-                        held += len(piece)
-                        if held > cap:
+                        if len(buf) + len(piece) > cap:
                             too_large = True
                             break
-                        parts.append(piece)
+                        buf += piece
             except BodyError as e:
                 log('%s %s: %s' % (self.command, path_only, e))
                 return
             if too_large:
-                del parts[:]
+                del buf[:]
                 self._refuse(path_only, 413, 'this request is larger than %d MiB, the most the guard takes for one chat '
                              '(RENDER_GUARD_MAX_BODY_MIB). A chat sends all its pictures again at every turn: start a new '
-                             'chat, or attach fewer or smaller pictures' % (cap // 1048576), pieces)
+                             'chat, or attach fewer or smaller pictures' % (cap // 1048576))
                 return
-            body = b''.join(parts)
-            del parts[:]
+            body = bytes(buf)   # one more copy for a moment, and less than the parsing below takes
+            del buf[:]
         if guarded and body:
             try:
                 obj = json.loads(body.decode('utf-8'))
@@ -758,7 +788,7 @@ class Handler(BaseHTTPRequestHandler):
                 raise
             except Exception as e:
                 self._send_json(502, {'error': 'render-guard: Ollama at %s is not reachable: %s' % (CONFIG['upstream'], e)})
-                self._drain(pieces)     # a client still sending its body would not get to read the 502
+                self._drain()   # a client still sending its body would not get to read the 502
                 return
             threading.Thread(target=self._watch_client, args=(conn, done), daemon=True).start()
             try:

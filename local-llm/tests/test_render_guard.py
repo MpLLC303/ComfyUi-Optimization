@@ -338,8 +338,9 @@ def post(port, path, obj):
 
 def send(port, path, body, chunked=False, headers=None):
     """POST raw bytes to the guard, with a Content-Length or (chunked) in chunks of 100000 bytes
-    without one. Returns (HTTP status, the answer's bytes); status 0: the connection broke before
-    an answer could be read."""
+    without one. A body the caller has framed in chunks itself goes out as it is when headers
+    names the Transfer-Encoding. Returns (HTTP status, the answer's bytes); status 0: the
+    connection broke before an answer could be read."""
     c = http.client.HTTPConnection('127.0.0.1', port, timeout=60)
     h = {'Content-Type': 'application/json'}
     h.update(headers or {})
@@ -392,6 +393,75 @@ def upload(port, path, data, chunked=False):
         return 0, early
     finally:
         c.close()
+
+
+def raw_open(port, path, headers, data):
+    """Start a POST on a plain socket and send it the way it is written here: the header lines,
+    then data as it is (the caller frames the body, or frames it wrongly on purpose). Returns the
+    socket, still open: the caller goes on sending, stops sending or reads the answer."""
+    s = socket.create_connection(('127.0.0.1', port), timeout=30)
+    lines = ['POST %s HTTP/1.1' % path, 'Host: 127.0.0.1:%d' % port] + list(headers)
+    try:
+        s.sendall('\r\n'.join(lines).encode('ascii') + b'\r\n\r\n' + data)
+    except OSError:
+        pass    # the other side hung up meanwhile; raw_status tells what it answered first, if anything
+    return s
+
+
+def raw_status(s, seconds=20):
+    """The HTTP status of the answer on a plain socket, read as far as the end of its header
+    lines (the connection is left open). 0: the other side closed the connection without an
+    answer. -1: it did neither for that many seconds."""
+    s.settimeout(seconds)
+    got = b''
+    try:
+        while b'\r\n\r\n' not in got:
+            data = s.recv(65536)
+            if not data:
+                break
+            got += data
+    except socket.timeout:
+        return -1
+    except OSError:
+        pass    # reset: closed as well, with nothing more to read
+    m = re.match(rb'HTTP/1\.[01] (\d{3})\b', got)
+    return int(m.group(1)) if m else 0
+
+
+def held_open(s, seconds, drip=None):
+    """How many seconds from now the other side keeps a connection open: reads and drops what it
+    sends until it closes the connection. None: still open after that many seconds. drip: bytes
+    sent again every 0.3 s meanwhile, like a client that never stops sending."""
+    t0 = time.time()
+    s.settimeout(0.3)
+    while time.time() - t0 < seconds:
+        try:
+            if drip:
+                s.sendall(drip)
+            if s.recv(65536) == b'':
+                return time.time() - t0
+        except socket.timeout:
+            continue
+        except OSError:
+            return time.time() - t0     # reset, or nothing can be sent any more: closed as well
+    return None
+
+
+def how_long(took):
+    return 'still open' if took is None else 'closed after %.1f s' % took
+
+
+def peak_kib(pid):
+    """The most memory a process has held at any moment since it started, in KiB: VmHWM in
+    /proc/<pid>/status (Linux). None where that cannot be read."""
+    try:
+        with open('/proc/%d/status' % pid) as f:
+            for line in f:
+                if line.startswith('VmHWM:'):
+                    return int(line.split()[1])
+    except (OSError, ValueError, IndexError):
+        pass
+    return None
 
 
 def refusal(answer):
@@ -694,6 +764,33 @@ def main():
               'the client hangs up in the middle of an upload: Ollama sees a body cut short, not a complete shorter one '
               '(%d bytes there, complete: %s)' % (BLOB['length'], BLOB['complete']))
 
+        # An upload the guard cannot read to its end, from a client that is still there to read an
+        # answer. The fault is the client's own: the guard gives no answer of its own (a 502 would
+        # say that Ollama is not reachable, and Ollama is) and ends the connection, and Ollama sees
+        # the upload cut short. Three ways: a chunk size that is not a number, nothing more sent in
+        # the middle of a chunk, nothing more sent before the Content-Length is reached. In the
+        # last two the client closes only its sending side, so an answer would still reach it.
+        broken = (('a chunk size that is not a number', ['Transfer-Encoding: chunked'],
+                   b'%x\r\n%s\r\nzz\r\n' % (200000, blob[:200000]), False),
+                  ('nothing more sent in the middle of a chunk', ['Transfer-Encoding: chunked'],
+                   b'%x\r\n%s' % (200000, blob[:100000]), True),
+                  ('nothing more sent before its Content-Length is reached', ['Content-Length: 200000'],
+                   blob[:100000], True))
+        for what, head, data, stop in broken:
+            reset_ollama()
+            s = raw_open(gport, '/api/blobs/sha256:' + digest, head, data)
+            if stop:
+                try:
+                    s.shutdown(socket.SHUT_WR)
+                except OSError:
+                    pass
+            code = raw_status(s)
+            s.close()
+            check(code == 0, 'an upload with %s: the guard ends the connection without an answer of its own, '
+                             'a 502 least of all (HTTP %d; 0: none, -1: nothing happened)' % (what, code))
+            check(wait_for(lambda: BLOB['complete'] is not None, 10) and BLOB['complete'] is False,
+                  'an upload with %s: Ollama sees it cut short (%d bytes there, complete: %s)' % (what, BLOB['length'], BLOB['complete']))
+
         # Chat and generate calls: the guard holds these whole, so these have the cap.
         reset_ollama()
         code, answer = send(gport, '/api/chat', chat_of(cap + 1))
@@ -709,6 +806,29 @@ def main():
         check(status(gport)['inflight'] == 0, 'a refused request is not counted as a chat in flight')
         lines = chat(gport)
         check(bool(lines) and lines[-1].get('done') is True, 'the next chat is answered')
+
+        # After a 413 the guard reads what the client still sends of the chat and drops it. With a
+        # Content-Length it knows where the chat ends, and ends the connection there by itself: it
+        # does not wait out DRAIN_SEC (30 s here) for a client that has sent everything and stays.
+        over = chat_of(cap + 1)
+        s = raw_open(gport, '/api/chat', ['Content-Type: application/json', 'Content-Length: %d' % len(over)], over)
+        code = raw_status(s)
+        took = held_open(s, 10)
+        s.close()
+        check(code == 413 and took is not None and took < 5,
+              'a refused chat with a Content-Length: once all of it has arrived the guard ends the connection '
+              'itself (HTTP %d, %s)' % (code, how_long(took)))
+
+        # A chat the guard cannot read to its end (a chunk size that is not a number), from a
+        # client that is still there: no answer, and Ollama is not given half a chat.
+        seen = SEEN['n']
+        s = raw_open(gport, '/api/chat', ['Content-Type: application/json', 'Transfer-Encoding: chunked'],
+                     b'11\r\n{"model":"m","mes\r\nzz\r\n')
+        code = raw_status(s)
+        s.close()
+        check(code == 0 and SEEN['n'] == seen,
+              'a chat with a chunk size that is not a number: the guard ends the connection without an answer and '
+              'sends nothing to Ollama (HTTP %d, %d request(s) there)' % (code, SEEN['n'] - seen))
 
         # Sent chunked there is no length to judge a chat by: it is read up to the cap, then refused.
         seen = SEEN['n']
@@ -731,10 +851,52 @@ def main():
                   'a chat of exactly the cap (%d bytes)%s is passed on byte for byte (HTTP %d)' % (
                       len(at_cap), ', sent chunked,' if chunked else '', code))
 
+        # The same chat once more, two bytes to the chunk. The cap counts the bytes of a chat; it
+        # must also be what the guard holds. A guard that keeps every piece it reads as an object of
+        # its own holds about 56 bytes for each of these chunks of two, some 28 MiB for this chat
+        # of 1 MiB, and the cap sees none of it. The guard has just held this very chat twice, so
+        # its peak memory (the kernel's count, VmHWM) has no reason to grow again; 8 MiB is leeway.
+        tiny = b''.join(b'2\r\n%s\r\n' % at_cap[i:i + 2] for i in range(0, cap, 2)) + b'0\r\n\r\n'
+        n = len(RAW)
+        before = peak_kib(guard.pid)
+        code, answer = send(gport, '/api/chat', tiny, headers={'Transfer-Encoding': 'chunked'})
+        after = peak_kib(guard.pid)
+        check(code == 200 and len(RAW) == n + 1 and RAW[-1] == at_cap,
+              'a chat of exactly the cap sent two bytes to the chunk (%d chunks) is passed on byte for byte (HTTP %d)' % (cap // 2, code))
+        grew = None if before is None or after is None else after - before
+        check(grew is not None and grew <= 8 * 1024,
+              "the guard holds that chat as its bytes, not as %d pieces: its peak memory grew by %s KiB for it "
+              "(8192 at most; None: no VmHWM in /proc, this check needs Linux)" % (cap // 2, grew))
+
         seen = SEEN['n']
         code, answer = send(gport, '/api/chat', b'', headers={'Content-Length': 'lots'})
         check(code == 400 and refusal(answer).startswith('render-guard:') and SEEN['n'] == seen,
               'a Content-Length that is not a number: HTTP 400 from the guard, nothing sent to Ollama (HTTP %d)' % code)
+    finally:
+        guard.terminate()
+        guard.wait(10)
+
+    print('\n=== after its own answer the guard reads on from a client for DRAIN_SEC, and no longer ===', flush=True)
+    reset_ollama()
+    # DRAIN_SEC=3: short enough to wait for its end here (30 s otherwise).
+    drain = 3
+    guard, gport = run_guard(comfy, up_port, {'RENDER_GUARD_MODE': 'off', 'RENDER_GUARD_MAX_BODY_MIB': '1', 'DRAIN_SEC': str(drain)})
+    try:
+        check(status(gport)['config'].get('drain_sec') == drain, 'status page: DRAIN_SEC=%d is a wait of %d s' % (drain, drain))
+        # A chunked chat over the cap. After the 413 its client starts one more chunk and never
+        # finishes the line with its size: one byte every 0.3 s. No single read of the guard ever
+        # times out on that, so only a limit on the whole wait ends it. A guard that follows the
+        # chunks here waits for the end of that line (4096 bytes: twenty minutes at this pace).
+        over = chat_of(cap + 1)
+        s = raw_open(gport, '/api/chat', ['Content-Type: application/json', 'Transfer-Encoding: chunked'],
+                     b'%x\r\n%s\r\n' % (len(over), over))
+        code = raw_status(s)
+        took = held_open(s, drain + 8, drip=b'0')
+        s.close()
+        check(code == 413, 'a chunked chat over the cap is refused while its client goes on sending (HTTP %d)' % code)
+        check(took is not None and drain / 3.0 <= took <= drain + 3,
+              'the client sends one more byte every 0.3 s: the guard reads on for DRAIN_SEC (%d s), then ends the '
+              'connection (%s; between %d and %d s expected)' % (drain, how_long(took), drain // 3, drain + 3))
     finally:
         guard.terminate()
         guard.wait(10)
