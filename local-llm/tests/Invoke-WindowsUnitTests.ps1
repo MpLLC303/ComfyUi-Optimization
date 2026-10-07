@@ -1219,7 +1219,7 @@ foreach ($c in 'de-DE', 'tr-TR', 'ja-JP') {
 [System.Globalization.CultureInfo]::CurrentCulture = $savedCulture
 Assert-That ($null -eq (ConvertTo-WatchDate 'not a date') -and $null -eq (ConvertTo-WatchDate '')) 'a damaged value reads as no date (no crash)'
 
-Write-Host "`n=== integrity watch: files, scheduled tasks and listeners against a baseline ===" -ForegroundColor Cyan
+Write-Host "`n=== integrity watch: files, settings, scheduled tasks and listeners against a baseline ===" -ForegroundColor Cyan
 # The watch compares the installed scripts, the Stack folder, the LocalAI-* tasks and the listeners
 # with what the last install or update recorded. First the parts every platform has.
 Assert-That ((Test-LaiIntegrityExcluded -Name '.env') -and (Test-LaiIntegrityExcluded -Name 'watch.log') -and (Test-LaiIntegrityExcluded -Name 'state.json.bak') -and (Test-LaiIntegrityExcluded -Name 'Secrets' -Folder)) '.env, logs, the leftovers of a save and a Secrets folder are left out'
@@ -1227,12 +1227,12 @@ Assert-That (-not (Test-LaiIntegrityExcluded -Name 'docker-compose.yml') -and -n
 $igRoot = Join-Path $Work 'integrity'
 $igScripts = Join-Path $igRoot 'Scripts'; $igStack = Join-Path $igRoot 'Stack'; $igOutside = Join-Path $Work 'integrity-outside'
 foreach ($d in (Join-Path $igScripts 'lib'), (Join-Path $igScripts 'Secrets'), $igStack, (Join-Path $igRoot 'Logs'), $igOutside) { New-Item -ItemType Directory -Force -Path $d | Out-Null }
-$igTool = Join-Path $igScripts 'tool.ps1'
+$igTool = Join-Path $igScripts 'tool.ps1'; $igHelper = Join-Path (Join-Path $igScripts 'lib') 'helper.psm1'; $igEnvFile = Join-Path $igStack '.env'
 Set-Content -LiteralPath $igTool -Value 'original'
-Set-Content -LiteralPath (Join-Path (Join-Path $igScripts 'lib') 'helper.psm1') -Value 'original'
+Set-Content -LiteralPath $igHelper -Value 'original'
 Set-Content -LiteralPath (Join-Path (Join-Path $igScripts 'Secrets') 'token.txt') -Value 'never read'
 Set-Content -LiteralPath (Join-Path $igStack 'docker-compose.yml') -Value 'services: {}'
-Set-Content -LiteralPath (Join-Path $igStack '.env') -Value 'A=1'
+Set-Content -LiteralPath $igEnvFile -Value @('A=1', 'OLLAMA_BASE_URL=http://render-guard:11434', 'WEBUI_SECRET_KEY=never-shown')
 Set-Content -LiteralPath (Join-Path $igOutside 'elsewhere.txt') -Value 'not part of the install'
 # A folder inside Stack swapped for a link to somewhere else (a junction needs no admin rights).
 $igLink = Join-Path $igStack 'linked'
@@ -1243,11 +1243,53 @@ $igNames = @($igFiles.Keys)
 Assert-That ($igNames.Count -eq 4 -and $igNames -contains 'Scripts\tool.ps1' -and $igNames -contains 'Scripts\lib\helper.psm1' -and $igNames -contains 'Stack\docker-compose.yml' -and $igNames -contains 'Stack\linked') "every file of Scripts and Stack is listed by its path below the install folder; .env and everything under Secrets are not ($(($igNames | Sort-Object) -join ', '))"
 Assert-That ([string]$igFiles['Scripts\tool.ps1'] -eq [string](Get-FileHash -LiteralPath $igTool -Algorithm SHA256).Hash) 'a file is recorded by its SHA-256'
 Assert-That ([string]$igFiles['Stack\linked'] -eq 'link' -and @($igNames | Where-Object { $_ -like '*elsewhere*' }).Count -eq 0) 'a link is recorded as a link and never followed (nothing outside the install folder is read)'
+# A folder swapped for a link after its parent was listed and before it is read itself (the walk
+# holds what the listing said about it): asked again right before the read, it is a link.
+$igSwapRoot = Join-Path $Work 'integrity-swap'; $igSwap = Join-Path $igSwapRoot 'sub'
+New-Item -ItemType Directory -Force -Path $igSwap | Out-Null
+Set-Content -LiteralPath (Join-Path $igSwap 'inside.txt') -Value 'x'
+$igStale = Get-Item -LiteralPath $igSwap -Force
+$igWasFolder = -not ($igStale.Attributes -band [IO.FileAttributes]::ReparsePoint)
+Remove-Item -LiteralPath $igSwap -Recurse -Force
+if ($onWindows) { $prev = $ErrorActionPreference; $ErrorActionPreference = 'Continue'; & cmd.exe /c mklink /J $igSwap $igOutside 2>&1 | Out-Null; $ErrorActionPreference = $prev } else { & ln -s $igOutside $igSwap }
+$igSwapMap = @{}
+Add-LaiIntegrityEntry -Map $igSwapMap -Item $igStale -Relative 'Stack\sub'
+Assert-That ($igWasFolder -and (Test-Path -LiteralPath (Join-Path $igSwap 'elsewhere.txt')) -and @($igSwapMap.Keys).Count -eq 1 -and [string]$igSwapMap['Stack\sub'] -eq 'link') "a folder that became a link after it was listed is not entered: recorded as a link, nothing behind it is named or hashed ($(@($igSwapMap.Keys | Sort-Object) -join ', '))"
 Assert-That ([string](Get-LaiIntegrityFiles -AIRoot $igRoot -MaxHashBytes 3)['Scripts\tool.ps1'] -like 'size *') 'a file above the size limit is recorded by its size instead of being hashed'
+
+# A folder filled beyond what the watch reads in one go (a container writing into Stack\searxng, an
+# archive unpacked there). The watch task is ended after ten minutes: a walk without a limit would
+# stop every later run before it reports anything. So the walk stops, says where, and the
+# comparison reports that once instead of calling everything it did not reach 'gone'.
+$igFull = Get-LaiIntegritySnapshot -AIRoot $igRoot -TaskPattern 'LaiNoSuchTask-*'
+$igPart = Get-LaiIntegritySnapshot -AIRoot $igRoot -TaskPattern 'LaiNoSuchTask-*' -Budget (New-LaiIntegrityBudget -MaxEntries 4)
+$igTiny = Get-LaiIntegritySnapshot -AIRoot $igRoot -TaskPattern 'LaiNoSuchTask-*' -Budget (New-LaiIntegrityBudget -MaxEntries 2)
+# (Other programs on this machine may open a port between two snapshots: not what is compared here.)
+foreach ($s in $igFull, $igPart, $igTiny) { $s['listeners'] = $null }
+Assert-That ([string]$igFull['filesStopped'] -eq '' -and @($igFull['files'].Keys).Count -eq 4) 'the folders as installed are read completely'
+Assert-That ([string]$igPart['filesStopped'] -eq 'Stack' -and @($igPart['files'].Keys).Count -eq 2 -and $igPart['files'].ContainsKey('Scripts\tool.ps1') -and $igPart['files'].ContainsKey('Scripts\lib\helper.psm1')) "a walk with room for four entries reads Scripts (first, in name order) and stops at Stack ($([string]$igPart['filesStopped']))"
+$igPartDiff = @(Compare-LaiIntegrity -Baseline $igFull -Current $igPart)
+Assert-That ($igPartDiff.Count -eq 1 -and [string]$igPartDiff[0].Id -eq 'walk|Stack' -and [string]$igPartDiff[0].Text -like 'reading "Stack" stopped at "Stack"*the rest was not compared') "against a complete baseline that is one difference, and no file it did not reach is called gone ($(@($igPartDiff | ForEach-Object { [string]$_.Text }) -join '; '))"
+$igTinyDiff = @(Compare-LaiIntegrity -Baseline $igFull -Current $igTiny)
+Assert-That ([string]$igTiny['filesStopped'] -like 'Scripts*' -and @($igTinyDiff | Where-Object { $_.Id -like 'file-|*' }).Count -eq 0 -and @($igTinyDiff | Where-Object { $_.Id -eq 'walk|Scripts' }).Count -eq 1) "a walk that stops inside Scripts says so and calls nothing gone ($([string]$igTiny['filesStopped']))"
+Assert-That (@(Compare-LaiIntegrity -Baseline $igPart -Current $igPart).Count -eq 0 -and @(Compare-LaiIntegrity -Baseline $igPart -Current $igFull).Count -eq 0) 'a baseline recorded that way raises nothing by itself, and files it never read are not called new'
+$igByBytes = Get-LaiIntegritySnapshot -AIRoot $igRoot -TaskPattern 'LaiNoSuchTask-*' -Budget (New-LaiIntegrityBudget -MaxBytes 1)
+$igByTime = Get-LaiIntegritySnapshot -AIRoot $igRoot -TaskPattern 'LaiNoSuchTask-*' -Budget (New-LaiIntegrityBudget -MaxSeconds 0)
+Assert-That ([string]$igByBytes['filesStopped'] -eq 'Scripts\tool.ps1' -and @($igByBytes['files'].Keys).Count -eq 1 -and [string]$igByTime['filesStopped'] -eq 'Scripts' -and @($igByTime['files'].Keys).Count -eq 0) "the walk also has a limit on the bytes it hashes and on its time ($([string]$igByBytes['filesStopped']) / $([string]$igByTime['filesStopped']))"
+Assert-That ((Get-LaiIntegritySummary -Baseline $igPart) -match '^2 files \(not all of them') 'and a baseline that could not read everything says so in its summary'
+
+# Where chats and searches are sent is a line in Stack\.env: those settings are compared by name, as
+# a fingerprint. Their values, and every other line (versions, ports, keys), are not kept.
+$igEnvMap = ConvertTo-LaiIntegrityEnv -Lines @('# a comment', 'OPEN_WEBUI_VERSION=v1', 'OLLAMA_BASE_URL=http://render-guard:11434', ' OLLAMA_UPSTREAM = http://host.docker.internal:11434 ', 'COMFYUI_URLS=http://host.docker.internal:8188', 'DEEP_RESEARCH_OLLAMA_URL=http://render-guard:11434', 'WEBUI_SECRET_KEY=never-shown', 'WEBUI_EXTRA_ORIGINS=;https://pc.tail.ts.net', 'WEBUI_PORT=3000')
+Assert-That (((@($igEnvMap.Keys) | Sort-Object) -join ',') -eq 'COMFYUI_URLS,DEEP_RESEARCH_OLLAMA_URL,OLLAMA_BASE_URL,OLLAMA_UPSTREAM') "of .env only the settings that route chats and searches are kept ($((@($igEnvMap.Keys) | Sort-Object) -join ','))"
+Assert-That ([string]$igEnvMap['OLLAMA_BASE_URL'] -match '^[0-9A-F]{12}$' -and [string]$igEnvMap['OLLAMA_BASE_URL'] -eq [string]$igEnvMap['DEEP_RESEARCH_OLLAMA_URL'] -and [string]$igEnvMap['OLLAMA_BASE_URL'] -ne [string]$igEnvMap['OLLAMA_UPSTREAM'] -and @($igEnvMap.Values | Where-Object { $_ -match 'http|render' }).Count -eq 0) 'each as a short fingerprint of its value: the same address reads the same, another one differs, and no value is kept'
+$igEnvNow = Get-LaiIntegrityEnv -AIRoot $igRoot
+Assert-That ($igEnvNow -is [hashtable] -and @($igEnvNow.Keys).Count -eq 1 -and [string]$igEnvNow['OLLAMA_BASE_URL'] -eq [string]$igEnvMap['OLLAMA_BASE_URL'] -and (Get-LaiIntegrityEnv -AIRoot $igOutside) -is [hashtable] -and @((Get-LaiIntegrityEnv -AIRoot $igOutside).Keys).Count -eq 0) 'read from the real file; no .env at all is an empty answer'
 
 # What counts as a difference, and how it reads (pure: made-up baselines).
 $igBase = @{
     files     = @{ 'Scripts\a.ps1' = 'AAAAAAAAAAAAAAAA1'; 'Scripts\b.ps1' = 'BBBB'; 'Stack\c.yml' = 'CCCC'; 'Scripts\lib' = 'DDDD' }
+    env       = @{ OLLAMA_BASE_URL = 'T1'; OLLAMA_UPSTREAM = 'T2'; DEEP_RESEARCH_OLLAMA_URL = 'T4' }
     tasks     = @{
         'LocalAI-Watch' = @{ Run = 'conhost.exe --headless powershell.exe -File watch.ps1'; User = 'owner'; LogonType = 'Interactive'; RunLevel = 'Limited' }
         'LocalAI-Gone'  = @{ Run = 'x.exe'; User = 'owner'; LogonType = 'Interactive'; RunLevel = 'Limited' }
@@ -1256,6 +1298,7 @@ $igBase = @{
 }
 $igNow = @{
     files     = @{ 'Scripts\a.ps1' = 'ZZZZZZZZZZZZZZZZ2'; 'Scripts\b.ps1' = 'BBBB'; 'Stack\new.yml' = 'NNNN'; 'Scripts\lib' = 'link' }
+    env       = @{ OLLAMA_BASE_URL = 'T1'; OLLAMA_UPSTREAM = 'T9'; COMFYUI_URLS = 'T3' }
     tasks     = @{
         'LocalAI-Watch' = @{ Run = 'other.exe'; User = 'someone-else'; LogonType = 'Interactive'; RunLevel = 'Highest' }
         'LocalAI-New'   = @{ Run = 'y.exe'; User = 'owner'; LogonType = 'Interactive'; RunLevel = 'Highest' }
@@ -1265,18 +1308,44 @@ $igNow = @{
 }
 $igDiff = @(Compare-LaiIntegrity -Baseline $igBase -Current $igNow -WatchedPorts @(11434, 3000))
 $igText = @($igDiff | ForEach-Object { [string]$_.Text })
-Assert-That ($igText -contains 'Scripts\a.ps1 was changed' -and $igText -contains 'Stack\new.yml is new' -and $igText -contains 'Stack\c.yml is gone' -and $igText -contains 'Scripts\lib is now a link to another place') "files: changed, new, gone and swapped for a link, each by name ($($igText -join '; '))"
-Assert-That ($igText -contains 'the scheduled task LocalAI-Watch now runs a different command and runs as a different account or sign-in type and runs with administrator rights') 'a task: what it runs, as whom and at what privilege'
-Assert-That ($igText -contains 'the scheduled task LocalAI-New is new and runs with administrator rights' -and $igText -contains 'the scheduled task LocalAI-Gone is gone') 'a new task (elevated ones say so) and a removed one'
-Assert-That ($igText -contains 'ollama now accepts connections from other devices on port 11434' -and $igText -contains 'steam now accepts connections from other devices on port 27036') 'a program newly reachable from the network is named with its port (also one that listened on loopback only before)'
-Assert-That ($igText -contains 'port 3000 is now held by python (it was com.docker.backend)') "one of the stack's own ports held by another program is news even on loopback"
-Assert-That (@($igText | Where-Object { $_ -like 'steam*a temporary port' }).Count -eq 1 -and @($igText | Where-Object { $_ -match 'svchost|llama-server' }).Count -eq 0 -and $igDiff.Count -eq 11) "not news: Windows' per-start ports for a program that had one (several count once), and a new loopback-only listener ($($igDiff.Count) differences)"
+Assert-That ($igText -contains '"Scripts\a.ps1" was changed' -and $igText -contains '"Stack\new.yml" is new' -and $igText -contains '"Stack\c.yml" is gone' -and $igText -contains '"Scripts\lib" is now a link to another place') "files: changed, new, gone and swapped for a link, each by name ($($igText -join '; '))"
+Assert-That ($igText -contains 'the setting "OLLAMA_UPSTREAM" in Stack\.env was changed' -and $igText -contains 'the setting "COMFYUI_URLS" was added to Stack\.env' -and $igText -contains 'the setting "DEEP_RESEARCH_OLLAMA_URL" was removed from Stack\.env' -and @($igText | Where-Object { $_ -match 'T9|T2|OLLAMA_BASE_URL' }).Count -eq 0) 'a routing setting in .env: changed, added and removed, by its name only'
+Assert-That ($igText -contains 'the scheduled task "LocalAI-Watch" now runs a different command and runs as a different account or sign-in type and runs with administrator rights') 'a task: what it runs, as whom and at what privilege'
+Assert-That ($igText -contains 'the scheduled task "LocalAI-New" is new and runs with administrator rights' -and $igText -contains 'the scheduled task "LocalAI-Gone" is gone') 'a new task (elevated ones say so) and a removed one'
+Assert-That ($igText -contains '"ollama" now accepts connections from other devices on port 11434' -and $igText -contains '"steam" now accepts connections from other devices on port 27036') 'a program newly reachable from the network is named with its port (also one that listened on loopback only before)'
+Assert-That ($igText -contains 'port 3000 is now held by "python" (it was "com.docker.backend")') "one of the stack's own ports held by another program is news even on loopback"
+Assert-That (@($igText | Where-Object { $_ -like '"steam"*a temporary port' }).Count -eq 1 -and @($igText | Where-Object { $_ -match 'svchost|llama-server' }).Count -eq 0 -and $igDiff.Count -eq 14) "not news: Windows' per-start ports for a program that had one (several count once), and a new loopback-only listener ($($igDiff.Count) differences)"
 Assert-That (@(Compare-LaiIntegrity -Baseline $igBase -Current $igNow | Where-Object { $_.Key -like 'port*' }).Count -eq 0) 'a port that is not one of the stack''s own changing hands on loopback is not news'
 Assert-That (@(Compare-LaiIntegrity -Baseline $igBase -Current $igBase).Count -eq 0) 'a state compared with itself: no difference'
-Assert-That (@(Compare-LaiIntegrity -Baseline $igBase -Current @{ files = $igBase['files']; tasks = $null; listeners = $null }).Count -eq 0) 'tasks and listeners that could not be read are skipped, not reported as gone'
-$igKeyA = [string]@(Compare-LaiIntegrity -Baseline @{ files = @{ 'Scripts\a' = 'H1' } } -Current @{ files = @{ 'Scripts\a' = 'H2' } })[0].Key
-$igKeyB = [string]@(Compare-LaiIntegrity -Baseline @{ files = @{ 'Scripts\a' = 'H1' } } -Current @{ files = @{ 'Scripts\a' = 'H3' } })[0].Key
-Assert-That ($igKeyA -and $igKeyA -ne $igKeyB -and $igKeyA -eq [string]@(Compare-LaiIntegrity -Baseline @{ files = @{ 'Scripts\a' = 'H1' } } -Current @{ files = @{ 'Scripts\a' = 'H2' } })[0].Key) 'the same change keeps its key (told once); another change to the same file is a new one'
+Assert-That (@(Compare-LaiIntegrity -Baseline $igBase -Current @{ files = $igBase['files']; env = $null; tasks = $null; listeners = $null }).Count -eq 0) 'settings, tasks and listeners that could not be read are skipped, not reported as gone'
+# What a difference is about (Id) and what its content was (Key): the watch counts its two looks
+# by the first, and knows a second, different change by the second.
+$igOne = @(Compare-LaiIntegrity -Baseline @{ files = @{ 'Scripts\a' = 'H1' } } -Current @{ files = @{ 'Scripts\a' = 'H2' } })[0]
+$igTwo = @(Compare-LaiIntegrity -Baseline @{ files = @{ 'Scripts\a' = 'H1' } } -Current @{ files = @{ 'Scripts\a' = 'H3' } })[0]
+Assert-That ([string]$igOne.Id -eq 'file|Scripts\a' -and [string]$igTwo.Id -eq [string]$igOne.Id -and [string]$igOne.Key -ne [string]$igTwo.Key -and [string]$igOne.Key -eq [string]@(Compare-LaiIntegrity -Baseline @{ files = @{ 'Scripts\a' = 'H1' } } -Current @{ files = @{ 'Scripts\a' = 'H2' } })[0].Key) "a file changed twice is one difference (same Id) with two contents (two Keys); the same change keeps its Key ($([string]$igOne.Key) / $([string]$igTwo.Key))"
+# An archive unpacked into the wrong folder is one line, not hundreds.
+$igManyNow = @{ 'Stack\c.yml' = 'CCCC'; 'Stack\searxng\settings.yml' = 'S'; 'Stack\searxng\one.yml' = 'N1' }
+foreach ($i in 1..25) { $igManyNow["Stack\unpacked\sub$($i % 3)\f$i.txt"] = "H$i" }
+$igManyBase = @{ files = @{ 'Stack\c.yml' = 'CCCC'; 'Stack\searxng\settings.yml' = 'S' } }
+$igManyText = @(Compare-LaiIntegrity -Baseline $igManyBase -Current @{ files = $igManyNow } | ForEach-Object { [string]$_.Text })
+Assert-That ($igManyText.Count -eq 2 -and $igManyText -contains '25 new files in "Stack\unpacked"' -and $igManyText -contains '"Stack\searxng\one.yml" is new') "more than 20 new files under one new folder are one difference with a count; one new file next to known ones keeps its name ($($igManyText -join '; '))"
+Assert-That (@(Compare-LaiIntegrity -Baseline $igManyBase -Current @{ files = $igManyNow } -MaxNewPerFolder ([int]::MaxValue)).Count -eq 26) 'and each is listed by name where every one has to be judged (what a new baseline takes in)'
+# Names are chosen by whoever made the change and are shown to every Open WebUI user on the banner.
+$igOddName = 'Stack\x. NOTICE - sign in again at [recover](www.example.org) <b>now</b>.yml'
+$igClean = ConvertTo-LaiIntegrityName -Name $igOddName
+Assert-That ($igClean.Length -eq $igOddName.Length -and $igClean -notmatch '[\[\]()<>/]' -and $igClean -like 'Stack\x. NOTICE - sign in again at ?recover??www.example.org? ?b?now??b?.yml') "a name keeps letters, digits, space, dot, underscore, hyphen and backslash; everything a link or a tag is made of becomes '?' ($igClean)"
+$igLong = ConvertTo-LaiIntegrityName -Name ('Stack\' + ('a' * 200) + '.yml')
+Assert-That ($igLong.Length -eq 80 -and $igLong -like 'Stack\aaa*...*aaa.yml' -and (ConvertTo-LaiIntegrityName -Name "a`r`nb`tc") -eq 'a??b?c' -and (ConvertTo-LaiIntegrityName -Name 'Scripts\.git_ignore-1') -eq 'Scripts\.git_ignore-1' -and (ConvertTo-LaiIntegrityName -Name ('caf' + [char]0x00E9 + '"`')) -eq ('caf' + [char]0x00E9 + '??')) "a long name is cut in the middle to 80 characters, a line break cannot start a second line, quotes and backticks go ($igLong)"
+$igOddText = [string]@(Compare-LaiIntegrity -Baseline @{ files = @{} } -Current @{ files = @{ $igOddName = 'H' } })[0].Text
+$igOddNet = [string]@(Compare-LaiIntegrity -Baseline @{ files = @{}; listeners = @() } -Current @{ files = @{}; listeners = @(@{ Program = 'x" now [a](b) "y'; Port = 4444; Network = $true }) })[0].Text
+Assert-That ($igOddText -eq ('"' + $igClean + '" is new') -and [regex]::Matches($igOddNet, '"').Count -eq 2 -and $igOddNet -notmatch '[\[\]]' -and $igOddNet -like '"x? now ?a??b? ?y" now accepts connections from other devices on port 4444') "in a difference the cleaned name stands in double quotes, and nothing in a name can end them ($igOddNet)"
+# The baseline file can be edited by hand, and one bad row must not stop every comparison for good.
+$igBadBase = @{ files = @{}; listeners = @(@{ Program = 'python'; Port = 'x'; Network = $true }, @{ Port = 8188; Network = $true }, 'junk', @{ Program = 'ollama'; Port = '11434'; Network = $false }) }
+$igBadDiff = $null; $igBadErr = ''
+try { $igBadDiff = @(Compare-LaiIntegrity -Baseline $igBadBase -Current @{ files = @{}; listeners = @(@{ Program = 'python'; Port = 8188; Network = $true }, @{ Program = 'ollama'; Port = 11434; Network = $false }) } -WatchedPorts @(11434)) } catch { $igBadErr = $_.Exception.Message }
+Assert-That (-not $igBadErr -and @($igBadDiff).Count -eq 1 -and [string]@($igBadDiff)[0].Id -eq 'net|python|8188') "a listener row without a port number is no row: the comparison still runs, and reports what that row would have covered ($igBadErr)"
+$igTempDiff = @(Compare-LaiIntegrity -Baseline @{ files = @{}; listeners = @(@{ Program = 'svchost'; Port = 0; Network = $true }, @{ Program = 'com.docker.backend'; Port = 50123; Network = $false }) } -Current @{ files = @{}; listeners = @(@{ Program = 'svchost'; Port = 49670; Network = $true }, @{ Program = 'svchost'; Port = 51111; Network = $true }, @{ Program = 'python'; Port = 50123; Network = $false }) } -WatchedPorts @(50123))
+Assert-That ($igTempDiff.Count -eq 1 -and [string]$igTempDiff[0].Text -eq 'port 50123 is now held by "python" (it was "com.docker.backend")') "a baseline row with port 0 stands for all of a program's temporary ports; one of the stack's own ports keeps its number even up there ($(@($igTempDiff | ForEach-Object { [string]$_.Text }) -join '; '))"
 $igRows = @(
     [pscustomobject]@{ LocalAddress = '127.0.0.1'; LocalPort = 11434; OwningProcess = [uint32]100 }, [pscustomobject]@{ LocalAddress = '::1'; LocalPort = 11434; OwningProcess = [uint32]100 },
     [pscustomobject]@{ LocalAddress = '127.0.0.1'; LocalPort = 3000; OwningProcess = [uint32]300 }, [pscustomobject]@{ LocalAddress = '0.0.0.0'; LocalPort = 3000; OwningProcess = [uint32]300 },
@@ -1287,26 +1356,147 @@ Assert-That (@($igSet).Count -eq 4 -and $igLine -eq 'com.docker.backend:3000:Tru
 $igEmpty = ConvertTo-LaiListenerSet -Connections @() -ProcessNames @{}
 Assert-That ($null -ne $igEmpty -and @($igEmpty).Count -eq 0) 'no listeners is an empty list, not "could not tell"'
 Assert-That ((Format-LaiIntegrityList -Items @('a', 'b', 'c', 'd', 'e') -Max 3) -eq 'a; b; c and 2 more' -and (Format-LaiIntegrityList -Items @('a')) -eq 'a') 'a long list is cut for a notification and says how many more'
+
+# The listeners a baseline keeps. An install carries a known one that is not running at that moment
+# (it would otherwise be news after every update), but not for ever; the owner's acceptance records
+# exactly what listens now.
+$igDay = [datetime]::new(2026, 6, 1, 12, 0, 0)
+$igCur = @(@{ Program = 'ollama'; Port = 11434; Network = $false }, @{ Program = 'svchost'; Port = 49664; Network = $true }, @{ Program = 'svchost'; Port = 49670; Network = $true },
+    @{ Program = 'svchost'; Port = 135; Network = $true }, @{ Program = 'com.docker.backend'; Port = 50123; Network = $false })
+$igKnown = @(
+    @{ Program = 'python'; Port = 8188; Network = $true; Seen = '2026-05-20T10:00:00' }, @{ Program = 'steam'; Port = 27036; Network = $true; Seen = '2026-02-01T10:00:00' },
+    @{ Program = 'later'; Port = 4444; Network = $true; Seen = '2099-01-01T00:00:00' }, @{ Program = 'undated'; Port = 5555; Network = $true },
+    @{ Program = 'ollama'; Port = 11434; Network = $false; Seen = '2026-05-20T10:00:00' }, @{ Program = 'python'; Port = 'x'; Network = $true; Seen = '2026-05-20T10:00:00' })
+$igRowText = { param($Rows) @(@($Rows) | ForEach-Object { '{0}:{1}:{2}' -f $_['Program'], $_['Port'], $_['Network'] }) }
+$igCarried = ConvertTo-LaiListenerBaseline -Current $igCur -Known $igKnown -Carry -Now $igDay -WatchedPorts @(11434, 50123) -KnownSeen '2026-05-01T09:00:00'
+$igCarriedText = & $igRowText $igCarried
+Assert-That ($igCarriedText.Count -eq 6 -and $igCarriedText -contains 'ollama:11434:False' -and $igCarriedText -contains 'svchost:135:True' -and $igCarriedText -contains 'svchost:0:True' -and $igCarriedText -contains 'com.docker.backend:50123:False' -and $igCarriedText -contains 'python:8188:True' -and $igCarriedText -contains 'undated:5555:True') "an install keeps what listens now, the temporary ports as one row per program (port 0), and a known listener that is not running ($($igCarriedText -join ' '))"
+Assert-That (@($igCarriedText | Where-Object { $_ -match '^(steam|later):' -or $_ -match ':x:' }).Count -eq 0) 'but not one last seen more than 90 days ago, one dated in the future, or a row without a port number'
+$igSeenOf = { param($Program) [string]@(@($igCarried) | Where-Object { $_['Program'] -eq $Program -and [int]$_['Port'] -ne 135 -and [int]$_['Port'] -ne 0 })[0]['Seen'] }
+Assert-That ((& $igSeenOf 'ollama') -eq '2026-06-01T12:00:00' -and (& $igSeenOf 'python') -eq '2026-05-20T10:00:00' -and (& $igSeenOf 'undated') -eq '2026-05-01T09:00:00') 'each row says when a baseline last saw it listening: now, the date it carried, or the date of its baseline when it had none'
+$igExact = ConvertTo-LaiListenerBaseline -Current $igCur -Known $igKnown -Now $igDay -WatchedPorts @(11434, 50123) -KnownSeen '2026-05-01T09:00:00'
+$igExactText = & $igRowText $igExact
+Assert-That ($igExactText.Count -eq 4 -and @($igExactText | Where-Object { $_ -match '^(python|undated|steam|later):' }).Count -eq 0) "the owner's acceptance keeps exactly what listens now: a listener that was switched off is no longer accepted ($($igExactText -join ' '))"
+$igNext = ConvertTo-LaiListenerBaseline -Current @(@{ Program = 'svchost'; Port = 50001; Network = $true }, @{ Program = 'svchost'; Port = 50002; Network = $true }) -Known @($igCarried) -Carry -Now ($igDay.AddDays(1)) -WatchedPorts @(11434, 50123)
+Assert-That (@(@($igNext) | Where-Object { $_['Program'] -eq 'svchost' -and [int]$_['Port'] -eq 0 }).Count -eq 1 -and @(@($igNext) | Where-Object { [int]$_['Port'] -ge 49152 -and [int]$_['Port'] -ne 50123 }).Count -eq 0) 'update after update the temporary ports stay one row per program: the list does not grow by a row per port'
+
+# Which differences are announced, and when (pure). A difference is told when two looks in a row
+# found it; the looks count by what it is about, so a file rewritten in between is still told.
+$igAt = [datetime]::new(2026, 6, 1, 12, 0, 0)
+$igMake = { param($Id, $Tag) [pscustomobject]@{ Id = $Id; Key = ($Id + '|' + $Tag); Text = ($Id + ' differs') } }
+$igNews = @(Select-LaiIntegrityNews -Diffs @((& $igMake 'file|Scripts\a' 'K2'), (& $igMake 'net|x|4444' 'K1')) -Told @() -Pending @('file|Scripts\a') -Now $igAt)
+Assert-That ($igNews.Count -eq 1 -and [string]$igNews[0].Id -eq 'file|Scripts\a') 'seen on the last look, with whatever content: announced now; seen for the first time: waits for the next look'
+$igToldA = @(@{ Id = 'file|Scripts\a'; Key = 'file|Scripts\a|K2'; At = $igAt.ToString('s') })
+Assert-That (@(Select-LaiIntegrityNews -Diffs @((& $igMake 'file|Scripts\a' 'K2')) -Told $igToldA -Pending @() -Now ($igAt.AddHours(30))).Count -eq 0) 'told, and unchanged since: never again'
+Assert-That (@(Select-LaiIntegrityNews -Diffs @((& $igMake 'file|Scripts\a' 'K3')) -Told $igToldA -Pending @() -Now ($igAt.AddHours(2))).Count -eq 0 -and @(Select-LaiIntegrityNews -Diffs @((& $igMake 'file|Scripts\a' 'K3')) -Told $igToldA -Pending @() -Now ($igAt.AddHours(25))).Count -eq 1) 'told, and changed again: news again, but at most once a day (a file rewritten all day is not a notice every half hour)'
+$igManyDiffs = @(1..250 | ForEach-Object { & $igMake "file+|Stack\f$_" 'H' })
+$igToldMany = @(Update-LaiIntegrityTold -Told @() -Announced $igManyDiffs -Diffs $igManyDiffs -Now $igAt)
+Assert-That ($igToldMany.Count -eq 250 -and @(Select-LaiIntegrityNews -Diffs $igManyDiffs -Told $igToldMany -Pending @() -Now ($igAt.AddMinutes(15))).Count -eq 0) "250 differences announced at once all stay told: none of them is news again on the next run ($($igToldMany.Count) kept)"
+# What the watch keeps is bounded: thousands of differences with long names would grow
+# watch-state.json past what Windows PowerShell 5.1 reads back, and the watch would lose its memory.
+$igHuge = @(1..400 | ForEach-Object { & $igMake ('file|Scripts\f{0:D4}' -f $_) 'H' }) + @((& $igMake 'task+|LocalAI-Helper' 'T'), (& $igMake 'net|x|4444' ''))
+$igCut = @(Limit-LaiIntegrityFound -Diffs $igHuge)
+$igCutIds = @($igCut | ForEach-Object { [string]$_.Id })
+Assert-That ($igCut.Count -eq 301 -and $igCutIds -contains 'task+|LocalAI-Helper' -and $igCutIds -contains 'net|x|4444' -and $igCutIds -contains 'file|Scripts\f0001' -and $igCutIds -notcontains 'file|Scripts\f0400' -and [string]$igCut[-1].Id -eq 'more|Scripts' -and [string]$igCut[-1].Key -eq 'more|Scripts|102' -and [string]$igCut[-1].Text -eq '102 more differences than are listed here') "402 differences are kept as 300 and one line for the rest; a task and a listener are never the ones cut ($([string]$igCut[-1].Text))"
+Assert-That (@(Limit-LaiIntegrityFound -Diffs $igManyDiffs).Count -eq 250 -and [string]@(Limit-LaiIntegrityFound -Diffs @(1..310 | ForEach-Object { & $igMake "file+|Stack\f$_" 'H' }))[-1].Id -eq 'more|other' -and @(Limit-LaiIntegrityFound -Diffs @()).Count -eq 0) 'fewer than that are left as they are; what was cut says whether a script is among it (that decides the advice)'
+$igCutTold = @(Update-LaiIntegrityTold -Told @() -Announced $igCut -Diffs $igCut -Now $igAt)
+Assert-That ($igCutTold.Count -eq 301 -and @(Select-LaiIntegrityNews -Diffs @(Limit-LaiIntegrityFound -Diffs $igHuge) -Told $igCutTold -Pending @() -Now ($igAt.AddMinutes(15))).Count -eq 0) 'and the same 402 on the next run are the same 301: told once, not in rotation'
+$igGone = @(1..230 | ForEach-Object { & $igMake "net|prog$_|4444" 'K' })
+$igToldAll = @(Update-LaiIntegrityTold -Told $igToldMany -Announced $igGone -Diffs $igManyDiffs -Now $igAt)
+$igToldIds = @($igToldAll | ForEach-Object { [string]$_['Id'] })
+Assert-That ($igToldAll.Count -eq 450 -and @($igToldIds | Where-Object { $_ -like 'file+|*' }).Count -eq 250 -and $igToldIds -contains 'net|prog230|4444' -and $igToldIds -notcontains 'net|prog30|4444') "only what is no longer found is ever forgotten (the 200 told last are kept: a program that listens while it runs is not news at every start) ($($igToldAll.Count) kept)"
+
+# What to do about a change nobody meant to make. Every Local AI shortcut starts a script from
+# <AIRoot>\Scripts, and Update toolkit then asks for administrator rights: when the scripts are what
+# changed, neither may be the advice.
+$igAdvIds = @('net|x|4444', 'file|Scripts\Get-LocalAI.ps1')
+$igBrief = Get-LaiIntegrityAdvice -Ids $igAdvIds -AIRoot 'C:\AI' -Brief
+$igLongAdv = Get-LaiIntegrityAdvice -Ids $igAdvIds -AIRoot 'C:\AI'
+Assert-That ($igBrief -notmatch 'Start menu|Health check|Update toolkit' -and $igBrief -match 'do not use the Local AI shortcuts' -and $igBrief -like '*"C:\AI\Logs\watch.log"*' -and $igBrief -match 'fresh copy of the toolkit') "a changed script: the notification names no shortcut, but watch.log and a fresh copy of the toolkit ($igBrief)"
+Assert-That ($igLongAdv -match 'do not repair this with Update toolkit' -and $igLongAdv -notmatch 'Start menu >' -and $igLongAdv -match 'fresh copy of the toolkit' -and $igLongAdv -match 'administrator rights') 'and the health check says not to use Update toolkit for it, and why'
+$igUntrusted = @('file+|Scripts\lib\new.psm1', 'file-|Scripts\x.ps1', 'files+|Scripts\lib', 'file|Scripts', 'walk|Scripts', 'more|Scripts', 'baseline|gone')
+Assert-That (@($igUntrusted | Where-Object { (Get-LaiIntegrityAdvice -Ids @($_) -AIRoot 'C:\AI' -Brief) -match 'Start menu' }).Count -eq 0) 'the same for a new or deleted script, a Scripts folder swapped for a link or not read to the end, and a baseline that is gone'
+$igOtherIds = @('file|Stack\docker-compose.yml', 'file+|Stack\Scripts\x.yml', 'task+|LocalAI-Helper', 'net|x|4444', 'env|OLLAMA_UPSTREAM', 'walk|Stack')
+$igBriefOther = Get-LaiIntegrityAdvice -Ids $igOtherIds -AIRoot 'C:\AI' -Brief
+$igLongOther = Get-LaiIntegrityAdvice -Ids $igOtherIds -AIRoot 'C:\AI'
+Assert-That ($igBriefOther -match 'open Start menu > Local AI - Health check') 'for Stack, settings, tasks and listeners the health check shortcut is named'
+Assert-That ($igLongOther -match 'first remove what was added' -and $igLongOther -match 'then run Start menu > Local AI - Update toolkit' -and $igLongOther -match 'records everything else it finds as the new baseline' -and $igLongOther -like '*"C:\AI\Stack"*' -and $igLongOther -match 'Task Scheduler') "and the health check says that Update toolkit is no undo: what was added has to be removed first, and where ($igLongOther)"
+
+# An install that got somewhere after the baseline and did not finish is told from the installer's
+# own record (a stage it finished), never from a log file: every run writes one, also a run that
+# was refused, and anybody can drop a file named like one into Logs.
+$igNowU = [datetime]::new(2026, 6, 10, 12, 0, 0); $igSinceU = [datetime]::new(2026, 6, 9, 8, 0, 0)
+$igInstState = Join-Path $igRoot 'install-state.json'
+foreach ($n in 'install-20260610-110000.log', 'install-20991231-000000.log') { Set-Content -LiteralPath (Join-Path (Join-Path $igRoot 'Logs') $n) -Value 'x' }
+Assert-That ($null -eq (Get-LaiUnfinishedInstall -AIRoot $igRoot -Since $igSinceU -Now $igNowU)) 'installer logs dated after the baseline (one of them in the future) are no unfinished install'
+Save-LaiState -State @{ stages = @{ Preflight = '2026-06-09T07:00:00'; Ollama = '2026-06-10T11:30:00'; Models = '2099-12-31T00:00:00' } } -Path $igInstState
+Assert-That ((Get-LaiUnfinishedInstall -AIRoot $igRoot -Since $igSinceU -Now $igNowU) -eq [datetime]::new(2026, 6, 10, 11, 30, 0)) 'a stage the installer finished after the baseline is: the newest one that is not dated in the future'
+Assert-That ($null -eq (Get-LaiUnfinishedInstall -AIRoot $igRoot -Since $igSinceU -Now ($igNowU.AddHours(60))) -and $null -eq (Get-LaiUnfinishedInstall -AIRoot $igRoot -Since ([datetime]::new(2026, 6, 10, 11, 30, 0)) -Now $igNowU)) 'not for ever (two days), and not a stage finished before the baseline was recorded'
+Remove-Item -LiteralPath $igInstState -Force
+
 # A baseline through the state file (Windows PowerShell 5.1 reads JSON its own way).
 $igSaved = Save-LaiIntegrityBaseline -AIRoot $igRoot -Reason 'test' -TaskPattern 'LaiNoSuchTask-*'
 $igRead = Read-LaiIntegrityBaseline -AIRoot $igRoot
-Assert-That ($igRead -and [string]$igRead['id'] -eq [string]$igSaved['id'] -and $igRead['files'] -is [hashtable] -and [string]$igRead['files']['Scripts\lib\helper.psm1'] -eq [string]$igFiles['Scripts\lib\helper.psm1']) 'a baseline survives being saved and read back (its id, paths with backslashes, hashes)'
+Assert-That ($igRead -and [string]$igRead['id'] -eq [string]$igSaved['id'] -and $igRead['files'] -is [hashtable] -and [string]$igRead['files']['Scripts\lib\helper.psm1'] -eq [string]$igFiles['Scripts\lib\helper.psm1'] -and $igRead['env'] -is [hashtable] -and [string]$igRead['env']['OLLAMA_BASE_URL'] -eq [string]$igEnvNow['OLLAMA_BASE_URL']) 'a baseline survives being saved and read back (its id, paths with backslashes, hashes, the settings)'
+Assert-That (@($igRead['accepted']).Count -eq 0 -and [int]$igRead['acceptedCount'] -eq 0) 'the first baseline took nothing in: there was none before it'
 Assert-That (@(Compare-LaiIntegrity -Baseline $igRead -Current (Get-LaiIntegritySnapshot -AIRoot $igRoot -TaskPattern 'LaiNoSuchTask-*') | Where-Object { $_.Key -notmatch '^(net|port)\|' }).Count -eq 0) 'and the same folder compared with it shows no difference'
 Assert-That ((Split-Path -Leaf (Split-Path -Parent (Get-LaiIntegrityPath -AIRoot $igRoot))) -eq 'integrity' -and (Get-LaiIntegritySummary -Baseline $igRead) -match '^4 files, ') "the baseline is kept in the install folder itself, outside the folders it describes ($(Get-LaiIntegritySummary -Baseline $igRead))"
 Set-Content -LiteralPath $igTool -Value 'changed outside an update'
-$igChanged = @(Compare-LaiIntegrity -Baseline $igRead -Current (Get-LaiIntegritySnapshot -AIRoot $igRoot -TaskPattern 'LaiNoSuchTask-*') | ForEach-Object { [string]$_.Text })
-Assert-That ($igChanged -contains 'Scripts\tool.ps1 was changed') "a script edited after the baseline is named ($($igChanged -join '; '))"
+Set-Content -LiteralPath $igEnvFile -Value @('A=2', 'OLLAMA_BASE_URL=http://elsewhere.example:11434', 'WEBUI_SECRET_KEY=another')
+$igChanged = @(Compare-LaiIntegrity -Baseline $igRead -Current (Get-LaiIntegritySnapshot -AIRoot $igRoot -TaskPattern 'LaiNoSuchTask-*') | Where-Object { $_.Key -notmatch '^(net|port)\|' } | ForEach-Object { [string]$_.Text })
+Assert-That ($igChanged.Count -eq 2 -and $igChanged -contains '"Scripts\tool.ps1" was changed' -and $igChanged -contains 'the setting "OLLAMA_BASE_URL" in Stack\.env was changed') "a script edited after the baseline is named, and so is a changed Ollama address in .env; its other lines are not watched ($($igChanged -join '; '))"
+# A new baseline takes in whatever is there. Recorded by hand it lists all of it (the watch then
+# says so: anything running as the owner can paste that command).
+$igHand = Save-LaiIntegrityBaseline -AIRoot $igRoot -Reason 'accepted by the owner' -TaskPattern 'LaiNoSuchTask-*'
+$igHandRead = @((Read-LaiIntegrityBaseline -AIRoot $igRoot)['accepted'] | Where-Object { $_ -is [hashtable] -and [string]$_['Id'] -notmatch '^(net|port)\|' })
+Assert-That ($igHandRead.Count -eq 2 -and @($igHandRead | Where-Object { [string]$_['Id'] -eq 'file|Scripts\tool.ps1' -and [string]$_['Text'] -eq '"Scripts\tool.ps1" was changed' }).Count -eq 1 -and @($igHandRead | Where-Object { [string]$_['Id'] -eq 'env|OLLAMA_BASE_URL' }).Count -eq 1 -and [int]$igHand['acceptedCount'] -ge 2) "a baseline recorded by hand lists what it took in, and the list survives the state file ($(@($igHandRead | ForEach-Object { [string]$_['Text'] }) -join '; '))"
+# Recorded by an install it lists only what the installer did not put there itself: not its own
+# copies, not the tasks and settings it writes. Update toolkit keeps everything else it finds.
+$igSource = Join-Path $Work 'integrity-source'
+New-Item -ItemType Directory -Force -Path (Join-Path $igSource 'stack') | Out-Null
+Set-Content -LiteralPath (Join-Path $igSource 'tool.ps1') -Value 'the next version'
+Set-Content -LiteralPath (Join-Path (Join-Path $igSource 'stack') 'docker-compose.yml') -Value 'services: { next: {} }'
+Copy-Item -LiteralPath (Join-Path $igSource 'tool.ps1') -Destination $igTool -Force
+Copy-Item -LiteralPath (Join-Path (Join-Path $igSource 'stack') 'docker-compose.yml') -Destination (Join-Path $igStack 'docker-compose.yml') -Force
+Set-Content -LiteralPath (Join-Path $igStack 'planted.yml') -Value 'x'
+Set-Content -LiteralPath $igHelper -Value 'edited, and not a file this installer ships'
+Set-Content -LiteralPath $igEnvFile -Value @('A=2', 'OLLAMA_BASE_URL=http://render-guard:11434', 'OLLAMA_UPSTREAM=http://elsewhere.example:11434')
+$igInstalled = Save-LaiIntegrityBaseline -AIRoot $igRoot -Reason 'install' -TaskPattern 'LaiNoSuchTask-*' -SourceRoot $igSource -OwnTasks @('LocalAI-Watch') -OwnSettings @('OLLAMA_BASE_URL')
+$igKeptText = @($igInstalled['accepted'] | Where-Object { [string]$_['Id'] -notmatch '^(net|port)\|' } | ForEach-Object { [string]$_['Text'] })
+Assert-That ($igKeptText.Count -eq 3 -and $igKeptText -contains '"Stack\planted.yml" is new' -and $igKeptText -contains '"Scripts\lib\helper.psm1" was changed' -and $igKeptText -contains 'the setting "OLLAMA_UPSTREAM" was added to Stack\.env') "a baseline recorded by an install lists the added file, the changed file it does not ship and the setting it does not write ($($igKeptText -join '; '))"
+Assert-That (@($igKeptText | Where-Object { $_ -match 'tool\.ps1|docker-compose|OLLAMA_BASE_URL' }).Count -eq 0) 'and none of its own: the files it copied and the setting it wrote'
+Set-Content -LiteralPath $igTool -Value 'changed, and the installer was started from the installed copy'
+$igSelf = Save-LaiIntegrityBaseline -AIRoot $igRoot -Reason 'install' -TaskPattern 'LaiNoSuchTask-*' -SourceRoot $igScripts
+Assert-That (@($igSelf['accepted'] | Where-Object { [string]$_['Id'] -eq 'file|Scripts\tool.ps1' }).Count -eq 1) 'an installer run from the installed folder copies no scripts, so a changed script is not its own work'
+$igOwn = { param($Id) Test-LaiIntegrityOwn -Difference ([pscustomobject]@{ Id = $Id }) -Snapshot @{ files = @{} } -AIRoot $igRoot -SourceRoot $igSource -OwnTasks @('LocalAI-Watch') -OwnSettings @('OLLAMA_BASE_URL') }
+Assert-That ((& $igOwn 'task|LocalAI-Watch') -and (& $igOwn 'env|OLLAMA_BASE_URL') -and (& $igOwn 'file-|Stack\gone.yml') -and (& $igOwn 'task-|LocalAI-Old')) 'its own: a task it registers, a setting it writes, and whatever is gone (nothing is taken in)'
+Assert-That (-not (& $igOwn 'task+|LocalAI-Helper') -and -not (& $igOwn 'task|LocalAI-Other') -and -not (& $igOwn 'env+|OLLAMA_UPSTREAM') -and -not (& $igOwn 'net|x|4444') -and -not (& $igOwn 'port|3000|x') -and -not (& $igOwn 'walk|Stack') -and -not (& $igOwn 'file+|Stack\nowhere.yml')) 'not its own: another LocalAI-* task, another setting, a new listener, a file it has no copy of'
 Set-Content -LiteralPath $igTool -Value 'original'
-# An installer run that started after the baseline and never recorded a new one (waiting for a restart, or failed).
-foreach ($n in 'install-20010101-120000.log', 'install-20010301-090000.log', 'install-not-a-date.log') { Set-Content -LiteralPath (Join-Path (Join-Path $igRoot 'Logs') $n) -Value 'x' }
-Assert-That ((Get-LaiUnfinishedInstall -AIRoot $igRoot -Since ([datetime]::new(2001, 2, 1))) -eq [datetime]::new(2001, 3, 1, 9, 0, 0)) 'an installer run that started after the baseline is found by its log'
-Assert-That ($null -eq (Get-LaiUnfinishedInstall -AIRoot $igRoot -Since ([datetime]::new(2001, 3, 1, 9, 0, 0)))) 'no run after the baseline: nothing unfinished'
+
+# The one place that makes 'an update is never reported as a change' true is the end of the
+# installer. Read from its source: after the last stage and after the resume task is removed, in a
+# try of its own (a baseline that cannot be written must not fail an install that worked), and
+# telling the baseline what the installer put there itself.
+$igInstAst = [System.Management.Automation.Language.Parser]::ParseFile((Join-Path $src 'Install-LocalAI.ps1'), [ref]$null, [ref]$null)
+$igCmds = @($igInstAst.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] }, $true))
+$igSaveCalls = @($igCmds | Where-Object { $_.GetCommandName() -eq 'Save-LaiIntegrityBaseline' })
+$igStages = @($igCmds | Where-Object { $_.GetCommandName() -eq 'Invoke-Stage' } | Sort-Object { $_.Extent.StartOffset })
+$igAfterStages = -1; if ($igStages.Count) { $igAfterStages = $igStages[-1].Extent.EndOffset }
+$igResumeGone = @($igCmds | Where-Object { $_.GetCommandName() -eq 'Unregister-ScheduledTask' -and $_.Extent.Text -match '\$ResumeTask' -and $_.Extent.StartOffset -gt $igAfterStages } | Sort-Object { $_.Extent.StartOffset })
+$igCall = $null; if ($igSaveCalls.Count -eq 1) { $igCall = $igSaveCalls[0] }
+$igTry = $null
+if ($igCall) { $igTry = $igCall.Parent; while ($igTry -and -not ($igTry -is [System.Management.Automation.Language.TryStatementAst])) { $igTry = $igTry.Parent } }
+Assert-That ($igCall -and $igStages.Count -ge 5 -and $igResumeGone.Count -ge 1 -and $igCall.Extent.StartOffset -gt $igAfterStages -and $igCall.Extent.StartOffset -gt $igResumeGone[0].Extent.EndOffset) "the installer records the baseline once, after its last stage and after the resume task is removed ($($igSaveCalls.Count) call(s), $($igStages.Count) stages)"
+Assert-That ($igTry -and $igTry.CatchClauses.Count -gt 0 -and $igTry.Extent.StartOffset -gt $igAfterStages -and $igTry.Extent.Text -notmatch '\bthrow\b|Stop-Install') 'in a try of its own whose catch only warns: a baseline that cannot be written does not fail an install that worked'
+Assert-That ($igCall -and $igCall.Extent.Text -match "-Reason 'install'" -and $igCall.Extent.Text -match '-SourceRoot \$SourceRoot' -and $igCall.Extent.Text -match '-OwnTasks @\(\$BackupTask, \$WatchTask, \$RecheckTask\)' -and $igCall.Extent.Text -match '-OwnSettings') 'as an install, naming its own copy of the toolkit, the three tasks it registers and the settings it writes'
+Assert-That ($igTry -and $igTry.Extent.Text -match "\['accepted'\]" -and $igTry.Extent.Text -match 'Write-LaiLog WARN "Kept, although this run did not install it') 'and it logs a warning for everything else the new baseline is about to make normal'
+
 if ($onWindows) {
     # Real scheduled tasks and real listeners exist only here, and so does the non-elevated watch that
     # must read them the way the installer recorded them. A throwaway task (never started: it has no
     # trigger) and two ports opened by this test process stand in for a tampered task and a new server.
     $igTask = 'LocalAI-IntegrityTest'
-    $igNet = $null; $igLocal = $null
+    $igNet = $null; $igLocal = $null; $igLock = $null
     try {
         Register-ScheduledTask -TaskName $igTask -Action (New-ScheduledTaskAction -Execute 'cmd.exe' -Argument '/c exit 0') -Force | Out-Null
         $igTasks = Get-LaiIntegrityTasks -NamePattern 'LocalAI-IntegrityTest*'
@@ -1324,17 +1514,28 @@ if ($onWindows) {
         $igNet.Stop(); $igNet = $null
 
         # End to end, as the scheduled task runs it: baseline, three changes outside an update, two runs.
+        # From a clean slate: no earlier baseline, so this one took nothing in and has nothing to confirm.
         ConvertTo-Json @{ WebUIPort = 39996; SearxngPort = 39995; OllamaUrl = 'http://127.0.0.1:39994' } | Set-Content -LiteralPath (Join-Path $igRoot 'localai-config.json')
+        $igStateFile = Join-Path $igRoot 'watch-state.json'
+        foreach ($f in (Get-LaiIntegrityPath -AIRoot $igRoot), $igStateFile) { if (Test-Path -LiteralPath $f) { Remove-Item -LiteralPath $f -Force } }
         $igB = Save-LaiIntegrityBaseline -AIRoot $igRoot -Reason 'test'
         $igBRead = Read-LaiIntegrityBaseline -AIRoot $igRoot
-        Assert-That ($igBRead['tasks'] -is [hashtable] -and $igBRead['tasks'][$igTask] -is [hashtable] -and @($igBRead['listeners'] | Where-Object { $_ -is [hashtable] -and [int]$_['Port'] -eq 39872 -and [string]$_['Program'] -eq $igMe }).Count -eq 1 -and [string]$igBRead['id'] -eq [string]$igB['id']) "the recorded baseline holds the task and the listeners ($(Get-LaiIntegritySummary -Baseline $igBRead))"
+        Assert-That ($igBRead['tasks'] -is [hashtable] -and $igBRead['tasks'][$igTask] -is [hashtable] -and @($igBRead['listeners'] | Where-Object { $_ -is [hashtable] -and [int]$_['Port'] -eq 39872 -and [string]$_['Program'] -eq $igMe -and [string]$_['Seen'] }).Count -eq 1 -and [string]$igBRead['id'] -eq [string]$igB['id']) "the recorded baseline holds the task and the listeners ($(Get-LaiIntegritySummary -Baseline $igBRead))"
+        $igListenRows = @($igBRead['listeners'] | Where-Object { $_ -is [hashtable] })
+        $igTempRows = @($igListenRows | Where-Object { [int]$_['Port'] -eq 0 })
+        $igTwice = @($igTempRows | Group-Object { '{0}|{1}' -f $_['Program'], $_['Network'] } | Where-Object { $_.Count -gt 1 })
+        Assert-That (@($igListenRows | Where-Object { [int]$_['Port'] -ge 49152 }).Count -eq 0 -and $igTwice.Count -eq 0) "Windows' per-start ports are kept as one 'temporary' row per program, not as a row per port ($($igTempRows.Count) of $($igListenRows.Count) rows)"
         $igWatchArgs = @('-AIRoot', $igRoot, '-NoHeal', '-NoNotify')
-        $igStateFile = Join-Path $igRoot 'watch-state.json'
-        $igNotices = { @(Get-Content -LiteralPath (Join-Path (Join-Path $igRoot 'Logs') 'watch.log') -Encoding UTF8 -ErrorAction SilentlyContinue | Where-Object { $_ -like '* NOTIFY Local AI: changed outside an update*' }) }
+        $igWatchLog = { @(Get-Content -LiteralPath (Join-Path (Join-Path $igRoot 'Logs') 'watch.log') -Encoding UTF8 -ErrorAction SilentlyContinue) }
+        # (Only the notices about this test's own changes: another program on this machine opening a
+        # port during the test is a difference too, and would be announced as well.)
+        $igNotices = { @(& $igWatchLog | Where-Object { $_ -like '* NOTIFY Local AI: changed outside an update*' -and $_ -match 'tool\.ps1|IntegrityTest|39871' }) }
         $igView = { $s = (Read-LaiState -Path $igStateFile)['integrity']; if ($s -is [hashtable]) { $s } else { @{} } }
+        $igOurs = { @((& $igView)['found'] | Where-Object { $_ -is [hashtable] -and [string]$_['Text'] -match 'tool\.ps1|IntegrityTest|39871' }) }
+        $igHourAgo = { $s = Read-LaiState -Path $igStateFile; $s['integrity']['checkedAt'] = (Get-Date).AddMinutes(-61).ToString('s'); Save-LaiState -State $s -Path $igStateFile }
         $r = Invoke-Child 'Watch-LocalAI.ps1' $igWatchArgs
         $igS = & $igView
-        Assert-That ([string]$igS['baseline'] -eq [string]$igB['id'] -and @($igS['found'] | Where-Object { $_ -is [hashtable] -and [string]$_['Text'] -match 'tool\.ps1|IntegrityTest|39871' }).Count -eq 0 -and $r.Text -notmatch 'Exception') "the watch compares against the baseline and finds none of it changed ($(@($igS['found'] | Where-Object { $_ -is [hashtable] } | ForEach-Object { [string]$_['Text'] }) -join '; '))"
+        Assert-That ([string]$igS['baseline'] -eq [string]$igB['id'] -and @(& $igOurs).Count -eq 0 -and @($igS['notRead']).Count -eq 0 -and $r.Text -notmatch 'Exception') "the watch compares against the baseline, reads tasks and listeners as the baseline did, and finds none of it changed ($(@($igS['found'] | Where-Object { $_ -is [hashtable] } | ForEach-Object { [string]$_['Text'] }) -join '; '))"
         Set-Content -LiteralPath $igTool -Value 'changed outside an update'
         Register-ScheduledTask -TaskName $igTask -Action (New-ScheduledTaskAction -Execute 'cmd.exe' -Argument '/c exit 1') -Force | Out-Null
         $igNet = New-Object System.Net.Sockets.TcpListener([System.Net.IPAddress]::Any, 39871); $igNet.Start()
@@ -1342,33 +1543,62 @@ if ($onWindows) {
         # opening a port just then would be): the next run is not due.
         $igS = Read-LaiState -Path $igStateFile; $igS['integrity']['pending'] = @(); $igS['integrity']['checkedAt'] = (Get-Date).ToString('s'); Save-LaiState -State $igS -Path $igStateFile
         $r = Invoke-Child 'Watch-LocalAI.ps1' $igWatchArgs
-        Assert-That (@((& $igView)['found'] | Where-Object { $_ -is [hashtable] -and [string]$_['Text'] -match 'tool\.ps1|IntegrityTest|39871' }).Count -eq 0 -and @(& $igNotices).Count -eq 0) 'the next run, minutes later, does not hash again (about once an hour)'
-        $igS = Read-LaiState -Path $igStateFile; $igS['integrity']['checkedAt'] = (Get-Date).AddMinutes(-61).ToString('s'); Save-LaiState -State $igS -Path $igStateFile
+        Assert-That (@(& $igOurs).Count -eq 0 -and @(& $igNotices).Count -eq 0) 'the next run, minutes later, does not hash again (about once an hour)'
+        & $igHourAgo
         $r = Invoke-Child 'Watch-LocalAI.ps1' $igWatchArgs
         $igSeen = @((& $igView)['found'] | Where-Object { $_ -is [hashtable] } | ForEach-Object { [string]$_['Text'] })
-        Assert-That ($igSeen -contains 'Scripts\tool.ps1 was changed' -and $igSeen -contains "the scheduled task $igTask now runs a different command" -and $igSeen -contains "$igMe now accepts connections from other devices on port 39871") "an hour later: the changed file, the changed task and the new network listener are seen ($($igSeen -join '; '))"
+        $igTaskText = 'the scheduled task "{0}" now runs a different command' -f $igTask
+        Assert-That ($igSeen -contains '"Scripts\tool.ps1" was changed' -and $igSeen -contains $igTaskText -and $igSeen -contains ('"{0}" now accepts connections from other devices on port 39871' -f $igMe)) "an hour later: the changed file, the changed task and the new network listener are seen ($($igSeen -join '; '))"
         Assert-That (@(& $igNotices).Count -eq 0) 'seen once: not announced yet (two strikes)'
+        # The file is rewritten before the second look: still the same difference.
+        Set-Content -LiteralPath $igTool -Value 'rewritten before the second look'
         $r = Invoke-Child 'Watch-LocalAI.ps1' $igWatchArgs
         $igN = @(& $igNotices)
-        $igTold = @((& $igView)['told'] | Where-Object { $_ })
-        Assert-That ($igN.Count -eq 1 -and $igN[0] -like '*Scripts\tool.ps1 was changed*' -and $igN[0] -like "*the scheduled task $igTask now runs a different command*" -and $igN[0] -like '*Health check*') "seen again on the next run: one notification that names what changed and the next step ($($igN -join ' | '))"
-        Assert-That (@($igTold | Where-Object { $_ -like 'net|*|39871' }).Count -eq 1 -and @($igTold | Where-Object { $_ -like 'task|*' }).Count -eq 1 -and $r.Text -notmatch 'Exception') 'the listener and the task count as told (no second notification for them)'
-        $igS = Read-LaiState -Path $igStateFile; $igS['integrity']['checkedAt'] = (Get-Date).AddMinutes(-61).ToString('s'); Save-LaiState -State $igS -Path $igStateFile
+        $igTold = @((& $igView)['told'] | Where-Object { $_ -is [hashtable] } | ForEach-Object { [string]$_['Id'] })
+        Assert-That ($igN.Count -eq 1 -and $igN[0] -like '*"Scripts\tool.ps1" was changed*' -and $igN[0] -like ('*' + $igTaskText + '*') -and $igN[0] -like '*If you did not do this*') "seen again on the next run: one notification that names what changed, also the file that was rewritten in between ($($igN -join ' | '))"
+        Assert-That ($igN.Count -eq 1 -and $igN[0] -notlike '*Health check*' -and $igN[0] -notlike '*Update toolkit*' -and $igN[0] -notlike '*Start menu*' -and $igN[0] -like '*Logs\watch.log*' -and $igN[0] -like '*fresh copy of the toolkit*') 'a script is among the changes: the next step names no shortcut (each starts a script from that folder), but watch.log and a fresh copy'
+        $igWaiting = @((& $igView)['pending'] | Where-Object { $_ -match 'tool\.ps1|IntegrityTest|39871' })
+        Assert-That ($igTold -contains ('net|{0}|39871' -f $igMe) -and $igTold -contains ('task|' + $igTask) -and $igTold -contains 'file|Scripts\tool.ps1' -and $igWaiting.Count -eq 0 -and $r.Text -notmatch 'Exception') 'the file, the task and the listener count as told, and none of them waits for another look'
+        & $igHourAgo
         $r = Invoke-Child 'Watch-LocalAI.ps1' $igWatchArgs
         Assert-That (@(& $igNotices).Count -eq 1) 'compared again an hour later: what was told is not told again'
-        # The owner made these changes: accepted, they are the baseline.
-        $r = Invoke-Child 'Watch-LocalAI.ps1' @('-AIRoot', $igRoot, '-AcceptBaseline')
-        Assert-That ($r.Code -eq 0 -and $r.Text -match 'integrity baseline accepted' -and $r.Text -match 'accepted: Scripts\\tool\.ps1 was changed' -and $r.Text -match "accepted: the scheduled task $igTask now runs a different command") "-AcceptBaseline records the current state and lists what it accepted (exit $($r.Code))"
+        # An installer run or a model update holds the setup lock (here: this process). The watch does not
+        # compare half-replaced files, keeps its last result, and records that it did not look.
+        & $igHourAgo
+        $igAtBefore = [string](& $igView)['checkedAt']
+        $igLock = Enter-LaiSetupLock
+        $r = Invoke-Child 'Watch-LocalAI.ps1' $igWatchArgs
+        Exit-LaiVolumeLock $igLock; $igLock = $null
+        $igS = & $igView
+        $igSkipLines = @(& $igWatchLog | Where-Object { $_ -like '* INTEGRITY not compared: an install or a model update is running*' })
+        Assert-That ([string]$igS['checkedAt'] -eq $igAtBefore -and [string]$igS['skippedWhy'] -like 'an install or a model update is running*' -and [string]$igS['skippedSince'] -and $igSkipLines.Count -eq 1) "while the setup lock is held the watch does not compare, keeps its last result and says why ($($igSkipLines.Count) line(s) in watch.log)"
         $r = Invoke-Child 'Watch-LocalAI.ps1' $igWatchArgs
         $igS = & $igView
-        Assert-That ([string]$igS['baseline'] -ne [string]$igB['id'] -and [string]$igS['checkedAt'] -and @($igS['found'] | Where-Object { $_ -is [hashtable] -and [string]$_['Text'] -match 'tool\.ps1|IntegrityTest|39871' }).Count -eq 0 -and @(& $igNotices).Count -eq 1) 'after that the same state is compared with the new baseline: nothing of it is reported'
-        # A listener known from an earlier baseline is still known when it is not running at the next one.
+        Assert-That (-not $igS['skippedWhy'] -and -not $igS['skippedSince'] -and [string]$igS['checkedAt'] -ne $igAtBefore -and @(& $igNotices).Count -eq 1) 'and compares again on the first run after the lock is free'
+        # The owner made these changes: accepted, they are the baseline.
+        $r = Invoke-Child 'Watch-LocalAI.ps1' @('-AIRoot', $igRoot, '-AcceptBaseline')
+        Assert-That ($r.Code -eq 0 -and $r.Text -match 'integrity baseline accepted' -and $r.Text -match 'accepted: "Scripts\\tool\.ps1" was changed' -and $r.Text -like ('*accepted: ' + $igTaskText + '*')) "-AcceptBaseline records the current state and lists what it accepted (exit $($r.Code))"
+        $r = Invoke-Child 'Watch-LocalAI.ps1' $igWatchArgs
+        $r = Invoke-Child 'Watch-LocalAI.ps1' $igWatchArgs
+        $igS = & $igView
+        Assert-That ([string]$igS['baseline'] -ne [string]$igB['id'] -and [string]$igS['checkedAt'] -and @(& $igOurs).Count -eq 0 -and @(& $igNotices).Count -eq 1) 'after that the same state is compared with the new baseline: nothing of it is reported'
+        # Anything running as the owner can run that command, so the acceptance is itself announced.
+        $igAccepted = @(& $igWatchLog | Where-Object { $_ -like '* NOTIFY Local AI: integrity baseline accepted*' })
+        Assert-That ($igAccepted.Count -eq 1 -and $igAccepted[0] -like '*"Scripts\tool.ps1" was changed*' -and $igAccepted[0] -like '*If that was not you*') "the next scheduled run names what was accepted, once over two runs ($($igAccepted -join ' | '))"
+        # Listeners, both ways of recording a baseline. The accepted one holds the open port.
+        $igHas = { @((Read-LaiIntegrityBaseline -AIRoot $igRoot)['listeners'] | Where-Object { $_ -is [hashtable] -and [int]$_['Port'] -eq 39871 -and [string]$_['Program'] -eq $igMe -and $_['Network'] }).Count }
+        $igWhileOpen = & $igHas
         $igNet.Stop(); $igNet = $null
-        Save-LaiIntegrityBaseline -AIRoot $igRoot -Reason 'test' | Out-Null
-        Assert-That (@((Read-LaiIntegrityBaseline -AIRoot $igRoot)['listeners'] | Where-Object { $_ -is [hashtable] -and [int]$_['Port'] -eq 39871 -and [string]$_['Program'] -eq $igMe -and $_['Network'] }).Count -eq 1) 'a program that listened at the earlier baseline is kept in the next one (not announced again after every update)'
+        Save-LaiIntegrityBaseline -AIRoot $igRoot -Reason 'install' | Out-Null
+        $igAfterInstall = & $igHas
+        Save-LaiIntegrityBaseline -AIRoot $igRoot -Reason 'accepted by the owner' | Out-Null
+        $igAfterAccept = & $igHas
+        Assert-That ($igWhileOpen -eq 1 -and $igAfterInstall -eq 1) 'an install keeps a listener the baseline before it knew although it is not running right now (not announced again after every update)'
+        Assert-That ($igAfterAccept -eq 0) "the owner accepting the current state records what listens now: a port that was closed again is no longer accepted ($igAfterAccept)"
     } catch {
         Assert-That $false "the integrity checks on Windows ran through ($($_.Exception.Message))"
     } finally {
+        if ($igLock) { Exit-LaiVolumeLock $igLock }
         foreach ($l in $igNet, $igLocal) { if ($l) { $l.Stop() } }
         Unregister-ScheduledTask -TaskName $igTask -Confirm:$false -ErrorAction SilentlyContinue
         # What the watch wrote about its comparisons, for reading a failure above.

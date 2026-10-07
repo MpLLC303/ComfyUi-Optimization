@@ -595,15 +595,23 @@ function Test-LaiSetupLockBusy {
 
 #region Integrity watch (what changed outside an install or update) -------------------------
 # A baseline (<AIRoot>\integrity-baseline.json) records, at the end of every successful install or
-# update: the SHA-256 of each file under <AIRoot>\Scripts and <AIRoot>\Stack, what each LocalAI-*
-# scheduled task runs, as whom and at what privilege, and which programs listen on which TCP ports.
+# update: the SHA-256 of each file under <AIRoot>\Scripts and <AIRoot>\Stack, a fingerprint of the
+# settings in Stack\.env that say where chats and searches are sent, what each LocalAI-* scheduled
+# task runs, as whom and at what privilege, and which programs listen on which TCP ports.
 # Watch-LocalAI.ps1 compares the PC with it about once an hour and names what differs.
+# Not compared: the rest of Stack\.env (versions, ports, keys, the extra origins that
+# Enable-TailscaleAccess.ps1 sets), logs, the .tmp/.bak/.bad leftovers of a save, and anything in a
+# folder called Secrets.
 #
 # What this is good for, and what it is not: the baseline lives in the install folder, which the
 # signed-in user (and so anything running as that user) can write. It catches accidental changes,
 # other software and unsophisticated tampering. It does NOT stop, or even notice, an attacker who
-# already runs as the owner and rewrites the baseline (or the watch) together with the change. And
-# program names are only names: anything that calls itself 'ollama' reads as Ollama here.
+# already runs as the owner and rewrites the baseline (or the watch, or the watch's own record)
+# together with the change. And program names are only names: anything that calls itself 'ollama'
+# reads as Ollama here. Nor is every new listener news: a program that accepted connections on one
+# of Windows' per-start ports (49152 and up) when the baseline was recorded may open any number of
+# them without a word, and so may anything with its name; a listener an install knew stays
+# accepted for 90 days after it was last seen (ConvertTo-LaiListenerBaseline).
 
 function Get-LaiIntegrityPath {
     # The baseline file: next to the other state files, never under Scripts or Stack (it would be
@@ -613,15 +621,54 @@ function Get-LaiIntegrityPath {
 }
 
 function Test-LaiIntegrityExcluded {
-    # Pure (unit-tested). Names the integrity watch leaves out because they change in normal use:
-    # Stack\.env (updates and the Tailscale script rewrite it; it also holds secrets), logs, and the
-    # .tmp/.bak/.bad leftovers of a file being saved. A folder called Secrets is never entered, so
-    # nothing in it is listed, read or hashed.
+    # Pure (unit-tested). Names the file comparison leaves out because they change in normal use:
+    # Stack\.env (updates and the Tailscale script rewrite it, and it holds secrets; the settings in
+    # it that decide where chats go are compared by name, see ConvertTo-LaiIntegrityEnv), logs, and
+    # the .tmp/.bak/.bad leftovers of a file being saved. A folder called Secrets is never entered,
+    # so nothing in it is listed, read or hashed.
     param([Parameter(Mandatory)][string]$Name, [switch]$Folder)
     if ($Folder) { return ($Name -eq 'Secrets') }
     if ($Name -eq '.env') { return $true }
     foreach ($pattern in @('*.log', '*.tmp', '*.bak', '*.bad')) { if ($Name -like $pattern) { return $true } }
     return $false
+}
+
+function ConvertTo-LaiIntegrityName {
+    # Pure (unit-tested). A file, task, setting or program name as it may be shown. Whoever made the
+    # change chose these names (a container can create files in Stack\searxng, any program can listen
+    # under any name), and they end up in a notification, in watch.log, in the health check and in
+    # the Open WebUI banner, which every Open WebUI user sees rendered as Markdown. So letters,
+    # digits, space, dot, underscore, hyphen and backslash stay, everything else becomes '?', and a
+    # long name is cut in the middle: a name cannot carry a link, a second line or a paragraph.
+    param([AllowEmptyString()][string]$Name = '', [int]$Max = 80)
+    $t = [regex]::Replace($Name, '[^\p{L}\p{Nd} ._\\-]', '?')
+    if ($t.Length -gt $Max) {
+        $head = [int][math]::Floor(($Max - 3) / 2)
+        $t = $t.Substring(0, $head) + '...' + $t.Substring($t.Length - ($Max - 3 - $head))
+    }
+    return $t
+}
+
+function ConvertTo-LaiIntegrityDate {
+    # A time from a state file: PowerShell 7 reads an ISO string back as a date, Windows PowerShell
+    # 5.1 as text. $null when it is neither.
+    param($Value)
+    if ($null -eq $Value -or "$Value" -eq '') { return $null }
+    if ($Value -is [datetime]) { return $Value }
+    $d = [datetime]::MinValue
+    if ([datetime]::TryParse([string]$Value, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::None, [ref]$d)) { return $d }
+    return $null
+}
+
+function New-LaiIntegrityBudget {
+    # How much one walk over Scripts and Stack may read: entries (files, folders, links), bytes
+    # hashed and seconds. The toolkit installs well under a hundred files there. But Stack\searxng
+    # is writable from inside the SearXNG container, anything running as the user can fill either
+    # folder, and the watch task is ended after ten minutes: without a limit one such folder would
+    # stop every later run before it reports anything at all. 'Stopped' names the first entry that
+    # was not read ('' = everything was).
+    param([int]$MaxEntries = 3000, [long]$MaxBytes = 300MB, [int]$MaxSeconds = 20)
+    return @{ MaxEntries = $MaxEntries; MaxBytes = $MaxBytes; MaxSeconds = $MaxSeconds; Entries = 0; Bytes = [long]0; Clock = [System.Diagnostics.Stopwatch]::StartNew(); Stopped = '' }
 }
 
 function Add-LaiIntegrityEntry {
@@ -630,33 +677,94 @@ function Add-LaiIntegrityEntry {
     # baseline as administrator in a folder the user controls, and a planted link must neither make it
     # read files elsewhere nor hide that a folder was swapped for one. A file that cannot be read is
     # 'unreadable'; one above -MaxHashBytes (nothing the toolkit installs comes near it) is recorded
-    # by size, so a huge file dropped there cannot make the watch run for minutes.
-    param([Parameter(Mandatory)][hashtable]$Map, [Parameter(Mandatory)][System.IO.FileSystemInfo]$Item, [Parameter(Mandatory)][string]$Relative, [long]$MaxHashBytes = 50MB)
+    # by size, so a huge file dropped there cannot make the watch run for minutes. With -Budget
+    # (New-LaiIntegrityBudget) the walk ends where the budget does and says where.
+    param([Parameter(Mandatory)][hashtable]$Map, [Parameter(Mandatory)][System.IO.FileSystemInfo]$Item, [Parameter(Mandatory)][string]$Relative, [long]$MaxHashBytes = 50MB, [hashtable]$Budget = $null)
+    if ($Budget) {
+        if ($Budget['Stopped']) { return }
+        if ($Budget['Entries'] -ge $Budget['MaxEntries'] -or $Budget['Bytes'] -ge $Budget['MaxBytes'] -or $Budget['Clock'].Elapsed.TotalSeconds -ge $Budget['MaxSeconds']) { $Budget['Stopped'] = $Relative; return }
+        $Budget['Entries'] = [int]$Budget['Entries'] + 1
+    }
+    # $Item was listed with its parent, some time ago: what it is, is asked again right before it is
+    # read, and for a folder once more after it was listed. A folder swapped for a link in between is
+    # then a 'link' and whatever was read below it is dropped, so names and hashes from elsewhere do
+    # not end up in a file the user can read. This narrows that gap to the moment between the
+    # question and the read; it does not close it (a swap there, undone before the second question,
+    # is still followed).
+    try { $Item.Refresh() } catch { $Map[$Relative] = 'unreadable'; return }
+    if (-not $Item.Exists) { return }
     if ($Item.Attributes -band [IO.FileAttributes]::ReparsePoint) { $Map[$Relative] = 'link'; return }
     if ($Item -is [System.IO.DirectoryInfo]) {
-        $children = @()
-        try { $children = @($Item.GetFileSystemInfos()) } catch { $Map[$Relative] = 'unreadable'; return }
-        foreach ($child in $children) {
+        # By name, whatever order the file system lists them in, so a walk that runs out of budget
+        # stops at the same entry every time. No more are listed than the budget has room for: a
+        # folder with a million entries is not read to the end just to be sorted.
+        $children = New-Object 'System.Collections.Generic.SortedDictionary[string,object]' ([System.StringComparer]::Ordinal)
+        $room = [int]::MaxValue; if ($Budget) { $room = [int]$Budget['MaxEntries'] - [int]$Budget['Entries'] }
+        $cut = $false
+        try { foreach ($child in $Item.EnumerateFileSystemInfos()) { if ($children.Count -ge $room) { $cut = $true; break }; $children[$child.Name] = $child } }
+        catch { $Map[$Relative] = 'unreadable'; return }
+        foreach ($child in @($children.Values)) {
             if (Test-LaiIntegrityExcluded -Name $child.Name -Folder:($child -is [System.IO.DirectoryInfo])) { continue }
-            Add-LaiIntegrityEntry -Map $Map -Item $child -Relative ($Relative + '\' + $child.Name) -MaxHashBytes $MaxHashBytes
+            Add-LaiIntegrityEntry -Map $Map -Item $child -Relative ($Relative + '\' + $child.Name) -MaxHashBytes $MaxHashBytes -Budget $Budget
         }
+        $swapped = $false
+        try { $Item.Refresh(); $swapped = [bool]($Item.Exists -and ($Item.Attributes -band [IO.FileAttributes]::ReparsePoint)) } catch { $swapped = $true }
+        if ($swapped) {
+            $below = $Relative + '\'
+            foreach ($k in @($Map.Keys | Where-Object { ([string]$_).StartsWith($below, [StringComparison]::OrdinalIgnoreCase) })) { $Map.Remove($k) }
+            $Map[$Relative] = 'link'
+            return
+        }
+        if ($cut -and $Budget -and -not $Budget['Stopped']) { $Budget['Stopped'] = $Relative }
         return
     }
     if ($Item.Length -gt $MaxHashBytes) { $Map[$Relative] = 'size ' + $Item.Length; return }
+    if ($Budget) { $Budget['Bytes'] = [long]$Budget['Bytes'] + $Item.Length }
     try { $Map[$Relative] = [string](Get-FileHash -LiteralPath $Item.FullName -Algorithm SHA256 -ErrorAction Stop).Hash }
     catch { $Map[$Relative] = 'unreadable' }
 }
 
 function Get-LaiIntegrityFiles {
     # Every file under <AIRoot>\Scripts and <AIRoot>\Stack with its SHA-256, keyed by its path below
-    # the install folder (always with backslashes, so a baseline reads the same everywhere).
-    param([Parameter(Mandatory)][string]$AIRoot, [long]$MaxHashBytes = 50MB)
+    # the install folder (always with backslashes, so a baseline reads the same everywhere). Scripts
+    # first: when -Budget runs out in Stack, the scripts have all been read.
+    param([Parameter(Mandatory)][string]$AIRoot, [long]$MaxHashBytes = 50MB, [hashtable]$Budget = $null)
     $map = @{}
     foreach ($top in @('Scripts', 'Stack')) {
         $item = Get-Item -LiteralPath (Join-Path $AIRoot $top) -Force -ErrorAction SilentlyContinue
-        if ($item) { Add-LaiIntegrityEntry -Map $map -Item $item -Relative $top -MaxHashBytes $MaxHashBytes }
+        if ($item) { Add-LaiIntegrityEntry -Map $map -Item $item -Relative $top -MaxHashBytes $MaxHashBytes -Budget $Budget }
     }
     return $map
+}
+
+function ConvertTo-LaiIntegrityEnv {
+    # Pure (unit-tested). The lines of Stack\.env become name = tag for the settings that say where
+    # chats and searches are sent: names ending in _URL, _URLS or _UPSTREAM (OLLAMA_BASE_URL,
+    # OLLAMA_UPSTREAM, DEEP_RESEARCH_OLLAMA_URL, COMFYUI_URLS). One changed line there sends every
+    # prompt and answer through another machine. Only a short tag of each value is kept, never the
+    # value, and no other line is looked at: versions and ports change with every Open WebUI update,
+    # the keys are secrets, and WEBUI_EXTRA_ORIGINS is rewritten by Enable-TailscaleAccess.ps1, which
+    # records no baseline.
+    param([string[]]$Lines = @())
+    $map = @{}
+    foreach ($line in $Lines) {
+        if ([string]$line -match '^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=(.*)$') {
+            $name = $Matches[1]; $value = $Matches[2]
+            if ($name -like '*_URL' -or $name -like '*_URLS' -or $name -like '*_UPSTREAM') { $map[$name] = Get-LaiIntegrityTag -Text $value.Trim() }
+        }
+    }
+    return $map
+}
+
+function Get-LaiIntegrityEnv {
+    # The routing settings of <AIRoot>\Stack\.env (ConvertTo-LaiIntegrityEnv). Empty when there is no
+    # .env; $null when it cannot be told (a link, which is not followed; not a file; too big to be
+    # one; unreadable): the comparison then skips the settings instead of calling them all removed.
+    param([Parameter(Mandatory)][string]$AIRoot)
+    $item = Get-Item -LiteralPath (Join-Path (Join-Path $AIRoot 'Stack') '.env') -Force -ErrorAction SilentlyContinue
+    if (-not $item) { return @{} }
+    if (($item -is [System.IO.DirectoryInfo]) -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -or $item.Length -gt 1MB) { return $null }
+    try { return (ConvertTo-LaiIntegrityEnv -Lines @(Get-Content -LiteralPath $item.FullName -Encoding UTF8 -ErrorAction Stop)) } catch { return $null }
 }
 
 function Get-LaiIntegrityTasks {
@@ -741,12 +849,37 @@ function Get-LaiIntegrityTag {
     finally { $sha.Dispose() }
 }
 
+function Get-LaiIntegrityPorts {
+    # The stack's own ports, from localai-config.json: another program holding one of them is news
+    # even on loopback. The watch and the baseline both ask here, so they always mean the same ports.
+    param([Parameter(Mandatory)][string]$AIRoot)
+    $config = Read-LaiState -Path (Join-Path $AIRoot 'localai-config.json')
+    $ports = @(3000, 8888, 11434)
+    try {
+        if ($config['WebUIPort']) { $ports[0] = [int]$config['WebUIPort'] }
+        if ($config['SearxngPort']) { $ports[1] = [int]$config['SearxngPort'] }
+        if ($config['OllamaUrl']) { $ports[2] = [int]([uri][string]$config['OllamaUrl']).Port }
+        if ($config['DeepResearchPort'] -and [int]$config['DeepResearchPort'] -gt 0) { $ports += [int]$config['DeepResearchPort'] }
+    } catch { Write-Verbose "a port in localai-config.json could not be read: $($_.Exception.Message)" }
+    return [int[]]$ports
+}
+
 function Compare-LaiIntegrity {
-    # Pure (unit-tested). What differs between a baseline and the state now, as objects with Text (a
-    # plain sentence fragment naming the thing: 'Scripts\x.ps1 was changed') and Key (stable for the
-    # same difference, so it is announced once; it carries a tag of the new content, so a second,
-    # different change to the same file is news again).
-    #   files      changed, new and gone, each by name.
+    # Pure (unit-tested). What differs between a baseline and the state now, as objects with
+    #   Id    what the difference is about (its kind and name). It stays the same for as long as the
+    #         thing differs, whatever its content: a file rewritten between two looks is still one
+    #         difference, and the watch counts its two strikes by this;
+    #   Key   the Id plus a tag of the new content: a second, different change to the same thing has
+    #         another Key, which is how the watch knows it is news again;
+    #   Text  a plain sentence fragment that names the thing: '"Scripts\x.ps1" was changed'. Names
+    #         are cleaned (ConvertTo-LaiIntegrityName) and stand in double quotes, and nothing else
+    #         in a Text does, so the banner can show exactly the names as code.
+    #   files      changed, new and gone, each by name. More than -MaxNewPerFolder new files in one
+    #              place (an archive unpacked into the wrong folder) are one difference with a count.
+    #              A walk that ran out of budget ('filesStopped') cannot say what is gone from there
+    #              on and says that instead; a baseline recorded that way cannot say what is new.
+    #   settings   the routing settings of Stack\.env (ConvertTo-LaiIntegrityEnv): changed, added,
+    #              removed, by name only. Skipped when either side could not read them.
     #   tasks      a different command, account or privilege; new and gone. Skipped when either side
     #              could not read tasks.
     #   listeners  only additions, and only what matters: a program that now accepts connections
@@ -757,23 +890,71 @@ function Compare-LaiIntegrity {
     #              program that is not running; the health checks cover the stack's own) and new
     #              loopback-only ones (not reachable from the network; Ollama's model runners and
     #              ordinary programs open them all day). Skipped when either side could not read them.
-    param([Parameter(Mandatory)][hashtable]$Baseline, [Parameter(Mandatory)][hashtable]$Current, [int[]]$WatchedPorts = @(), [int]$DynamicPortFrom = 49152)
+    param([Parameter(Mandatory)][hashtable]$Baseline, [Parameter(Mandatory)][hashtable]$Current, [int[]]$WatchedPorts = @(), [int]$DynamicPortFrom = 49152, [int]$MaxNewPerFolder = 20)
     $out = New-Object System.Collections.Generic.List[object]
     $seen = @{}
-    $add = { param([string]$Key, [string]$Text) if (-not $seen.ContainsKey($Key)) { $seen[$Key] = $true; $out.Add([pscustomobject]@{ Key = $Key; Text = $Text }) } }
+    # -Tag '' = nothing of its own to tell apart by (the thing is gone).
+    $add = { param([string]$Id, [string]$Tag, [string]$Text)
+        if ($seen.ContainsKey($Id)) { return }
+        $seen[$Id] = $true
+        $full = $Id; if ($Tag) { $full = $Id + '|' + $Tag }
+        $out.Add([pscustomobject]@{ Id = $Id; Key = $full; Text = $Text })
+    }
+    $q = { param([string]$Name) return ('"' + (ConvertTo-LaiIntegrityName -Name $Name) + '"') }
 
     $bf = @{}; if ($Baseline['files'] -is [hashtable]) { $bf = $Baseline['files'] }
     $cf = @{}; if ($Current['files'] -is [hashtable]) { $cf = $Current['files'] }
+    $bStopped = [string]$Baseline['filesStopped']; $cStopped = [string]$Current['filesStopped']
+    # The folders the baseline knows. New files are counted under the topmost folder it does not
+    # know (a whole unpacked tree is one place), else under the folder they are in.
+    $bFolders = @{}
+    foreach ($k in $bf.Keys) {
+        $p = [string]$k
+        while ($p.LastIndexOf('\') -gt 0) { $p = $p.Substring(0, $p.LastIndexOf('\')); $bFolders[$p] = $true }
+    }
+    $new = @{}
     foreach ($k in @($cf.Keys | Sort-Object)) {
         $now = [string]$cf[$k]
-        $tag = $now; if ($tag.Length -gt 12) { $tag = $tag.Substring(0, 12) }
-        if (-not $bf.ContainsKey($k)) { & $add "file+|$k|$tag" "$k is new"; continue }
+        $tag = $now; if ($now.Length -eq 64) { $tag = $now.Substring(0, 12) }
+        if (-not $bf.ContainsKey($k)) {
+            if ($bStopped) { continue }
+            $parts = ([string]$k).Split('\'); $place = ''
+            for ($i = 1; $i -lt $parts.Count; $i++) { $place = ($parts[0..($i - 1)] -join '\'); if (-not $bFolders.ContainsKey($place)) { break } }
+            if (-not $new.ContainsKey($place)) { $new[$place] = New-Object System.Collections.Generic.List[object] }
+            $new[$place].Add(@{ Name = [string]$k; Tag = $tag })
+            continue
+        }
         if ([string]$bf[$k] -eq $now) { continue }
         $what = 'was changed'
         if ($now -eq 'link') { $what = 'is now a link to another place' } elseif ($now -eq 'unreadable') { $what = 'can no longer be read' }
-        & $add "file|$k|$tag" "$k $what"
+        & $add "file|$k" $tag ((& $q $k) + ' ' + $what)
     }
-    foreach ($k in @($bf.Keys | Sort-Object)) { if (-not $cf.ContainsKey($k)) { & $add "file-|$k" "$k is gone" } }
+    foreach ($place in @($new.Keys | Sort-Object)) {
+        $list = $new[$place]
+        if ($list.Count -gt $MaxNewPerFolder) { & $add "files+|$place" ([string]$list.Count) ('{0} new files in {1}' -f $list.Count, (& $q $place)); continue }
+        foreach ($f in $list) { & $add ('file+|' + $f['Name']) ([string]$f['Tag']) ((& $q $f['Name']) + ' is new') }
+    }
+    $cTop = ''; if ($cStopped) { $cTop = $cStopped.Split('\')[0] }
+    foreach ($k in @($bf.Keys | Sort-Object)) {
+        if ($cf.ContainsKey($k)) { continue }
+        # A walk that stopped early cannot say what is gone from there on. Scripts is read first, so
+        # one that stopped in Stack still read all of Scripts.
+        $read = (-not $cStopped) -or ($cTop -eq 'Stack' -and ([string]$k -eq 'Scripts' -or ([string]$k).StartsWith('Scripts\', [StringComparison]::OrdinalIgnoreCase)))
+        if ($read) { & $add "file-|$k" '' ((& $q $k) + ' is gone') }
+    }
+    if ($cStopped -and -not $bStopped) {
+        & $add "walk|$cTop" '' ('reading {0} stopped at {1} (more files, data or time than the watch allows itself), so the rest was not compared' -f (& $q $cTop), (& $q $cStopped))
+    }
+
+    if ($Baseline['env'] -is [hashtable] -and $Current['env'] -is [hashtable]) {
+        $be = $Baseline['env']; $ce = $Current['env']
+        foreach ($n in @($ce.Keys | Sort-Object)) {
+            $tag = [string]$ce[$n]
+            if (-not $be.ContainsKey($n)) { & $add "env+|$n" $tag ('the setting {0} was added to Stack\.env' -f (& $q $n)); continue }
+            if ([string]$be[$n] -ne $tag) { & $add "env|$n" $tag ('the setting {0} in Stack\.env was changed' -f (& $q $n)) }
+        }
+        foreach ($n in @($be.Keys | Sort-Object)) { if (-not $ce.ContainsKey($n)) { & $add "env-|$n" '' ('the setting {0} was removed from Stack\.env' -f (& $q $n)) } }
+    }
 
     if ($Baseline['tasks'] -is [hashtable] -and $Current['tasks'] -is [hashtable]) {
         $bt = $Baseline['tasks']; $ct = $Current['tasks']
@@ -781,9 +962,10 @@ function Compare-LaiIntegrity {
             $c = $ct[$n]
             if (-not ($c -is [hashtable])) { continue }
             $tag = Get-LaiIntegrityTag -Text (@([string]$c['Run'], [string]$c['User'], [string]$c['LogonType'], [string]$c['RunLevel']) -join '|')
+            $task = 'the scheduled task ' + (& $q $n)
             if (-not ($bt[$n] -is [hashtable])) {
                 $admin = ''; if ([string]$c['RunLevel'] -eq 'Highest') { $admin = ' and runs with administrator rights' }
-                & $add "task+|$n|$tag" "the scheduled task $n is new$admin"
+                & $add "task+|$n" $tag ($task + ' is new' + $admin)
                 continue
             }
             $b = $bt[$n]
@@ -793,43 +975,77 @@ function Compare-LaiIntegrity {
             if ([string]$b['RunLevel'] -ne [string]$c['RunLevel']) {
                 if ([string]$c['RunLevel'] -eq 'Highest') { $ch += 'runs with administrator rights' } else { $ch += 'runs without administrator rights' }
             }
-            if ($ch.Count) { & $add "task|$n|$tag" ("the scheduled task $n now " + ($ch -join ' and ')) }
+            if ($ch.Count) { & $add "task|$n" $tag ($task + ' now ' + ($ch -join ' and ')) }
         }
-        foreach ($n in @($bt.Keys | Sort-Object)) { if (-not $ct.ContainsKey($n)) { & $add "task-|$n" "the scheduled task $n is gone" } }
+        foreach ($n in @($bt.Keys | Sort-Object)) { if (-not $ct.ContainsKey($n)) { & $add "task-|$n" '' ('the scheduled task ' + (& $q $n) + ' is gone') } }
     }
 
     if ($null -ne $Baseline['listeners'] -and $null -ne $Current['listeners']) {
+        # Port 0 in a baseline row stands for 'a temporary port' (ConvertTo-LaiListenerBaseline). One of
+        # the stack's own ports is never a temporary one, wherever it was put.
+        $slotOf = { param([int]$Port) if ($Port -le 0 -or ($Port -ge $DynamicPortFrom -and $WatchedPorts -notcontains $Port)) { return 'temporary' }; return [string]$Port }
         $net = @{}; $owners = @{}
         foreach ($l in @($Baseline['listeners'])) {
-            if (-not ($l -is [hashtable])) { continue }
-            $prog = [string]$l['Program']; $port = [int]$l['Port']
-            $slot = [string]$port; if ($port -ge $DynamicPortFrom) { $slot = 'temporary' }
+            $port = 0
+            # A row without a program or a port number is no row: the file can be edited by hand, and
+            # one bad row must not stop every comparison.
+            if (-not ($l -is [hashtable]) -or -not $l['Program'] -or -not [int]::TryParse([string]$l['Port'], [ref]$port)) { continue }
+            $prog = [string]$l['Program']; $slot = & $slotOf $port
             if ($l['Network']) { $net["$prog|$slot"] = $true }
             if ($WatchedPorts -contains $port) { $owners[$slot] = @($owners[$slot] | Where-Object { $_ }) + $prog }
         }
         foreach ($l in @($Current['listeners'])) {
-            if (-not ($l -is [hashtable])) { continue }
-            $prog = [string]$l['Program']; $port = [int]$l['Port']
-            $slot = [string]$port; $place = "port $port"
-            if ($port -ge $DynamicPortFrom) { $slot = 'temporary'; $place = 'a temporary port' }
+            $port = 0
+            if (-not ($l -is [hashtable]) -or -not [int]::TryParse([string]$l['Port'], [ref]$port)) { continue }
+            $prog = [string]$l['Program']; $slot = & $slotOf $port
+            $place = "port $port"; if ($slot -eq 'temporary') { $place = 'a temporary port' }
             $was = @($owners[$slot] | Where-Object { $_ } | Select-Object -Unique)
             if ($WatchedPorts -contains $port -and $was.Count -and $was -notcontains $prog -and $prog -ne 'unknown' -and $was -notcontains 'unknown') {
-                & $add "port|$slot|$prog" ("port $port is now held by $prog (it was " + ($was -join ', ') + ')')
+                & $add "port|$slot|$prog" '' ('port {0} is now held by {1} (it was {2})' -f $port, (& $q $prog), (@($was | ForEach-Object { & $q $_ }) -join ', '))
             } elseif ($l['Network'] -and -not $net.ContainsKey("$prog|$slot")) {
-                & $add "net|$prog|$slot" "$prog now accepts connections from other devices on $place"
+                & $add "net|$prog|$slot" '' ('{0} now accepts connections from other devices on {1}' -f (& $q $prog), $place)
             }
         }
     }
     return $out.ToArray()
 }
 
+function Limit-LaiIntegrityFound {
+    # Pure (unit-tested). The first -Max of -Diffs (Compare-LaiIntegrity) as they are, and everything
+    # after them as one more difference with a count. The watch keeps what it found, what it told and
+    # what waits for a second look in watch-state.json, next to the record of the health checks:
+    # thousands of entries with long names would grow that file past what Windows PowerShell 5.1
+    # reads back (2 MB), and the watch would lose its whole memory with it. Files are cut in the
+    # order of Compare-LaiIntegrity (by name), so the same ones on every run. The one that stands for
+    # the rest says whether an installed script is among them ('more|Scripts'), which decides the
+    # advice (Get-LaiIntegrityAdvice); its Key carries the count, so a count that changes is news
+    # again like any other changed difference.
+    param([object[]]$Diffs = @(), [int]$Max = 300)
+    $all = @($Diffs | Where-Object { $null -ne $_ })
+    if ($all.Count -le $Max) { return $all }
+    # Settings, tasks and listeners are few and are never the ones cut: a new task must not go
+    # unnamed because a few hundred files changed as well.
+    $all = @($all | Where-Object { [string]$_.Id -notmatch '^files?[+-]?\|' }) + @($all | Where-Object { [string]$_.Id -match '^files?[+-]?\|' })
+    $rest = @($all | Select-Object -Skip $Max)
+    $place = 'other'
+    if (@($rest | Where-Object { [string]$_.Id -match '^(files?[+-]?\|Scripts(\\|$)|walk\|Scripts$)' }).Count) { $place = 'Scripts' }
+    $more = [pscustomobject]@{ Id = "more|$place"; Key = ('more|{0}|{1}' -f $place, $rest.Count); Text = ('{0} more differences than are listed here' -f $rest.Count) }
+    return @(@($all | Select-Object -First $Max) + $more)
+}
+
 function Get-LaiIntegritySnapshot {
-    # The state right now, in the shape of a baseline: files (hashed), tasks, listeners.
-    param([Parameter(Mandatory)][string]$AIRoot, [string]$TaskPattern = 'LocalAI-*')
+    # The state right now, in the shape of a baseline: files (hashed; 'filesStopped' names where the
+    # walk ran out of budget, '' when it read everything), the routing settings of Stack\.env, tasks,
+    # listeners.
+    param([Parameter(Mandatory)][string]$AIRoot, [string]$TaskPattern = 'LocalAI-*', [hashtable]$Budget = $null)
+    if (-not $Budget) { $Budget = New-LaiIntegrityBudget }
+    $files = Get-LaiIntegrityFiles -AIRoot $AIRoot -Budget $Budget
     return @{
-        files     = (Get-LaiIntegrityFiles -AIRoot $AIRoot)
-        tasks     = (Get-LaiIntegrityTasks -NamePattern $TaskPattern)
-        listeners = (Get-LaiIntegrityListeners)
+        files        = $files
+        filesStopped = [string]$Budget['Stopped']
+        env          = (Get-LaiIntegrityEnv -AIRoot $AIRoot)
+        tasks        = (Get-LaiIntegrityTasks -NamePattern $TaskPattern)
+        listeners    = (Get-LaiIntegrityListeners)
     }
 }
 
@@ -843,24 +1059,110 @@ function Read-LaiIntegrityBaseline {
     return $b
 }
 
+function ConvertTo-LaiListenerBaseline {
+    # Pure (unit-tested). The listener rows a baseline keeps: Program, Port, Network, and Seen (when a
+    # baseline last found it listening).
+    #   -Current  what listens now (ConvertTo-LaiListenerSet): always kept, Seen = now.
+    #   -Known    the rows of the baseline this one replaces. Only with -Carry (an install or update)
+    #             is one that does not listen right now kept: a game, or a ComfyUI started for the
+    #             LAN, would otherwise be announced again after every update. It is kept for
+    #             -KeepDays after it was last seen and then forgotten, so the list of what counts as
+    #             normal cannot only ever grow. A row dated in the future, or not dated at all
+    #             (-KnownSeen: the date of its baseline, for rows from before rows had one), is not
+    #             carried. Without -Carry (the owner accepting the current state) the baseline is
+    #             exactly what listens now: what the owner switched off is no longer accepted.
+    # Ports from -DynamicPortFrom up are handed out by Windows anew at every start: one row per
+    # program with Port 0 stands for all of them, instead of one more row per port at every update.
+    # One of -WatchedPorts (the stack's own) keeps its number wherever it was put.
+    # Callers assign the result, never wrap the call in @().
+    param([object[]]$Current = @(), [object[]]$Known = @(), [switch]$Carry, [datetime]$Now = (Get-Date), [int]$KeepDays = 90, [int[]]$WatchedPorts = @(), [int]$DynamicPortFrom = 49152, [string]$KnownSeen = '')
+    $rows = @{}
+    $put = { param($Row, [string]$Seen)
+        $port = 0
+        if (-not ($Row -is [hashtable]) -or -not $Row['Program'] -or -not [int]::TryParse([string]$Row['Port'], [ref]$port)) { return }
+        if ($port -lt 0 -or ($port -ge $DynamicPortFrom -and $WatchedPorts -notcontains $port)) { $port = 0 }
+        $rowKey = '{0}|{1:D5}|{2}' -f ([string]$Row['Program']), $port, [bool]$Row['Network']
+        if (-not $rows.ContainsKey($rowKey)) { $rows[$rowKey] = @{ Program = [string]$Row['Program']; Port = $port; Network = [bool]$Row['Network']; Seen = $Seen } }
+    }
+    $nowText = $Now.ToString('s')
+    foreach ($r in $Current) { & $put $r $nowText }
+    if ($Carry) {
+        foreach ($r in $Known) {
+            if (-not ($r -is [hashtable])) { continue }
+            $seen = ConvertTo-LaiIntegrityDate $r['Seen']
+            if (-not $seen) { $seen = ConvertTo-LaiIntegrityDate $KnownSeen }
+            if (-not $seen -or $seen -gt $Now.AddDays(1) -or ($Now - $seen).TotalDays -gt $KeepDays) { continue }
+            $seenText = $seen.ToString('s')
+            & $put $r $seenText
+        }
+    }
+    return , @($rows.Keys | Sort-Object | ForEach-Object { $rows[$_] })
+}
+
+function Test-LaiIntegrityOwn {
+    # $true when a difference between the last baseline and the state after an install is the
+    # installer's own work, or takes nothing in: a file that now equals the installer's own copy
+    # (-SourceRoot: its files are copied to Scripts, those under its stack\ to Stack), a task it
+    # registers (-OwnTasks), a setting it writes (-OwnSettings), or something that is gone. $false
+    # for everything else: it was there before the run, or something else put it there, and the new
+    # baseline takes it in. A run started from <AIRoot>\Scripts itself copies no scripts, so nothing
+    # in Scripts is its own then.
+    param([Parameter(Mandatory)]$Difference, [Parameter(Mandatory)][hashtable]$Snapshot, [Parameter(Mandatory)][string]$AIRoot, [string]$SourceRoot = '', [string[]]$OwnTasks = @(), [string[]]$OwnSettings = @())
+    $kind, $name = ([string]$Difference.Id) -split '\|', 2
+    if ($kind -like '*-') { return $true }
+    if ($kind -eq 'task' -or $kind -eq 'task+') { return ($OwnTasks -contains $name) }
+    if ($kind -eq 'env' -or $kind -eq 'env+') { return ($OwnSettings -contains $name) }
+    if ($kind -ne 'file' -and $kind -ne 'file+') { return $false }
+    if (-not $SourceRoot -or -not ($Snapshot['files'] -is [hashtable])) { return $false }
+    # Only a file recorded by its SHA-256 can equal a copy (not a link, not one recorded by size).
+    $now = [string]$Snapshot['files'][$name]
+    $parts = @(([string]$name).Split('\'))
+    if ($now.Length -ne 64 -or $parts.Count -lt 2) { return $false }
+    $own = $SourceRoot
+    if ($parts[0] -eq 'Stack') { $own = Join-Path $own 'stack' }
+    elseif ($parts[0] -ne 'Scripts' -or $SourceRoot.TrimEnd('\', '/') -eq (Join-Path $AIRoot 'Scripts').TrimEnd('\', '/')) { return $false }
+    foreach ($seg in @($parts | Select-Object -Skip 1)) { $own = Join-Path $own $seg }
+    if (-not (Test-Path -LiteralPath $own -PathType Leaf)) { return $false }
+    try { return ([string](Get-FileHash -LiteralPath $own -Algorithm SHA256 -ErrorAction Stop).Hash -eq $now) } catch { return $false }
+}
+
 function Save-LaiIntegrityBaseline {
     # Records the state right now as the baseline and returns it. Called where an install or update
-    # ends successfully (so an update is never reported as a change) and by Watch-LocalAI.ps1
-    # -AcceptBaseline (the owner accepting changes they made). Files and tasks are replaced by what is
-    # there now. Listeners are added to the ones already known: a program that listened at an earlier
-    # baseline and is not running at this moment (a game, a ComfyUI started for the LAN) would
-    # otherwise be announced again after every update.
+    # ends successfully (-Reason 'install', so an update is never reported as a change) and by
+    # Watch-LocalAI.ps1 -AcceptBaseline (the owner accepting changes they made).
+    # A new baseline takes in whatever is there, also what nobody meant to put there: the installer
+    # overwrites its own files and registers its own tasks, and removes nothing else. So 'accepted'
+    # lists what this baseline has that the one before it did not, for the installer's log, the
+    # watch and the health check to show: for the owner's acceptance all of it, for an install only
+    # what the installer did not put there itself (Test-LaiIntegrityOwn; -SourceRoot, -OwnTasks and
+    # -OwnSettings say what it did).
+    # Listeners: ConvertTo-LaiListenerBaseline (an install carries known ones for a while, the
+    # owner's acceptance records exactly what listens now).
     # 'id' is what the watch remembers the baseline by: PowerShell 7 reads a saved time back as a
     # date and Windows PowerShell 5.1 as text, an id reads the same in both.
-    param([Parameter(Mandatory)][string]$AIRoot, [string]$Reason = 'install', [string]$TaskPattern = 'LocalAI-*')
+    param([Parameter(Mandatory)][string]$AIRoot, [string]$Reason = 'install', [string]$TaskPattern = 'LocalAI-*', [string]$SourceRoot = '', [string[]]$OwnTasks = @(), [string[]]$OwnSettings = @())
     $snap = Get-LaiIntegritySnapshot -AIRoot $AIRoot -TaskPattern $TaskPattern
     $old = Read-LaiIntegrityBaseline -AIRoot $AIRoot
-    if ($old -and $null -ne $old['listeners'] -and $null -ne $snap['listeners']) {
-        $have = @{}
-        foreach ($l in @($snap['listeners'])) { $have[('{0}|{1}|{2}' -f $l['Program'], $l['Port'], [bool]$l['Network'])] = $true }
-        $kept = @($old['listeners'] | Where-Object { $_ -is [hashtable] -and -not $have.ContainsKey(('{0}|{1}|{2}' -f $_['Program'], $_['Port'], [bool]$_['Network'])) })
-        $snap['listeners'] = @($snap['listeners']) + $kept
+    $ports = Get-LaiIntegrityPorts -AIRoot $AIRoot
+    $install = ($Reason -eq 'install')
+    $taken = @()
+    if ($old) {
+        # Every new file by its own name here (no 'N new files in ...'): each is judged on its own.
+        $taken = @(Compare-LaiIntegrity -Baseline $old -Current $snap -WatchedPorts $ports -MaxNewPerFolder ([int]::MaxValue))
+        if ($install) { $taken = @($taken | Where-Object { -not (Test-LaiIntegrityOwn -Difference $_ -Snapshot $snap -AIRoot $AIRoot -SourceRoot $SourceRoot -OwnTasks $OwnTasks -OwnSettings $OwnSettings) }) }
     }
+    if ($null -ne $snap['listeners']) {
+        $known = @(); $knownSeen = ''
+        if ($old -and $null -ne $old['listeners']) {
+            $known = @($old['listeners'])
+            $oldAt = ConvertTo-LaiIntegrityDate $old['recordedAt']
+            if ($oldAt) { $knownSeen = $oldAt.ToString('s') }
+        }
+        $snap['listeners'] = ConvertTo-LaiListenerBaseline -Current @($snap['listeners']) -Known $known -Carry:$install -WatchedPorts $ports -KnownSeen $knownSeen
+    }
+    # The first 50 by name (a notification shows three, the health check twelve), and how many in all.
+    $snap['accepted'] = @($taken | Select-Object -First 50 | ForEach-Object { @{ Id = [string]$_.Id; Text = [string]$_.Text } })
+    $snap['acceptedCount'] = $taken.Count
     $snap['version'] = 1
     $snap['id'] = [guid]::NewGuid().ToString('N')
     $snap['recordedAt'] = (Get-Date).ToString('s')
@@ -871,12 +1173,13 @@ function Save-LaiIntegrityBaseline {
 
 function Get-LaiIntegritySummary {
     # '61 files, 3 scheduled tasks, 24 listeners' for messages; says so when tasks or listeners could
-    # not be read where the baseline was recorded.
+    # not be read where the baseline was recorded, or when the folders held more than is read.
     param([Parameter(Mandatory)][hashtable]$Baseline)
     $files = 0; if ($Baseline['files'] -is [hashtable]) { $files = @($Baseline['files'].Keys).Count }
+    $more = ''; if ($Baseline['filesStopped']) { $more = ' (not all of them: the folders hold more than the watch reads)' }
     $tasks = 'scheduled tasks not read'; if ($Baseline['tasks'] -is [hashtable]) { $tasks = '{0} scheduled tasks' -f @($Baseline['tasks'].Keys).Count }
     $listeners = 'listeners not read'; if ($null -ne $Baseline['listeners']) { $listeners = '{0} listeners' -f @($Baseline['listeners']).Count }
-    return ('{0} files, {1}, {2}' -f $files, $tasks, $listeners)
+    return ('{0} files{1}, {2}, {3}' -f $files, $more, $tasks, $listeners)
 }
 
 function Format-LaiIntegrityList {
@@ -889,20 +1192,103 @@ function Format-LaiIntegrityList {
 }
 
 function Get-LaiUnfinishedInstall {
-    # The start time of the newest installer run that began after -Since (the time the baseline was
-    # recorded), else $null. Every run writes Logs\install-<yyyyMMdd-HHmmss>.log from its start and
-    # records a baseline only when it succeeds, so such a log means an install or update that is
-    # still waiting for a restart, or failed: its changes are an unfinished update, and the watch
-    # says that instead of reporting them as changes nobody asked for.
-    param([Parameter(Mandatory)][string]$AIRoot, [Parameter(Mandatory)][datetime]$Since)
+    # When the installer last finished one of its stages after -Since (the time the baseline was
+    # recorded), else $null. The installer stamps every finished stage into install-state.json and
+    # records a baseline only at the very end, so a stamp newer than the baseline means an install or
+    # update that got somewhere and then failed, or is waiting for a restart: file differences may be
+    # its half-done work. The watch adds that as one sentence to its notice and never lets it replace
+    # the warning: install-state.json is as writable as the baseline, so it may put a notice into
+    # context but must not explain one away. Hence also the limits: nothing dated in the future,
+    # nothing older than -MaxAgeHours. (An installer log proves no work: every run writes one, also
+    # a run that was refused because another one was going.)
+    param([Parameter(Mandatory)][string]$AIRoot, [Parameter(Mandatory)][datetime]$Since, [datetime]$Now = (Get-Date), [int]$MaxAgeHours = 48)
+    $stages = (Read-LaiState -Path (Join-Path $AIRoot 'install-state.json'))['stages']
+    if (-not ($stages -is [hashtable])) { return $null }
     $newest = $null
-    foreach ($f in @(Get-ChildItem -LiteralPath (Join-Path $AIRoot 'Logs') -Filter 'install-*.log' -File -ErrorAction SilentlyContinue)) {
-        if ($f.Name -notmatch '^install-(\d{8}-\d{6})\.log$') { continue }
-        $started = $null
-        try { $started = [datetime]::ParseExact($Matches[1], 'yyyyMMdd-HHmmss', [Globalization.CultureInfo]::InvariantCulture) } catch { continue }
-        if ($started -gt $Since -and (-not $newest -or $started -gt $newest)) { $newest = $started }
+    foreach ($v in @($stages.Values)) {
+        $t = ConvertTo-LaiIntegrityDate $v
+        if (-not $t -or $t -le $Since -or $t -gt $Now -or ($Now - $t).TotalHours -gt $MaxAgeHours) { continue }
+        if (-not $newest -or $t -gt $newest) { $newest = $t }
     }
     return $newest
+}
+
+function Select-LaiIntegrityNews {
+    # Pure (unit-tested). Which of -Diffs (Compare-LaiIntegrity) the watch announces now.
+    #   -Pending  the Ids seen on the last look and not told yet;
+    #   -Told     what was announced: Id, Key (the content it had then) and At.
+    # Never told: announced when the last look saw it too. Two strikes, so a file being saved or a
+    # port open for a minute raises nothing; and counted by Id, not by content, so a file that is
+    # rewritten between the two looks is still the same difference.
+    # Told before: quiet while its content is the one that was told. Changed again since: news
+    # again, but at most once in -QuietHours, so a file that is rewritten all day is one notice a
+    # day and not one every half hour.
+    param([object[]]$Diffs = @(), [object[]]$Told = @(), [string[]]$Pending = @(), [datetime]$Now = (Get-Date), [int]$QuietHours = 24)
+    $toldById = @{}; $waiting = @{}
+    foreach ($t in $Told) { if ($t -is [hashtable] -and $t['Id']) { $toldById[[string]$t['Id']] = $t } }
+    foreach ($p in $Pending) { if ($p) { $waiting[[string]$p] = $true } }
+    $out = New-Object System.Collections.Generic.List[object]
+    foreach ($d in $Diffs) {
+        if ($null -eq $d) { continue }
+        $id = [string]$d.Id
+        if (-not $toldById.ContainsKey($id)) { if ($waiting.ContainsKey($id)) { $out.Add($d) }; continue }
+        if ([string]$toldById[$id]['Key'] -eq [string]$d.Key) { continue }
+        $at = ConvertTo-LaiIntegrityDate $toldById[$id]['At']
+        if (-not $at -or [math]::Abs(($Now - $at).TotalHours) -ge $QuietHours) { $out.Add($d) }
+    }
+    return $out.ToArray()
+}
+
+function Update-LaiIntegrityTold {
+    # Pure (unit-tested). The 'told' list after -Announced went out (none: only tidied), cut to what
+    # is worth remembering: everything that is still found (-Diffs), however many, because one of
+    # those dropped from the list would be announced again on the next run, and the next, in turn;
+    # plus the -MaxStale most recently told ones that are not found right now (a program that
+    # listens only while it runs must not be news every time it is started).
+    param([object[]]$Told = @(), [object[]]$Announced = @(), [object[]]$Diffs = @(), [datetime]$Now = (Get-Date), [int]$MaxStale = 200)
+    $byId = [ordered]@{}
+    foreach ($t in $Told) {
+        if (-not ($t -is [hashtable]) -or -not $t['Id']) { continue }
+        $at = ConvertTo-LaiIntegrityDate $t['At']
+        $atText = ''; if ($at) { $atText = $at.ToString('s') }
+        $byId[[string]$t['Id']] = @{ Id = [string]$t['Id']; Key = [string]$t['Key']; At = $atText }
+    }
+    foreach ($a in $Announced) {
+        if ($null -eq $a) { continue }
+        $id = [string]$a.Id
+        # Told last = most recent: taken out and put back at the end.
+        if ($byId.Contains($id)) { $byId.Remove($id) }
+        $byId[$id] = @{ Id = $id; Key = [string]$a.Key; At = $Now.ToString('s') }
+    }
+    $found = @{}
+    foreach ($d in $Diffs) { if ($null -ne $d) { $found[[string]$d.Id] = $true } }
+    $keep = @($byId.Values | Where-Object { $found.ContainsKey($_['Id']) })
+    $stale = @($byId.Values | Where-Object { -not $found.ContainsKey($_['Id']) } | Select-Object -Last $MaxStale)
+    return @($stale + $keep)
+}
+
+function Get-LaiIntegrityAdvice {
+    # Pure (unit-tested). What to do about differences nobody meant to make, by their Ids: -Brief for
+    # the notification and the banner, else for the health check. The caller writes the 'If you did
+    # not ...' in front.
+    # A difference in the installed scripts, or a baseline that is gone, means nothing in
+    # <AIRoot>\Scripts can be trusted to report on itself or to repair itself: every Local AI
+    # shortcut starts a script from there, and Update toolkit goes on to ask for administrator
+    # rights, which would hand them to whatever replaced Get-LocalAI.ps1. So no shortcut is named
+    # then: the list is in watch.log, and the files come back from a fresh copy of the toolkit.
+    # Otherwise the shortcuts are fine, but Update toolkit is no undo: it puts the toolkit's own
+    # files and its three tasks back and records everything else it finds as the new baseline, so
+    # what was added has to be removed first.
+    param([string[]]$Ids = @(), [Parameter(Mandatory)][string]$AIRoot, [switch]$Brief)
+    $root = $AIRoot.TrimEnd('\', '/')
+    $fresh = 'a fresh copy of the toolkit (the one-line install command in its README, or a new download)'
+    $scripts = @($Ids | Where-Object { $_ -match '^(files?[+-]?\|Scripts(\\|$)|walk\|Scripts$|more\|Scripts$|baseline\|)' }).Count -gt 0
+    if ($scripts) {
+        if ($Brief) { return ('do not use the Local AI shortcuts to look into it (they start the installed scripts, which may no longer be the toolkit''s own): the list is in "{0}\Logs\watch.log", and {1} puts the files back.' -f $root, $fresh) }
+        return ('do not repair this with Update toolkit or any other Local AI shortcut: the scripts in "{0}\Scripts" may no longer be the toolkit''s own, the shortcuts start them, and Update toolkit then asks for administrator rights. Delete what was added, get {1} and run its installer: that puts the toolkit''s own files and its three scheduled tasks back, and records everything else it finds as the new baseline.' -f $root, $fresh)
+    }
+    if ($Brief) { return 'open Start menu > Local AI - Health check: it lists every change and what to do about it.' }
+    return ('first remove what was added (new files from "{0}\Stack", new tasks in Task Scheduler > Task Scheduler Library; Start menu > Local AI - Security check lists every program that listens), then run Start menu > Local AI - Update toolkit. In that order: Update toolkit puts the toolkit''s own files and its three scheduled tasks back, and records everything else it finds as the new baseline.' -f $root)
 }
 
 #endregion

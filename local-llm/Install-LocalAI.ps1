@@ -1987,9 +1987,17 @@ if ($State.flags.ContainsKey('resumeFailures')) { [void]$State.flags.Remove('res
 # baseline that cannot be written is a warning: it must not fail an install that worked. The file
 # sits in the install folder, which the user can write: it catches accidents, other software and
 # clumsy tampering, not someone who runs as the user and rewrites it.
+# A baseline takes in whatever is there, and this run removed nothing it did not install: a file
+# added to Scripts or Stack, a kept settings.yml that was changed, another LocalAI-* task, a new
+# program listening. So the run says what it is about to make 'normal' that it did not put there
+# itself (not its own copies from $SourceRoot, not the three tasks and the two .env settings it
+# writes): one WARN line each here, and the health watch names them once in a notification.
 try {
-    $integrityBaseline = Save-LaiIntegrityBaseline -AIRoot $AIRoot -Reason 'install'
+    $integrityBaseline = Save-LaiIntegrityBaseline -AIRoot $AIRoot -Reason 'install' -SourceRoot $SourceRoot -OwnTasks @($BackupTask, $WatchTask, $RecheckTask) -OwnSettings @('OLLAMA_BASE_URL', 'DEEP_RESEARCH_OLLAMA_URL')
     Write-LaiLog OK "Integrity baseline recorded: $(Get-LaiIntegritySummary -Baseline $integrityBaseline). The health watch tells you when they change outside an update (Watch-LocalAI.ps1 -AcceptBaseline accepts changes you made yourself)."
+    $integrityKept = @($integrityBaseline['accepted'] | Where-Object { $_ -is [hashtable] } | ForEach-Object { [string]$_['Text'] })
+    foreach ($kept in @($integrityKept | Select-Object -First 20)) { Write-LaiLog WARN "Kept, although this run did not install it, and from now on counted as normal: $kept. If you did not add it, remove it." }
+    if ([int]$integrityBaseline['acceptedCount'] -gt 20) { Write-LaiLog WARN ('...and {0} more of that kind; Start menu > Local AI - Health check lists them.' -f ([int]$integrityBaseline['acceptedCount'] - 20)) }
 } catch { Write-LaiLog WARN "The integrity baseline could not be recorded ($($_.Exception.Message)): the health watch may report what this run installed as changed. Watch-LocalAI.ps1 -AcceptBaseline records it." }
 $rows = foreach ($m in ($Catalog.Models | Sort-Object { $_.Order })) {
     $t = $State.tuning[$m.Key]
