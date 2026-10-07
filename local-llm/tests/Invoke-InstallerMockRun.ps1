@@ -214,6 +214,43 @@ Assert-That ($global:Tasks['LocalAI-Install-Resume'] -match "-Resume" -and $glob
 Assert-That (@($global:Calls | Where-Object { $_ -like 'shutdown /r /t 60*' }).Count -eq 1) 'reboot scheduled with 60 s warning'
 Assert-That ($null -ne $state.stages.Tuning -and $null -eq $state.stages.WSL) 'stages up to Tuning done, WSL pending'
 Assert-That (Test-Path (Join-Path $aiRoot 'Scripts/lib/LocalAI.psm1')) 'scripts copied to AI\Scripts'
+# The rules for an AI agent opened in the install folder (config\agent-rules.md): a first install places
+# the template as AI\CLAUDE.md, byte for byte, and its log says that it was placed.
+$agentFile = Join-Path $aiRoot 'CLAUDE.md'
+$agentTemplate = Join-Path (Join-Path $src 'config') 'agent-rules.md'
+$agentLog1 = (@(Get-ChildItem (Join-Path $aiRoot 'Logs') -Filter 'install-*.log') | ForEach-Object { Get-Content -Raw -Encoding UTF8 -LiteralPath $_.FullName }) -join "`n"
+Assert-That ((Test-Path -LiteralPath $agentFile -PathType Leaf) -and (Get-FileHash -LiteralPath $agentFile).Hash -eq (Get-FileHash -LiteralPath $agentTemplate).Hash) 'a fresh install places config\agent-rules.md as AI\CLAUDE.md, byte for byte'
+Assert-That ($agentLog1 -match 'Rules for an AI agent opened in this folder placed' -and $agentLog1 -notmatch 'already exists: left as it is') 'the install log says the rules file was placed (and not that one was already there)'
+Assert-That (Test-Path -LiteralPath (Join-Path (Join-Path $aiRoot 'Scripts') 'config/agent-rules.md')) 'the template travels to AI\Scripts\config with the other config files (the toolkit copy)'
+# But under another name: an agent that reads a file in a subfolder loads a CLAUDE.md there as rules
+# too, and the owner can neither edit the copy in Scripts (read-only, replaced by every update) nor
+# remove it. The only CLAUDE.md the installer creates is the owner's, in the install folder.
+$agentStray = @(Get-ChildItem -LiteralPath (Join-Path $aiRoot 'Scripts') -Recurse -File -Force | Where-Object { $_.Name -ieq 'CLAUDE.md' } | ForEach-Object { $_.FullName })
+Assert-That ($agentStray.Count -eq 0) "no CLAUDE.md in the toolkit copy in AI\Scripts: only the one in the install folder is read as rules ($($agentStray -join ', '))"
+$agentStrayRepo = @(Get-ChildItem -LiteralPath (Join-Path $src 'config') -Recurse -File -Force | Where-Object { $_.Name -ieq 'CLAUDE.md' } | ForEach-Object { $_.FullName })
+Assert-That ($agentStrayRepo.Count -eq 0) "no CLAUDE.md in the toolkit's config folder either: a session that reads config\models.psd1 would load it ($($agentStrayRepo -join ', '))"
+# The template itself: what the agent is told must stay true of this toolkit.
+$agentText = Get-Content -Raw -Encoding UTF8 -LiteralPath $agentTemplate
+Assert-That ($agentText -cnotmatch '[^\x00-\x7F]') 'the rules template is ASCII only'
+$agentSections = @('## Never', '## Fine without asking', '## Ask first', '## Reporting', '## Where things are')
+$agentMissing = @($agentSections | Where-Object { $agentText -notmatch ('(?m)^' + [regex]::Escape($_) + '\s*$') })
+Assert-That ($agentMissing.Count -eq 0) "the rules template has all five sections ($($agentMissing -join ', ') missing)"
+$agentNever = [regex]::Match($agentText, '(?s)## Never(.*?)## Fine without asking').Groups[1].Value
+$agentNotNever = @('Reset-Sandbox.ps1', 'Invoke-AllTests.ps1', 'docker rm', 'docker volume rm', 'docker compose down -v', 'docker system prune', 'Uninstall-LocalAI.ps1', 'Restore-OpenWebUI.ps1', 'Backups', 'Secrets') | Where-Object { $agentNever -notmatch [regex]::Escape($_) }
+Assert-That (@($agentNotNever).Count -eq 0) "everything destructive is under Never ($(@($agentNotNever) -join ', ') missing)"
+$agentFine = [regex]::Match($agentText, '(?s)## Fine without asking(.*?)## Ask first').Groups[1].Value
+$agentNotFine = @('Test-LocalAI.ps1 -Quick', 'Test-PCSecurity.ps1', 'install-report.md', 'localai-config.json', 'docker ps', 'docker logs --tail 100', 'nvidia-smi', 'ollama ps', 'ollama list') | Where-Object { $agentFine -notmatch [regex]::Escape($_) }
+Assert-That (@($agentNotFine).Count -eq 0) "the read-only checks are under Fine without asking ($(@($agentNotFine) -join ', ') missing)"
+# Every script it names exists in this toolkit (a renamed script would leave the agent a dead rule).
+$agentNamed = @([regex]::Matches($agentText, '[A-Za-z][A-Za-z0-9-]*\.ps1') | ForEach-Object { $_.Value } | Select-Object -Unique)
+$agentUnknown = @($agentNamed | Where-Object { -not (Test-Path -LiteralPath (Join-Path $src $_)) -and -not (Test-Path -LiteralPath (Join-Path (Join-Path $src 'tests') $_)) })
+Assert-That ($agentNamed.Count -ge 9 -and $agentUnknown.Count -eq 0) "every script the rules name exists in the toolkit ($($agentNamed.Count) named; unknown: $($agentUnknown -join ', '))"
+# An install in another folder (-AIRoot): the scripts the agent may run default to C:\AI, so the rules
+# must tell it to pass the folder on. Each script the note lists really takes -AIRoot.
+$agentIntro = [regex]::Match($agentText, '(?s)^(.*?)## Never').Groups[1].Value
+$agentRootScripts = @('Test-LocalAI.ps1', 'Test-PCSecurity.ps1', 'Start-LocalAI.ps1', 'Stop-LocalAI.ps1')
+$agentRootBad = @($agentRootScripts | Where-Object { $agentIntro -notmatch [regex]::Escape($_) -or (Get-Content -Raw -Encoding UTF8 -LiteralPath (Join-Path $src $_)) -cnotmatch '\[string\]\$AIRoot\s*=' })
+Assert-That ($agentIntro -match [regex]::Escape('-AIRoot <that folder>') -and $agentRootBad.Count -eq 0) "the rules tell the agent to pass -AIRoot to the scripts when the install is elsewhere (not covered: $($agentRootBad -join ', '))"
 
 # ---- phase 2: resume after "reboot" ----------------------------------------------------------
 # ---- phase 1b: the (non-elevated) resume task at sign-in asks for admin rights --------------
@@ -322,6 +359,7 @@ Assert-That (@($global:Calls | Where-Object { $_ -like ('icacls ' + (Join-Path $
 $elevated = Join-Path $env:ProgramFiles 'LocalAI'
 Assert-That ((Test-Path (Join-Path $elevated 'Install-LocalAI.ps1')) -and (Test-Path (Join-Path $elevated 'lib/LocalAI.psm1'))) 'resume copy of the toolkit in Program Files\LocalAI'
 Assert-That (@($global:Calls | Where-Object { $_ -like ('icacls ' + $elevated + ' /inheritance:r /grant:r *' + $userSid + ':(OI)(CI)RX *') }).Count -ge 1) 'that copy is read-only for the user'
+Assert-That (@(Get-ChildItem -LiteralPath $elevated -Recurse -File -Force | Where-Object { $_.Name -ieq 'CLAUDE.md' }).Count -eq 0) 'and holds no CLAUDE.md (an agent reading a file there would load it as rules)'
 Assert-That ([string]$global:TaskPrincipals['LocalAI-Backup-OpenWebUI'] -match 'Limited' -and [string]$global:TaskPrincipals['LocalAI-Backup-OpenWebUI'] -notmatch 'Highest') 'nightly backup task runs non-elevated'
 # Windows Terminal (Windows 11's default console) shows a window despite -WindowStyle Hidden, and
 # closing it kills the run: both tasks go through conhost --headless.
@@ -365,6 +403,11 @@ $stG.flags.guardHash = 'hash-of-an-older-version'
 # As after a first install that stopped before its end screen: the password it made is still to be shown.
 $stG.flags | Add-Member -NotePropertyName adminPasswordToShow -NotePropertyValue $true -Force
 $stG | ConvertTo-Json -Depth 20 | Set-Content (Join-Path $aiRoot 'install-state.json')
+# The owner edited the rules file the first install placed (CRLF on purpose: nothing may normalise it).
+# The re-run must neither restore the template nor merge into the file.
+$ownerRules = "# Rules of my own`r`nAnswer in French.`r`n"
+[System.IO.File]::WriteAllText($agentFile, $ownerRules, (New-Object System.Text.UTF8Encoding($false)))
+$ownerRulesHash = (Get-FileHash -LiteralPath $agentFile).Hash
 $sw = [Diagnostics.Stopwatch]::StartNew()
 # One optional step fails (a rejected knowledge collection): a warning in the report, not a failed install.
 $env:LOCALAI_TEST_KNOWLEDGE_FAIL = 'PC & Electronics'
@@ -406,6 +449,8 @@ Assert-That (@((Get-Content -Encoding UTF8 -Raw (Join-Path $aiRoot 'install-stat
 $p3Log = Get-Content -Raw (Get-ChildItem (Join-Path $aiRoot 'Logs') -Filter 'install-*.log' | Sort-Object LastWriteTime | Select-Object -Last 1).FullName  # lai-ok: objects
 Assert-That ($p3Log -match 'Official: missing tag is not set up: it failed before' -and $p3Log -notmatch 'Downloading testorg/official-does-not-exist') 'a re-run does not try the failed official model again, and says how to'
 Assert-That (@((Get-Content -Encoding UTF8 -Raw (Join-Path $aiRoot 'install-state.json') | ConvertFrom-Json).flags.selectedModels) -contains 'official-ok') 're-run keeps the official model'
+Assert-That ((Get-FileHash -LiteralPath $agentFile).Hash -eq $ownerRulesHash -and [System.IO.File]::ReadAllText($agentFile) -ceq $ownerRules) 're-run leaves a rules file the owner edited byte for byte as it is (not restored from the template, not merged)'
+Assert-That ($p3Log -match 'already exists: left as it is' -and $p3Log -notmatch 'Rules for an AI agent opened in this folder placed') 'and the re-run log says it was left, not placed'
 
 # ---- phase 4: drop the trial again ---------------------------------------------------------------
 Write-Host "`n=== PHASE 4: re-run with -TrialModels none ===" -ForegroundColor Cyan
@@ -702,6 +747,32 @@ $ow7e = (& /usr/bin/docker inspect -f '{{.State.Status}}|{{.HostConfig.RestartPo
 Assert-That ($c7e -ne 0 -and $log7e -match 'A container named searxng from another setup' -and $log7e -match 'No container was changed') "a 'searxng' container of another setup: stops before changing anything (exit $c7e)"
 Assert-That ($ow7e -eq 'running|always' -and @(& /usr/bin/docker ps -a --filter 'name=^/open-webui-legacy-' --format '{{.Names}}').Count -eq $legacy7e) "the existing Open WebUI keeps running under its name, restart=always ($ow7e)"
 & /usr/bin/docker rm -f searxng open-webui 2>$null | Out-Null
+
+Write-Host "`n=== PHASE 7f: a rules file for an AI agent: one there before the first install, then none on an update ===" -ForegroundColor Cyan
+# A folder that already holds a CLAUDE.md of the owner's before the installer has ever run there: no
+# install state at all, so nothing but the file itself can tell the installer to leave it. The run
+# stops at the first stage after Preflight (where the file is handled), so the stack is not touched.
+$ai3 = Join-Path $Work 'AI-rules'
+$theirRulesFile = Join-Path $ai3 'CLAUDE.md'
+New-Item -ItemType Directory -Force -Path $ai3 | Out-Null
+$theirRules = "# Notes of the owner`r`nThis file was here before the toolkit.`r`n"
+[System.IO.File]::WriteAllText($theirRulesFile, $theirRules, (New-Object System.Text.UTF8Encoding($false)))
+$theirRulesHash = (Get-FileHash -LiteralPath $theirRulesFile).Hash
+$env:LOCALAI_TEST_FAIL_STAGE = 'Ollama'
+& (Join-Path $aiRoot 'Scripts/Install-LocalAI.ps1') -AIRoot $ai3 -SkipTests -TrialModels none
+$env:LOCALAI_TEST_FAIL_STAGE = ''
+$log7f = (@(Get-ChildItem -LiteralPath (Join-Path $ai3 'Logs') -Filter 'install-*.log' -ErrorAction SilentlyContinue) | ForEach-Object { Get-Content -Raw -Encoding UTF8 -LiteralPath $_.FullName }) -join "`n"
+Assert-That ($log7f -match '=+ Preflight =+' -and $log7f -match 'Test hook: stage Ollama failed' -and (Test-Path -LiteralPath (Join-Path $ai3 'Scripts/Install-LocalAI.ps1'))) 'the first run in a new folder went through Preflight and stopped at the Ollama stage'
+Assert-That ((Get-FileHash -LiteralPath $theirRulesFile).Hash -eq $theirRulesHash -and [System.IO.File]::ReadAllText($theirRulesFile) -ceq $theirRules) 'a CLAUDE.md that was there before the first install is not replaced (byte for byte)'
+Assert-That ($log7f -match 'already exists: left as it is' -and $log7f -notmatch 'Rules for an AI agent opened in this folder placed') 'and the log says it was left, not placed'
+# An install made before the installer placed this file has none: the update places it.
+Remove-Item -LiteralPath $agentFile -Force
+$env:LOCALAI_TEST_FAIL_STAGE = 'Ollama'
+& (Join-Path $aiRoot 'Scripts/Install-LocalAI.ps1') -AIRoot $aiRoot -SkipTests -TrialModels none
+$env:LOCALAI_TEST_FAIL_STAGE = ''
+$log7fb = Get-NewestLog
+Assert-That ((Test-Path -LiteralPath $agentFile -PathType Leaf) -and (Get-FileHash -LiteralPath $agentFile).Hash -eq (Get-FileHash -LiteralPath $agentTemplate).Hash) 'an update of an install without the file places the template, byte for byte'
+Assert-That ($log7fb -match 'Rules for an AI agent opened in this folder placed' -and $log7fb -notmatch 'already exists: left as it is') 'and the log says it was placed'
 
 Write-Host "`n=== PHASE 8: -DeepResearch (Local Deep Research), then -NoDeepResearch ===" -ForegroundColor Cyan
 # compose is mocked: a real Local Deep Research container stands in for the one compose would start
