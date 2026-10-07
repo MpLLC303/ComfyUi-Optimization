@@ -207,9 +207,11 @@ if ($AcceptBaseline) {
     foreach ($t in $tookShown) { Write-LaiLog INFO "accepted: $t" }
     if ($tookCount -gt $tookShown.Count) { Write-LaiLog INFO ('accepted: and {0} more' -f ($tookCount - $tookShown.Count)) }
     # The watch starts over with the new baseline: what it found against the old one is settled.
-    # Whether the owner knows of this acceptance is not: nothing is marked as said here, so the next
-    # scheduled run names what was accepted in a notification. Anything running as this user can
-    # start this script; the notification is what makes an acceptance the owner did not make visible.
+    # Whether the owner knows of this acceptance is not: nothing is marked as said or tried here, so
+    # the next scheduled run names what was accepted in a notification. Anything running as this user
+    # can start this script; the notification is what makes an acceptance the owner did not make
+    # visible. Running it again, or an update, before that run does not empty the list: what this
+    # acceptance settled stays in it until the watch has had its turn (Save-LaiIntegrityBaseline).
     $st = Read-LaiState -Path $statePath
     $st['integrity'] = @{ baseline = [string]$new['id'] }
     Save-LaiState -State $st -Path $statePath
@@ -466,6 +468,8 @@ if ($ollamaVer -and $recheckKey -and [string]$recheck['ollamaVersion'] -eq $olla
 # What the watch keeps about it (watch-state.json, 'integrity'):
 #   baseline      the id of the baseline all of this belongs to (another id: start over)
 #   announced     the id of the baseline whose own additions the owner was told about
+#   tried         the id of the baseline whose own additions were written to watch.log and put in a
+#                 notification, whether or not that went out (Save-LaiIntegrityBaseline reads both)
 #   checkedAt     the last finished comparison
 #   startedAt     set while one runs; still there afterwards when it was ended before it finished
 #   found         the differences of the last comparison (Id, Key, Text; the first 300 and one line
@@ -533,6 +537,10 @@ try {
                     $text = "The baseline$of was recorded by hand (Watch-LocalAI.ps1 -AcceptBaseline), so $takenCount change(s) now count as normal: $list. If that was not you, $advice"
                 }
                 Write-WatchLog ('{0} INTEGRITY the baseline{1} took in {2}: {3}' -f (Get-Date -Format 's'), $of, $takenCount, (Format-LaiIntegrityList -Items $takenText -Max 20))
+                # The watch has had its turn with this baseline, whether or not the toast goes out:
+                # the next baseline no longer lists what an acceptance had settled (it waits for
+                # that, and must not wait for good on a PC where no toast ever goes out).
+                $next['tried'] = $baseId
                 # A toast that failed is tried again on the next run.
                 if (Send-Notification $title $text) { $next['announced'] = $baseId }
             }
@@ -571,16 +579,27 @@ try {
                 # Under the baseline this run compares with: a mark left in the record of the one before
                 # it (the first comparison after an install, an update or -AcceptBaseline) would be
                 # dropped by the next run together with that record, and the comparison started again.
-                if ([string]$markIg['baseline'] -ne $baseId) {
-                    $markIg = @{ baseline = $baseId }
-                    if ($next['announced']) { $markIg['announced'] = $next['announced'] }
-                }
+                if ([string]$markIg['baseline'] -ne $baseId) { $markIg = @{ baseline = $baseId } }
+                # What this run has just said about that baseline, or tried to, goes into the mark in
+                # either case. After -AcceptBaseline the record on disk already carries the new id and
+                # nothing else: a run ended here would otherwise leave no word of its notification,
+                # and the next run would send the same one again.
+                foreach ($k in @('announced', 'tried')) { if ($next[$k]) { $markIg[$k] = $next[$k] } }
                 $markIg['startedAt'] = $startedNow
-                $mark['integrity'] = $markIg
-                Save-LaiState -State $mark -Path $statePath
                 # Test hook (tests/Invoke-WatchTest.ps1): the run ends here, with the mark written and
                 # nothing compared yet, as when Task Scheduler ends it in the middle of a comparison.
-                if ($env:LOCALAI_TEST_INTEGRITY_END) { exit 0 }
+                # An environment variable can be set for good by any program running as this user, so
+                # the hook is no switch: it works only while its value is the id of the baseline being
+                # compared (the next install, update or -AcceptBaseline ends it), and the mark says
+                # what ended the run, for watch.log, the health check and the notice after
+                # $integritySkipHours hours.
+                $hookWhy = 'the environment variable LOCALAI_TEST_INTEGRITY_END (a test hook) is set and ends the comparison before anything is compared; remove that variable'
+                $endHere = ($env:LOCALAI_TEST_INTEGRITY_END -and [string]$env:LOCALAI_TEST_INTEGRITY_END -eq $baseId)
+                if ($endHere) { $markIg['skippedWhy'] = $hookWhy }
+                elseif ([string]$markIg['skippedWhy'] -eq $hookWhy) { $markIg.Remove('skippedWhy') }
+                $mark['integrity'] = $markIg
+                Save-LaiState -State $mark -Path $statePath
+                if ($endHere) { exit 0 }
 
                 $since = $null; $notRead = @()
                 if ($baseline) {
