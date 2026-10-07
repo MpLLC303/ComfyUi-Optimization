@@ -1180,20 +1180,45 @@ function Save-LaiIntegrityBaseline {
     # What the baseline before this one took in is carried on for as long as nobody has settled it
     # and it is still so (Test-LaiIntegrityStill): without that a second update minutes after the
     # first, or the acceptance command run twice, would record an empty list, and the addition would
-    # drop out of every report with nobody having looked. Settled means the owner accepted it: an
-    # install does not carry what a by-hand baseline listed once the watch has announced that
-    # baseline, and a by-hand baseline does not carry what the watch has announced. One install
-    # after another always carries (minus what the installer has since put there itself).
+    # drop out of every report with nobody having looked. Settled means the owner accepted it:
+    #   - One install after another always carries (minus what the installer has since put there
+    #     itself).
+    #   - A baseline recorded by hand settles what an install listed. It names that once more,
+    #     marked 'Settled' (the acceptance says what it accepted, and the watch's notice of it names
+    #     it), and no baseline after it carries it. That does not wait for the watch: on a PC where
+    #     no notification ever goes out nothing would be settled, and every acceptance and every
+    #     update would list the same things again. Not named again when the watch has already
+    #     announced that install's list.
+    #   - What a baseline recorded by hand took in itself is carried by the next one, of either
+    #     kind, until the watch has announced that baseline: anything running as the owner can
+    #     record one, and the watch's notice is what shows an acceptance the owner did not make.
+    # What the watch has announced is read from watch-state.json, which the watch replaces every
+    # few minutes. A read that fails counts as 'not announced', which carries (the safe side); it
+    # must not keep the baseline from being recorded, or the watch would report the whole update.
+    # 'The rest was not compared' (a walk that stopped) is carried without asking whether it is
+    # still so: it names no single thing that could be gone again, and stays true of every
+    # baseline recorded since.
+    # 'accepted' names all of it, up to -MaxListed: a list cut to what the reports show (a
+    # notification three, the health check twelve; they cut for themselves) lost the rest at the
+    # next carry. What does not fit, and what a baseline counted without naming it (one recorded
+    # when the list was cut at 50), is one last entry 'more|Scripts' or 'more|other', as
+    # Limit-LaiIntegrityFound makes it ('Scripts' also when nothing says what it stands for), and
+    # stays in 'acceptedCount'. Nobody can tell whether that is still there, so that number does
+    # not go down until the owner's acceptance settles it.
     # Listeners: ConvertTo-LaiListenerBaseline (an install carries known ones for a while, the
     # owner's acceptance records exactly what listens now).
     # 'id' is what the watch remembers the baseline by: PowerShell 7 reads a saved time back as a
     # date and Windows PowerShell 5.1 as text, an id reads the same in both.
-    param([Parameter(Mandatory)][string]$AIRoot, [string]$Reason = 'install', [string]$TaskPattern = 'LocalAI-*', [string]$SourceRoot = '', [string[]]$OwnTasks = @(), [string[]]$OwnSettings = @())
-    $snap = Get-LaiIntegritySnapshot -AIRoot $AIRoot -TaskPattern $TaskPattern
+    # -Budget as for Get-LaiIntegritySnapshot.
+    param([Parameter(Mandatory)][string]$AIRoot, [string]$Reason = 'install', [string]$TaskPattern = 'LocalAI-*', [string]$SourceRoot = '', [string[]]$OwnTasks = @(), [string[]]$OwnSettings = @(), [hashtable]$Budget = $null, [int]$MaxListed = 1000)
+    $snap = Get-LaiIntegritySnapshot -AIRoot $AIRoot -TaskPattern $TaskPattern -Budget $Budget
     $old = Read-LaiIntegrityBaseline -AIRoot $AIRoot
     $ports = Get-LaiIntegrityPorts -AIRoot $AIRoot
     $install = ($Reason -eq 'install')
     $taken = @()
+    # $settled: the Ids listed here only because this acceptance settles them. $unnamed: how many
+    # this baseline carries without a name; $restScripts: an installed script may be among those.
+    $settles = $false; $settled = @{}; $unnamed = 0; $restScripts = $false
     if ($old) {
         # Every new file by its own name here (no 'N new files in ...'): each is judged on its own.
         $taken = @(Compare-LaiIntegrity -Baseline $old -Current $snap -WatchedPorts $ports -MaxNewPerFolder ([int]::MaxValue))
@@ -1201,22 +1226,37 @@ function Save-LaiIntegrityBaseline {
     }
     if ($old) {
         $oldAccepted = @($old['accepted'] | Where-Object { $_ -is [hashtable] -and $_['Id'] })
+        $oldNamed = @($oldAccepted | Where-Object { [string]$_['Id'] -notlike 'more|*' })
+        $oldMore = @($oldAccepted | Where-Object { [string]$_['Id'] -like 'more|*' })
+        # The file can be edited by hand: a count that is no number is none.
+        $oldCount = 0
+        if (-not [int]::TryParse([string]$old['acceptedCount'], [ref]$oldCount)) { $oldCount = 0 }
+        $oldUnnamed = [math]::Max(0, $oldCount - $oldNamed.Count)
         $announced = ''
-        $watchIg = (Read-LaiState -Path (Join-Path $AIRoot 'watch-state.json'))['integrity']
-        if ($watchIg -is [hashtable]) { $announced = [string]$watchIg['announced'] }
-        $bothInstalls = ($install -and [string]$old['reason'] -eq 'install')
-        if ($oldAccepted.Count -and ($bothInstalls -or $announced -ne [string]$old['id'])) {
+        try {
+            $watchIg = (Read-LaiState -Path (Join-Path $AIRoot 'watch-state.json'))['integrity']
+            if ($watchIg -is [hashtable]) { $announced = [string]$watchIg['announced'] }
+        } catch { Write-Verbose "watch-state.json could not be read, so the baseline before this one counts as not announced: $($_.Exception.Message)" }
+        $oldInstall = ([string]$old['reason'] -eq 'install')
+        $settles = ($oldInstall -and -not $install)
+        if (($oldNamed.Count -or $oldUnnamed) -and (($install -and $oldInstall) -or $announced -ne [string]$old['id'])) {
             # 'is new' and 'was changed' are about the same thing: listed once.
             $have = @{}
             foreach ($d in $taken) { $have[([string]$d.Id -replace '^([a-z]+)\+\|', '$1|')] = $true }
-            foreach ($a in $oldAccepted) {
+            foreach ($a in $oldNamed) {
+                if ($a['Settled']) { continue }
                 $d = [pscustomobject]@{ Id = [string]$a['Id']; Key = [string]$a['Id']; Text = [string]$a['Text'] }
                 $same = $d.Id -replace '^([a-z]+)\+\|', '$1|'
                 if ($have.ContainsKey($same)) { continue }
-                if (-not (Test-LaiIntegrityStill -Id $d.Id -Snapshot $snap)) { continue }
+                if ($d.Id -notlike 'walk|*' -and -not (Test-LaiIntegrityStill -Id $d.Id -Snapshot $snap)) { continue }
                 if ($install -and (Test-LaiIntegrityOwn -Difference $d -Snapshot $snap -AIRoot $AIRoot -SourceRoot $SourceRoot -OwnTasks $OwnTasks -OwnSettings $OwnSettings)) { continue }
                 $have[$same] = $true
+                if ($settles) { $settled[$d.Id] = $true }
                 $taken += $d
+            }
+            if ($oldUnnamed -and @($oldMore | Where-Object { $_['Settled'] }).Count -eq 0) {
+                $unnamed = $oldUnnamed
+                $restScripts = ($oldMore.Count -eq 0 -or @($oldMore | Where-Object { [string]$_['Id'] -eq 'more|Scripts' }).Count -gt 0)
             }
         }
     }
@@ -1229,9 +1269,34 @@ function Save-LaiIntegrityBaseline {
         }
         $snap['listeners'] = ConvertTo-LaiListenerBaseline -Current @($snap['listeners']) -Known $known -Carry:$install -WatchedPorts $ports -KnownSeen $knownSeen
     }
-    # The first 50 by name (a notification shows three, the health check twelve), and how many in all.
-    $snap['accepted'] = @($taken | Select-Object -First 50 | ForEach-Object { @{ Id = [string]$_.Id; Text = [string]$_.Text } })
-    $snap['acceptedCount'] = $taken.Count
+    $listed = @($taken); $cut = @()
+    if ($taken.Count -gt $MaxListed) {
+        # The first -MaxListed in the order of Limit-LaiIntegrityFound (settings, tasks and listeners
+        # are never the ones cut); its last entry says whether a script is among the rest.
+        $limited = @(Limit-LaiIntegrityFound -Diffs $taken -Max $MaxListed)
+        if ([string]$limited[-1].Id -eq 'more|Scripts') { $restScripts = $true }
+        $listed = @($limited | Select-Object -First $MaxListed)
+        $shown = @{}
+        foreach ($d in $listed) { $shown[[string]$d.Id] = $true }
+        $cut = @($taken | Where-Object { -not $shown.ContainsKey([string]$_.Id) })
+    }
+    $accepted = @($listed | ForEach-Object {
+            $entry = @{ Id = [string]$_.Id; Text = [string]$_.Text }
+            if ($settled.ContainsKey([string]$_.Id)) { $entry['Settled'] = $true }
+            $entry
+        })
+    $rest = $unnamed + $cut.Count
+    if ($rest -gt 0) {
+        $place = 'other'; if ($restScripts) { $place = 'Scripts' }
+        $more = @{ Id = "more|$place"; Text = ('{0} more than are listed here' -f $rest) }
+        # Settled as well when this acceptance settles all it stands for: what is carried without a
+        # name always is, what did not fit only where the acceptance did not take it in itself.
+        if ($settles -and @($cut | Where-Object { -not $settled.ContainsKey([string]$_.Id) }).Count -eq 0) { $more['Settled'] = $true }
+        $accepted += $more
+    }
+    # By name, and how many in all (more than the names when one entry stands for the rest).
+    $snap['accepted'] = $accepted
+    $snap['acceptedCount'] = $listed.Count + $rest
     $snap['version'] = 1
     $snap['id'] = [guid]::NewGuid().ToString('N')
     $snap['recordedAt'] = (Get-Date).ToString('s')

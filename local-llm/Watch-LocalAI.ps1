@@ -197,12 +197,15 @@ if ($PauseMinutes -gt 0 -or $Unpause) {
 
 # ---- accept the current state as the integrity baseline ---------------------------------------
 if ($AcceptBaseline) {
-    # The new baseline lists what it took in (everything that differed from the one before).
+    # The new baseline lists what it took in (everything that differed from the one before, and what
+    # an update had kept: accepting is what settles that). By name here the first 50; an entry that
+    # stands for what the baseline does not name ('more|...') is part of the count.
     $new = Save-LaiIntegrityBaseline -AIRoot $AIRoot -Reason 'accepted by the owner'
-    $took = @($new['accepted'] | Where-Object { $_ -is [hashtable] } | ForEach-Object { [string]$_['Text'] })
+    $took = @($new['accepted'] | Where-Object { $_ -is [hashtable] -and [string]$_['Id'] -notlike 'more|*' } | ForEach-Object { [string]$_['Text'] })
     $tookCount = $took.Count; if ([int]$new['acceptedCount'] -gt $tookCount) { $tookCount = [int]$new['acceptedCount'] }
-    foreach ($t in $took) { Write-LaiLog INFO "accepted: $t" }
-    if ($tookCount -gt $took.Count) { Write-LaiLog INFO ('accepted: and {0} more' -f ($tookCount - $took.Count)) }
+    $tookShown = @($took | Select-Object -First 50)
+    foreach ($t in $tookShown) { Write-LaiLog INFO "accepted: $t" }
+    if ($tookCount -gt $tookShown.Count) { Write-LaiLog INFO ('accepted: and {0} more' -f ($tookCount - $tookShown.Count)) }
     # The watch starts over with the new baseline: what it found against the old one is settled.
     # Whether the owner knows of this acceptance is not: nothing is marked as said here, so the next
     # scheduled run names what was accepted in a notification. Anything running as this user can
@@ -513,7 +516,12 @@ try {
             else {
                 $takenCount = $taken.Count; if ([int]$baseline['acceptedCount'] -gt $takenCount) { $takenCount = [int]$baseline['acceptedCount'] }
                 $takenText = @($taken | ForEach-Object { [string]$_['Text'] })
-                $list = (@($takenText | Select-Object -First 3) -join '; '); if ($takenCount -gt 3) { $list += ' and {0} more' -f ($takenCount - 3) }
+                # By name the first three. An entry that stands for what the baseline does not name
+                # ('more|...') is no name: it is part of the count, and of the advice below.
+                $takenShown = @($taken | Where-Object { [string]$_['Id'] -notlike 'more|*' } | ForEach-Object { [string]$_['Text'] } | Select-Object -First 3)
+                $list = $takenShown -join '; '
+                if ($takenShown.Count -eq 0) { $list = 'none of them is listed by name any more' }
+                elseif ($takenCount -gt $takenShown.Count) { $list += ' and {0} more' -f ($takenCount - $takenShown.Count) }
                 $recorded = ConvertTo-WatchDate $baseline['recordedAt']
                 $of = ''; if ($recorded) { $of = ' of ' + $recorded.ToString('yyyy-MM-dd HH:mm') }
                 $advice = Get-LaiIntegrityAdvice -Ids @($taken | ForEach-Object { [string]$_['Id'] }) -AIRoot $AIRoot -Brief
@@ -570,6 +578,9 @@ try {
                 $markIg['startedAt'] = $startedNow
                 $mark['integrity'] = $markIg
                 Save-LaiState -State $mark -Path $statePath
+                # Test hook (tests/Invoke-WatchTest.ps1): the run ends here, with the mark written and
+                # nothing compared yet, as when Task Scheduler ends it in the middle of a comparison.
+                if ($env:LOCALAI_TEST_INTEGRITY_END) { exit 0 }
 
                 $since = $null; $notRead = @()
                 if ($baseline) {
