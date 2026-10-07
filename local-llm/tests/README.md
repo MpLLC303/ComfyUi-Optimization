@@ -40,7 +40,7 @@ and the jobs run in parallel:
 | `gate` | Static checks, the runner self-test, the render guard test, the cross-platform unit tests and the bootstrap update review: the five suites that need no sandbox services. |
 | `integration` | The integration test, then the health watch test. |
 | `installer` | The installer mock run. |
-| `webui-update` | The Open WebUI update / rollback test, on its own. It shared the `installer` job until the two together took 39 of that job's 40 minutes (the mock run 17, the update test 17, the Open WebUI setup 3). The update test ends in the quick health check, which only passes on an Open WebUI that has the tuned model aliases and presets, and the mock run used to leave them. So this job makes them itself, in the step before the test, with the first two calls of the integration test (model setup, then Open WebUI setup). It starts no deep research image. |
+| `webui-update` | The Open WebUI update / rollback test, on its own. It shared the `installer` job until the two together took 39 of that job's 40 minutes (the mock run 17, the update test 17, the Open WebUI setup 3). The update test ends in the quick health check, which only passes on an Open WebUI that has the tuned model aliases and presets, and the mock run used to leave them. So this job makes them itself, in the step before the test, with the model setup and Open WebUI setup calls of the integration test, without its knowledge collections. It starts no deep research image. |
 | `models` | The model update test, then the uninstall test (Ollama and Docker only). |
 | `stack` | `Invoke-StackSmokeTest.ps1`: the production stack from the compose file with the real images. |
 | `all-passed` | Needs every job above and fails unless each one succeeded, and unless its list of jobs is the list of jobs in the file. Its name, `local-llm Linux - every job passed`, is the one status to require on the branch. |
@@ -51,8 +51,9 @@ logs when it failed. The jobs that start SearXNG from the compose file (`integra
 stop with its log when it does not answer. No job is expected to need more than about 25 of its 40
 minutes; that is an estimate until CI has run a few times. Adding a job means adding it to the
 `needs` list of `all-passed`. If the branch protection requires `local-llm Linux - every job
-passed` only, nothing else has to change; a rule that requires `installer` by name needs
-`webui-update` added next to it.
+passed` only, nothing else has to change. A rule that names a single job holds that job's title,
+and the installer job's title changed (it was `Installer mock run and Open WebUI update / rollback
+test`): such a rule needs the two new titles in its place.
 
 The Windows workflow is one job: static checks, `Invoke-WindowsUnitTests.ps1` and
 `Invoke-GetLocalAITest.ps1`, all on Windows PowerShell 5.1.

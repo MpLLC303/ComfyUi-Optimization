@@ -446,7 +446,7 @@ function Find-ComposeSecGap([string]$Text) {
     # an anchor this check does not follow, and so can 'extends'. A line at the service's own level
     # that this check cannot read as 'key: value' (a quoted key, a space before the colon) is a gap
     # too: it could be a 'privileged' or 'ports' key written another way, which Docker reads.
-    $gaps =New-Object System.Collections.Generic.List[string]
+    $gaps = New-Object System.Collections.Generic.List[string]
     $bodies = [ordered]@{}
     $inServices = $false; $svc = $null; $ind = $null
     foreach ($raw in ($Text -split "`n")) {

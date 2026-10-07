@@ -6,7 +6,7 @@
 # One job used to run every suite in a row and took about 57 of its 60 minutes. The suites share one
 # Ollama, one Open WebUI and one Docker engine, so they cannot run side by side on one machine; here
 # each job is its own machine with only the services its suites need, and the jobs run in parallel
-# (none should take more than about 25 minutes; each is cut off at 40):
+# (none should take more than about 25 minutes; the sandbox jobs are cut off at 40):
 #   gate          Static checks, runner self-test, render guard behaviour, cross-platform unit tests,
 #                 bootstrap update review (the five suites Invoke-AllTests.ps1 runs without a sandbox)
 #   integration   Integration test, then the health watch test
@@ -18,8 +18,9 @@
 #   all-passed    Needs every job above: the one status to require
 # The update / rollback test ends in Test-LocalAI -Quick, which only passes on an Open WebUI that has
 # the tuned model aliases and presets (Invoke-AllTests runs the test after the mock run, which leaves
-# them). In a job of its own nothing has made them, so the job makes them itself, with the same two
-# calls that open tests/Invoke-IntegrationTest.ps1 (see the step before the test).
+# them). In a job of its own nothing has made them, so the job makes them itself, with the model
+# setup and Open WebUI setup calls of tests/Invoke-IntegrationTest.ps1, without its knowledge
+# collections (see the step before the test).
 # Adding a job? Put it in the needs list of all-passed (that job fails when the list is not the list
 # of jobs in this file).
 name: local-llm (end-to-end on Linux)
@@ -288,8 +289,9 @@ jobs:
   # alpine stand-in images, so there is no deep research image to pull here). It used to follow the
   # installer mock run in that job; moved out, it has to make what the mock run left behind for
   # its health check: the tuned aliases (localai-main, localai-fast) and the presets built on them.
-  # The step before the test does that with the first calls of tests/Invoke-IntegrationTest.ps1, the
-  # same functions with the same arguments. Open WebUI is pointed at 127.0.0.1 so that the leftover
+  # The step before the test does that with the model setup and Open WebUI setup calls of
+  # tests/Invoke-IntegrationTest.ps1 (the same two functions, without the knowledge
+  # collections). Open WebUI is pointed at 127.0.0.1 so that the leftover
   # check, which wants that address, finds nothing to put back.
   webui-update:
     name: Open WebUI update / rollback test

@@ -2031,7 +2031,7 @@ try {
     $integrityKept = @($integrityBaseline['accepted'] | Where-Object { $_ -is [hashtable] -and [string]$_['Id'] -notlike 'more|*' } | ForEach-Object { [string]$_['Text'] })
     $integrityNamed = @($integrityKept | Select-Object -First 20)
     foreach ($kept in $integrityNamed) { Write-LaiLog WARN "Kept, although this run did not install it, and from now on counted as normal: $kept. If you did not add it, remove it." }
-    if ($integrityKeptAll -gt $integrityNamed.Count) { Write-LaiLog WARN ('...and {0} more of that kind; Start menu > Local AI - Health check lists them.' -f ($integrityKeptAll - $integrityNamed.Count)) }
+    if ($integrityKeptAll -gt $integrityNamed.Count) { Write-LaiLog WARN ('...and {0} more of that kind; Start menu > Local AI - Health check shows the first of them and the count.' -f ($integrityKeptAll - $integrityNamed.Count)) }
 } catch { Write-LaiLog WARN "The integrity baseline could not be recorded ($($_.Exception.Message)): the health watch may report what this run installed as changed. Watch-LocalAI.ps1 -AcceptBaseline records it." }
 $rows = foreach ($m in ($Catalog.Models | Sort-Object { $_.Order })) {
     $t = $State.tuning[$m.Key]
