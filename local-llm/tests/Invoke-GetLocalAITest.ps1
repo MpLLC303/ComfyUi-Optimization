@@ -7,17 +7,21 @@
     - The decisions are pure functions inside Get-LocalAI.ps1. They are read out of the file with the
       parser (the bootstrap itself is not run) and fed GitHub's answers as JSON written here: a first
       install, an update, a repair run, a comparison that failed or cannot be read, an install whose
-      commit is unknown, an older or diverged commit, a long file list, hostile text, the typed answer.
+      commit is unknown or that sits in another folder, an older or diverged commit, a long or cut-off
+      file list, file names Windows stores elsewhere than git says, hostile text, the typed answer.
+    - An update whose commit GitHub cannot name stops without a question; a first install goes on.
     - The one way to skip the question (LOCALAI_REVIEWED_COMMIT naming the incoming commit in full),
       and that nothing else does: no other value, no fetched text, no other variable.
-    - The bootstrap's own flow, read from its syntax tree: one question, before the one download and
-      the one installer start.
+    - The bootstrap's own flow, read from its syntax tree: the ref is checked before GitHub is asked,
+      one question, before the one download and the one installer start.
     - The gate (Get-UpdateConsent) with a stand-in for the keyboard: only an OK typed after the review
       goes on; no keyboard, an error, a piped-in OK or an unreadable review does not.
     - Windows only: the whole bootstrap in a child process, started the way 'irm | iex' starts it,
       with GitHub replaced by stand-ins and a stand-in installer in the archive. With nobody to type
       OK, or with an OK piped in, nothing is downloaded and no installer starts; with the reviewed
-      commit named, the commit that was shown is the one downloaded, recorded and run.
+      commit named, the commit that was shown is the one downloaded, recorded and run. Every trace of
+      an install the bootstrap looks for (in the AI folder, and the Start-menu folder outside it)
+      makes it ask; a ref that is no plain name reaches neither GitHub nor the download.
     Exit code = number of failed assertions.
 #>
 param([string]$Work = (Join-Path ([System.IO.Path]::GetTempPath()) 'lai-getlocalai-test'))
@@ -44,8 +48,8 @@ $bootstrap = Join-Path $src 'Get-LocalAI.ps1'
 $tokens = $null; $parseErrors = $null
 $ast = [System.Management.Automation.Language.Parser]::ParseFile($bootstrap, [ref]$tokens, [ref]$parseErrors)
 $fnAsts = @($ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true))
-$wanted = @('ConvertTo-ReviewText', 'Get-ReviewField', 'ConvertTo-ReviewDate', 'ConvertTo-ReviewCount', 'Get-CommitSummary', 'Get-IncomingCommit', 'Get-InstalledToolkit',
-    'Get-ChangedFileGroup', 'Get-ChangedFileReport', 'Get-UpdateReview', 'Test-UpdateAnswer', 'Get-UpdateConsent')
+$wanted = @('ConvertTo-ReviewText', 'Get-ReviewField', 'ConvertTo-ReviewDate', 'ConvertTo-ReviewCount', 'Get-CommitSummary', 'Test-ToolkitRef', 'Test-DirectCommitRef', 'Get-IncomingCommit',
+    'Get-InstalledToolkit', 'Test-PlainRepoPath', 'Get-ChangedFileGroup', 'Get-ChangedFileReport', 'Get-UpdateReview', 'Test-UpdateAnswer', 'Get-UpdateConsent')
 $have = @($fnAsts | ForEach-Object { $_.Name })
 $missing = @($wanted | Where-Object { $have -notcontains $_ })
 $haveFunctions = (@($parseErrors).Count -eq 0 -and $missing.Count -eq 0)
@@ -114,6 +118,24 @@ if ($haveFunctions) {
     Assert-That ($accepted.Count -eq 0) "anything but a 40-character commit id in the config is not taken as the installed commit ($($accepted.Count) accepted)"
     $odd = Get-InstalledToolkit -ConfigText (ConvertTo-Json -InputObject @{ ToolkitVersion = ('1' + $esc + '[2J'); ToolkitCommit = $shaOld.ToUpperInvariant() }) -OtherSigns $true
     Assert-That ($odd.State -eq 'known' -and $odd.Commit -eq $shaOld -and $odd.Version -eq '') 'an upper-case id is the same commit; a version with control characters is not shown'
+    # The command in the README does not know the AI folder: an install in another one must not pass
+    # for a first install. The installer's Start-menu folder is there wherever the AI folder is.
+    $elsewhere = Get-InstalledToolkit -ConfigText $null -OtherSigns $false -StartMenu $true
+    Assert-That ($elsewhere.State -eq 'unknown' -and $elsewhere.Elsewhere -eq $true -and $elsewhere.Why -match 'another folder') "an empty AI folder while the installer's Start-menu folder exists: an install in another folder, not 'nothing installed' ($($elsewhere.State))"
+    $menuToo = @((Get-InstalledToolkit -ConfigText $configText -OtherSigns $true -StartMenu $true), (Get-InstalledToolkit -ConfigText $null -OtherSigns $true -StartMenu $true), (Get-InstalledToolkit -ConfigText '' -OtherSigns $false -StartMenu $true))
+    Assert-That ($menuToo[0].State -eq 'known' -and $menuToo[1].Why -match 'did not finish' -and $menuToo[2].Why -match 'could not be read' -and @($menuToo | Where-Object { $_.Elsewhere }).Count -eq 0 -and -not $none.Elsewhere) 'with a trace of an install in the AI folder itself, the Start-menu folder changes nothing'
+
+    Write-Host "`n=== the ref: a plain name, and whether it names a commit directly ===" -ForegroundColor Cyan
+    # LOCALAI_REF goes into the addresses GitHub is asked for; .NET folds '..' parts away, so
+    # zip/../../../other/repo/zip/main would be fetched from another repository than the one shown.
+    $goodRefs = @('main', 'v2026.10.05', 'claude/item-update-review', 'refs/heads/main', 'feature_x', $shaNew, $shaNew.Substring(0, 7))
+    $badRefs = @('', '../../../other/repo/zip/main', 'main/../../x', 'a..b', './main', 'main/.', '/main', 'main/', 'a//b', 'main?x=1', 'main#x', 'main x', "main`n", 'main%2e%2e', 'main\x', ('m' * 201), ('ma' + [char]0xEF + 'n'))
+    $refWrong = @($goodRefs | Where-Object { -not (Test-ToolkitRef -Ref $_) }) + @($badRefs | Where-Object { Test-ToolkitRef -Ref $_ })
+    Assert-That ($refWrong.Count -eq 0) "a ref is the plain name of a branch, tag or commit: no '..', no empty or '.' part, nothing an address reads as more than a name ($($refWrong.Count) of $($goodRefs.Count + $badRefs.Count) judged wrongly)"
+    $direct = @($shaNew, $shaNew.ToUpperInvariant(), $shaNew.Substring(0, 7), $shaNew.Substring(0, 12), 'pull/12/head', 'refs/pull/12/merge', 'refs/remotes/x')
+    $byName = @('main', 'v2026.10.05', 'refs/heads/main', 'refs/tags/v1', 'heads/main', 'claude/item-update-review', 'abc', 'deadbee-fix')
+    $directWrong = @($direct | Where-Object { -not (Test-DirectCommitRef -Ref $_) }) + @($byName | Where-Object { Test-DirectCommitRef -Ref $_ })
+    Assert-That ($directWrong.Count -eq 0) "a commit id (short or full) and a pull request's ref name a commit directly; a branch or tag does not (wrong: $($directWrong -join ', '))"
 
     Write-Host "`n=== a commit as GitHub describes it ===" -ForegroundColor Cyan
     $incoming = Get-CommitSummary -Commit (New-GitHubCommit -Sha $shaNew -Date '2026-10-06T23:30:00Z' -Message "Incoming subject line`n`nA body that says OK.")
@@ -132,10 +154,21 @@ if ($haveFunctions) {
     Write-Host "`n=== which changed files matter ===" -ForegroundColor Cyan
     $admin = @('local-llm/Install-LocalAI.ps1', 'local-llm/lib/LocalAI.psm1', 'local-llm/lib/anything.txt', 'local-llm/Install-LocalAI.cmd', 'local-llm/Some-Script.ps1', 'local-llm/new-folder/Tool.PS1', 'local-llm/stack/helper.exe', 'local-llm\lib\LocalAI.psm1')
     $toolkit = @('local-llm/stack/compose-part.yml', 'local-llm/config/models.psd1', 'local-llm/skills/a/SKILL.md', 'local-llm/VERSION', 'local-llm/README.md')
-    $other = @('local-llm/tests/Invoke-Some.ps1', 'local-llm/docs/NOTES.md', 'local-llm/IMPROVEMENTS.md', 'README.md', 'another-folder/run.ps1', '')
+    $other = @('local-llm/tests/Invoke-Some.ps1', 'local-llm/docs/NOTES.md', 'local-llm/IMPROVEMENTS.md', 'README.md', 'another-folder/run.ps1', '.github/workflows/ci.yml', 'LOCAL-LLM/docs/NOTES.md')
     $bad = @($admin | Where-Object { (Get-ChangedFileGroup -Path $_) -ne 'admin' }) + @($toolkit | Where-Object { (Get-ChangedFileGroup -Path $_) -ne 'toolkit' }) + @($other | Where-Object { (Get-ChangedFileGroup -Path $_) -ne 'other' })
     Assert-That ($bad.Count -eq 0) "installer, module and toolkit scripts run (or can be started) as administrator; stack and config are installed; tests, docs and other folders are not (wrong: $($bad -join ', '))"
     Assert-That ((Get-ChangedFileGroup -Path 'local-llm/Tests/Sneaky.ps1') -eq 'admin') "only the exact tests and docs folders count as not installed (a script in 'Tests' is listed with the administrator scripts)"
+    # The archive is unpacked on Windows, and the bootstrap then starts local-llm\Install-LocalAI.ps1
+    # whatever its capitals. Names git takes for another file and Windows for the same one: other
+    # capitals, a '.', '..' or empty part, a trailing dot or space, a stream (':'), a short 8.3 name,
+    # anything outside printable ASCII, and an entry without a name. None of them is "not installed".
+    $sameOnWindows = @('Local-LLM/Install-LocalAI.ps1', 'LOCAL-LLM/lib/x.psm1', 'local-llm/LIB/anything.txt', 'local-llm/tests\..\Install-LocalAI.ps1', 'local-llm/tests/../Install-LocalAI.ps1', 'local-llm/docs/./../Install-LocalAI.ps1',
+        'local-llm/Install-LocalAI.ps1.', 'local-llm/Install-LocalAI.ps1 ', 'local-llm /Install-LocalAI.ps1', 'local-llm./Install-LocalAI.ps1', 'local-llm//Install-LocalAI.ps1', '/local-llm/Install-LocalAI.ps1',
+        'local-llm/Install-LocalAI.ps1::$DATA', 'local-llm/tests/x.txt:Install-LocalAI.ps1', 'LOCAL-~1/INSTAL~1.PS1', 'local-llm/tests/INSTAL~1', ('local-llm/tests/x' + [char]0xE9 + '.txt'), "local-llm/tests/x`t.txt", '')
+    $missed = @($sameOnWindows | Where-Object { (Get-ChangedFileGroup -Path $_) -ne 'admin' })
+    Assert-That ($missed.Count -eq 0) "a name that Windows stores as (or over) another file is listed with the administrator scripts, never as 'not installed' (missed: $($missed -join ' | '))"
+    $plainWrong = @($sameOnWindows | Select-Object -Skip 3 | Where-Object { Test-PlainRepoPath -Path $_ }) + @(@($admin + $toolkit + $other) | Where-Object { -not (Test-PlainRepoPath -Path $_) })
+    Assert-That ($plainWrong.Count -eq 0) "and all but a change of capitals is called an unusual name; an ordinary path is not ($($plainWrong.Count) judged wrongly)"
 
     $base = New-GitHubCommit -Sha $shaOld -Date '2026-10-05T10:00:00Z' -Message 'Installed subject line'
     $fewFiles = @(
@@ -148,7 +181,7 @@ if ($haveFunctions) {
         @{ filename = 'docs/old-notes.md'; status = 'removed' }
     )
     $few = Get-ChangedFileReport -Files (New-GitHubCompare -Status 'ahead' -Ahead 3 -Behind 0 -Base $base -Files $fewFiles).files
-    $fewText = $few.Lines -join "`n"
+    $fewText = Get-ReviewText $few
     $shownAll = @($fewFiles | Where-Object { $fewText -notmatch [regex]::Escape($_.filename) }).Count -eq 0
     Assert-That ($few.Total -eq 7 -and $few.Admin -eq 4 -and -not $few.Long -and $shownAll) "a short list names every file ($($few.Total) files, $($few.Admin) that run as administrator)"
     $iInstaller = Get-LineIndex -Text $fewText -Pattern 'local-llm/Install-LocalAI\.ps1'
@@ -163,13 +196,57 @@ if ($haveFunctions) {
     foreach ($n in 1..20) { $manyFiles += @{ filename = ('local-llm/stack/part-{0:d2}.yml' -f $n); status = 'modified' } }
     foreach ($n in 1..37) { $manyFiles += @{ filename = ('local-llm/tests/case-{0:d2}.ps1' -f $n); status = 'added' } }
     $many = Get-ChangedFileReport -Files (New-GitHubCompare -Status 'ahead' -Ahead 9 -Behind 0 -Base $base -Files $manyFiles).files -MaxListed 10
-    $manyText = $many.Lines -join "`n"
+    $manyText = Get-ReviewText $many
     $stackShown = @([regex]::Matches($manyText, 'local-llm/stack/part-\d\d\.yml')).Count
-    Assert-That ($many.Total -eq 60 -and $many.Long -and $many.Admin -eq 3) "a long list is counted ($($many.Total) files, $($many.Admin) that run as administrator)"
+    Assert-That ($many.Total -eq 60 -and $many.Long -and -not $many.Cut -and $many.Admin -eq 3) "a long list is counted ($($many.Total) files, $($many.Admin) that run as administrator)"
     Assert-That ($manyText -match 'local-llm/Install-LocalAI\.ps1' -and $manyText -match 'local-llm/lib/LocalAI\.psm1' -and $manyText -match 'local-llm/Some-Script\.ps1' -and (Get-LineIndex -Text $manyText -Pattern 'Install-LocalAI\.ps1') -lt (Get-LineIndex -Text $manyText -Pattern 'part-\d\d\.yml')) 'and still names every administrator script, first'
-    Assert-That ($stackShown -eq 7 -and $manyText -match 'and 13 more' -and $manyText -notmatch 'case-\d\d\.ps1' -and $manyText -match '37 file\(s\), not listed') "then the other toolkit files that still fit ($stackShown of 20), and only a count of what is not installed"
+    Assert-That ($stackShown -eq 20 -and $manyText -notmatch 'more, not listed' -and $manyText -notmatch 'case-\d\d\.ps1' -and $manyText -match '37 file\(s\), not listed') "then every other installed file by name ($stackShown of 20): only what is not installed is reduced to a count"
+    # Padding must not push an installed file off the screen: 20 scripts with a one-line change each
+    # used to leave room for five more names, and the stack's compose file (images, published ports,
+    # mounted folders) sorts last.
+    $paddedFiles = @(1..20 | ForEach-Object { @{ filename = ('local-llm/Script-{0:d2}.ps1' -f $_); status = 'modified' } })
+    foreach ($n in @('local-llm/README.md', 'local-llm/VERSION', 'local-llm/config/models.psd1', 'local-llm/config/system-prompt.txt', 'local-llm/skills/a/SKILL.md', 'local-llm/stack/docker-compose.yml', 'local-llm/tests/one.ps1')) { $paddedFiles += @{ filename = $n; status = 'modified' } }
+    $padded = Get-ChangedFileReport -Files (New-GitHubCompare -Status 'ahead' -Ahead 1 -Behind 0 -Base $base -Files $paddedFiles).files
+    $paddedText = Get-ReviewText $padded
+    $paddedMissing = @($paddedFiles | Where-Object { $_.filename -notlike '*tests*' -and $paddedText -notmatch [regex]::Escape($_.filename) })
+    Assert-That ($padded.Long -and $padded.Admin -eq 20 -and $paddedMissing.Count -eq 0 -and $paddedText -notmatch 'more, not listed' -and $paddedText -match '1 file\(s\), not listed') "a list padded with 20 changed scripts still names every installed file, docker-compose.yml included ($($paddedMissing.Count) missing)"
+    $iCompose = Get-LineIndex -Text $paddedText -Pattern 'stack/docker-compose\.yml'
+    $iConfig = Get-LineIndex -Text $paddedText -Pattern 'config/models\.psd1'
+    Assert-That ($iCompose -ge 0 -and $iCompose -lt $iConfig -and $iConfig -lt (Get-LineIndex -Text $paddedText -Pattern 'local-llm/README\.md') -and $iConfig -lt (Get-LineIndex -Text $paddedText -Pattern 'skills/a/SKILL\.md')) 'among the other installed files the stack comes first, then the config, then the rest'
     $noAdmin = Get-ChangedFileReport -Files (New-GitHubCompare -Status 'ahead' -Ahead 1 -Behind 0 -Base $base -Files @(@{ filename = 'local-llm/VERSION'; status = 'modified' })).files
-    Assert-That ($noAdmin.Total -eq 1 -and $noAdmin.Admin -eq 0 -and ($noAdmin.Lines -join "`n") -match 'none of them differ') 'a change without administrator scripts says so (a one-file list stays a list on 5.1)'
+    Assert-That ($noAdmin.Total -eq 1 -and $noAdmin.Admin -eq 0 -and (Get-ReviewText $noAdmin) -match 'none of them differ') 'a change without administrator scripts says so (a one-file list stays a list on 5.1)'
+    # A file that was moved counts for the stricter of its two names: the installer moved into a
+    # folder whose name differs only in capitals is still the installer on Windows; a script moved
+    # out of the toolkit is a script that is gone; the compose file moved away is an installed file.
+    $movedFiles = @(
+        @{ filename = 'local-llm/tests/a.txt'; previous_filename = 'local-llm/tests/b.txt'; status = 'renamed' }
+        @{ filename = 'docs/compose.md'; previous_filename = 'local-llm/stack/docker-compose.yml'; status = 'renamed' }
+        @{ filename = 'local-llm/tests/Parked.txt'; previous_filename = 'local-llm/Watch-LocalAI.ps1'; status = 'renamed' }
+        @{ filename = 'Local-LLM/Install-LocalAI.ps1'; previous_filename = 'local-llm/Install-LocalAI.ps1'; status = 'renamed' }
+        @{ filename = 'local-llm/tests\..\Install-LocalAI.ps1'; status = 'added' }
+    )
+    $moved = Get-ChangedFileReport -Files (New-GitHubCompare -Status 'ahead' -Ahead 1 -Behind 0 -Base $base -Files $movedFiles).files
+    $movedText = Get-ReviewText $moved
+    $iHead = Get-LineIndex -Text $movedText -Pattern 'Scripts that run as administrator'
+    $iToolkitHead = Get-LineIndex -Text $movedText -Pattern 'Other toolkit files'
+    $iOtherHead = Get-LineIndex -Text $movedText -Pattern 'Not installed on this PC'
+    Assert-That ($moved.Admin -eq 3 -and $movedText -notmatch 'none of them differ' -and (Get-LineIndex -Text $movedText -Pattern 'local-llm/Install-LocalAI\.ps1 -> Local-LLM/Install-LocalAI\.ps1') -eq ($iHead + 1)) "the installer moved into 'Local-LLM' is listed first among the administrator scripts, not as a file that is not installed ($($moved.Admin) administrator scripts)"
+    $iParked = Get-LineIndex -Text $movedText -Pattern 'Watch-LocalAI\.ps1 -> local-llm/tests/Parked\.txt'
+    $iMovedCompose = Get-LineIndex -Text $movedText -Pattern 'stack/docker-compose\.yml -> docs/compose\.md'
+    Assert-That ($iParked -gt $iHead -and $iParked -lt $iToolkitHead -and $iMovedCompose -gt $iToolkitHead -and $iMovedCompose -lt $iOtherHead -and (Get-LineIndex -Text $movedText -Pattern 'tests/b\.txt -> local-llm/tests/a\.txt') -gt $iOtherHead) 'a moved file counts for the stricter of its two names (a script moved into tests, the compose file moved into docs, a test renamed)'
+    Assert-That (@($movedText -split "`n" | Where-Object { $_ -match 'unusual name' }).Count -eq 1 -and $movedText -match 'local-llm/tests\\\.\.\\Install-LocalAI\.ps1\s+\(unusual name') "and a name Windows may store elsewhere ('tests\..\Install-LocalAI.ps1') says so on its line"
+    # GitHub's list stops at 300 files. Whatever sorts after the 300th is not in it, so a list of that
+    # length cannot say that no administrator script differs.
+    $cutNone = Get-ChangedFileReport -Files (New-GitHubCompare -Status 'ahead' -Ahead 1 -Behind 0 -Base $base -Files @(1..6 | ForEach-Object { @{ filename = ('.github/pad/{0:d3}.txt' -f $_); status = 'added' } })).files -ListLimit 6
+    $cutNoneText = Get-ReviewText $cutNone
+    Assert-That ($cutNone.Cut -and $cutNoneText -notmatch 'none of them differ' -and @($cutNone.Lines | Where-Object { $_.Text -match 'can start: not known' -and $_.Text -match 'may be among those not listed' -and $_.Color -eq 'Yellow' }).Count -eq 1) 'a list as long as GitHub lists at most: whether an administrator script differs is not known, said in yellow, never "none of them differ"'
+    Assert-That ((Get-LineIndex -Text $cutNoneText -Pattern 'at most 6 files') -eq 0 -and @($cutNone.Lines)[0].Color -eq 'Yellow') 'and the notice that the list is cut off stands above it'
+    $cutSome = Get-ChangedFileReport -Files (New-GitHubCompare -Status 'ahead' -Ahead 1 -Behind 0 -Base $base -Files (@($fewFiles | Select-Object -First 5) + @(@{ filename = 'docs/x.md'; status = 'added' }))).files -ListLimit 6
+    Assert-That ($cutSome.Cut -and (Get-ReviewText $cutSome) -match 'more may be among the files it did not list' -and (Get-ReviewText $cutSome) -match 'local-llm/Install-LocalAI\.ps1') 'with administrator scripts in the listed part they are named, and more are said to be possible'
+    $notCut = Get-ChangedFileReport -Files (New-GitHubCompare -Status 'ahead' -Ahead 1 -Behind 0 -Base $base -Files @(1..5 | ForEach-Object { @{ filename = ('.github/pad/{0:d3}.txt' -f $_); status = 'added' } })).files -ListLimit 6
+    Assert-That (-not $notCut.Cut -and (Get-ReviewText $notCut) -match 'none of them differ' -and (Get-ReviewText $notCut) -notmatch 'at most') 'one file short of that length the list is complete and says so'
+    $reports = @($few, $many, $padded, $moved, $cutNone, $cutSome, $notCut, $noAdmin)
+    Assert-That (@($reports | ForEach-Object { $_.Lines } | Where-Object { @('Gray', 'Yellow') -notcontains $_.Color -or $_.Text -isnot [string] -or -not $_.Text }).Count -eq 0) 'every line of a file list is text with a colour the console knows'
 
     Write-Host "`n=== the review: first install, update, repair ===" -ForegroundColor Cyan
     $compare = New-GitHubCompare -Status 'ahead' -Ahead 3 -Behind 0 -Base $base -Files $fewFiles
@@ -184,6 +261,13 @@ if ($haveFunctions) {
     Assert-That ($updateText -match '3 commit\(s\), 7 file\(s\) differ' -and $updateText -match 'local-llm/Install-LocalAI\.ps1' -and $updateText -match [regex]::Escape("https://github.com/$repo/compare/$shaOld...$shaNew")) 'and the files that differ between the two, with the address of the full comparison'
     $repair = Get-UpdateReview -Repo $repo -Root 'C:\AI' -Ref 'main' -Installed $known -Incoming (Get-CommitSummary -Commit $base)
     Assert-That ($repair.Kind -eq 'repair' -and $repair.NeedsOk -and (Get-ReviewText $repair) -match 'repair run of the same version') 'the commit that is already installed: a repair run of the same version, asked once (no comparison needed)'
+    $otherFolder = Get-UpdateReview -Repo $repo -Root 'C:\AI' -Ref 'main' -Installed $elsewhere -Incoming $incoming
+    $otherFolderText = Get-ReviewText $otherFolder
+    Assert-That ($otherFolder.NeedsOk -and -not $otherFolder.Stop -and $otherFolderText -notmatch 'First install' -and $otherFolderText -match 'installed on this PC' -and $otherFolderText -match 'but not in C:\\AI' -and $otherFolderText -match 'set LOCALAI_ROOT to that folder') 'an install that is not in the AI folder named here: said so, with LOCALAI_ROOT as the way to name the right one, and OK asked (not a first install)'
+    Assert-That ($otherFolderText -match "To install\s+: commit $shaNew" -and $otherFolderText -match 'not known which commit is installed \(the install is in another folder' -and $otherFolderText -notmatch 'file\(s\) differ') 'the incoming commit is still shown, and no file list is made up for it'
+    $byId = Get-UpdateReview -Repo $repo -Root 'C:\AI' -Ref $shaNew -Installed $known -Incoming $incoming -Compare $compare
+    $firstById = Get-UpdateReview -Repo $repo -Root 'C:\AI' -Ref $shaNew.Substring(0, 7) -Installed $none -Incoming $incoming
+    Assert-That (@($byId.Lines | Where-Object { $_.Text -match 'Not checked to be on a branch of this repository' -and $_.Text -match 'fork' -and $_.Color -eq 'Yellow' }).Count -eq 1 -and (Get-ReviewText $firstById) -match 'Not checked to be on a branch' -and $updateText -notmatch 'Not checked to be on a branch') 'a ref that is a commit id (not a branch or tag) is said not to be checked to be on a branch of this repository; a branch gets no such line'
 
     Write-Host "`n=== the review: when the comparison is not there ===" -ForegroundColor Cyan
     $failed = Get-UpdateReview -Repo $repo -Root 'C:\AI' -Ref 'main' -Installed $known -Incoming $incoming -Compare $null -CompareError 'The remote server returned an error: (403) Forbidden.'
@@ -197,11 +281,17 @@ if ($haveFunctions) {
     $unknown = Get-UpdateReview -Repo $repo -Root 'C:\AI' -Ref 'main' -Installed $handZip -Incoming $incoming
     $unknownText = Get-ReviewText $unknown
     Assert-That ($unknown.NeedsOk -and $unknownText -match 'not known which commit is installed' -and $unknownText -match 'names no commit' -and $unknownText -match "To install\s+: commit $shaNew" -and $unknownText -notmatch 'file\(s\) differ') 'an install whose commit is unknown: said so, with the reason; the incoming commit shown, OK asked'
+    # An update whose commit cannot be named (the lookup shares GitHub's hourly limit with the
+    # comparison) is not offered: an OK would be an OK to code nobody saw, fetched from the branch
+    # unpinned and recorded without a commit. It stops; nothing in the review can be downloaded.
     $unpinned = Get-UpdateReview -Repo $repo -Root 'C:\AI' -Ref 'main' -Installed $known -Incoming $null -IncomingError 'The operation has timed out.'
     $unpinnedText = Get-ReviewText $unpinned
-    Assert-That ($unpinned.NeedsOk -and $unpinned.Commit -eq '' -and $unpinned.Get -eq 'main' -and $unpinnedText -match 'could not name its commit \(The operation has timed out\.\)' -and $unpinnedText -match 'cannot be shown or pinned') 'GitHub cannot name the incoming commit: said so with the error, nothing is shown as if it were pinned, OK asked'
+    Assert-That ($unpinned.Kind -eq 'unpinned' -and $unpinned.Stop -match 'could not be named' -and $unpinned.Stop -match 'LOCALAI_REF' -and $unpinned.NeedsOk -and $unpinned.Commit -eq '' -and $unpinned.Get -eq '' -and $unpinned.Url -eq '') "GitHub cannot name the incoming commit of an update: the review says stop and holds nothing to download (address '$($unpinned.Url)')"
+    Assert-That ($unpinnedText -match "could not name the commit 'main' stands for \(The operation has timed out\.\)" -and $unpinnedText -match 'Try again later, or set LOCALAI_REF to the full 40-character id' -and $unpinnedText -match "Installed now : version 2026\.10\.05, commit $shaOld" -and $unpinnedText -notmatch 'whatever' -and $unpinnedText -notmatch 'zip/main') 'it says so with the error and the two ways on (later, or a full commit id); what is installed is still shown, the branch is not offered'
+    $unpinnedOthers = @($handZip, $half, $elsewhere, (Get-InstalledToolkit -ConfigText '' -OtherSigns $false) | ForEach-Object { Get-UpdateReview -Repo $repo -Root 'C:\AI' -Ref 'main' -Installed $_ -Incoming $null -IncomingError 'offline' })
+    Assert-That (@($unpinnedOthers | Where-Object { -not $_.Stop -or $_.Url -ne '' }).Count -eq 0) "the same for every install that is not 'nothing installed': commit not recorded, not finished, in another folder, config unreadable"
     $firstUnpinned = Get-UpdateReview -Repo $repo -Root 'C:\AI' -Ref 'main' -Installed $none -Incoming $null -IncomingError 'The operation has timed out.'
-    Assert-That (-not $firstUnpinned.NeedsOk -and $firstUnpinned.Url -eq "https://codeload.github.com/$repo/zip/main") 'a first install then goes on as before, downloading the ref as it is'
+    Assert-That (-not $firstUnpinned.NeedsOk -and -not $firstUnpinned.Stop -and $firstUnpinned.Url -eq "https://codeload.github.com/$repo/zip/main" -and (Get-ReviewText $firstUnpinned) -match 'cannot be shown or pinned') 'only a first install then goes on as before, downloading the ref as it is, and says that it is not pinned'
     $selfPinned = Get-UpdateReview -Repo $repo -Root 'C:\AI' -Ref $shaNew -Installed $known -Incoming $pinnedRef -IncomingError 'The operation has timed out.' -CompareError 'The operation has timed out.'
     $selfPinnedText = Get-ReviewText $selfPinned
     Assert-That ($selfPinned.NeedsOk -and $selfPinnedText -match "To install\s+: commit $shaNew" -and $selfPinnedText -match 'could not describe it \(The operation has timed out\.\)' -and $selfPinnedText -notmatch 'cannot be shown or pinned') 'a ref that is a full commit id, without GitHub: the id is shown as pinned, said to come without date and subject line, OK asked'
@@ -215,15 +305,30 @@ if ($haveFunctions) {
     $diverged = Get-UpdateReview -Repo $repo -Root 'C:\AI' -Ref 'main' -Installed $known -Incoming $incoming -Compare (New-GitHubCompare -Status 'diverged' -Ahead 4 -Behind 2 -Base $base -Files $fewFiles)
     $divergedText = Get-ReviewText $diverged
     Assert-That ($diverged.Kind -eq 'diverged' -and $diverged.NeedsOk -and $divergedText -match 'does not continue from the installed one \(4 commit\(s\) ahead of their common ancestor, 2 behind\)' -and $divergedText -match 'rewritten' -and $divergedText -match 'local-llm/Install-LocalAI\.ps1') 'a commit that does not continue from the installed one (another branch, rewritten history) is named as such, with its files'
-    $hundreds = @(1..300 | ForEach-Object { @{ filename = ('local-llm/tests/gen-{0:d3}.ps1' -f $_); status = 'added' } })
+    # 300 added files that sort before local-llm/ fill GitHub's list: a changed installer after them
+    # is not in it. The review must not say that no administrator script differs.
+    $hundreds = @(1..300 | ForEach-Object { @{ filename = ('.github/pad/{0:d3}.txt' -f $_); status = 'added' } })
     $truncated = Get-UpdateReview -Repo $repo -Root 'C:\AI' -Ref 'main' -Installed $known -Incoming $incoming -Compare (New-GitHubCompare -Status 'ahead' -Ahead 40 -Behind 0 -Base $base -Files $hundreds)
-    Assert-That ($truncated.NeedsOk -and (Get-ReviewText $truncated) -match '300 file\(s\) differ' -and (Get-ReviewText $truncated) -match 'at most 300 files') "GitHub's limit of 300 listed files is said, not hidden"
+    $truncatedText = Get-ReviewText $truncated
+    Assert-That ($truncated.NeedsOk -and $truncatedText -match '300 or more file\(s\) differ' -and $truncatedText -notmatch ' 300 file\(s\) differ' -and $truncatedText -match 'at most 300 files') "GitHub's limit of 300 listed files is said, not hidden: '300 or more' files differ"
+    Assert-That ($truncatedText -notmatch 'none of them differ' -and @($truncated.Lines | Where-Object { $_.Text -match 'can start: not known' -and $_.Color -eq 'Yellow' }).Count -eq 1) "a list cut off at 300 never says that no administrator script differs: it says 'not known', in yellow"
+    $iCutNotice = Get-LineIndex -Text $truncatedText -Pattern 'at most 300 files'
+    Assert-That ($iCutNotice -gt (Get-LineIndex -Text $truncatedText -Pattern '300 or more file') -and $iCutNotice -lt (Get-LineIndex -Text $truncatedText -Pattern 'Scripts that run as administrator') -and $iCutNotice -lt (Get-LineIndex -Text $truncatedText -Pattern 'Not installed on this PC')) 'and the notice stands above the list, not under it'
+    $nearly = Get-UpdateReview -Repo $repo -Root 'C:\AI' -Ref 'main' -Installed $known -Incoming $incoming -Compare (New-GitHubCompare -Status 'ahead' -Ahead 40 -Behind 0 -Base $base -Files @($hundreds | Select-Object -First 299))
+    Assert-That ((Get-ReviewText $nearly) -match ' 299 file\(s\) differ' -and (Get-ReviewText $nearly) -match 'none of them differ' -and (Get-ReviewText $nearly) -notmatch 'at most 300') 'a list of 299 files is complete and is reported as before'
 
     Write-Host "`n=== what is shown is what is downloaded ===" -ForegroundColor Cyan
-    $pinned = @($first, $update, $repair, $failed, $unknown, $selfPinned, $older, $diverged, $truncated)
+    $pinned = @($first, $update, $repair, $otherFolder, $byId, $failed, $unknown, $selfPinned, $older, $diverged, $truncated)
     $mismatch = @($pinned | Where-Object { $shown = Get-ShownCommit $_; -not $shown -or $_.Commit -ne $shown -or $_.Get -ne $shown -or $_.Url -ne "https://codeload.github.com/$repo/zip/$shown" })
     Assert-That ($mismatch.Count -eq 0) "in every review the commit on the 'To install' line is the one in the download address and the one recorded ($($mismatch.Count) of $($pinned.Count) differ)"
     Assert-That ((Get-ShownCommit $update) -eq $shaNew -and (Get-ShownCommit $repair) -eq $shaOld -and (Get-ShownCommit $unpinned) -eq '') 'and that is the commit GitHub named for the ref (none is shown when it named none)'
+    # Every review that can go on (asked or not) names a commit, except the first install of a ref
+    # GitHub did not answer for; an update never has an address without a commit shown for it.
+    $everyReview = @($pinned) + @($unpinned, $firstUnpinned, $nearly) + @($unpinnedOthers)
+    $unseen = @($everyReview | Where-Object { $_.Kind -ne 'first' -and $_.Url -and -not (Get-ShownCommit $_) })
+    Assert-That ($unseen.Count -eq 0) "no update holds a download address without a commit on its 'To install' line ($($unseen.Count) of $($everyReview.Count) do)"
+    $colours = @($everyReview | ForEach-Object { $_.Lines } | Where-Object { @('Gray', 'Yellow', 'Cyan') -notcontains $_.Color -or -not $_.Text })
+    Assert-That ($colours.Count -eq 0) 'every line of every review is text with a colour the console knows (the file list included)'
     $ids = @([regex]::Matches($updateText, '\b[0-9a-f]{40}\b') | ForEach-Object { $_.Value } | Select-Object -Unique)
     Assert-That ($ids.Count -eq 2 -and $ids -contains $shaOld -and $ids -contains $shaNew) 'no other commit id appears in the review'
 
@@ -241,8 +346,8 @@ if ($haveFunctions) {
     Assert-That ($skipped.Count -eq 0) "any other value (another commit, a short id, 1, true, yes, OK) does not skip it ($($skipped.Count) of $($notThis.Count) did)"
     $stale = Get-UpdateReview -Repo $repo -Root 'C:\AI' -Ref 'main' -Installed $known -Incoming $incoming -Compare $compare -ReviewedCommit $shaOther
     Assert-That ($stale.NeedsOk -and (Get-ReviewText $stale) -match 'LOCALAI_REVIEWED_COMMIT is set, but not to the full id of this commit') 'a value left over from an earlier run is said not to count, and the question is asked'
-    $unpinnedSkips = @(@('main', $shaNew, $shaOld, '') | Where-Object { -not (Get-UpdateReview -Repo $repo -Root 'C:\AI' -Ref 'main' -Installed $known -Incoming $null -IncomingError 'offline' -ReviewedCommit $_).NeedsOk })
-    Assert-That ($unpinnedSkips.Count -eq 0) 'when GitHub cannot name the commit nothing skips the question, not even the ref itself'
+    $unpinnedGoes = @(@('main', $shaNew, $shaOld, '') | Where-Object { $r = Get-UpdateReview -Repo $repo -Root 'C:\AI' -Ref 'main' -Installed $known -Incoming $null -IncomingError 'offline' -ReviewedCommit $_; -not $r.NeedsOk -or -not $r.Stop -or $r.Url -or (Get-UpdateConsent -Review $r -HostName 'ConsoleHost' -InputRedirected $false -ReadAnswer { 'OK' }).Go })
+    Assert-That ($unpinnedGoes.Count -eq 0) "when GitHub cannot name the commit of an update nothing makes it go on: no value of LOCALAI_REVIEWED_COMMIT (not even the ref itself), and no typed OK ($($unpinnedGoes.Count) of 4 went on)"
 
     Write-Host "`n=== the gate: only an OK typed after the review goes on ===" -ForegroundColor Cyan
     $script:asked = 0
@@ -268,6 +373,13 @@ if ($haveFunctions) {
     $notReviews = @($null, 'text', (ConvertFrom-Json -InputObject '{"NeedsOk": "False"}'), (ConvertFrom-Json -InputObject '{"Kind": "first"}'))
     $slipped = @($notReviews | Where-Object { (Get-UpdateConsent -Review $_ -HostName 'ConsoleHost' -InputRedirected $false -ReadAnswer $typesNo).Go })
     Assert-That ($slipped.Count -eq 0) "a review that is missing or unreadable is asked about, never waved through ($($slipped.Count) of $($notReviews.Count) went on)"
+    # A review that says Stop (an update whose commit could not be named) is not asked about at all:
+    # there is nothing on screen an OK could be about.
+    $script:asked = 0
+    $gate = Get-UpdateConsent -Review $unpinned -HostName 'ConsoleHost' -InputRedirected $false -ReadAnswer $typesOk
+    Assert-That (-not $gate.Go -and $script:asked -eq 0 -and $gate.Why -match 'could not be named' -and $gate.Why -match 'Try again later') "an update whose commit could not be named stops without the question (asked $($script:asked) time(s)), and says what to do"
+    $gate = Get-UpdateConsent -Review ([pscustomobject]@{ NeedsOk = $false; Stop = 'stand-in reason' }) -HostName 'ConsoleHost' -InputRedirected $false -ReadAnswer $typesOk
+    Assert-That (-not $gate.Go -and $script:asked -eq 0 -and $gate.Why -eq 'stand-in reason') 'Stop wins over everything else in a review, "nothing to ask" included'
 
     Write-Host "`n=== fetched text cannot answer for the owner ===" -ForegroundColor Cyan
     $evilCommit = Get-CommitSummary -Commit (New-GitHubCommit -Sha $shaNew -Date '2026-10-06T23:30:00Z' -Message ('OK' + [char]13 + $esc + "[1A  To install    : commit $shaOther"))
@@ -298,11 +410,17 @@ Assert-That $inOrder "the bootstrap asks once, before its one download and its o
 $askOwner = $null
 if ($asks.Count -eq 1) { $askOwner = $asks[0].Parent; while ($askOwner -and $askOwner -isnot [System.Management.Automation.Language.CommandAst]) { $askOwner = $askOwner.Parent } }
 Assert-That ($askOwner -and $askOwner.GetCommandName() -eq 'Get-UpdateConsent') 'and only through the gate: Get-UpdateConsent decides whether to ask and what the answer means'
+# LOCALAI_REF is part of every address GitHub is asked for: it is checked before the first of them.
+$refChecks = @($commands | Where-Object { $_.GetCommandName() -eq 'Test-ToolkitRef' })
+$firstFetch = @($commands | Where-Object { @('Invoke-RestMethod', 'Invoke-WebRequest') -contains $_.GetCommandName() } | ForEach-Object { $_.Extent.StartOffset } | Sort-Object | Select-Object -First 1)
+Assert-That ($refChecks.Count -eq 1 -and $firstFetch.Count -eq 1 -and $refChecks[0].Extent.StartOffset -lt $firstFetch[0]) "the ref is checked to be a plain name before GitHub is asked anything (checks: $($refChecks.Count))"
 # Every setting the bootstrap takes from outside is an environment variable (it has no parameters:
 # 'irm | iex' could not pass any). A new one is a new way in and has to be added here on purpose.
+# ProgramData is Windows' own: the all-users Start menu is under it (the installer builds the same
+# path), which is how an install in another AI folder is noticed.
 $envVars = @($ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.VariableExpressionAst] -and $n.VariablePath.DriveName -eq 'env' }, $true))
 $envNames = @($envVars | ForEach-Object { $_.VariablePath.UserPath -replace '^env:', '' })
-$allowed = @('LOCALAI_REF', 'LOCALAI_ROOT', 'LOCALAI_ARGS', 'LOCALAI_REVIEWED_COMMIT', 'TEMP')
+$allowed = @('LOCALAI_REF', 'LOCALAI_ROOT', 'LOCALAI_ARGS', 'LOCALAI_REVIEWED_COMMIT', 'TEMP', 'ProgramData')
 $unexpected = @($envNames | Where-Object { $allowed -notcontains $_ } | Select-Object -Unique)
 Assert-That ($null -eq $ast.ParamBlock -and $unexpected.Count -eq 0) "the bootstrap takes no parameters and reads only the documented environment variables (others: $($unexpected -join ', '))"
 $skipReads = @($envVars | Where-Object { $_.VariablePath.UserPath -eq 'env:LOCALAI_REVIEWED_COMMIT' })
@@ -312,6 +430,13 @@ Assert-That ($skipReads.Count -eq 1 -and $skipOwner -and $skipOwner.GetCommandNa
 $firstCodeLine = $ast.EndBlock.Extent.StartLineNumber
 $header = (@($tokens | Where-Object { $_.Kind -eq 'Comment' -and $_.Extent.StartLineNumber -lt $firstCodeLine } | ForEach-Object { $_.Text }) -join "`n")
 Assert-That ($header -match 'LOCALAI_REVIEWED_COMMIT' -and $header -match 'typed OK') 'the comment at the top of the file documents the review and the one way to skip it'
+Assert-That ($header -match 'only as trustworthy as the copy of this file' -and $header -match 'replace refs/heads/main' -and $header -match 'not what changed inside them' -and $header -match 'already runs under your Windows account' -and $header -match 'fork') 'and where the review ends: the command that fetches this file from main, file names without their contents, a program of the same user, a commit id that may be from a fork'
+# The Start-menu folder is looked for under ProgramData, where the installer creates it: the two
+# files have to spell the same folder, or an install in another AI folder passes for a first install.
+$menuPath = 'Microsoft\Windows\Start Menu\Programs\Local AI'
+$menuInBootstrap = @($ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.StringConstantExpressionAst] -and $n.Value -eq $menuPath }, $true)).Count
+$installerText = [System.IO.File]::ReadAllText((Join-Path $src 'Install-LocalAI.ps1'))
+Assert-That ($menuInBootstrap -eq 1 -and $installerText.Contains("Join-Path `$env:ProgramData '$menuPath'")) "the bootstrap looks for the Start-menu folder exactly where the installer creates it (%ProgramData%\$menuPath)"
 # The resume after a reboot must not come through the bootstrap: nobody is there to type OK at
 # sign-in. The installer's logon task starts the copy of the installer that was already downloaded.
 $installerAst = [System.Management.Automation.Language.Parser]::ParseFile((Join-Path $src 'Install-LocalAI.ps1'), [ref]$null, [ref]$null)
@@ -330,9 +455,18 @@ if ($onWindows) {
     $apiNone = Join-Path $e2e 'api-none'
     $rootInstalled = Join-Path $e2e 'root-installed'
     $rootEmpty = Join-Path $e2e 'root-empty'
+    # AI folders that each hold one trace of an install the bootstrap looks for, and nothing else.
+    $rootStateOnly = Join-Path $e2e 'root-state-only'
+    $rootScriptsOnly = Join-Path $e2e 'root-scripts-only'
+    $rootDamaged = Join-Path $e2e 'root-damaged'
+    $rootLocked = Join-Path $e2e 'root-locked'
+    # Stand-ins for %ProgramData%: without the installer's Start-menu folder, and with it.
+    $pdNone = Join-Path $e2e 'programdata-none'
+    $pdMenu = Join-Path $e2e 'programdata-menu'
+    $menuDir = Join-Path $pdMenu $menuPath
     $zipTop = Join-Path (Join-Path $e2e 'zipsrc') "ComfyUi-Optimization-$shaNew"
     $zipLlm = Join-Path $zipTop 'local-llm'
-    foreach ($d in @($e2eTemp, $apiFull, $apiNoCompare, $apiNone, $rootInstalled, $rootEmpty, $zipLlm)) { New-Item -ItemType Directory -Force -Path $d | Out-Null }
+    foreach ($d in @($e2eTemp, $apiFull, $apiNoCompare, $apiNone, $rootInstalled, $rootEmpty, $rootStateOnly, (Join-Path $rootScriptsOnly 'Scripts'), $rootDamaged, $rootLocked, $pdNone, $menuDir, $zipLlm)) { New-Item -ItemType Directory -Force -Path $d | Out-Null }
     $e2eLog = Join-Path $e2e 'calls.log'
     $harness = Join-Path $e2e 'harness.ps1'
     $zipFile = Join-Path $e2e 'toolkit.zip'
@@ -361,48 +495,70 @@ exit 0
     [System.IO.File]::WriteAllText((Join-Path $apiFull 'commit.json'), $commitJson)
     [System.IO.File]::WriteAllText((Join-Path $apiFull 'compare.json'), $compareJson)
     [System.IO.File]::WriteAllText((Join-Path $apiNoCompare 'commit.json'), $commitJson)
-    [System.IO.File]::WriteAllText((Join-Path $rootInstalled 'localai-config.json'), (ConvertTo-Json -InputObject @{ AIRoot = $rootInstalled; ToolkitVersion = '2026.10.05'; ToolkitCommit = $shaOld }))
+    $installedConfig = ConvertTo-Json -InputObject @{ AIRoot = $rootInstalled; ToolkitVersion = '2026.10.05'; ToolkitCommit = $shaOld }
+    [System.IO.File]::WriteAllText((Join-Path $rootInstalled 'localai-config.json'), $installedConfig)
+    # One trace each: the installer's state file (an install that did not finish), the installed copy
+    # of the installer, a config cut off mid-write, and a config that is there but cannot be opened.
+    [System.IO.File]::WriteAllText((Join-Path $rootStateOnly 'install-state.json'), '{}')
+    [System.IO.File]::WriteAllText((Join-Path (Join-Path $rootScriptsOnly 'Scripts') 'Install-LocalAI.ps1'), '# stand-in')
+    [System.IO.File]::WriteAllText((Join-Path $rootDamaged 'localai-config.json'), '{"ToolkitCommit": "1a2b')
+    $lockedConfig = Join-Path $rootLocked 'localai-config.json'
+    [System.IO.File]::WriteAllText($lockedConfig, $installedConfig)
 
     # The harness: functions with the names of the two cmdlets that reach GitHub (functions win over
     # cmdlets), then the bootstrap's text through Invoke-Expression, as 'irm | iex' runs it.
     # Everything else is the real thing: the review, the gate, Read-Host, Expand-Archive and
     # powershell.exe for the installer.
+    # The stand-ins are called from inside the bootstrap's script block, and PowerShell looks a
+    # variable up in the caller's scope first: a harness value named like one of the bootstrap's own
+    # variables ($zip, $root, $ref) would be read as the bootstrap's. Hence the StandIn names, and
+    # $script: wherever a stand-in function reads one.
     $harnessText = @'
-param([string]$Bootstrap, [string]$Zip, [string]$Log, [string]$ApiDir, [string]$Root, [string]$Ref, [string]$Reviewed, [string]$TempDir)
+param([string]$StandInBootstrap, [string]$StandInZip, [string]$StandInLog, [string]$StandInApi, [string]$StandInRoot, [string]$StandInRef, [string]$StandInReviewed, [string]$StandInTemp, [string]$StandInProgramData)
 $ErrorActionPreference = 'Stop'
-$env:TEMP = $TempDir
-$env:LOCALAI_ROOT = $Root
-$env:LOCALAI_REF = $Ref
+$env:TEMP = $StandInTemp
+$env:ProgramData = $StandInProgramData
+$env:LOCALAI_ROOT = $StandInRoot
+$env:LOCALAI_REF = $StandInRef
 $env:LOCALAI_ARGS = ''
 $env:LOCALAI_REVIEWED_COMMIT = ''
-if ($Reviewed -ne 'NONE') { $env:LOCALAI_REVIEWED_COMMIT = $Reviewed }
+if ($StandInReviewed -ne 'NONE') { $env:LOCALAI_REVIEWED_COMMIT = $StandInReviewed }
 function Invoke-RestMethod {
     param([string]$Uri, $Headers, [switch]$UseBasicParsing, [int]$TimeoutSec)
-    [System.IO.File]::AppendAllText($Log, "API $Uri`r`n")
-    $name = 'commit.json'
-    if ($Uri -like '*/compare/*') { $name = 'compare.json' }
-    $file = Join-Path $ApiDir $name
-    if (-not (Test-Path -LiteralPath $file)) { throw 'The remote server returned an error: (403) Forbidden.' }
-    return (ConvertFrom-Json -InputObject ([System.IO.File]::ReadAllText($file)))
+    [System.IO.File]::AppendAllText($script:StandInLog, "API $Uri`r`n")
+    $standInName = 'commit.json'
+    if ($Uri -like '*/compare/*') { $standInName = 'compare.json' }
+    $standInFile = Join-Path $script:StandInApi $standInName
+    if (-not (Test-Path -LiteralPath $standInFile)) { throw 'The remote server returned an error: (403) Forbidden.' }
+    return (ConvertFrom-Json -InputObject ([System.IO.File]::ReadAllText($standInFile)))
 }
 function Invoke-WebRequest {
     param([string]$Uri, [string]$OutFile, [switch]$UseBasicParsing)
-    [System.IO.File]::AppendAllText($Log, "GET $Uri`r`n")
-    Copy-Item -LiteralPath $Zip -Destination $OutFile -Force
+    [System.IO.File]::AppendAllText($script:StandInLog, "GET $Uri`r`n")
+    Copy-Item -LiteralPath $script:StandInZip -Destination $OutFile -Force
 }
-Invoke-Expression ([System.IO.File]::ReadAllText($Bootstrap))
+Invoke-Expression ([System.IO.File]::ReadAllText($StandInBootstrap))
 '@
     [System.IO.File]::WriteAllText($harness, $harnessText)
+    # No name the harness reads may be one the bootstrap assigns: that was a real fault here (the
+    # download stand-in read the bootstrap's $zip, copied the target onto itself, and no installer ran).
+    $bootstrapNames = @($ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.VariableExpressionAst] }, $true) | ForEach-Object { $_.VariablePath.UserPath } | Select-Object -Unique)
+    $harnessAst = [System.Management.Automation.Language.Parser]::ParseInput($harnessText, [ref]$null, [ref]$null)
+    $harnessNames = @($harnessAst.FindAll({ param($n) $n -is [System.Management.Automation.Language.VariableExpressionAst] }, $true) | ForEach-Object { $_.VariablePath.UserPath -replace '^script:', '' } | Where-Object { $_ -like 'StandIn*' } | Select-Object -Unique)
+    $shared = @($harnessNames | Where-Object { $bootstrapNames -contains $_ })
+    Assert-That ($harnessNames.Count -ge 9 -and $shared.Count -eq 0) "the harness's own values have names the bootstrap does not use ($($harnessNames.Count) names, shared: $($shared -join ', '))"
 
     function Invoke-Bootstrap {
         # One run of Get-LocalAI.ps1 through the harness; nobody can type on it: -NonInteractive, and
         # on the CI runner no keyboard at all. -Ref: LOCALAI_REF. -Reviewed: LOCALAI_REVIEWED_COMMIT
-        # (NONE: not set). -PipeOk: the text OK is piped into the run instead (no -NonInteractive, so
-        # a Read-Host would take it; the pipe closes after it, so nothing can wait for more).
-        param([string]$Root, [string]$ApiDir, [string]$Ref = 'main', [string]$Reviewed = 'NONE', [switch]$PipeOk)
+        # (NONE: not set). -ProgramData: the stand-in for %ProgramData% (default: one without the
+        # installer's Start-menu folder). -PipeOk: the text OK is piped into the run instead (no
+        # -NonInteractive, so a Read-Host would take it; the pipe closes after it, so nothing can
+        # wait for more).
+        param([string]$Root, [string]$ApiDir, [string]$Ref = 'main', [string]$Reviewed = 'NONE', [string]$ProgramData = $pdNone, [switch]$PipeOk)
         $marker = Join-Path $Root 'installer-ran.txt'
         foreach ($f in @($e2eLog, $marker)) { if (Test-Path -LiteralPath $f) { Remove-Item -LiteralPath $f -Force } }
-        $harnessArgs = @('-Bootstrap', $bootstrap, '-Zip', $zipFile, '-Log', $e2eLog, '-ApiDir', $ApiDir, '-Root', $Root, '-Ref', $Ref, '-Reviewed', $Reviewed, '-TempDir', $e2eTemp)
+        $harnessArgs = @('-StandInBootstrap', $bootstrap, '-StandInZip', $zipFile, '-StandInLog', $e2eLog, '-StandInApi', $ApiDir, '-StandInRoot', $Root, '-StandInRef', $Ref, '-StandInReviewed', $Reviewed, '-StandInTemp', $e2eTemp, '-StandInProgramData', $ProgramData)
         $prev = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
         if ($PipeOk) { $out = 'OK' | & $childExe -NoProfile -ExecutionPolicy Bypass -File $harness @harnessArgs 2>&1 | ForEach-Object { "$_" } }
         else { $out = & $childExe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $harness @harnessArgs 2>&1 | ForEach-Object { "$_" } }
@@ -438,9 +594,40 @@ Invoke-Expression ([System.IO.File]::ReadAllText($Bootstrap))
     $r = Invoke-Bootstrap -Root $rootInstalled -ApiDir $apiNoCompare -Reviewed $shaNew
     Assert-That ($r.Ran -eq "commit=$shaNew") "the reviewed commit installs even then: the owner decided, not the error (installer '$($r.Ran)')"
     $r = Invoke-Bootstrap -Root $rootInstalled -ApiDir $apiNone
-    Assert-That ($r.Get.Count -eq 0 -and -not $r.Ran -and $r.Text -match 'cannot be shown or pinned' -and $r.Text -match 'Stopped: ') "GitHub not answering at all: said so, and the branch is not installed unseen (installer '$($r.Ran)'; $($r.Tail))"
+    Assert-That ($r.Get.Count -eq 0 -and -not $r.Ran -and $r.Text -match 'Stopped: the commit to install could not be named' -and $r.Text -match 'Try again later, or set LOCALAI_REF' -and $r.Text -notmatch 'whatever' -and $r.Text -match $shaOld) "GitHub not answering at all for an update: it stops and says what to do; the branch is not offered, let alone installed unseen (installer '$($r.Ran)'; $($r.Tail))"
+    $r = Invoke-Bootstrap -Root $rootInstalled -ApiDir $apiNone -Reviewed $shaNew
+    Assert-That ($r.Get.Count -eq 0 -and -not $r.Ran -and $r.Text -match 'Stopped: the commit to install could not be named') "and LOCALAI_REVIEWED_COMMIT does not carry it through: there is no commit it could name (installer '$($r.Ran)')"
     $r = Invoke-Bootstrap -Root $rootInstalled -ApiDir $apiNone -Ref $shaNew -Reviewed $shaNew
     Assert-That ($r.Ran -eq "commit=$shaNew" -and $r.Get.Count -eq 1 -and $r.Get[0] -like "GET https://codeload.github.com/*/zip/$shaNew") "a ref and a reviewed commit that both name the full id install it without GitHub's API (installer '$($r.Ran)'; $($r.Tail))"
+    Assert-That ($r.Text -match 'Not checked to be on a branch of this repository') 'and the review says that a commit id was not checked to be on a branch of this repository'
+    $r = Invoke-Bootstrap -Root $rootEmpty -ApiDir $apiNone
+    Assert-That ($r.Ran -eq 'commit=' -and $r.Get.Count -eq 1 -and $r.Get[0] -like 'GET https://codeload.github.com/*/zip/main' -and $r.Text -match 'cannot be shown or pinned') "only a first install goes on without GitHub's API, with the ref as it is and no commit recorded (installer '$($r.Ran)'; $($r.Tail))"
+
+    # What the bootstrap itself takes for an install. Each of these AI folders holds one trace only;
+    # missing one of them would turn an update into a "first install" that is not asked about.
+    $traces = @(
+        @{ Root = $rootStateOnly; Says = 'did not finish'; What = 'only install-state.json (an install that did not finish)' }
+        @{ Root = $rootScriptsOnly; Says = 'did not finish'; What = 'only Scripts\Install-LocalAI.ps1' }
+        @{ Root = $rootDamaged; Says = 'localai-config\.json could not be read'; What = 'a localai-config.json cut off mid-write' }
+    )
+    foreach ($trace in $traces) {
+        $r = Invoke-Bootstrap -Root $trace.Root -ApiDir $apiFull
+        Assert-That ($r.Text -match 'Update review' -and $r.Text -notmatch 'First install' -and $r.Text -match $trace.Says -and $r.Text -match "To install\s+: commit $shaNew" -and $r.Text -match 'Stopped: ' -and $r.Get.Count -eq 0 -and -not $r.Ran) "an AI folder with $($trace.What) is an install, not a first install: reviewed, asked, nothing downloaded (downloads $($r.Get.Count), installer '$($r.Ran)'; $($r.Tail))"
+    }
+    # A config that exists but cannot be opened (held by another program): the read error must end
+    # as "an install whose commit is unknown", not as "no config, so nothing installed".
+    $lock = [System.IO.File]::Open($lockedConfig, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::None)
+    try { $r = Invoke-Bootstrap -Root $rootLocked -ApiDir $apiFull } finally { $lock.Dispose() }
+    Assert-That ($r.Text -match 'Update review' -and $r.Text -notmatch 'First install' -and $r.Text -match 'localai-config\.json could not be read' -and $r.Text -match 'Stopped: ' -and $r.Get.Count -eq 0 -and -not $r.Ran -and @($r.Api | Where-Object { $_ -like '*/compare/*' }).Count -eq 0) "a localai-config.json that cannot be opened is an install whose commit is unknown: asked, nothing downloaded (downloads $($r.Get.Count), installer '$($r.Ran)'; $($r.Tail))"
+    $r = Invoke-Bootstrap -Root $rootLocked -ApiDir $apiFull
+    Assert-That ($r.Text -match "Installed now : version 2026\.10\.05, commit $shaOld" -and $r.Api.Count -eq 2) 'the same folder with the file free again reads as the install it is (so it was the lock that made the difference)'
+    # An install in another folder: the AI folder named here is empty, the installer's Start-menu
+    # folder exists. With the command from the README (no LOCALAI_ROOT) that is an update, not a first install.
+    $r = Invoke-Bootstrap -Root $rootEmpty -ApiDir $apiFull -ProgramData $pdMenu
+    Assert-That ($r.Text -notmatch 'First install' -and $r.Text -match 'installed on this PC' -and $r.Text -match 'but not in' -and $r.Text -match 'set LOCALAI_ROOT to that folder' -and $r.Text -match "To install\s+: commit $shaNew" -and $r.Text -match 'Stopped: ' -and $r.Get.Count -eq 0 -and -not $r.Ran) "an empty AI folder on a PC that has the installer's Start-menu folder: not a first install; said so with LOCALAI_ROOT, asked, nothing downloaded (downloads $($r.Get.Count), installer '$($r.Ran)'; $($r.Tail))"
+    # A ref that is more than a name: .NET would fold the '..' parts away and fetch another repository.
+    $r = Invoke-Bootstrap -Root $rootEmpty -ApiDir $apiNone -Ref '../../../other/repo/zip/main'
+    Assert-That ($r.Api.Count -eq 0 -and $r.Get.Count -eq 0 -and -not $r.Ran -and $r.Text -match 'LOCALAI_REF may hold only' -and $r.Text -match 'Nothing was downloaded or changed') "a LOCALAI_REF with '..' in it is refused before GitHub is asked anything: no lookup, no download, no installer (API $($r.Api.Count), downloads $($r.Get.Count), installer '$($r.Ran)'; $($r.Tail))"
     if ($failures -eq 0) { Remove-Item -LiteralPath $Work -Recurse -Force -ErrorAction SilentlyContinue }
 } else {
     Skip 'the bootstrap end to end (it starts powershell.exe: the Windows job runs this part)'

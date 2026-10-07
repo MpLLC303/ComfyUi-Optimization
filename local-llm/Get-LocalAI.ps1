@@ -6,21 +6,36 @@
 #   [Net.ServicePointManager]::SecurityProtocol = 'Tls12'
 #   irm https://raw.githubusercontent.com/MpLLC303/ComfyUi-Optimization/refs/heads/main/local-llm/Get-LocalAI.ps1 | iex
 #
-# LOCALAI_REF selects the branch, tag or commit to install from. LOCALAI_ARGS passes installer options,
-# e.g. $env:LOCALAI_ARGS = '-OfficialModels none'. Everything runs inside a script block so the settings
-# below do not leak into your PowerShell session.
+# LOCALAI_REF selects the branch, tag or commit to install from (letters, digits and . _ / - only).
+# LOCALAI_ARGS passes installer options, e.g. $env:LOCALAI_ARGS = '-OfficialModels none'. LOCALAI_ROOT
+# names the AI folder when it is not C:\AI (the Start-menu entry sets it). Everything runs inside a
+# script block so the settings below do not leak into your PowerShell session.
 #
 # Update review: when Local AI is already installed, nothing is downloaded until you have seen what is
 # installed now, the commit about to be installed (id, date, subject line) and the files that differ
 # between the two, and have typed OK at the keyboard (an OK piped in, or pasted ahead of the question,
-# does not count). A first install has nothing to compare and is not asked.
+# does not count). A first install has nothing to compare and is not asked. An install that is found
+# on this PC but not in the AI folder named here is asked about as well.
+# An update whose commit GitHub cannot name (offline, rate limit) is not offered at all: nothing is
+# shown as agreed that could not be shown. Try again later, or set LOCALAI_REF to a full commit id.
 # The one way to skip the question, for a run nobody watches: name the commit you reviewed, in full:
 #
 #   $env:LOCALAI_REVIEWED_COMMIT = '<its 40-character id>'
 #
-# It counts for exactly that commit. When the branch has moved on, or the commit cannot be named
-# (GitHub does not answer and LOCALAI_REF is not itself a full commit id), the question is asked as
-# usual, and without a typed OK nothing is installed.
+# It counts for exactly that commit. When the branch has moved on, the question is asked as usual, and
+# without a typed OK nothing is installed.
+#
+# What the review does not cover:
+# - It is only as trustworthy as the copy of this file that runs it. Start menu > Local AI > Update
+#   toolkit runs the copy already on this PC. The command above fetches this file from the main branch
+#   and runs it unseen: whoever can change that branch can change the review with it. To review that
+#   path too, replace refs/heads/main in its address with the id of a commit you have read.
+# - It lists the names of the files that differ, not what changed inside them (it prints the address
+#   of the full comparison). GitHub lists at most 300 files; a longer list is said to be cut off.
+# - It is no defence against a program that already runs under your Windows account: the installed
+#   copy of this file sits in a folder such a program can write to.
+# - A commit id in LOCALAI_REF is not checked to be on a branch of this repository (GitHub also
+#   answers at this address for commits that exist only in a fork); the review says so.
 & {
     $ErrorActionPreference = 'Stop'
     $ProgressPreference = 'SilentlyContinue'
@@ -86,6 +101,28 @@
         }
     }
 
+    function Test-ToolkitRef {
+        # Whether -Ref (LOCALAI_REF) may go into the addresses GitHub is asked for: the name of a
+        # branch, a tag or a commit, made of letters, digits and . _ / - only. No '..', no '.' or
+        # empty part between slashes: .NET folds such parts away, and the address would then name
+        # another repository than the one the review shows.
+        param([string]$Ref)
+        if ($Ref.Length -gt 200 -or $Ref -notmatch '^[A-Za-z0-9._/-]+\z' -or $Ref.Contains('..')) { return $false }
+        foreach ($part in $Ref.Split('/')) { if ($part -eq '' -or $part -eq '.') { return $false } }
+        return $true
+    }
+
+    function Test-DirectCommitRef {
+        # Whether -Ref names a commit by itself instead of through a branch or tag of this
+        # repository: a commit id (short or full), a pull request's ref or another refs/ name. GitHub
+        # answers for such a commit also when it exists only in a fork, so the review says that it
+        # was not checked to be on a branch of this repository.
+        param([string]$Ref)
+        if ($Ref -match '^[0-9a-f]{7,40}\z') { return $true }
+        if ($Ref -match '(^|/)pull/') { return $true }
+        return ($Ref -match '^refs/' -and $Ref -notmatch '^refs/(heads|tags)/')
+    }
+
     function Get-IncomingCommit {
         # The commit -Ref points to: GitHub's answer when it names one. When it does not, a -Ref that
         # is itself a full commit id (it pins the download by itself; date and subject line stay
@@ -100,16 +137,20 @@
     function Get-InstalledToolkit {
         # What the install in the AI folder says about itself: Install-LocalAI.ps1 records
         # ToolkitVersion and ToolkitCommit in localai-config.json near its end.
-        #   State 'none'     nothing is installed there: a first install
+        #   State 'none'     nothing is installed: a first install
         #   State 'known'    an install, and the commit it came from
         #   State 'unknown'  an install, but not which commit (Why: what exactly is missing)
         # -ConfigText: the text of localai-config.json, $null when there is no such file.
         # -OtherSigns: the folder holds other traces of an install (install-state.json, the Scripts
         # folder). Whatever cannot be read is 'unknown', never 'none'.
-        param($ConfigText, [bool]$OtherSigns)
-        $r = [pscustomobject]@{ State = 'none'; Version = ''; Commit = ''; Why = '' }
+        # -StartMenu: the installer's Start-menu folder exists. It does not depend on the AI folder,
+        # so with nothing in the AI folder it means an install somewhere else (Elsewhere): the AI
+        # folder named here is the wrong one, and that is not a first install either.
+        param($ConfigText, [bool]$OtherSigns, [bool]$StartMenu)
+        $r = [pscustomobject]@{ State = 'none'; Version = ''; Commit = ''; Why = ''; Elsewhere = $false }
         if ($null -eq $ConfigText) {
             if ($OtherSigns) { $r.State = 'unknown'; $r.Why = 'there is no localai-config.json: the install did not finish' }
+            elseif ($StartMenu) { $r.State = 'unknown'; $r.Elsewhere = $true; $r.Why = 'the install is in another folder, so its localai-config.json was not read' }
             return $r
         }
         $r.State = 'unknown'
@@ -125,28 +166,60 @@
         return $r
     }
 
-    function Get-ChangedFileGroup {
-        # Where a changed file matters, from its path in the repository:
-        #   'admin'    the installer, the module it loads and every toolkit script it can start (the
-        #              installer runs as administrator); also a script or program in a new toolkit folder
-        #   'toolkit'  the other files installed on this PC (stack, config, skills, VERSION, README)
-        #   'other'    not installed: tests, docs, the backlog and the repository's other folders
+    function Test-PlainRepoPath {
+        # Whether Windows stores a file of the archive under exactly the path git gives it. Not so
+        # for: no name at all; a '.' or '..' part, an empty part, or a part that ends in a dot or a
+        # space (Windows drops those); a character outside printable ASCII; one of : * ? " < > |
+        # (a colon names a stream of another file); '~' and a digit (a short 8.3 name of another
+        # file). Git takes such a path for a file of its own; on this PC it can be, or replace,
+        # another one, the installer included.
         param([string]$Path)
         $p = $Path -replace '\\', '/'
-        if (-not $p.StartsWith('local-llm/', [System.StringComparison]::Ordinal)) { return 'other' }
+        if ($p -eq '' -or $p -match '[^\x20-\x7E]' -or $p -match '[:*?"<>|]' -or $p -match '~[0-9]') { return $false }
+        foreach ($part in $p.Split('/')) { if ($part -eq '' -or $part -match '[. ]\z') { return $false } }
+        return $true
+    }
+
+    function Get-ChangedFileGroup {
+        # Where a changed file matters, from its path in the repository as Windows will store it
+        # (the archive is unpacked on this PC: capitals do not tell two names apart, '\' is '/'):
+        #   'admin'    the installer, the module it loads and every toolkit script it can start (the
+        #              installer runs as administrator); also a script or program in a new toolkit
+        #              folder, and every path Windows may store elsewhere than written (Test-PlainRepoPath)
+        #   'toolkit'  the other files installed on this PC (stack, config, skills, VERSION, README)
+        #   'other'    not installed: tests, docs, the backlog and the repository's other folders
+        # Only the exact names tests, docs and IMPROVEMENTS.md count as not installed.
+        param([string]$Path)
+        if (-not (Test-PlainRepoPath -Path $Path)) { return 'admin' }
+        $p = $Path -replace '\\', '/'
+        if (-not $p.StartsWith('local-llm/', [System.StringComparison]::OrdinalIgnoreCase)) { return 'other' }
         $rest = $p.Substring(10)
         if ($rest -cmatch '^(tests|docs)/' -or $rest -ceq 'IMPROVEMENTS.md') { return 'other' }
-        if ($rest -cmatch '^lib/' -or $rest -match '\.(ps1|psm1|cmd|bat|exe|msi|dll|vbs)\z') { return 'admin' }
+        if ($rest -match '^lib/' -or $rest -match '\.(ps1|psm1|cmd|bat|exe|msi|dll|vbs)\z') { return 'admin' }
         return 'toolkit'
     }
 
     function Get-ChangedFileReport {
-        # The comparison's file list as lines to print, scripts that run as administrator first (the
-        # installer, then its module, then the rest by name). Up to -MaxListed files are all named. A
-        # longer list is summarised: every administrator script by name, then as many other toolkit
-        # files as still fit, and the files that are not installed only counted.
-        param($Files, [int]$MaxListed = 25)
+        # The comparison's file list as lines (Text, Color) to print. Every file that is installed on
+        # this PC is named, however long the list: first the scripts that run as administrator (the
+        # installer, then its module, then the rest by name), then the other toolkit files (the stack
+        # and the config first: images, published ports and mounted folders are set there). A list
+        # of more than -MaxListed files is summarised: the files that are not installed are only
+        # counted. A renamed file counts for the stricter of its two names.
+        # GitHub sends at most -ListLimit files. A list of that length is called cut off (Cut), above
+        # the list, and is never said to hold no administrator script: that is then not known.
+        param($Files, [int]$MaxListed = 25, [int]$ListLimit = 300)
         $words = @{ added = 'new'; removed = 'removed'; modified = 'changed'; changed = 'changed'; renamed = 'renamed'; copied = 'copied' }
+        $strictness = @{ admin = 0; toolkit = 1; other = 2 }
+        $rankOf = {
+            # Capitals do not matter here either: -eq and -like read names as Windows does.
+            param([string]$Path)
+            $p = $Path -replace '\\', '/'
+            if ($p -eq 'local-llm/Install-LocalAI.ps1') { return 0 }
+            if ($p -like 'local-llm/lib/*' -or $p -like 'local-llm/stack/*') { return 1 }
+            if ($p -like 'local-llm/config/*') { return 2 }
+            return 3
+        }
         $items = New-Object System.Collections.Generic.List[object]
         foreach ($f in @($Files)) {
             if ($null -eq $f) { continue }
@@ -154,41 +227,52 @@
             $status = [string](Get-ReviewField -Object $f -Path 'status')
             $word = 'changed'; if ($words.ContainsKey($status)) { $word = $words[$status] }
             $shown = '(a file GitHub did not name)'; if ($name) { $shown = ConvertTo-ReviewText -Text $name -Max 110 }
+            $group = Get-ChangedFileGroup -Path $name
+            $rank = & $rankOf $name
+            $plain = (-not $name) -or (Test-PlainRepoPath -Path $name)
             $old = [string](Get-ReviewField -Object $f -Path 'previous_filename')
-            if ($old -and $status -eq 'renamed') { $shown = (ConvertTo-ReviewText -Text $old -Max 110) + ' -> ' + $shown }
-            $rank = 2
-            if ($name -ceq 'local-llm/Install-LocalAI.ps1') { $rank = 0 } elseif ($name -clike 'local-llm/lib/*') { $rank = 1 }
-            $items.Add([pscustomobject]@{ Group = (Get-ChangedFileGroup -Path $name); Rank = $rank; Name = $name; Line = ('    {0,-8} {1}' -f $word, $shown) })
+            if ($old) {
+                # Moved or renamed: the name it had counts as much as the name it has now.
+                $shown = (ConvertTo-ReviewText -Text $old -Max 110) + ' -> ' + $shown
+                $oldGroup = Get-ChangedFileGroup -Path $old
+                if ($strictness[$oldGroup] -lt $strictness[$group]) { $group = $oldGroup }
+                $oldRank = & $rankOf $old
+                if ($oldRank -lt $rank) { $rank = $oldRank }
+                if (-not (Test-PlainRepoPath -Path $old)) { $plain = $false }
+            }
+            if (-not $plain) { $shown += '  (unusual name: Windows may store it somewhere else)' }
+            $items.Add([pscustomobject]@{ Group = $group; Rank = $rank; Name = $name; Line = ('    {0,-8} {1}' -f $word, $shown) })
         }
         $admin = @($items | Where-Object { $_.Group -eq 'admin' } | Sort-Object { $_.Rank }, { $_.Name })
-        $toolkit = @($items | Where-Object { $_.Group -eq 'toolkit' } | Sort-Object { $_.Name })
+        $toolkit = @($items | Where-Object { $_.Group -eq 'toolkit' } | Sort-Object { $_.Rank }, { $_.Name })
         $other = @($items | Where-Object { $_.Group -eq 'other' } | Sort-Object { $_.Name })
-        $long = $items.Count -gt $MaxListed
-        $lines = New-Object System.Collections.Generic.List[string]
-        if ($admin.Count) {
-            $lines.Add("  Scripts that run as administrator, or that the installer can start ($($admin.Count)):")
-            foreach ($i in $admin) { $lines.Add($i.Line) }
+        $long = ($items.Count -gt $MaxListed -and $other.Count -gt 0)
+        $cut = (@($Files).Count -ge $ListLimit)
+        $lines = New-Object System.Collections.Generic.List[object]
+        $say = { param($Text, $Color) $lines.Add([pscustomobject]@{ Text = [string]$Text; Color = [string]$Color }) }
+        $title = '  Scripts that run as administrator, or that the installer can start'
+        if ($cut) { & $say "  GitHub lists at most $ListLimit files and this list is that long: it is cut off, and more files may differ than are shown here." 'Yellow' }
+        if ($admin.Count -and $cut) {
+            & $say "$title ($($admin.Count) in the part GitHub listed; more may be among the files it did not list):" 'Yellow'
+        } elseif ($admin.Count) {
+            & $say "$title ($($admin.Count)):" 'Gray'
+        } elseif ($cut) {
+            & $say "${title}: not known. GitHub's list stops at $ListLimit files, and administrator scripts may be among those not listed." 'Yellow'
         } else {
-            $lines.Add('  Scripts that run as administrator, or that the installer can start: none of them differ.')
+            & $say "${title}: none of them differ." 'Gray'
         }
+        foreach ($i in $admin) { & $say $i.Line 'Gray' }
         if ($toolkit.Count) {
-            $room = $toolkit.Count
-            if ($long) { $room = [Math]::Max(0, $MaxListed - $admin.Count) }
-            if ($room -gt 0) {
-                $lines.Add("  Other toolkit files installed on this PC ($($toolkit.Count)):")
-                foreach ($i in @($toolkit | Select-Object -First $room)) { $lines.Add($i.Line) }
-                if ($toolkit.Count -gt $room) { $lines.Add("    ... and $($toolkit.Count - $room) more, not listed here") }
-            } else {
-                $lines.Add("  Other toolkit files installed on this PC: $($toolkit.Count) file(s), not listed here")
-            }
+            & $say "  Other toolkit files installed on this PC ($($toolkit.Count)):" 'Gray'
+            foreach ($i in $toolkit) { & $say $i.Line 'Gray' }
         }
         if ($other.Count -and $long) {
-            $lines.Add("  Not installed on this PC (tests, notes, other folders): $($other.Count) file(s), not listed here")
+            & $say "  Not installed on this PC (tests, notes, other folders): $($other.Count) file(s), not listed here" 'Gray'
         } elseif ($other.Count) {
-            $lines.Add("  Not installed on this PC (tests, notes, other folders) ($($other.Count)):")
-            foreach ($i in $other) { $lines.Add($i.Line) }
+            & $say "  Not installed on this PC (tests, notes, other folders) ($($other.Count)):" 'Gray'
+            foreach ($i in $other) { & $say $i.Line 'Gray' }
         }
-        return [pscustomobject]@{ Total = $items.Count; Admin = $admin.Count; Long = $long; Lines = $lines.ToArray() }
+        return [pscustomobject]@{ Total = $items.Count; Admin = $admin.Count; Long = $long; Cut = $cut; Lines = $lines.ToArray() }
     }
 
     function Get-UpdateReview {
@@ -199,15 +283,19 @@
         #   -Compare         GitHub's comparison of the installed commit with the incoming one; $null
         #                    when there is none (-CompareError: why)
         #   -ReviewedCommit  LOCALAI_REVIEWED_COMMIT, the one way to skip the question
-        # Returns Lines (Text, Color) to print; NeedsOk: wait for a typed OK before going on; and
-        # Commit, Get and Url: what is downloaded. Url is built from the commit that Lines shows, so
-        # what is read here is what is fetched and run. Nothing in the fetched data clears NeedsOk:
-        # only a first install and a matching -ReviewedCommit do.
+        # Returns Lines (Text, Color) to print; NeedsOk: wait for a typed OK before going on; Stop:
+        # when not empty, why this run ends here without a question; and Commit, Get and Url: what is
+        # downloaded. Url is built from the commit that Lines shows, so what is read here is what is
+        # fetched and run. An update whose commit cannot be named is not offered (Stop, no Url):
+        # there is nothing to show, so there is nothing to agree to. Only a first install goes on
+        # with the ref as it is. Nothing in the fetched data clears NeedsOk: only a first install and
+        # a matching -ReviewedCommit do, and nothing clears Stop.
         param([string]$Repo, [string]$Root, [string]$Ref, $Installed, $Incoming, [string]$IncomingError, $Compare, [string]$CompareError, [string]$ReviewedCommit, [int]$MaxListed = 25)
         $lines = New-Object System.Collections.Generic.List[object]
         $say = { param($Text, $Color) $lines.Add([pscustomobject]@{ Text = [string]$Text; Color = [string]$Color }) }
         $pad = ' ' * 18
         $commit = ''; if ($Incoming) { $commit = [string]$Incoming.Sha }
+        $refShown = ConvertTo-ReviewText -Text $Ref -Max 80
         $get = $Ref; if ($commit) { $get = $commit }
         $url = "https://codeload.github.com/$Repo/zip/$get"
         $first = ($Installed.State -eq 'none')
@@ -215,6 +303,11 @@
         if ($first) {
             $kind = 'first'
             & $say "First install: nothing is installed in $Root yet, so there is nothing to compare." 'Cyan'
+        } elseif ($Installed.Elsewhere) {
+            & $say "Update review: Local AI is installed on this PC (its Start-menu folder is there), but not in $Root." 'Yellow'
+            & $say '  If it lives in another folder: type anything but OK, set LOCALAI_ROOT to that folder and run this again.' 'Yellow'
+            & $say '  Start menu > Local AI > Update toolkit names the folder by itself.' 'Yellow'
+            & $say "  Installed now : not in $Root" 'Gray'
         } else {
             & $say "Update review: Local AI is already installed in $Root." 'Cyan'
             $version = 'version unknown'; if ($Installed.Version) { $version = "version $($Installed.Version)" }
@@ -226,25 +319,33 @@
                 & $say "  Installed now : $version, commit not recorded" 'Gray'
             }
         }
+        $notNamed = ConvertTo-ReviewText -Text $IncomingError -Max 160 -AllowUnicode
         if ($commit) {
-            & $say "  To install    : commit $commit (from '$Ref')" 'Gray'
+            & $say "  To install    : commit $commit (from '$refShown')" 'Gray'
             $described = ($Incoming.Date + '  ' + $Incoming.Subject).Trim()
             if ($described) { & $say ($pad + $described) 'Gray' }
-            else { & $say ($pad + "GitHub could not describe it ($(ConvertTo-ReviewText -Text $IncomingError -Max 160 -AllowUnicode)): no date or subject line.") 'Yellow' }
+            else { & $say ($pad + "GitHub could not describe it ($notNamed): no date or subject line.") 'Yellow' }
+            if (Test-DirectCommitRef -Ref $Ref) { & $say ($pad + "Not checked to be on a branch of this repository: '$refShown' names a commit directly, and GitHub also answers here for commits that exist only in a fork.") 'Yellow' }
+        } elseif ($first) {
+            & $say "  To install    : whatever '$refShown' is on GitHub when the download starts." 'Yellow'
+            & $say ($pad + "GitHub could not name its commit ($notNamed), so it cannot be shown or pinned.") 'Yellow'
         } else {
-            & $say "  To install    : whatever '$Ref' is on GitHub when the download starts." 'Yellow'
-            & $say ($pad + "GitHub could not name its commit ($(ConvertTo-ReviewText -Text $IncomingError -Max 160 -AllowUnicode)), so it cannot be shown or pinned.") 'Yellow'
+            & $say "  To install    : not known. GitHub could not name the commit '$refShown' stands for ($notNamed)." 'Yellow'
+            & $say ($pad + 'An update is installed only after its commit was shown here. Try again later, or set LOCALAI_REF to the full 40-character id of the commit to install.') 'Yellow'
         }
-        if ($first) { return [pscustomobject]@{ Kind = $kind; NeedsOk = $false; Lines = $lines.ToArray(); Commit = $commit; Get = $get; Url = $url } }
+        if ($first) { return [pscustomobject]@{ Kind = $kind; NeedsOk = $false; Stop = ''; Lines = $lines.ToArray(); Commit = $commit; Get = $get; Url = $url } }
+        if (-not $commit) {
+            # No question: an OK here would be an OK to code nobody has seen, and LOCALAI_REVIEWED_COMMIT
+            # has no commit to be compared with. Nothing is left to download either.
+            $stop = 'the commit to install could not be named, so there is nothing to show and nothing to agree to. Try again later, or set LOCALAI_REF to the full id of the commit to install.'
+            return [pscustomobject]@{ Kind = 'unpinned'; NeedsOk = $true; Stop = $stop; Lines = $lines.ToArray(); Commit = ''; Get = ''; Url = '' }
+        }
 
         $link = ''
         if ($Installed.State -ne 'known') {
             $kind = 'unknown'
             & $say "  The changes cannot be listed: it is not known which commit is installed ($($Installed.Why))." 'Yellow'
-            if ($commit) { $link = "  This commit on GitHub: https://github.com/$Repo/commit/$commit" }
-        } elseif (-not $commit) {
-            $kind = 'unpinned'
-            & $say '  The changes cannot be listed without the commit that would be installed.' 'Yellow'
+            $link = "  This commit on GitHub: https://github.com/$Repo/commit/$commit"
         } elseif ($Installed.Commit -eq $commit) {
             $kind = 'repair'
             & $say '  That is the commit already installed: a repair run of the same version. It is downloaded again and the installer re-applies it.' 'Gray'
@@ -272,10 +373,10 @@
                     & $say '  The files below changed since that ancestor; what the installed commit added after it would be gone.' 'Yellow'
                 }
                 $report = Get-ChangedFileReport -Files $files -MaxListed $MaxListed
-                $note = ''; if ($report.Long) { $note = ' (a long list: summarised)' }
-                & $say "  Changes       : $ahead commit(s), $($report.Total) file(s) differ$note" 'Gray'
-                foreach ($l in $report.Lines) { & $say $l 'Gray' }
-                if ($report.Total -ge 300) { & $say '  GitHub lists at most 300 files: more than these may differ.' 'Yellow' }
+                $count = [string]$report.Total; if ($report.Cut) { $count = "$($report.Total) or more" }
+                $note = ''; if ($report.Long) { $note = ' (a long list: the files that are not installed are only counted)' }
+                & $say "  Changes       : $ahead commit(s), $count file(s) differ$note" 'Gray'
+                foreach ($l in $report.Lines) { & $say $l.Text $l.Color }
             }
         }
         if ($link) { & $say $link 'Gray' }
@@ -290,7 +391,7 @@
                 & $say '  LOCALAI_REVIEWED_COMMIT is set, but not to the full id of this commit: it does not count here.' 'Yellow'
             }
         }
-        return [pscustomobject]@{ Kind = $kind; NeedsOk = $needsOk; Lines = $lines.ToArray(); Commit = $commit; Get = $get; Url = $url }
+        return [pscustomobject]@{ Kind = $kind; NeedsOk = $needsOk; Stop = ''; Lines = $lines.ToArray(); Commit = $commit; Get = $get; Url = $url }
     }
 
     function Test-UpdateAnswer {
@@ -303,6 +404,7 @@
 
     function Get-UpdateConsent {
         # Whether the installer may be started after the review: Go, and when not, Why.
+        #   the review says Stop (an update whose commit could not be named)         stop, not asked
         #   nothing to ask (-Review says so: a first install, the reviewed commit)   go on
         #   the console window's input is redirected: nobody can type there          stop, not asked
         #   -ReadAnswer (asks, returns what was typed) fails                          stop: an error is not consent
@@ -311,6 +413,9 @@
         # session, an editor) ask through their own window. A review that cannot be read is asked about.
         param($Review, [string]$HostName, [bool]$InputRedirected, [scriptblock]$ReadAnswer)
         $unattended = 'For a run nobody watches, set LOCALAI_REVIEWED_COMMIT to the full id of the commit you reviewed.'
+        # Stop comes first: no answer and no setting turns it into a go.
+        $stop = [string](Get-ReviewField -Object $Review -Path 'Stop')
+        if ($stop) { return [pscustomobject]@{ Go = $false; Why = $stop } }
         if ($Review -and $Review.NeedsOk -is [bool] -and -not $Review.NeedsOk) { return [pscustomobject]@{ Go = $true; Why = '' } }
         if ($HostName -eq 'ConsoleHost' -and $InputRedirected) {
             return [pscustomobject]@{ Go = $false; Why = "there is no keyboard to type OK on (this window's input comes from a file or another program). $unattended" }
@@ -326,6 +431,12 @@
 
     $ref = $env:LOCALAI_REF
     if (-not $ref) { $ref = 'main' }
+    # The ref goes into the addresses GitHub is asked for: a plain name only, checked before any of them is built.
+    if (-not (Test-ToolkitRef -Ref $ref)) {
+        Write-Host "LOCALAI_REF may hold only the name of a branch, a tag or a commit (letters, digits and . _ / - , no '..'); not used: $(ConvertTo-ReviewText -Text $ref -Max 120)" -ForegroundColor Red
+        Write-Host 'Nothing was downloaded or changed.' -ForegroundColor Yellow
+        return
+    }
     # LOCALAI_ROOT: the install's AI folder (set by the Start-menu 'Update toolkit' shortcut).
     $root = $env:LOCALAI_ROOT
     if (-not $root) { $root = 'C:\AI' }
@@ -336,7 +447,8 @@
     $zip = Join-Path $env:TEMP 'localai-installer.zip'
     # The ref is resolved to one commit first: what is downloaded is exactly what is shown here, and a
     # re-run after a failure (or the resume after a reboot) installs the same code even if the branch
-    # moved meanwhile. Without GitHub's API (rate limit, proxy) the ref itself is used.
+    # moved meanwhile. Without GitHub's API (rate limit, proxy) only a first install goes on, with the
+    # ref itself; an update stops, because its commit could not be shown.
     $lookup = $null; $incomingError = ''
     try { $lookup = Invoke-RestMethod -Uri "https://api.github.com/repos/$repo/commits/$ref" -UseBasicParsing -Headers @{ Accept = 'application/vnd.github+json' } }
     catch { $incomingError = $_.Exception.Message; if (-not $incomingError) { $incomingError = 'no answer' } }
@@ -351,7 +463,13 @@
         $configFile = [System.IO.Path]::Combine($root, 'localai-config.json')
         if (Test-Path -LiteralPath $configFile) { $configText = [System.IO.File]::ReadAllText($configFile) }
     } catch { $configText = '' }
-    $installed = Get-InstalledToolkit -ConfigText $configText -OtherSigns $otherSigns
+    # An install in another folder than $root (the command in the README does not know LOCALAI_ROOT)
+    # is no first install either. The installer's Start-menu folder is for all users, wherever the AI
+    # folder is, and only an administrator can remove it. Not readable counts as "it is there".
+    $startMenu = $false
+    try { if ($env:ProgramData) { $startMenu = Test-Path -LiteralPath ([System.IO.Path]::Combine($env:ProgramData, 'Microsoft\Windows\Start Menu\Programs\Local AI')) } }
+    catch { $startMenu = $true }
+    $installed = Get-InstalledToolkit -ConfigText $configText -OtherSigns $otherSigns -StartMenu $startMenu
     # The files that differ between the two commits (GitHub's compare API; the repository is public).
     $compare = $null; $compareError = ''
     if ($installed.State -eq 'known' -and $incoming -and $installed.Commit -ne $incoming.Sha) {
