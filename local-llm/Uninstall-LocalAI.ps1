@@ -18,7 +18,7 @@
     and WSL are never uninstalled (other programs may use them; remove them in Settings > Apps).
 
       -RemoveData       also delete the open-webui volume (and the deep research one) and C:\AI\{Stack,Scripts,Secrets,Logs}
-                        and state files. The Backups folder is always kept.
+                        and state files. The Backups folder and a CLAUDE.md in the install folder are always kept.
       -RemoveModels     also delete the catalog's source models from Ollama (and OLLAMA_MODELS).
       -ResetOllamaSettings  remove the OLLAMA_* user variables the installer set (flash attention,
                         q8_0 KV cache, keep-alive, ...), plus OLLAMA_HOST and its LAN firewall block.
@@ -106,6 +106,8 @@ if ($RemoveData) { $plan += 'Open WebUI data volume (chats, memories, knowledge)
 if ($RemoveModels) { $plan += 'downloaded models from the catalog' } else { $kept += 'downloaded models' }
 if ($ResetOllamaSettings) { $plan += 'OLLAMA_* user variables set by the installer (+ OLLAMA_HOST firewall rule)' } else { $kept += 'Ollama settings' }
 $kept += "backups in $(Join-Path $AIRoot 'Backups')"
+# The rules file for an AI coding agent (written by the installer, edited by the owner) is not in the list of what -RemoveData deletes.
+if (Test-Path -LiteralPath (Join-Path $AIRoot 'CLAUDE.md') -PathType Leaf) { $kept += "CLAUDE.md in $AIRoot (the rules for an AI coding agent)" }
 Write-LaiLog STEP 'Uninstall plan'
 foreach ($p in $plan) { Write-LaiLog INFO "remove: $p" }
 foreach ($k in $kept) { Write-LaiLog INFO "keep:   $k" }

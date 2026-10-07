@@ -511,6 +511,17 @@ Add-Check 'Health watch' {
     Pass "last check $mins min ago"
 }
 
+function Format-TakenList {
+    # What a baseline took in, for the Integrity watch line: the first twelve by name, and how many
+    # there are in all (-Count; more than the names when the baseline counts some without naming them).
+    param([string[]]$Names = @(), [int]$Count = 0)
+    $shown = @($Names | Select-Object -First 12)
+    $list = $shown -join '; '
+    if ($shown.Count -eq 0) { $list = 'none of them is listed by name any more' }
+    elseif ($Count -gt $shown.Count) { $list += ' and {0} more' -f ($Count - $shown.Count) }
+    return $list
+}
+
 Add-Check 'Integrity watch' {
     # What the health watch found when it last compared the installed scripts, the Stack folder, the
     # LocalAI-* scheduled tasks and the network listeners with the baseline the last install or update
@@ -555,17 +566,44 @@ Add-Check 'Integrity watch' {
         # By name the first twelve. An entry that stands for what the baseline does not name ('more|...',
         # past a thousand kept items or in the old 50-name form) is no name: it is part of the count,
         # and of the advice below.
-        $takenShown = @($taken | Where-Object { [string]$_['Id'] -notlike 'more|*' } | ForEach-Object { [string]$_['Text'] } | Select-Object -First 12)
-        $takenList = $takenShown -join '; '
-        if ($takenShown.Count -eq 0) { $takenList = 'none of them is listed by name any more' }
-        elseif ($takenCount -gt $takenShown.Count) { $takenList += ' and {0} more' -f ($takenCount - $takenShown.Count) }
+        $takenNamed = @($taken | Where-Object { [string]$_['Id'] -notlike 'more|*' })
+        $takenList = Format-TakenList -Names @($takenNamed | ForEach-Object { [string]$_['Text'] }) -Count $takenCount
         $takenAdvice = Get-LaiIntegrityAdvice -Ids @($taken | ForEach-Object { [string]$_['Id'] }) -AIRoot $AIRoot
         if ($byHand) { $origin = " That baseline was recorded by hand (-AcceptBaseline), which made $takenCount change(s) count as normal: $takenList. If that was not you, $takenAdvice" }
-        else { $origin = " That install or update kept $takenCount thing(s) it did not install, which now count as normal: $takenList. If you did not add them, $takenAdvice If you did, this goes away with: $accept" }
+        else {
+            # An install carries on, marked 'Settled', what the owner accepted by hand and the watch has not
+            # had its turn with yet: that was not "kept although the install did not put it there", it is
+            # worded apart. What the baseline counts without naming it ('more|...') is settled only when
+            # its own entry says so.
+            $restSettled = (@($taken | Where-Object { [string]$_['Id'] -like 'more|*' -and $_['Settled'] }).Count -gt 0)
+            $restCount = [math]::Max(0, $takenCount - $takenNamed.Count)
+            $keptNamed = @($takenNamed | Where-Object { -not $_['Settled'] })
+            $settledNamed = @($takenNamed | Where-Object { $_['Settled'] })
+            $keptCount = $keptNamed.Count; $settledCount = $settledNamed.Count
+            if ($restSettled) { $settledCount += $restCount } else { $keptCount += $restCount }
+            # The sentence that ends in the command to paste comes last.
+            $origin = ''
+            if ($settledCount) {
+                $settledList = Format-TakenList -Names @($settledNamed | ForEach-Object { [string]$_['Text'] }) -Count $settledCount
+                $settledAdvice = Get-LaiIntegrityAdvice -Ids @($taken | Where-Object { $_['Settled'] } | ForEach-Object { [string]$_['Id'] }) -AIRoot $AIRoot
+                $origin = " That install or update carried on $settledCount thing(s) already accepted by hand (-AcceptBaseline), which still count as normal: $settledList. If that acceptance was not yours, $settledAdvice"
+            }
+            if ($keptCount) {
+                $keptList = Format-TakenList -Names @($keptNamed | ForEach-Object { [string]$_['Text'] }) -Count $keptCount
+                $keptAdvice = Get-LaiIntegrityAdvice -Ids @($taken | Where-Object { -not $_['Settled'] } | ForEach-Object { [string]$_['Id'] }) -AIRoot $AIRoot
+                $origin += " That install or update kept $keptCount thing(s) it did not install, which now count as normal: $keptList. If you did not add them, $keptAdvice If you did, this goes away with: $accept"
+            }
+        }
     }
     # An update that kept what it did not install is a warning until the owner has looked.
     $keptByUpdate = ($takenCount -gt 0 -and -not $byHand)
     if ([string]$ig['baseline'] -ne [string]$base['id'] -or -not $ig['checkedAt']) {
+        # The watch's record belongs to this baseline only when it names its id: under another id it is
+        # the previous baseline's, and the reason in it (every install leaves 'an install ... is
+        # running' there) is stale. Under this one, a comparison that could not run says why.
+        if ([string]$ig['baseline'] -eq [string]$base['id'] -and $ig['skippedWhy']) {
+            return (Warn "$about; the health watch has not compared the PC with it yet: the comparison is not running ($($ig['skippedWhy'])).$origin")
+        }
         $msg = "$about; the health watch compares the PC with it on its next run.$origin"
         if ($keptByUpdate) { return (Warn $msg) }
         return (Pass $msg)
