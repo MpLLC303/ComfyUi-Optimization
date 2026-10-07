@@ -20,6 +20,17 @@
     (Update-Models.ps1 -RecheckOnly -Scheduled) measures them again; the watch notifies only when a
     preset could not be put back fully on the GPU, or the re-check could not run for 3 days (once per
     new version without that task).
+    About once an hour it also compares the installed scripts (<AIRoot>\Scripts), the Stack folder, the
+    LocalAI-* scheduled tasks and the programs that listen for network connections with the record
+    the last successful install or update left (<AIRoot>\integrity-baseline.json), and notifies
+    once, naming what changed, when a second look still finds the difference. Of Stack\.env only
+    the settings that say where chats and searches are sent (names ending in _URL, _URLS or
+    _UPSTREAM) are compared, by name; the rest of it (versions, ports, keys, extra origins), logs
+    and everything under a Secrets folder are not watched. Changes you made yourself:
+    -AcceptBaseline records the current state as the new baseline, and the next scheduled run
+    confirms that with a notification, so an acceptance you did not make is seen. That record sits
+    in a folder you can write yourself, so this notices accidents, other software and clumsy
+    tampering, not an attacker who already runs as you and rewrites the record too.
 
 .EXAMPLE
     .\Watch-LocalAI.ps1              # one check, as the scheduled task runs it
@@ -29,6 +40,8 @@
     .\Watch-LocalAI.ps1 -PauseMinutes 240   # quiet for 4 hours (gaming, stack stopped on purpose)
 .EXAMPLE
     .\Watch-LocalAI.ps1 -Unpause
+.EXAMPLE
+    .\Watch-LocalAI.ps1 -AcceptBaseline     # the reported changes are yours: make them the new baseline
 #>
 [CmdletBinding()]
 param(
@@ -41,7 +54,10 @@ param(
     [int]$MinFreeGB = 10,
     # Silence the watch (no checks, restarts or notifications) for this many minutes, then exit.
     [int]$PauseMinutes = 0,
-    [switch]$Unpause
+    [switch]$Unpause,
+    # Record the installed scripts, the Stack folder, the LocalAI-* tasks and the listeners as they
+    # are now as the integrity baseline (after changes you made yourself), then exit.
+    [switch]$AcceptBaseline
 )
 $ErrorActionPreference = 'Stop'
 Import-Module (Join-Path (Join-Path $PSScriptRoot 'lib') 'LocalAI.psm1') -Force
@@ -60,6 +76,12 @@ $healAllowed = -not $NoHeal
 # A problem that persists is announced again after this many hours (a single toast is easy to miss:
 # Focus Assist during a game, a busy morning), until it is fixed.
 $remindHours = 24
+# The integrity comparison (hash every installed file, read the tasks and the listeners) runs when
+# the last one is this old: on every 15-minute run it would be the slowest thing the watch does.
+$integrityMinutes = 60
+# A comparison that could not run for this long (an install or model update holds the setup lock, or
+# it keeps failing) is announced once: until then only watch.log and the health check say so.
+$integritySkipHours = 6
 # Windows' notification switch for PowerShell, as last seen by a toast ('' = no toast tried this run).
 $script:toastSetting = ''
 
@@ -170,6 +192,29 @@ if ($PauseMinutes -gt 0 -or $Unpause) {
     Save-LaiState -State $st -Path $statePath
     Write-WatchLog ('{0} {1}' -f (Get-Date -Format 's'), $msg)
     Write-LaiLog OK $msg
+    exit 0
+}
+
+# ---- accept the current state as the integrity baseline ---------------------------------------
+if ($AcceptBaseline) {
+    # The new baseline lists what it took in (everything that differed from the one before).
+    $new = Save-LaiIntegrityBaseline -AIRoot $AIRoot -Reason 'accepted by the owner'
+    $took = @($new['accepted'] | Where-Object { $_ -is [hashtable] } | ForEach-Object { [string]$_['Text'] })
+    $tookCount = $took.Count; if ([int]$new['acceptedCount'] -gt $tookCount) { $tookCount = [int]$new['acceptedCount'] }
+    foreach ($t in $took) { Write-LaiLog INFO "accepted: $t" }
+    if ($tookCount -gt $took.Count) { Write-LaiLog INFO ('accepted: and {0} more' -f ($tookCount - $took.Count)) }
+    # The watch starts over with the new baseline: what it found against the old one is settled.
+    # Whether the owner knows of this acceptance is not: nothing is marked as said here, so the next
+    # scheduled run names what was accepted in a notification. Anything running as this user can
+    # start this script; the notification is what makes an acceptance the owner did not make visible.
+    $st = Read-LaiState -Path $statePath
+    $st['integrity'] = @{ baseline = [string]$new['id'] }
+    Save-LaiState -State $st -Path $statePath
+    $msg = 'integrity baseline accepted: {0}; {1} change(s) now count as normal' -f (Get-LaiIntegritySummary -Baseline $new), $tookCount
+    $logLine = $msg; if ($took.Count) { $logLine += ': ' + (Format-LaiIntegrityList -Items $took -Max 20) }
+    Write-WatchLog ('{0} INTEGRITY {1}' -f (Get-Date -Format 's'), $logLine)
+    Write-LaiLog OK $msg
+    if ($tookCount) { Write-LaiLog INFO 'The health watch confirms this with a notification on its next run.' }
     exit 0
 }
 function Test-WatchPaused {
@@ -402,6 +447,198 @@ if ($ollamaVer -and $recheckKey -and [string]$recheck['ollamaVersion'] -eq $olla
     if (Send-Notification 'Local AI: a preset is off the GPU' $text) { $recheckNotice = $recheckKey }
 }
 
+# ---- integrity: files, settings, tasks and listeners against the baseline ---------------------
+# The last successful install or update (or the owner, with -AcceptBaseline) recorded what the
+# installed scripts, the Stack folder (of its .env: where chats and searches are sent), the
+# LocalAI-* scheduled tasks and the network listeners looked like. Every $integrityMinutes the PC
+# is compared with that record. Two strikes, as for the checks above: a difference is announced
+# when a second look, on the next run, still finds it, so a file being saved or a port a program
+# opens for a minute raises nothing; each difference is announced once, and once more (at most
+# daily) when the same thing was changed again. Not a failed check (nothing is broken): no
+# reminders, no exit code. Announced differences that are still there also go on the Open WebUI
+# banner below, which carries the news when Windows drops the toast. Nothing happens here without
+# a baseline (an install from before this existed gets one from its next Update toolkit).
+# The limit, plainly: the record sits in $AIRoot, which this user can write. This notices accidents,
+# other software and clumsy tampering, not someone who runs as this user and rewrites the record.
+# What the watch keeps about it (watch-state.json, 'integrity'):
+#   baseline      the id of the baseline all of this belongs to (another id: start over)
+#   announced     the id of the baseline whose own additions the owner was told about
+#   checkedAt     the last finished comparison
+#   startedAt     set while one runs; still there afterwards when it was ended before it finished
+#   found         the differences of the last comparison (Id, Key, Text; the first 300 and one line
+#                 for the rest): the health check lists them
+#   pending       Ids seen once, waiting for the second look
+#   told          what was announced (Id, Key, At)
+#   notRead       what could not be read, and so was not compared, although the baseline has it
+#   skippedSince, skippedWhy, skippedTold   a comparison that is due and does not run
+# $null = leave the saved findings as they are.
+function Update-IntegritySkip {
+    # A comparison that is due and does not run (the setup lock is held, which any program can do; it
+    # was ended before it finished; it failed). Nothing else would say so: the health check would go
+    # on showing the last result as today's. So it is recorded for the health check, written to
+    # watch.log once, and announced once when it has lasted $integritySkipHours hours.
+    param([Parameter(Mandatory)][hashtable]$State, [Parameter(Mandatory)][string]$Why, [switch]$Logged)
+    if (-not $State['skippedSince']) {
+        $State['skippedSince'] = (Get-Date).ToString('s')
+        if (-not $Logged) { Write-WatchLog ('{0} INTEGRITY not compared: {1}' -f (Get-Date -Format 's'), $Why) }
+    }
+    $State['skippedWhy'] = $Why
+    $skipSince = ConvertTo-WatchDate $State['skippedSince']
+    if (-not $State['skippedTold'] -and $skipSince -and ((Get-Date) - $skipSince).TotalHours -ge $integritySkipHours) {
+        $skipText = "The installed scripts, tasks and listeners have not been compared with the baseline since $($skipSince.ToString('yyyy-MM-dd HH:mm')): $Why. Changes made meanwhile are not reported. If nothing of the kind is running, close an installer window that is still open or restart the PC; the details are in $logFile."
+        if (Send-Notification 'Local AI: changes are not being checked' $skipText) { $State['skippedTold'] = $true }
+    }
+}
+$integrityState = $null
+$integrityShown = @()
+try {
+    $ig = @{}; if ($previous['integrity'] -is [hashtable]) { $ig = $previous['integrity'] }
+    $baseline = Read-LaiIntegrityBaseline -AIRoot $AIRoot
+    $knownId = [string]$ig['baseline']
+    if ($baseline -or $knownId) {
+        $baseId = $knownId; if ($baseline) { $baseId = [string]$baseline['id'] }
+        # A new baseline (install, update, -AcceptBaseline): what was found against the old one is settled.
+        $next = @{}
+        if ($baseId -eq $knownId) { foreach ($k in @($ig.Keys)) { $next[$k] = $ig[$k] } }
+        $next['baseline'] = $baseId
+
+        # A baseline takes in whatever is there when it is recorded. What it took in beyond the
+        # toolkit's own (an install), or at all (-AcceptBaseline, which any program running as this
+        # user can start), is said once: the baseline lists it, and the run that first sees the
+        # baseline tells. Without this an addition would be gone from every report the moment an
+        # update, or one pasted command, made it 'normal'.
+        if ($baseline -and [string]$next['announced'] -ne $baseId) {
+            $taken = @($baseline['accepted'] | Where-Object { $_ -is [hashtable] })
+            if ($taken.Count -eq 0) { $next['announced'] = $baseId }
+            else {
+                $takenCount = $taken.Count; if ([int]$baseline['acceptedCount'] -gt $takenCount) { $takenCount = [int]$baseline['acceptedCount'] }
+                $takenText = @($taken | ForEach-Object { [string]$_['Text'] })
+                $list = (@($takenText | Select-Object -First 3) -join '; '); if ($takenCount -gt 3) { $list += ' and {0} more' -f ($takenCount - 3) }
+                $recorded = ConvertTo-WatchDate $baseline['recordedAt']
+                $of = ''; if ($recorded) { $of = ' of ' + $recorded.ToString('yyyy-MM-dd HH:mm') }
+                $advice = Get-LaiIntegrityAdvice -Ids @($taken | ForEach-Object { [string]$_['Id'] }) -AIRoot $AIRoot -Brief
+                if ([string]$baseline['reason'] -eq 'install') {
+                    $title = 'Local AI: the update kept changes it did not make'
+                    $text = "The install or update$of put the toolkit's own files and tasks back, but $takenCount thing(s) it did not install were there and now count as normal: $list. If you did not add them, $advice"
+                } else {
+                    $title = 'Local AI: integrity baseline accepted'
+                    $text = "The baseline$of was recorded by hand (Watch-LocalAI.ps1 -AcceptBaseline), so $takenCount change(s) now count as normal: $list. If that was not you, $advice"
+                }
+                Write-WatchLog ('{0} INTEGRITY the baseline{1} took in {2}: {3}' -f (Get-Date -Format 's'), $of, $takenCount, (Format-LaiIntegrityList -Items $takenText -Max 20))
+                # A toast that failed is tried again on the next run.
+                if (Send-Notification $title $text) { $next['announced'] = $baseId }
+            }
+        }
+
+        $told = @($next['told'] | Where-Object { $_ -is [hashtable] })
+        $pending = @($next['pending'] | Where-Object { $_ } | ForEach-Object { [string]$_ })
+        $igLast = ConvertTo-WatchDate $next['checkedAt']
+        # Also due right away for the second look at something seen once, and after the clock was set back.
+        $igDue = (-not $igLast) -or $pending.Count -gt 0 -or [math]::Abs(((Get-Date) - $igLast).TotalMinutes) -ge $integrityMinutes
+        # Why a comparison that is due does not run ('' = it runs, or none is due).
+        $skipWhy = ''; $skipLogged = $false
+        # One that was started and did not finish (Task Scheduler ends this task after ten minutes) is
+        # not started again on every run: a comparison that cannot finish would otherwise end every
+        # run before the checks above are reported and saved.
+        $igStarted = ConvertTo-WatchDate $next['startedAt']
+        if ($igDue -and $igStarted -and [math]::Abs(((Get-Date) - $igStarted).TotalMinutes) -lt $integrityMinutes) {
+            $igDue = $false
+            $skipWhy = [string]$next['skippedWhy']
+            if (-not $skipWhy) { $skipWhy = 'the comparison started at ' + $igStarted.ToString('HH:mm') + ' did not finish' }
+        }
+        # An installer run or a model update in progress is replacing files right now: next run. Any
+        # program can hold that lock, so a comparison kept from running is recorded and, when it
+        # lasts, announced (below).
+        if ($igDue -and (Test-LaiSetupLockBusy)) {
+            $igDue = $false
+            $skipWhy = 'an install or a model update is running (or another program holds its lock)'
+        }
+        if ($igDue) {
+            try {
+                # Left behind if this run is ended in the middle of the comparison (see above).
+                $startedNow = (Get-Date).ToString('s')
+                $next['startedAt'] = $startedNow
+                $mark = Read-LaiState -Path $statePath
+                $markIg = @{}; if ($mark['integrity'] -is [hashtable]) { $markIg = $mark['integrity'] }
+                $markIg['startedAt'] = $startedNow
+                $mark['integrity'] = $markIg
+                Save-LaiState -State $mark -Path $statePath
+
+                $since = $null; $notRead = @()
+                if ($baseline) {
+                    $snapshot = Get-LaiIntegritySnapshot -AIRoot $AIRoot
+                    # No more of them than the state file can carry (Limit-LaiIntegrityFound).
+                    $diffs = @(Limit-LaiIntegrityFound -Diffs @(Compare-LaiIntegrity -Baseline $baseline -Current $snapshot -WatchedPorts (Get-LaiIntegrityPorts -AIRoot $AIRoot)))
+                    $since = ConvertTo-WatchDate $baseline['recordedAt']
+                    # In the baseline, but not readable now: skipped by the comparison, and said so
+                    # (a clean result that left the tasks out is not the same clean result).
+                    if ($baseline['tasks'] -is [hashtable] -and -not ($snapshot['tasks'] -is [hashtable])) { $notRead += 'the scheduled tasks' }
+                    if ($null -ne $baseline['listeners'] -and $null -eq $snapshot['listeners']) { $notRead += 'the listening programs' }
+                    if ($baseline['env'] -is [hashtable] -and -not ($snapshot['env'] -is [hashtable])) { $notRead += 'the settings in Stack\.env' }
+                } else {
+                    # A baseline was there on an earlier run and is not now: that is a change too.
+                    $diffs = @([pscustomobject]@{ Id = 'baseline|gone'; Key = 'baseline|gone'; Text = 'the baseline itself ("' + (Get-LaiIntegrityPath -AIRoot $AIRoot) + '") is gone or cannot be read' })
+                }
+                $texts = @($diffs | ForEach-Object { [string]$_.Text }) + @($notRead | ForEach-Object { 'not read: ' + $_ })
+                $wasTexts = @($next['found'] | Where-Object { $_ -is [hashtable] } | ForEach-Object { [string]$_['Text'] }) + @($next['notRead'] | Where-Object { $_ } | ForEach-Object { 'not read: ' + $_ })
+                if (($texts -join "`n") -ne ($wasTexts -join "`n")) {
+                    # The whole list goes to the log (a notification has room for three).
+                    if ($texts.Count) { Write-WatchLog ('{0} INTEGRITY {1} difference(s) from the baseline: {2}' -f (Get-Date -Format 's'), $diffs.Count, (Format-LaiIntegrityList -Items $texts -Max 20)) }
+                    else { Write-WatchLog ('{0} INTEGRITY matches the baseline again' -f (Get-Date -Format 's')) }
+                }
+                # Two strikes by what a difference is about, not by its content; told once, and again (at
+                # most once in $remindHours h) when the same thing was changed once more: Select-LaiIntegrityNews.
+                $announce = @(Select-LaiIntegrityNews -Diffs $diffs -Told $told -Pending $pending -QuietHours $remindHours)
+                $sent = @()
+                if ($announce.Count) {
+                    $ids = @($announce | ForEach-Object { [string]$_.Id })
+                    $list = Format-LaiIntegrityList -Items @($announce | ForEach-Object { [string]$_.Text }) -Max 3
+                    $when = ''; if ($since) { $when = ' (' + $since.ToString('yyyy-MM-dd HH:mm') + ')' }
+                    # The next step depends on what changed: a shortcut is not named when the scripts it
+                    # would start are among the changes (Get-LaiIntegrityAdvice).
+                    $text = "Changed since the last install or update${when}: $list. If you did not do this, " + (Get-LaiIntegrityAdvice -Ids $ids -AIRoot $AIRoot -Brief)
+                    # An install or update that got somewhere after the baseline and did not finish: changed
+                    # files may be its half-done work. One added sentence, for file and setting differences
+                    # only; the title and the 'if you did not do this' above stay as they are.
+                    if ($since -and @($ids | Where-Object { $_ -match '^(files?[+-]?|env[+-]?)\|' }).Count) {
+                        $unfinished = Get-LaiUnfinishedInstall -AIRoot $AIRoot -Since $since
+                        if ($unfinished) { $text += " (An install or update was still working at $($unfinished.ToString('yyyy-MM-dd HH:mm')) and has not finished: if these are its changes, running the installer again finishes it.)" }
+                    }
+                    # A toast that failed is not counted as told: the difference stays pending and the next run tries again.
+                    if (Send-Notification 'Local AI: changed outside an update' $text) { $sent = $announce }
+                }
+                $told = @(Update-LaiIntegrityTold -Told $told -Announced $sent -Diffs $diffs)
+                $toldIds = @{}; foreach ($t in $told) { $toldIds[[string]$t['Id']] = $true }
+                $next['checkedAt'] = (Get-Date).ToString('s')
+                $next['told'] = $told
+                $next['pending'] = @($diffs | ForEach-Object { [string]$_.Id } | Where-Object { -not $toldIds.ContainsKey($_) })
+                $next['found'] = @($diffs | ForEach-Object { @{ Id = [string]$_.Id; Key = [string]$_.Key; Text = [string]$_.Text } })
+                $next['notRead'] = $notRead
+                foreach ($k in @('startedAt', 'skippedSince', 'skippedWhy', 'skippedTold')) { $next.Remove($k) }
+            } catch {
+                # 'startedAt' stays, so a comparison that fails is tried again in an hour, not on every run.
+                $skipWhy = 'it failed: ' + ($_.Exception.Message -replace '\s+', ' ')
+                Write-WatchLog ('{0} INTEGRITY not compared: {1}' -f (Get-Date -Format 's'), $skipWhy)
+                $skipLogged = $true
+            }
+        }
+        if ($skipWhy) { Update-IntegritySkip -State $next -Why $skipWhy -Logged:$skipLogged }
+        $integrityState = $next
+        $toldNow = @{}; foreach ($t in @($next['told'] | Where-Object { $_ -is [hashtable] })) { $toldNow[[string]$t['Id']] = $true }
+        $integrityShown = @($next['found'] | Where-Object { $_ -is [hashtable] -and $toldNow.ContainsKey([string]$_['Id']) })
+    }
+} catch {
+    # The integrity comparison must never take the health checks down with it. With a baseline in use,
+    # what went wrong is kept like any other comparison that did not run (nothing to keep otherwise).
+    $igWhy = 'it failed: ' + ($_.Exception.Message -replace '\s+', ' ')
+    Write-WatchLog ('{0} INTEGRITY not compared: {1}' -f (Get-Date -Format 's'), $igWhy)
+    if ($previous['integrity'] -is [hashtable] -and $previous['integrity']['baseline']) {
+        $integrityState = @{}
+        foreach ($k in @($previous['integrity'].Keys)) { $integrityState[$k] = $previous['integrity'][$k] }
+        try { Update-IntegritySkip -State $integrityState -Why $igWhy -Logged } catch { Write-Verbose "integrity: $($_.Exception.Message)" }
+    }
+}
+
 # ---- report ---------------------------------------------------------------------------------
 # Two strikes before a notification: right after sign-in Docker Desktop needs a minute or two, and
 # one failed check would otherwise toast every morning. A failure is reported when it has been seen
@@ -474,7 +711,15 @@ if ($toNotify.Count -gt 0) {
 # The same two strikes as the toast: a problem seen on two runs in a row is also shown at the top of
 # every Open WebUI page (phone included) until it is fixed, so it is seen even when the toast was
 # missed or Windows drops it. Signs in only when the set of problems changes.
-$bannerKeys = (@($failed | Where-Object { $prevFailed -contains $_ } | Sort-Object) -join ', ')
+$failedKeys = (@($failed | Where-Object { $prevFailed -contains $_ } | Sort-Object) -join ', ')
+# Announced integrity differences that are still there share the banner (and change its key, so it is
+# rewritten when they change and removed when they are accepted or undone). The key follows what the
+# banner says, not the content of a file: one that is rewritten every hour is the same line each time.
+$bannerKeys = $failedKeys
+if ($integrityShown.Count) {
+    $bannerKeys = 'changed ' + (Get-LaiIntegrityTag -Text (@($integrityShown | ForEach-Object { [string]$_['Text'] }) -join "`n"))
+    if ($failedKeys) { $bannerKeys = $failedKeys + ' | ' + $bannerKeys }
+}
 $prevBanner = ''; if ($previous.ContainsKey('banner')) { $prevBanner = [string]$previous['banner'] }
 $bannerDone = $null
 $credFile = Join-Path (Join-Path $AIRoot 'Secrets') 'openwebui-admin.json'
@@ -484,9 +729,22 @@ if ($bannerKeys -ne $prevBanner -and -not $NoNotify -and $results['Open WebUI'] 
         $webUrl = "http://127.0.0.1:$webPort"
         $tok = Connect-LaiWebUI -BaseUrl $webUrl -Email $cred.email -Password $cred.password
         if ($bannerKeys) {
-            $shownKeys = @($bannerKeys -split ', ')
-            $what = @($shownKeys | ForEach-Object { if ($details.ContainsKey($_)) { '{0} ({1})' -f $_, $details[$_] } else { $_ } }) -join ', '
-            $text = "Health watch ({0}): not working: {1}. {2}" -f (Get-Date -Format 'yyyy-MM-dd HH:mm'), $what, (Get-WatchHint $shownKeys)
+            $parts = @()
+            if ($failedKeys) {
+                $shownKeys = @($failedKeys -split ', ')
+                $what = @($shownKeys | ForEach-Object { if ($details.ContainsKey($_)) { '{0} ({1})' -f $_, $details[$_] } else { $_ } }) -join ', '
+                $parts += ('not working: {0}. {1}' -f $what, (Get-WatchHint $shownKeys))
+            }
+            if ($integrityShown.Count) {
+                $changed = 'changed since the last install or update: {0}. If you did not do this, {1}' -f (Format-LaiIntegrityList -Items @($integrityShown | ForEach-Object { [string]$_['Text'] }) -Max 3),
+                    (Get-LaiIntegrityAdvice -Ids @($integrityShown | ForEach-Object { [string]$_['Id'] }) -AIRoot $AIRoot -Brief)
+                # Open WebUI renders a banner as Markdown, for everyone who uses it, and the names in it
+                # were chosen by whoever made the change. In these texts names and paths stand in double
+                # quotes and nothing else does (Compare-LaiIntegrity, Get-LaiIntegrityAdvice): shown as
+                # code they cannot become a link, and their backslashes are not eaten.
+                $parts += $changed.Replace('"', '`')
+            }
+            $text = 'Health watch ({0}): {1}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm'), ($parts -join ' Also ')
             Set-LaiWebUIBanner -BaseUrl $webUrl -Token $tok -Text $text | Out-Null
             Write-WatchLog ('{0} BANNER {1}' -f (Get-Date -Format 's'), $text)
         } else {
@@ -510,5 +768,7 @@ if ($script:toastSetting) { if ($script:toastSetting -ne 'Enabled') { $final['to
 if ($null -ne $ollamaNotice) { if ($ollamaNotice) { $final['ollamaNotifiedFor'] = $ollamaNotice } else { $final.Remove('ollamaNotifiedFor') } }
 if ($null -ne $driftSince) { if ($driftSince) { $final['ollamaDriftSince'] = $driftSince } else { $final.Remove('ollamaDriftSince') } }
 if ($recheckNotice) { $final['recheckNotifiedFor'] = $recheckNotice }
+# (A baseline accepted while this run was busy has another id: the next run starts over with it.)
+if ($null -ne $integrityState) { $final['integrity'] = $integrityState }
 Save-LaiState -State $final -Path $statePath
 exit $failed.Count

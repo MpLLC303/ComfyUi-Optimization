@@ -387,6 +387,208 @@ services:
     } finally {
         Invoke-LaiApi -Method POST -Uri "$wu/api/v1/configs/banners" -Token $tok9 -Body @{ banners = @($bannersBefore) } | Out-Null
     }
+
+    Write-Host "`n=== 10. integrity watch: a change outside an install or update is named once; your own can be accepted ===" -ForegroundColor Cyan
+    # Files and the routing settings of Stack\.env only: Linux has no Task Scheduler and no
+    # Get-NetTCPConnection, so tasks and listeners are skipped here (the Windows unit tests run the
+    # watch against real ones). The sandbox's real Open WebUI (port 3000, as in 9.) shows the banner.
+    $igScripts = Join-Path $aiRoot 'Scripts'; $igStack = Join-Path $aiRoot 'Stack'
+    foreach ($d in (Join-Path $igScripts 'lib'), (Join-Path $igScripts 'Secrets')) { New-Item -ItemType Directory -Force -Path $d | Out-Null }
+    $igTool = Join-Path $igScripts 'tool.ps1'; $igHelper = Join-Path (Join-Path $igScripts 'lib') 'helper.psm1'
+    $igEnv = Join-Path $igStack '.env'
+    Set-Content -LiteralPath $igTool -Value 'original'
+    Set-Content -LiteralPath $igHelper -Value 'original'
+    Set-Content -LiteralPath (Join-Path (Join-Path $igScripts 'Secrets') 'token.txt') -Value 'secret-1'
+    Set-Content -LiteralPath $igEnv -Value @('OPEN_WEBUI_VERSION=v1', 'OLLAMA_UPSTREAM=http://host.docker.internal:11434')
+    Set-Content -LiteralPath (Join-Path $igStack 'compose.log') -Value 'line 1'
+    $igView = { $s = (Read-LaiState -Path $statePath)['integrity']; if ($s -is [hashtable]) { $s } else { @{} } }
+    $igFound = { @((& $igView)['found'] | Where-Object { $_ -is [hashtable] } | ForEach-Object { [string]$_['Text'] }) }
+    $igLog = { @((Get-WatchLog) -split "`n" | Where-Object { $_ -cmatch ' INTEGRITY ' }) }
+    # Only notifications that went out (a failed toast is logged as 'NOTIFY (toast failed) ...').
+    $igNotices = { param($Title) @((Get-WatchLog) -split "`n" | Where-Object { $_ -match (' NOTIFY Local AI: ' + $Title) }) }
+    $igChanged = { @(& $igNotices 'changed outside an update') }
+    $igHourLater = { $s = Read-LaiState -Path $statePath; $s['integrity']['checkedAt'] = (Get-Date).AddMinutes(-61).ToString('s'); Save-LaiState -State $s -Path $statePath }
+    # An hour later, then the run after it: the two looks a difference needs before it is announced.
+    $igTwoLooks = { & $igHourLater; Invoke-Watch $w9 | Out-Null; Invoke-Watch $w9 | Out-Null }
+    $igHealth = { @((& pwsh -NoProfile -File (Join-Path $src 'Test-LocalAI.ps1') -AIRoot $aiRoot -Quick 2>&1 | ForEach-Object { "$_" }) | Where-Object { $_ -match 'Integrity watch' }) -join "`n" }
+    $tok10 = Connect-LaiWebUI -BaseUrl $wu -Email 'admin@localhost' -Password 'Test-Password-123'
+    $igBanner = { @(Invoke-LaiApi -Uri "$wu/api/v1/configs/banners" -Token $tok10 | Where-Object { $null -ne $_ } | Where-Object { $_.id -eq 'localai-health-watch' -and $_.content -match 'changed since the last install or update' }) }
+    try {
+        Invoke-Watch $w9 | Out-Null
+        Assert-That (-not (Read-LaiState -Path $statePath).ContainsKey('integrity') -and @(& $igLog).Count -eq 0) 'without a baseline nothing is compared, recorded or logged'
+        $ig0 = Save-LaiIntegrityBaseline -AIRoot $aiRoot -Reason 'test'
+        $igNames = @($ig0['files'].Keys)
+        Assert-That ($igNames -contains 'Scripts\tool.ps1' -and $igNames -contains 'Scripts\lib\helper.psm1' -and $igNames -contains 'Stack\docker-compose.yml') "the baseline lists the files of Scripts and Stack ($(($igNames | Sort-Object) -join ', '))"
+        Assert-That (@($igNames | Where-Object { $_ -match 'Secrets|\.env$|\.log$' }).Count -eq 0) 'but not .env, not logs, and nothing under a Secrets folder'
+        Assert-That ($ig0['env'] -is [hashtable] -and @($ig0['env'].Keys).Count -eq 1 -and [string]$ig0['env']['OLLAMA_UPSTREAM'] -match '^[0-9A-F]{12}$' -and @($ig0['accepted']).Count -eq 0) "of .env only the setting that says where chats are sent is recorded, as a fingerprint and not as its value ($(@($ig0['env'].Keys) -join ', '))"
+        Invoke-Watch $w9 | Out-Null
+        Assert-That ([string](& $igView)['baseline'] -eq [string]$ig0['id'] -and @(& $igFound).Count -eq 0 -and @(& $igChanged).Count -eq 0 -and @(& $igNotices 'integrity baseline accepted').Count -eq 0) 'the first look after the baseline: nothing differs, nothing is announced'
+        # What changes in normal use is left alone.
+        Set-Content -LiteralPath $igEnv -Value @('OPEN_WEBUI_VERSION=v2', 'OLLAMA_UPSTREAM=http://host.docker.internal:11434', 'WEBUI_EXTRA_ORIGINS=;https://pc.tail.ts.net')
+        Add-Content -LiteralPath (Join-Path $igStack 'compose.log') -Value 'line 2'
+        Set-Content -LiteralPath (Join-Path (Join-Path $igScripts 'Secrets') 'token.txt') -Value 'secret-2'
+        & $igHourLater
+        Invoke-Watch $w9 | Out-Null
+        Assert-That (@(& $igFound).Count -eq 0 -and @(& $igLog).Count -eq 0) "an hour later: another Open WebUI version and the Tailscale origin in .env, a grown log and a changed file under Secrets are not differences ($(@(& $igFound) -join '; '))"
+        # A script changed outside an update: not hashed on every run, then two strikes, then told once.
+        Set-Content -LiteralPath $igTool -Value 'changed outside an update'
+        Invoke-Watch $w9 | Out-Null
+        Assert-That (@(& $igFound).Count -eq 0) 'a changed script is not looked for on the very next run (files are hashed about once an hour, not every 15 minutes)'
+        & $igHourLater
+        Invoke-Watch $w9 | Out-Null
+        Assert-That (@(& $igFound) -contains '"Scripts\tool.ps1" was changed' -and @((& $igView)['pending'] | Where-Object { $_ }).Count -eq 1 -and @(& $igChanged).Count -eq 0) "an hour later it is seen and recorded, not announced yet ($(@(& $igFound) -join '; '))"
+        Assert-That (@(& $igLog | Where-Object { $_ -match '1 difference\(s\) from the baseline: "Scripts\\tool\.ps1" was changed' }).Count -eq 1) 'and watch.log names it'
+        # The file is rewritten between the two looks (an editor that saves again, a program that keeps
+        # writing it): still the same difference, so the second look announces it. Here that
+        # notification fails once, and is tried again.
+        Set-Content -LiteralPath $igTool -Value 'rewritten before the second look'
+        $env:LOCALAI_TEST_TOAST_FAIL = '1'
+        try { Invoke-Watch $w9 | Out-Null } finally { $env:LOCALAI_TEST_TOAST_FAIL = '' }
+        $igFailed = @((Get-WatchLog) -split "`n" | Where-Object { $_ -match 'NOTIFY \(toast failed\) Local AI: changed outside an update' })
+        Assert-That ($igFailed.Count -eq 1 -and @((& $igView)['told'] | Where-Object { $_ }).Count -eq 0 -and @((& $igView)['pending'] | Where-Object { $_ }).Count -eq 1 -and @(& $igBanner).Count -eq 0) "seen again with other content: announced all the same; that notification failed, so it is not counted as told and kept for the next run ($($igFailed.Count) tried)"
+        Set-Content -LiteralPath $igTool -Value 'and rewritten once more'
+        Invoke-Watch $w9 | Out-Null
+        $n10 = @(& $igChanged)
+        Assert-That ($n10.Count -eq 1 -and $n10[0] -match '"Scripts\\tool\.ps1" was changed' -and $n10[0] -match 'If you did not do this') "the next run announces it once, although the file was rewritten before every look ($($n10 -join ' | '))"
+        # At that moment the advice must not send the owner to the scripts that were just reported.
+        Assert-That ($n10.Count -eq 1 -and $n10[0] -notmatch 'Start menu|Health check|Update toolkit' -and $n10[0] -match 'do not use the Local AI shortcuts' -and $n10[0] -match 'Logs\\watch\.log' -and $n10[0] -match 'fresh copy of the toolkit') 'for a changed script no shortcut is named (each starts a script from that folder, Update toolkit then asks for administrator rights): watch.log and a fresh copy are'
+        $b10 = @(& $igBanner)
+        Assert-That ($b10.Count -eq 1 -and $b10[0].content -match 'changed since the last install or update: `Scripts\\tool\.ps1` was changed' -and $b10[0].content -notmatch 'Health check|Update toolkit') "and it is on the Open WebUI banner, the name shown as code, with the same advice ($(@($b10 | ForEach-Object { $_.content }) -join ' | '))"
+        $hc10 = & $igHealth
+        Assert-That ($hc10 -match 'WARN Integrity watch: 1 change\(s\) since the baseline of [^\n]*"Scripts\\tool\.ps1" was changed[^\n]*do not repair this with Update toolkit[^\n]*fresh copy[^\n]*-AcceptBaseline' -and $hc10 -notmatch 'Start menu > Local AI - Update toolkit') 'the health check lists the change, does not offer Update toolkit for a changed script, and says how to accept it'
+        # The installer runs the health check itself, before it records its new baseline, holding the
+        # setup lock in that same process (where the lock reads as free: a mutex lets its owner in
+        # again). It must not tell the owner to accept a change the update is just undoing.
+        $igInScript = Join-Path $Work 'health-in-installer.ps1'
+        Set-Content -LiteralPath $igInScript -Value ("Import-Module '{0}' -Force; `$SetupLock = Enter-LaiSetupLock; & '{1}' -AIRoot '{2}' -Quick" -f (Join-Path (Join-Path $src 'lib') 'LocalAI.psm1'), (Join-Path $src 'Test-LocalAI.ps1'), $aiRoot)
+        $hcIn = @((& pwsh -NoProfile -File $igInScript 2>&1 | ForEach-Object { "$_" }) | Where-Object { $_ -match 'Integrity watch' }) -join "`n"
+        Assert-That ($hcIn -match 'SKIP Integrity watch: an install, update or model update is running' -and $hcIn -notmatch 'AcceptBaseline|tool\.ps1') "called by the installer (which holds the setup lock itself), the health check lists no old findings and offers no -AcceptBaseline ($hcIn)"
+        # Told, and rewritten again the same day: no second notice, and nothing waits for a second look,
+        # so the files are not hashed on every run.
+        Set-Content -LiteralPath $igTool -Value 'a script that keeps being rewritten'
+        & $igHourLater
+        Invoke-Watch $w9 | Out-Null
+        $igAt = [string](& $igView)['checkedAt']
+        Invoke-Watch $w9 | Out-Null
+        Assert-That (@(& $igChanged).Count -eq 1 -and @((& $igView)['pending'] | Where-Object { $_ }).Count -eq 0 -and [string](& $igView)['checkedAt'] -eq $igAt) 'rewritten again after it was told: no second notice the same day, and the run after it does not compare again'
+        # More changes: told together, without repeating the one already told. One new file has a name
+        # made to look like a link.
+        Set-Content -LiteralPath (Join-Path $igStack 'extra.yml') -Value 'services: {}'
+        Set-Content -LiteralPath (Join-Path $igStack 'x [open](www.example.org).yml') -Value 'x'
+        Remove-Item -LiteralPath $igHelper -Force
+        & $igTwoLooks
+        $n10 = @(& $igChanged)
+        Assert-That ($n10.Count -eq 2 -and $n10[-1] -match '"Stack\\extra\.yml" is new' -and $n10[-1] -match '"Scripts\\lib\\helper\.psm1" is gone' -and $n10[-1] -notmatch 'tool\.ps1') "new and deleted files are announced together, once; what was told is not repeated ($($n10[-1]))"
+        $b10 = @(& $igBanner)
+        Assert-That ($b10.Count -eq 1 -and $b10[0].content -match '`Stack\\x \?open\?\?www\.example\.org\?\.yml` is new' -and $b10[0].content -notmatch '\]\(') "a file name cannot put a link on the banner every Open WebUI user sees: it is cleaned and shown as code ($(@($b10 | ForEach-Object { $_.content }) -join ' | '))"
+        # Where chats are sent is one line in .env: watched by its name, its value never shown.
+        Set-Content -LiteralPath $igEnv -Value @('OPEN_WEBUI_VERSION=v2', 'OLLAMA_UPSTREAM=http://elsewhere.example:11434')
+        & $igTwoLooks
+        $n10 = @(& $igChanged)
+        Assert-That ($n10.Count -eq 3 -and $n10[-1] -match 'the setting "OLLAMA_UPSTREAM" in Stack\\\.env was changed' -and $n10[-1] -notmatch 'elsewhere' -and $n10[-1] -match 'Start menu > Local AI - Health check') "a changed Ollama address in .env is announced by the name of the setting, without its value; no script is part of this notice, so the shortcut is named ($($n10[-1]))"
+        # An archive unpacked into the wrong folder: 210 new files in 21 new folders, and 25 in one more.
+        foreach ($i in 1..21) {
+            $bulk = Join-Path $igStack ('bulk{0:D2}' -f $i)
+            New-Item -ItemType Directory -Force -Path $bulk | Out-Null
+            foreach ($j in 1..10) { Set-Content -LiteralPath (Join-Path $bulk "f$j.txt") -Value "$i-$j" }
+        }
+        $igUnpacked = Join-Path $igStack 'unpacked'
+        New-Item -ItemType Directory -Force -Path $igUnpacked | Out-Null
+        foreach ($j in 1..25) { Set-Content -LiteralPath (Join-Path $igUnpacked "u$j.txt") -Value "$j" }
+        & $igTwoLooks
+        Invoke-Watch $w9 | Out-Null
+        $n10 = @(& $igChanged)
+        $igToldNow = @((& $igView)['told'] | Where-Object { $_ -is [hashtable] })
+        Assert-That ($n10.Count -eq 4 -and $igToldNow.Count -ge 211 -and @((& $igView)['pending'] | Where-Object { $_ }).Count -eq 0) "more than 200 differences at once: one notice over three runs, and none of them is announced again by the run after it ($($n10.Count) notices, $($igToldNow.Count) told)"
+        Assert-That (@(& $igFound) -contains '25 new files in "Stack\unpacked"' -and @(& $igFound | Where-Object { $_ -like '*unpacked\u*' }).Count -eq 0) 'more than 20 new files in one new folder are one line with a count'
+        # An installer log proves no work (every run writes one, also a run that was refused because
+        # another one was going): it does not change the notice.
+        Set-Content -LiteralPath (Join-Path (Join-Path $aiRoot 'Logs') ('install-{0}.log' -f (Get-Date -Format 'yyyyMMdd-HHmmss'))) -Value 'a run that was refused'
+        Set-Content -LiteralPath (Join-Path $igStack 'more1.yml') -Value 'x'
+        & $igTwoLooks
+        $n10 = @(& $igChanged)
+        Assert-That ($n10.Count -eq 5 -and $n10[-1] -match '"Stack\\more1\.yml" is new' -and $n10[-1] -notmatch 'not finished') "an installer log dated after the baseline does not turn a change into an unfinished update ($($n10[-1]))"
+        # The installer finished a stage after the baseline and recorded no new one (it failed, or waits
+        # for a restart): one added sentence. The title and the warning stay as they are.
+        Save-LaiState -State @{ stages = @{ Stack = (Get-Date).ToString('s') } } -Path $instPath
+        Set-Content -LiteralPath (Join-Path $igStack 'more2.yml') -Value 'x'
+        & $igTwoLooks
+        Remove-Item -LiteralPath $instPath -Force
+        $n10 = @(& $igChanged)
+        Assert-That ($n10.Count -eq 6 -and $n10[-1] -match '"Stack\\more2\.yml" is new' -and $n10[-1] -match 'If you did not do this' -and $n10[-1] -match 'has not finished: if these are its changes' -and @(& $igNotices 'update not finished').Count -eq 0) "an install that got somewhere after the baseline and did not finish is one added sentence; it replaces neither the title nor the warning ($($n10[-1]))"
+        # While an installer run or a model update holds the setup lock, files are being replaced:
+        # nothing is compared and the last result is kept. That is said: once in watch.log, in the
+        # health check, and with one notification when it lasts for hours.
+        Set-Content -LiteralPath $holdScript -Value ("Import-Module '{0}' -Force; `$l = Enter-LaiSetupLock; Start-Sleep -Seconds 600; Exit-LaiVolumeLock `$l" -f (Join-Path (Join-Path $src 'lib') 'LocalAI.psm1'))
+        $holder = Start-Process -FilePath 'pwsh' -ArgumentList @('-NoProfile', '-File', $holdScript) -PassThru
+        $deadline = (Get-Date).AddSeconds(30)
+        while (-not (Test-LaiSetupLockBusy) -and (Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 300 }
+        Assert-That (Test-LaiSetupLockBusy) 'setup: another process holds the setup lock'
+        Set-Content -LiteralPath (Join-Path $igStack 'more3.yml') -Value 'x'
+        & $igHourLater
+        $igBefore = & $igView
+        Invoke-Watch $w9 | Out-Null
+        Invoke-Watch $w9 | Out-Null
+        $igDuring = & $igView
+        $igSkipLines = @(& $igLog | Where-Object { $_ -match 'INTEGRITY not compared: an install or a model update is running' })
+        Assert-That ([string]$igDuring['checkedAt'] -eq [string]$igBefore['checkedAt'] -and @($igDuring['found']).Count -eq @($igBefore['found']).Count -and @(& $igFound) -notcontains '"Stack\more3.yml" is new' -and [string]$igDuring['skippedWhy'] -match 'an install or a model update is running' -and $igSkipLines.Count -eq 1) "while the setup lock is held nothing is compared: the last result stays as it was, and watch.log says so once over two runs ($($igSkipLines.Count) line(s))"
+        # During an install the watch's findings against the old baseline are no advice to act on.
+        $hc10 = & $igHealth
+        Assert-That ($hc10 -match 'SKIP Integrity watch: an install, update or model update is running' -and $hc10 -notmatch 'AcceptBaseline|change\(s\) since') "while the lock is held the health check does not list old findings or offer to accept them ($hc10)"
+        $s10 = Read-LaiState -Path $statePath; $s10['integrity']['skippedSince'] = (Get-Date).AddHours(-7).ToString('s'); Save-LaiState -State $s10 -Path $statePath
+        Invoke-Watch $w9 | Out-Null
+        Invoke-Watch $w9 | Out-Null
+        # Any program can hold that lock: held for hours, it no longer hides the result.
+        $hc10 = & $igHealth
+        Assert-That ($hc10 -match 'WARN Integrity watch: [^\n]*the comparison is not running \(an install or a model update is running') 'a lock held for hours: the health check shows the result again and says that it is an old one'
+        $igUnchecked = @(& $igNotices 'changes are not being checked')
+        Assert-That ($igUnchecked.Count -eq 1 -and $igUnchecked[0] -match 'have not been compared with the baseline since') "a comparison kept from running for hours is announced, once over two runs ($($igUnchecked -join ' | '))"
+        if (-not $holder.HasExited) { $holder.Kill() }
+        $deadline = (Get-Date).AddSeconds(30)
+        while ((Test-LaiSetupLockBusy) -and (Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 300 }
+        Invoke-Watch $w9 | Out-Null
+        $igAfter = & $igView
+        Assert-That (@(& $igFound) -contains '"Stack\more3.yml" is new' -and -not $igAfter['skippedWhy'] -and -not $igAfter['skippedSince'] -and [string]$igAfter['checkedAt'] -ne [string]$igBefore['checkedAt']) 'once the lock is free the next run compares again and sees the change made meanwhile'
+        Invoke-Watch $w9 | Out-Null
+        Assert-That (@(& $igChanged).Count -eq 7) 'and announces it on the run after'
+        # The owner accepts the current state.
+        $acc10 = Invoke-Watch @('-AcceptBaseline')
+        Assert-That ($acc10 -match 'integrity baseline accepted' -and $acc10 -match 'accepted: "Stack\\extra\.yml" is new' -and $acc10 -match 'confirms this with a notification' -and [string](Read-LaiIntegrityBaseline -AIRoot $aiRoot)['id'] -ne [string]$ig0['id']) "-AcceptBaseline records the current state as the new baseline and lists what it accepted ($(($acc10 -split "`n" | Select-Object -Last 2) -join ' / '))"
+        Invoke-Watch $w9 | Out-Null
+        Invoke-Watch $w9 | Out-Null
+        Assert-That (@(& $igFound).Count -eq 0 -and [string](& $igView)['checkedAt'] -and @(& $igBanner).Count -eq 0 -and @(& $igChanged).Count -eq 7) 'after that nothing differs any more, and the banner is gone'
+        # Anything running as the owner can paste that command. So the acceptance itself is news, once.
+        $igAcc = @(& $igNotices 'integrity baseline accepted')
+        Assert-That ($igAcc.Count -eq 1 -and $igAcc[0] -match 'recorded by hand \(Watch-LocalAI\.ps1 -AcceptBaseline\), so \d+ change\(s\) now count as normal: "Scripts\\tool\.ps1" was changed' -and $igAcc[0] -match 'If that was not you') "the next scheduled run names what was accepted in a notification, once over two runs: an acceptance the owner did not make is seen ($($igAcc -join ' | '))"
+        $hc10 = & $igHealth
+        Assert-That ($hc10 -match 'PASS Integrity watch: nothing changed since the baseline of [^\n]*recorded by hand \(-AcceptBaseline\), which made \d+ change\(s\) count as normal: "Scripts\\tool\.ps1" was changed') 'and the health check keeps showing how that baseline came about'
+        # An update records a new baseline too, and with it whatever else is there. What the installer
+        # did not put there itself is named: its own copy of tool.ps1 is not, a file next to it is.
+        $igSource = Join-Path $Work 'ig-source'
+        New-Item -ItemType Directory -Force -Path $igSource | Out-Null
+        Set-Content -LiteralPath (Join-Path $igSource 'tool.ps1') -Value 'the new version'
+        Copy-Item -LiteralPath (Join-Path $igSource 'tool.ps1') -Destination $igTool -Force
+        Set-Content -LiteralPath (Join-Path $igStack 'planted.yml') -Value 'x'
+        $ig2 = Save-LaiIntegrityBaseline -AIRoot $aiRoot -Reason 'install' -SourceRoot $igSource
+        $igKept = @($ig2['accepted'] | ForEach-Object { [string]$_['Text'] })
+        Assert-That ($igKept.Count -eq 1 -and $igKept[0] -eq '"Stack\planted.yml" is new') "a baseline recorded by an install lists what it took in that the installer did not put there, and none of the installer's own files ($($igKept -join '; '))"
+        Invoke-Watch $w9 | Out-Null
+        Invoke-Watch $w9 | Out-Null
+        $igKeptNotice = @(& $igNotices 'the update kept changes it did not make')
+        Assert-That ($igKeptNotice.Count -eq 1 -and $igKeptNotice[0] -match '"Stack\\planted\.yml" is new' -and $igKeptNotice[0] -match 'If you did not add them' -and @(& $igFound).Count -eq 0) "the watch says so once: an addition does not drop out of every report because an update ran ($($igKeptNotice -join ' | '))"
+        $hc10 = & $igHealth
+        Assert-That ($hc10 -match 'WARN Integrity watch: [^\n]*kept 1 thing\(s\) it did not install, which now count as normal: "Stack\\planted\.yml" is new[^\n]*first remove what was added') 'and the health check keeps warning, with the order that works: remove it first, because Update toolkit keeps what it finds'
+        # The baseline itself removed: that is a change, too.
+        Remove-Item -LiteralPath (Get-LaiIntegrityPath -AIRoot $aiRoot) -Force
+        & $igTwoLooks
+        $n10 = @(& $igChanged)
+        Assert-That ($n10.Count -eq 8 -and $n10[-1] -match 'the baseline itself \("[^"]*integrity-baseline\.json"\) is gone' -and $n10[-1] -notmatch 'Start menu|Health check') "a baseline that disappears is announced, without sending the owner to the installed scripts ($($n10[-1]))"
+        $hc10 = & $igHealth
+        Assert-That ($hc10 -match 'WARN Integrity watch: the baseline [^\n]*is gone or cannot be read') 'and the health check does not call that "no baseline yet"'
+    } finally {
+        if ($holder -and -not $holder.HasExited) { $holder.Kill() }
+        Set-LaiWebUIBanner -BaseUrl $wu -Token $tok10 -Clear | Out-Null
+    }
 } finally {
     if ($holder -and -not $holder.HasExited) { $holder.Kill() }
     $tc = Join-Path (Join-Path $aiRoot 'Stack') 'docker-compose.yml'

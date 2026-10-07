@@ -14,7 +14,8 @@
       upload matching what Ollama reports for the model), no context size set in Open WebUI over
       the tuned aliases, signup off / memories on, RAG + web search settings, a chat per preset, an
       image read by each preset with images (Uncensored Vision), memory recall, document retrieval, web
-      search, backups, and that nothing listens beyond 127.0.0.1.
+      search, backups, the health watch (and what it found changed in the installed scripts, tasks
+      and listeners since the last install or update), and that nothing listens beyond 127.0.0.1.
 
     The functional tests create a temporary memory and a temporary knowledge collection and delete
     both afterwards. Exit code = number of failed checks (0 = V1 complete).
@@ -508,6 +509,83 @@ Add-Check 'Health watch' {
     if ($mins -gt 120) { return (Warn ("last check {0:N1} h ago ({1}); unless the PC was asleep or off since, the LocalAI-Watch task has stopped running - see its History in Task Scheduler, or {2}" -f ($mins / 60), $last.ToString('yyyy-MM-dd HH:mm'), $fix)) }
     if ($ws['toastSetting']) { return (Warn "last check $mins min ago, but Windows has notifications switched off for PowerShell ($($ws['toastSetting'])), so its alerts never pop up: Settings > System > Notifications > Windows PowerShell. Problems that last still show as a banner in Open WebUI") }
     Pass "last check $mins min ago"
+}
+
+Add-Check 'Integrity watch' {
+    # What the health watch found when it last compared the installed scripts, the Stack folder, the
+    # LocalAI-* scheduled tasks and the network listeners with the baseline the last install or update
+    # recorded. Read from the watch's own record: nothing is hashed here, and a difference is a
+    # warning, not a failure (the stack works; something was changed). The baseline sits in a folder
+    # this user can write, so this shows accidents, other software and clumsy tampering, no more.
+    # Not watched at all, and so never part of this result: Stack\.env beyond the settings that say
+    # where chats and searches go, logs, and everything under a Secrets folder.
+    $ws = Read-LaiState -Path (Join-Path $AIRoot 'watch-state.json')
+    $ig = @{}; if ($ws['integrity'] -is [hashtable]) { $ig = $ws['integrity'] }
+    $accept = "& $(ConvertTo-LaiPsQuoted (Join-Path (Join-Path $AIRoot 'Scripts') 'Watch-LocalAI.ps1')) -AIRoot $(ConvertTo-LaiPsQuoted $AIRoot) -AcceptBaseline"
+    # The installer runs this checklist itself before it records its new baseline, and files are
+    # being replaced while any install or model update runs: what the watch found against the old
+    # baseline is then no advice to act on ('accept this change' about a file that was just put
+    # back). The installer holds the setup lock on this very thread, where it reads as free (a mutex
+    # lets its owner in again), so that case is told by the installer's own $SetupLock, which this
+    # script sees when the installer calls it. Any program can hold that lock, though: one held for
+    # $skipHours hours no longer hides the result (the watch announces it after the same time).
+    $skipHours = 6
+    $byInstaller = (Get-Variable -Name SetupLock -ValueOnly -ErrorAction SilentlyContinue) -is [System.Threading.Mutex]
+    $lockSince = ConvertTo-LaiIntegrityDate $ig['skippedSince']
+    if ($byInstaller -or ((Test-LaiSetupLockBusy) -and (-not $lockSince -or [math]::Abs(((Get-Date) - $lockSince).TotalHours) -lt $skipHours))) {
+        return (Skip 'an install, update or model update is running: files are being replaced, so nothing is compared until it has finished (an install or update then records a new baseline)')
+    }
+    $base = Read-LaiIntegrityBaseline -AIRoot $AIRoot
+    if (-not $base) {
+        # The watch had one and it is gone: that is not 'none yet'.
+        if ($ig['baseline']) { return (Warn ("the baseline (""{0}"") is gone or cannot be read, so changes are no longer noticed. If you did not remove it, {1} If you did, record a new one by pasting this into PowerShell: {2}" -f (Get-LaiIntegrityPath -AIRoot $AIRoot), (Get-LaiIntegrityAdvice -Ids @('baseline|gone') -AIRoot $AIRoot), $accept)) }
+        return (Skip 'no baseline yet (an install or Start menu > Local AI - Update toolkit records one when it finishes)')
+    }
+    $recorded = ConvertTo-LaiIntegrityDate $base['recordedAt']
+    $when = [string]$base['recordedAt']; if ($recorded) { $when = $recorded.ToString('yyyy-MM-dd HH:mm') }
+    $about = "baseline of $when ($(Get-LaiIntegritySummary -Baseline $base))"
+    # A baseline takes in whatever is there when it is recorded. What it took in beyond the toolkit's
+    # own (an install or update), or at all (recorded by hand, which any program running as this user
+    # can do), stays in this line for as long as that baseline is the one in use.
+    $taken = @($base['accepted'] | Where-Object { $_ -is [hashtable] })
+    $takenCount = $taken.Count; if ([int]$base['acceptedCount'] -gt $takenCount) { $takenCount = [int]$base['acceptedCount'] }
+    $byHand = ([string]$base['reason'] -ne 'install')
+    $origin = ''; if ($byHand) { $origin = ' That baseline was recorded by hand (-AcceptBaseline).' }
+    if ($takenCount) {
+        $takenList = (@($taken | ForEach-Object { [string]$_['Text'] } | Select-Object -First 12) -join '; '); if ($takenCount -gt 12) { $takenList += ' and {0} more' -f ($takenCount - 12) }
+        $takenAdvice = Get-LaiIntegrityAdvice -Ids @($taken | ForEach-Object { [string]$_['Id'] }) -AIRoot $AIRoot
+        if ($byHand) { $origin = " That baseline was recorded by hand (-AcceptBaseline), which made $takenCount change(s) count as normal: $takenList. If that was not you, $takenAdvice" }
+        else { $origin = " That install or update kept $takenCount thing(s) it did not install, which now count as normal: $takenList. If you did not add them, $takenAdvice If you did, this goes away with: $accept" }
+    }
+    # An update that kept what it did not install is a warning until the owner has looked.
+    $keptByUpdate = ($takenCount -gt 0 -and -not $byHand)
+    if ([string]$ig['baseline'] -ne [string]$base['id'] -or -not $ig['checkedAt']) {
+        $msg = "$about; the health watch compares the PC with it on its next run.$origin"
+        if ($keptByUpdate) { return (Warn $msg) }
+        return (Pass $msg)
+    }
+    # A result is only as good as the comparison behind it: say when that did not run, or left
+    # something out, instead of showing an old 'nothing changed' as today's.
+    $notes = @()
+    $checkedAt = ConvertTo-LaiIntegrityDate $ig['checkedAt']
+    $watchRan = ConvertTo-LaiIntegrityDate $ws['checked']
+    $checkedText = [string]$ig['checkedAt']; if ($checkedAt) { $checkedText = $checkedAt.ToString('yyyy-MM-dd HH:mm') }
+    if ($ig['skippedWhy']) {
+        $notes += "the comparison is not running ($($ig['skippedWhy'])), so this is the result of $checkedText and later changes are not in it"
+    } elseif ($checkedAt -and $watchRan -and ((Get-Date) - $checkedAt).TotalHours -gt 3 -and ((Get-Date) - $watchRan).TotalMinutes -le 120) {
+        $notes += "the last comparison was at $checkedText although the health watch has run since, so later changes are not in it (see Logs\watch.log)"
+    }
+    $unread = @($ig['notRead'] | Where-Object { $_ } | ForEach-Object { [string]$_ })
+    if ($unread.Count) { $notes += ($unread -join ' and ') + ' could not be read at the last comparison and were not compared' }
+    $found = @($ig['found'] | Where-Object { $_ -is [hashtable] })
+    if ($found.Count -eq 0) {
+        if ($notes.Count) { return (Warn ("no change was found against the $about, but " + ($notes -join '; ') + ".$origin")) }
+        if ($keptByUpdate) { return (Warn "nothing changed since the $about.$origin") }
+        return (Pass "nothing changed since the $about.$origin")
+    }
+    $more = ''; if ($notes.Count) { $more = ' Also: ' + ($notes -join '; ') + '.' }
+    Warn ("{0} change(s) since the {1}: {2}. If you did not make them, {3} If you did, make them the new baseline by pasting this into PowerShell: {4}{5}{6}" -f $found.Count, $about, (Format-LaiIntegrityList -Items @($found | ForEach-Object { [string]$_['Text'] }) -Max 12),
+        (Get-LaiIntegrityAdvice -Ids @($found | ForEach-Object { [string]$_['Id'] }) -AIRoot $AIRoot), $accept, $more, $origin)
 }
 
 Add-Check 'Nothing exposed beyond localhost' {
