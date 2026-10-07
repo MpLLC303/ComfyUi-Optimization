@@ -270,7 +270,9 @@ jobs:
   # Ollama and Docker only: Update-Models.ps1 never signs in to Open WebUI in its test (the install
   # root has no admin login) and the uninstall test runs against a fake Ollama and stand-in containers.
   # The leftover check therefore skips the Open WebUI state and does not count the services this job
-  # does not start (SearXNG, Open WebUI); whatever a suite left behind still counts.
+  # does not start (SearXNG, Open WebUI); whatever a suite left behind still counts. -LeftoversOnly
+  # also stops counting an unreachable Ollama, which this job does start and whose test models the
+  # check looks for, so the step requires Ollama itself before the check.
   models:
     name: Model update and uninstall tests
     runs-on: ubuntu-latest
@@ -307,6 +309,11 @@ jobs:
       - name: Nothing left behind (containers, volumes, helper processes, models)
         shell: pwsh
         run: |
+          # Without this, an Ollama that died during a suite would pass: the check below would print
+          # MISSING and exit 0, and the test models (testorg/update-test*, localai-update-test*) would
+          # never have been looked for.
+          try { Invoke-RestMethod -Uri 'http://127.0.0.1:11434/api/version' -TimeoutSec 10 | Out-Null }
+          catch { Write-Host "Ollama at http://127.0.0.1:11434 is not reachable, so its test models cannot be checked: $($_.Exception.Message)"; exit 1 }
           & ./local-llm/tests/Reset-Sandbox.ps1 -Check -SkipWebUI -LeftoversOnly
           exit $LASTEXITCODE
 
@@ -324,7 +331,10 @@ jobs:
   stack:
     name: Production stack (docker compose, the real images)
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # Expected run time is well under 30 minutes. The smoke step is capped lower than the job so a
+    # stuck pull or start fails that step (and the log step below still runs) instead of the runner
+    # ending the whole job with the container logs unread.
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v5
 
@@ -344,6 +354,7 @@ jobs:
 
       - name: Stack smoke test (compose up on stack/docker-compose.yml, with deep research)
         shell: pwsh
+        timeout-minutes: 25
         run: |
           & ./local-llm/tests/Invoke-StackSmokeTest.ps1 -DeepResearch
           exit $LASTEXITCODE
@@ -358,6 +369,10 @@ jobs:
         if: failure()
         run: |
           docker logs --tail 80 ollama-test || true
+          for c in open-webui render-guard searxng deep-research; do
+            echo "=== $c ==="
+            docker logs --tail 80 "$c" || true
+          done
           docker ps -a
 
   # Runs even when a job above failed or was skipped (a skipped required check would count as

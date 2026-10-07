@@ -201,6 +201,7 @@ try {
         $ready = (@($expected | Where-Object { $have -notcontains $_ }).Count -eq 0) -and (@($containers | Where-Object { -not (Test-ContainerReady $_) }).Count -eq 0)
         if (-not $ready) { Start-Sleep -Seconds 5 }
     }
+    $notReady = @()
     foreach ($svc in $expected) {
         $c = @($containers | Where-Object { (Get-ServiceName $_) -eq $svc }) | Select-Object -First 1
         $what = 'missing'
@@ -209,8 +210,14 @@ try {
             if ($c.State.PSObject.Properties['Health'] -and $c.State.Health) { $what += ", health $($c.State.Health.Status)" } else { $what += ', no healthcheck' }
             $what += ", $([int]$c.RestartCount) restart(s)"
         }
-        Assert-That ($c -and (Test-ContainerReady $c) -and [int]$c.RestartCount -eq 0) "service $svc is running, healthy where it has a healthcheck, and never restarted ($what)"
+        $isReady = [bool]($c -and (Test-ContainerReady $c))
+        if (-not $isReady) { $notReady += $svc }
+        Assert-That ($isReady -and [int]$c.RestartCount -eq 0) "service $svc is running, healthy where it has a healthcheck, and never restarted ($what)"
     }
+    # Stop here when a service never came ready: everything below would wait out its own timeout
+    # (minutes each) before the finally block prints the container logs, and the job's time limit
+    # could end the run first, with the logs unread.
+    if ($notReady.Count) { throw "not ready after $StartTimeoutSec seconds: $($notReady -join ', ')" }
     $owui = @($containers | Where-Object { (Get-ServiceName $_) -eq 'open-webui' }) | Select-Object -First 1
     $guard = @($containers | Where-Object { (Get-ServiceName $_) -eq 'render-guard' }) | Select-Object -First 1
     if (-not $owui -or -not $guard) { throw 'open-webui or render-guard is not there; the checks below need both' }
