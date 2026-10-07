@@ -58,7 +58,7 @@ Every service: `cap_drop: [ALL]`, `security_opt: ["no-new-privileges:true"]`, a 
     not in the limit: see "Still to do".
   - It runs from the SearXNG image, so it would carry that image's volumes too, if the image
     declares any. The compose file mounts nothing over them for the guard: the smoke test checks
-    instead that the guard's user (65534) can write nowhere.
+    instead that the guard's user (65534) can write nowhere outside /dev.
 - **deep-research** (compose profile `research`, enabled through `COMPOSE_PROFILES` in Stack\.env):
   already had `cap_drop: [ALL]` plus CHOWN, FOWNER, DAC_OVERRIDE, SETUID, SETGID, and
   `no-new-privileges` (its image drops privileges with `setpriv`, which works under
@@ -75,9 +75,12 @@ matches it with a regex.
   CI jobs): a service in the compose file without no-new-privileges, `cap_drop` ALL, a `mem_limit`
   or a `pids_limit`, or with a published port not bound to 127.0.0.1, is a problem. So is a line
   that hands it all back while those keys are still there: `privileged` (anything but false),
-  ALL under `cap_add`, or a `<<:` merge at the service's own level (it could bring in `privileged`
-  or `ports` from an anchor the check does not follow). It reads only what is written out in the
-  service's own block: a flow mapping or a `${VARIABLE}` for a limit does not satisfy it. Its
+  ALL under `cap_add`, a `<<:` merge or an `extends` key at the service's own level (they could
+  bring in `privileged` or `ports` from an anchor or a service the check does not follow), or a
+  line at the service's own level the check cannot read as `key: value` (a quoted key, a space
+  before the colon: it could be one of those keys written another way). It reads only what is
+  written out in the service's own block: a flow mapping or a `${VARIABLE}` for a limit does not
+  satisfy it. Its
   canaries take one thing at a time away from a hardened service, or add one such line, and
   require exactly that gap to be reported.
 - **Stack smoke test** (`tests/Invoke-StackSmokeTest.ps1`, CI job `stack`, real images):
@@ -90,8 +93,12 @@ matches it with a regex.
   - searxng and render-guard (the services with a read-only root), from the kernel's mount table
     inside the container: every read-write mount outside /proc, /sys and /dev is tried as the
     service's user. searxng may be able to write only to /tmp and /var/cache/searxng, each a
-    tmpfs with a size limit and noexec; render-guard nowhere. A volume the image declares and the
-    compose file does not cover fails this;
+    tmpfs with a size limit and noexec; render-guard nowhere outside /dev. A volume the image
+    declares and the compose file does not cover fails this. The mounts under /dev are not tried:
+    Docker's own /dev/shm (a tmpfs of 64 MB, mounted noexec, gone at a restart, its pages counted
+    against the memory limit) could take a file from a service that was taken over, but not a
+    program that can be run. A later `shm_size:` or `ipc: host` line would change that mount and
+    this test would not notice;
   - Open WebUI, with no capability at all, starts, makes the admin account from .env, signs it in
     and reaches Ollama through the render guard;
   - SearXNG is started with a settings.yml dated 2020, as old as an existing install's, and the
@@ -108,8 +115,11 @@ matches it with a regex.
   - deep research reaches Ollama through the guard under its limits;
   - after all of that every container is still running, was never ended for exceeding its memory
     limit and never restarted.
-- The CI jobs `integration` and `installer` start SearXNG from the same compose file, so their
-  web-search checks also run against the hardened SearXNG.
+- The CI jobs `integration`, `installer` and `webui-update` start SearXNG from the same compose file,
+  so their web-search checks also run against the hardened SearXNG. They mount the repository's own
+  `stack/searxng` folder (the template `settings.yml`, dated by the checkout, so newer than the
+  image's) read-only; the job step makes the folder readable for user 977 first and stops with
+  SearXNG's log when it does not answer.
 
 ## Deliberately not applied
 - **CPU limits:** a `cpus` value above the Docker VM's CPU count stops the container from being
@@ -124,11 +134,6 @@ matches it with a regex.
   backup's check image all assume `repo:tag`.
 
 ## Still to do
-- **Register the rule:** add COMPOSESEC to `VerdictPattern` in `tests/Invoke-AllTests.ps1` (so the
-  runner's summary quotes its hits; a hit already fails the run by its exit code), then list it in
-  the rule list at the top of `tests/Invoke-StaticChecks.ps1` like the others. That script checks
-  that every listed rule is in the pattern, which is why the rule is described at its function for
-  now. Until then the runner's summary does not quote a COMPOSESEC hit.
 - **Request bodies in the render guard** (`stack/render-guard/render_guard.py`): pass the body of
   a path it does not rewrite straight through instead of reading it whole, or answer 413 above a
   size. Until then a request too big for the guard's memory limit ends the guard.
@@ -136,8 +141,6 @@ matches it with a regex.
   file system`: the image's start script does write beside an older settings.yml. Then decide with
   that log whether the line is harmless (SearXNG still starts and answers) and may be allowed in
   the test, or the folder must stay writable.
-- **Docs:** README security notes; the backlog row; the stack smoke test's row in
-  `tests/README.md`.
 - **By hand on a real install** (the smoke test has no browser and no model): upload a document
   (embedding and reranking), run a web search from a chat, save the skill notebook tool (that path
   runs pip install), and run one deep research report, all with the hardening on.

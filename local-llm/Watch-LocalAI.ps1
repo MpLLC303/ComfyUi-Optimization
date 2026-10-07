@@ -479,6 +479,9 @@ if ($ollamaVer -and $recheckKey -and [string]$recheck['ollamaVersion'] -eq $olla
 #   notRead       what could not be read, and so was not compared, although the baseline has it
 #   skippedSince, skippedWhy, skippedTold   a comparison that is due and does not run
 # $null = leave the saved findings as they are.
+# Why a comparison is kept from running while the setup lock is held. The advice in the notice below
+# (close an installer window, restart the PC) fits only this reason.
+$setupLockWhy = 'an install or a model update is running (or another program holds its lock)'
 function Update-IntegritySkip {
     # A comparison that is due and does not run (the setup lock is held, which any program can do; it
     # was ended before it finished; it failed). Nothing else would say so: the health check would go
@@ -492,7 +495,9 @@ function Update-IntegritySkip {
     $State['skippedWhy'] = $Why
     $skipSince = ConvertTo-WatchDate $State['skippedSince']
     if (-not $State['skippedTold'] -and $skipSince -and ((Get-Date) - $skipSince).TotalHours -ge $integritySkipHours) {
-        $skipText = "The installed scripts, tasks and listeners have not been compared with the baseline since $($skipSince.ToString('yyyy-MM-dd HH:mm')): $Why. Changes made meanwhile are not reported. If nothing of the kind is running, close an installer window that is still open or restart the PC; the details are in $logFile."
+        $advice = ''
+        if ($Why -eq $setupLockWhy) { $advice = ' If nothing of the kind is running, close an installer window that is still open or restart the PC.' }
+        $skipText = "The installed scripts, tasks and listeners have not been compared with the baseline since $($skipSince.ToString('yyyy-MM-dd HH:mm')): $Why. Changes made meanwhile are not reported.$advice The details are in $logFile."
         if (Send-Notification 'Local AI: changes are not being checked' $skipText) { $State['skippedTold'] = $true }
     }
 }
@@ -567,7 +572,7 @@ try {
         # lasts, announced (below).
         if ($igDue -and (Test-LaiSetupLockBusy)) {
             $igDue = $false
-            $skipWhy = 'an install or a model update is running (or another program holds its lock)'
+            $skipWhy = $setupLockWhy
         }
         if ($igDue) {
             try {
@@ -593,7 +598,7 @@ try {
                 # compared (the next install, update or -AcceptBaseline ends it), and the mark says
                 # what ended the run, for watch.log, the health check and the notice after
                 # $integritySkipHours hours.
-                $hookWhy = 'the environment variable LOCALAI_TEST_INTEGRITY_END (a test hook) is set and ends the comparison before anything is compared; remove that variable'
+                $hookWhy = 'the environment variable LOCALAI_TEST_INTEGRITY_END (a test hook) was set when the comparison started and ended it before anything was compared; remove that variable'
                 $endHere = ($env:LOCALAI_TEST_INTEGRITY_END -and [string]$env:LOCALAI_TEST_INTEGRITY_END -eq $baseId)
                 if ($endHere) { $markIg['skippedWhy'] = $hookWhy }
                 elseif ([string]$markIg['skippedWhy'] -eq $hookWhy) { $markIg.Remove('skippedWhy') }

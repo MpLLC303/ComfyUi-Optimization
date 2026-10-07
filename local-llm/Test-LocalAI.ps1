@@ -552,7 +552,13 @@ Add-Check 'Integrity watch' {
     $byHand = ([string]$base['reason'] -ne 'install')
     $origin = ''; if ($byHand) { $origin = ' That baseline was recorded by hand (-AcceptBaseline).' }
     if ($takenCount) {
-        $takenList = (@($taken | ForEach-Object { [string]$_['Text'] } | Select-Object -First 12) -join '; '); if ($takenCount -gt 12) { $takenList += ' and {0} more' -f ($takenCount - 12) }
+        # By name the first twelve. An entry that stands for what the baseline does not name ('more|...',
+        # past a thousand kept items or in the old 50-name form) is no name: it is part of the count,
+        # and of the advice below.
+        $takenShown = @($taken | Where-Object { [string]$_['Id'] -notlike 'more|*' } | ForEach-Object { [string]$_['Text'] } | Select-Object -First 12)
+        $takenList = $takenShown -join '; '
+        if ($takenShown.Count -eq 0) { $takenList = 'none of them is listed by name any more' }
+        elseif ($takenCount -gt $takenShown.Count) { $takenList += ' and {0} more' -f ($takenCount - $takenShown.Count) }
         $takenAdvice = Get-LaiIntegrityAdvice -Ids @($taken | ForEach-Object { [string]$_['Id'] }) -AIRoot $AIRoot
         if ($byHand) { $origin = " That baseline was recorded by hand (-AcceptBaseline), which made $takenCount change(s) count as normal: $takenList. If that was not you, $takenAdvice" }
         else { $origin = " That install or update kept $takenCount thing(s) it did not install, which now count as normal: $takenList. If you did not add them, $takenAdvice If you did, this goes away with: $accept" }

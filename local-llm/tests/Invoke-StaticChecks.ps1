@@ -82,13 +82,10 @@ $files = Get-ChildItem -Path $Root -Recurse -File -Include *.ps1, *.psm1, *.psd1
 #            its notice must be exactly the list Update-Models re-checks (else it never clears).
 #   DEPSKIP  Test-LocalAI's 'SearXNG search' not skipping when the searxng container check failed
 #            (one cause reported as two FAILs).
-# One more rule, COMPOSESEC, is described at its function (Find-ComposeSecGap) instead of here: a
-# service in stack/docker-compose.yml without no-new-privileges, cap_drop ALL, a memory limit or a
-# pids limit, with a published port not bound to 127.0.0.1, or with a line that hands it all back
-# (privileged, ALL under cap_add, a '<<' merge at the service's own level). To do: list it above
-# like the others once Invoke-AllTests.ps1's VerdictPattern names it (the check near the end of this
-# file fails for a listed rule the runner does not know; until then a hit still fails the run, by
-# its exit code, but the runner's summary does not quote it).
+#   COMPOSESEC a service in stack/docker-compose.yml without no-new-privileges, cap_drop ALL, a
+#            mem_limit or a pids_limit, with a published port not bound to 127.0.0.1, or with a line
+#            that hands it all back or that this check cannot read (privileged, ALL under cap_add,
+#            a '<<' merge or 'extends' at the service's own level, a key not written plainly).
 function Find-Pitfall([System.Management.Automation.Language.Ast]$Ast, [string[]]$Lines, [string]$FileName = '', [switch]$UserFacing) {
     $found = New-Object System.Collections.Generic.List[object]
     $add = { param($Rule, $Node, $Msg) $found.Add([pscustomobject]@{ Rule = $Rule; Line = $Node.Extent.StartLineNumber; Message = $Msg }) }
@@ -446,8 +443,10 @@ function Find-ComposeSecGap([string]$Text) {
     # Only what is written out in the service's own block counts: a flow mapping or a ${VARIABLE}
     # for a limit cannot be read here, so it does not satisfy the rule. A '<<' merge at the
     # service's own level is a gap by itself: it can bring in any key ('privileged', 'ports') from
-    # an anchor this check does not follow.
-    $gaps = New-Object System.Collections.Generic.List[string]
+    # an anchor this check does not follow, and so can 'extends'. A line at the service's own level
+    # that this check cannot read as 'key: value' (a quoted key, a space before the colon) is a gap
+    # too: it could be a 'privileged' or 'ports' key written another way, which Docker reads.
+    $gaps =New-Object System.Collections.Generic.List[string]
     $bodies = [ordered]@{}
     $inServices = $false; $svc = $null; $ind = $null
     foreach ($raw in ($Text -split "`n")) {
@@ -492,6 +491,9 @@ function Find-ComposeSecGap([string]$Text) {
                 $key = $Matches[1]
                 $keys[$key] = New-Object System.Collections.Generic.List[string]
                 $keys[$key].Add(([string]$Matches[2]).Trim())
+            } else {
+                $shown = $l.Trim(); if ($shown.Length -gt 50) { $shown = $shown.Substring(0, 50) + '...' }
+                $gaps.Add("service '$name' has a line this check cannot read ($shown): write the key plainly, as key: value")
             }
         }
         if (-not @(& $items $keys['security_opt'] | Where-Object { $_ -match '^no-new-privileges([:=]true)?$' }).Count) {
@@ -509,6 +511,9 @@ function Find-ComposeSecGap([string]$Text) {
         }
         if ($keys.ContainsKey('<<')) {
             $gaps.Add("service '$name' takes keys from a '<<' merge (this check reads only what is written out in the service itself: write the keys out)")
+        }
+        if ($keys.ContainsKey('extends')) {
+            $gaps.Add("service '$name' takes keys from another service with 'extends' (this check does not follow it: write the keys out)")
         }
         $mem = (@(& $items $keys['mem_limit']) -join ' ')
         if ($mem -notmatch '^[0-9]' -or $mem -match '^0+(\.0+)?[A-Za-z]*$') {
@@ -670,6 +675,12 @@ $composeSecCanaries = @(
     @{ Fire = $true; Says = "takes keys from a '<<' merge"; Text = ($secOk + "`n    <<: *wide") }
     @{ Fire = $true; Says = "takes keys from a '<<' merge"; Text = $secOk.Replace('    image: x', "    <<: [*wide, *open]`n    image: x") }
     @{ Fire = $false; Text = ($secOk + "`n    environment:`n      <<: *env`n      A: b") }
+    @{ Fire = $true; Says = "another service with 'extends'"; Text = ($secOk + "`n    extends:`n      file: other.yml`n      service: wide") }
+    @{ Fire = $true; Says = "another service with 'extends'"; Text = ($secOk + "`n    extends: { file: other.yml, service: wide }") }
+    @{ Fire = $false; Text = ($secOk + "`n    environment:`n      extends: x") }
+    # A line the key pattern cannot read could be one of the keys above written another way.
+    @{ Fire = $true; Says = 'cannot read'; Text = ($secOk + "`n" + '    "privileged": true') }
+    @{ Fire = $true; Says = 'cannot read'; Text = ($secOk + "`n    privileged : true") }
     @{ Fire = $true; Says = 'mem_limit'; Text = $secOk.Replace('    mem_limit: 2g', '    # mem_limit: 2g') }
     @{ Fire = $true; Says = 'mem_limit'; Text = $secOk.Replace('mem_limit: 2g', 'mem_limit: 0') }
     @{ Fire = $true; Says = 'pids_limit'; Text = $secOk.Replace('    pids_limit: 512', "    environment:`n      pids_limit: 512") }

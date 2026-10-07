@@ -179,7 +179,9 @@ $procView = "import json;r=lambda p:dict(l.split(':',1) for l in open(p).read().
 # options in /proc/mounts) outside /proc, /sys and /dev, which are the kernel's own in every
 # container, each with its file system type, its options and whether the user asking can write
 # there. On a read-only root these mounts are the only places where a service, or whoever took it
-# over, can leave a file.
+# over, can leave a file, except under /dev: Docker's own /dev/shm (a tmpfs of 64 MB, mode 1777,
+# mounted noexec, gone when the container restarts, its pages counted against the memory limit)
+# and /dev/mqueue are not tried here.
 $rwView = "import json,os;k=('/proc','/sys','/dev');m=[l.split() for l in open('/proc/mounts')];print(json.dumps({'uid':os.getuid(),'rw':[{'path':x[1],'type':x[2],'opts':x[3],'write':os.access(x[1],os.W_OK)} for x in m if x[3].split(',')[0]=='rw' and not any(x[1]==a or x[1].startswith(a+'/') for a in k)]}))"
 # Run inside the Open WebUI container: one chat with pictures in it (base64, as Ollama's API takes
 # them), sent to the render guard the way Open WebUI sends its chats. The model does not exist, so
@@ -353,9 +355,9 @@ try {
             $minePaths = @($mine | ForEach-Object { [string]$_.path })
             $lacking = @($wantTmp | Where-Object { $minePaths -notcontains $_ })
             $show = { param($List) $text = (@($List | ForEach-Object { "$($_.path) [$($_.type) $($_.opts)]" }) -join '; '); if (-not $text) { $text = 'none' }; $text }
-            $wantText = 'nowhere'; if ($wantTmp.Count) { $wantText = "only to its tmpfs folders, each with a size limit and noexec ($($wantTmp -join ', '))" }
+            $wantText = 'nowhere outside /dev'; if ($wantTmp.Count) { $wantText = "only to its tmpfs folders, each with a size limit and noexec ($($wantTmp -join ', ')), apart from /dev" }
             $lackText = ''; if ($lacking.Count) { $lackText = " Not writable though it should be: $($lacking -join ', ')." }
-            Assert-That ($r.Code -eq 0 -and $view -and $stray.Count -eq 0 -and $lacking.Count -eq 0) "$svc (uid $($view.uid)) can write $wantText. Mounts it can write: $(& $show $mine). Read-write mounts it cannot write: $(& $show @($rw | Where-Object { $_.write -ne $true })).$lackText (exit $($r.Code))"
+            Assert-That ($r.Code -eq 0 -and $view -and $stray.Count -eq 0 -and $lacking.Count -eq 0) "$svc (uid $($view.uid)) can write $wantText. Mounts it can write: $(& $show $mine). Read-write mounts it cannot write: $(& $show @($rw | Where-Object { $_.write -ne $true })).$lackText Not tried: the mounts under /dev, such as Docker's own /dev/shm. (exit $($r.Code))"
         }
     }
 

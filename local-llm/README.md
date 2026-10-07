@@ -412,11 +412,17 @@ differs.
   whatever is there. What it takes in that the installer did not put there is a warning in the
   installer's log, is named once by the watch ("Local AI: the update kept changes it did not
   make") and stays a warning in the health check. Updating again does not clear that list: it is
-  carried on until you accept it or remove what was added. So remove additions first, then update.
+  carried on until you accept it or remove what was added. Accepting names it once more, and it
+  stays listed, also by a second acceptance or an update, until the health watch has run once after
+  that; it does not wait for the notification to get through. A folder the install could not read
+  to the end is carried the same way, and stays a warning until you accept it. So remove additions
+  first, then update.
 - **Changes you made yourself:** `C:\AI\Scripts\Watch-LocalAI.ps1 -AcceptBaseline` records the
   current state as the new baseline (the health check prints the exact line to paste). Any program
   running under your account could run that as well, so the next watch run confirms it with a
-  notification ("Local AI: integrity baseline accepted") that names what was accepted.
+  notification ("Local AI: integrity baseline accepted") that names what was accepted, including
+  what an earlier update had kept. If that notification cannot be shown (for example because
+  Windows has notifications off for PowerShell), the list is in `C:\AI\Logs\watch.log`.
 - **When a script changed,** or the baseline itself is gone, the advice names no Start-menu
   shortcut: every shortcut starts a script from that folder, and Update toolkit then asks for
   administrator rights. Delete what was added and install from a fresh copy of the toolkit (the
@@ -512,11 +518,29 @@ failures.
   Tailscale, sign in, turn on MagicDNS and HTTPS Certificates at login.tailscale.com/admin/dns, then run
   `C:\AI\Scripts\Enable-TailscaleAccess.ps1`: HTTPS at `https://<this-pc>.<tailnet>.ts.net`, tailnet only, survives
   reboots, nothing opened on the LAN (`-Disable` removes it). Never port-forward or bind to `0.0.0.0`.
+- **The containers are locked down.** Every container drops all Linux capabilities (deep research
+  keeps the five its start script needs and nothing more), cannot gain new privileges, and has a
+  memory limit and a limit on how many processes it may start: 16 GB for Open WebUI, 8 GB for deep
+  research, 2 GB each for SearXNG and the render guard. A container that misbehaves or is taken over
+  can therefore not use up the PC. SearXNG and the render guard also run as unprivileged users on a
+  read-only filesystem; SearXNG reads its settings from a folder it cannot write to, and gets two
+  small temporary folders it can write to but cannot run programs from. Open WebUI still runs as
+  root inside its container, with no capabilities and a writable filesystem, because it rewrites some
+  of its own files at every start. The render guard keeps each request in memory while it passes
+  it on, so a very large one (a model file sent through it, or a chat carrying hundreds of
+  megabytes of pictures) can outgrow its 2 GB limit and end it; Docker restarts it and the chats
+  running through it are cut off. An existing install gets
+  all of this the next time you run the installer or Update toolkit, which copies the new compose
+  file and recreates the containers whose settings changed. The reasons for each choice, and what
+  is still open, are in `docs/CONTAINER-HARDENING-PLAN.md`.
 - **Your data stays yours.**
   - `C:\AI` is readable only by you, SYSTEM and Administrators. Without this, other Windows accounts
     could read the backups, which hold every chat. Secrets in `C:\AI\Secrets` and
     `C:\AI\Stack\.env` are locked the same way.
   - The bootstrap admin password is removed from the container environment after the first login.
+  - The installer places `C:\AI\CLAUDE.md`, rules for an AI coding agent opened in that folder
+    (which commands it may run, what it must never touch), only if no file of that name is there;
+    it is never overwritten or merged, so edit it freely, and the uninstaller leaves it.
 - **No silent admin rights.** No scheduled task runs as administrator.
   - The nightly backup and the health watch run as you.
   - The installer's resume after a reboot starts as you and asks for administrator rights with the

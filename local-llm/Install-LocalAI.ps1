@@ -2024,9 +2024,14 @@ if ($State.flags.ContainsKey('resumeFailures')) { [void]$State.flags.Remove('res
 try {
     $integrityBaseline = Save-LaiIntegrityBaseline -AIRoot $AIRoot -Reason 'install' -SourceRoot $SourceRoot -OwnTasks @($BackupTask, $WatchTask, $RecheckTask) -OwnSettings @('OLLAMA_BASE_URL', 'DEEP_RESEARCH_OLLAMA_URL')
     Write-LaiLog OK "Integrity baseline recorded: $(Get-LaiIntegritySummary -Baseline $integrityBaseline). The health watch tells you when they change outside an update (Watch-LocalAI.ps1 -AcceptBaseline accepts changes you made yourself)."
-    $integrityKept = @($integrityBaseline['accepted'] | Where-Object { $_ -is [hashtable] } | ForEach-Object { [string]$_['Text'] })
-    foreach ($kept in @($integrityKept | Select-Object -First 20)) { Write-LaiLog WARN "Kept, although this run did not install it, and from now on counted as normal: $kept. If you did not add it, remove it." }
-    if ([int]$integrityBaseline['acceptedCount'] -gt 20) { Write-LaiLog WARN ('...and {0} more of that kind; Start menu > Local AI - Health check lists them.' -f ([int]$integrityBaseline['acceptedCount'] - 20)) }
+    # By name only what the baseline names: an entry that stands for the rest ('more|...') is no name,
+    # it is part of the count. The rest is counted from the number the baseline kept.
+    $integrityKeptAll = @($integrityBaseline['accepted'] | Where-Object { $_ -is [hashtable] }).Count
+    if ([int]$integrityBaseline['acceptedCount'] -gt $integrityKeptAll) { $integrityKeptAll = [int]$integrityBaseline['acceptedCount'] }
+    $integrityKept = @($integrityBaseline['accepted'] | Where-Object { $_ -is [hashtable] -and [string]$_['Id'] -notlike 'more|*' } | ForEach-Object { [string]$_['Text'] })
+    $integrityNamed = @($integrityKept | Select-Object -First 20)
+    foreach ($kept in $integrityNamed) { Write-LaiLog WARN "Kept, although this run did not install it, and from now on counted as normal: $kept. If you did not add it, remove it." }
+    if ($integrityKeptAll -gt $integrityNamed.Count) { Write-LaiLog WARN ('...and {0} more of that kind; Start menu > Local AI - Health check lists them.' -f ($integrityKeptAll - $integrityNamed.Count)) }
 } catch { Write-LaiLog WARN "The integrity baseline could not be recorded ($($_.Exception.Message)): the health watch may report what this run installed as changed. Watch-LocalAI.ps1 -AcceptBaseline records it." }
 $rows = foreach ($m in ($Catalog.Models | Sort-Object { $_.Order })) {
     $t = $State.tuning[$m.Key]

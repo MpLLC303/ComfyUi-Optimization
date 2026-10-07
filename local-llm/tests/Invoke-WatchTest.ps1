@@ -608,6 +608,14 @@ services:
         $igEndLines = @(& $igLog | Where-Object { $_ -match 'INTEGRITY not compared: [^\n]*LOCALAI_TEST_INTEGRITY_END' })
         Assert-That (-not $igAfterEnd['checkedAt'] -and [string]$igAfterEnd['startedAt'] -eq [string]$igEnded['startedAt'] -and [string]$igAfterEnd['announced'] -eq [string]$ig2['id'] -and @(& $igNotices 'the update kept changes it did not make').Count -eq 1) "the two runs after it do not start that comparison again and do not announce again what the update kept ($(@(& $igNotices 'the update kept changes it did not make').Count) notice(s))"
         Assert-That ([string]$igAfterEnd['skippedWhy'] -match 'LOCALAI_TEST_INTEGRITY_END' -and [string]$igAfterEnd['skippedWhy'] -match 'remove that variable' -and $igEndLines.Count -eq 1) "what ended it is named, for the health check and the notice after hours, and once in watch.log over two runs: the variable, not an installer window ($($igEndLines.Count) line(s): $([string]$igAfterEnd['skippedWhy']))"
+        # Hours later the notice names the variable and gives no advice made for the setup lock: closing
+        # an installer window or restarting the PC changes nothing for a variable that was set for good.
+        $s10 = Read-LaiState -Path $statePath; $s10['integrity']['skippedSince'] = (Get-Date).AddHours(-7).ToString('s'); Save-LaiState -State $s10 -Path $statePath
+        Invoke-Watch $w9 | Out-Null
+        $igHookNotices = @(& $igNotices 'changes are not being checked')
+        $igHookNotice = ''; if ($igHookNotices.Count) { $igHookNotice = [string]$igHookNotices[-1] }
+        Assert-That ($igHookNotices.Count -eq $igUnchecked.Count + 1 -and $igHookNotice -match 'LOCALAI_TEST_INTEGRITY_END' -and $igHookNotice -notmatch 'installer window|restart the PC') "the notice for a comparison ended by the test hook names the variable and does not send the owner to an installer window or a restart ($igHookNotice)"
+        Assert-That ($igUnchecked[0] -match 'close an installer window that is still open or restart the PC') "while the setup lock is held the notice does carry that advice ($($igUnchecked -join ' | '))"
         # An hour after it was started the comparison is tried again, and this time it finishes: also
         # with the variable still set to the id of the baseline before, as one set for good would be
         # after the next update. A value that is not the id of the baseline in use ends nothing.

@@ -6,9 +6,12 @@ Local AI - Update toolkit), never through edits made in a session.
 
 The install folder is written as C:\AI below. The installer's -AIRoot may have put it somewhere
 else: then read C:\AI as the folder this file is in, and pass -AIRoot <that folder> to every toolkit
-script you run (Test-LocalAI.ps1, Test-PCSecurity.ps1, Start-LocalAI.ps1 and Stop-LocalAI.ps1 all
-default to C:\AI: left out, they check an install that is not there or write into a folder that
-is not this one).
+script that takes it (Test-LocalAI.ps1, Test-PCSecurity.ps1, Start-LocalAI.ps1 and Stop-LocalAI.ps1
+all default to C:\AI: left out, they check an install that is not there or write into a folder that
+is not this one). The toolkit update does not take it: Get-LocalAI.ps1 reads the folder from the
+environment variable LOCALAI_ROOT, which the Start menu entry sets, so use that entry, or set
+LOCALAI_ROOT to this folder first. Passing -AIRoot to Get-LocalAI.ps1 is ignored without any
+error, and the update would then be checked against C:\AI.
 
 The installer placed this file only because none existed, and never overwrites or merges it. The
 owner may edit it freely.

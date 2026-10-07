@@ -246,11 +246,19 @@ $agentNamed = @([regex]::Matches($agentText, '[A-Za-z][A-Za-z0-9-]*\.ps1') | For
 $agentUnknown = @($agentNamed | Where-Object { -not (Test-Path -LiteralPath (Join-Path $src $_)) -and -not (Test-Path -LiteralPath (Join-Path (Join-Path $src 'tests') $_)) })
 Assert-That ($agentNamed.Count -ge 9 -and $agentUnknown.Count -eq 0) "every script the rules name exists in the toolkit ($($agentNamed.Count) named; unknown: $($agentUnknown -join ', '))"
 # An install in another folder (-AIRoot): the scripts the agent may run default to C:\AI, so the rules
-# must tell it to pass the folder on. Each script the note lists really takes -AIRoot.
+# must tell it how to pass the folder on. Every script the rules name outside Never is named in the
+# intro, and either really declares -AIRoot or is named there together with LOCALAI_ROOT (the toolkit
+# update, Get-LocalAI.ps1, has no parameters and reads the folder from that variable).
 $agentIntro = [regex]::Match($agentText, '(?s)^(.*?)## Never').Groups[1].Value
-$agentRootScripts = @('Test-LocalAI.ps1', 'Test-PCSecurity.ps1', 'Start-LocalAI.ps1', 'Stop-LocalAI.ps1')
-$agentRootBad = @($agentRootScripts | Where-Object { $agentIntro -notmatch [regex]::Escape($_) -or (Get-Content -Raw -Encoding UTF8 -LiteralPath (Join-Path $src $_)) -cnotmatch '\[string\]\$AIRoot\s*=' })
-Assert-That ($agentIntro -match [regex]::Escape('-AIRoot <that folder>') -and $agentRootBad.Count -eq 0) "the rules tell the agent to pass -AIRoot to the scripts when the install is elsewhere (not covered: $($agentRootBad -join ', '))"
+$agentOutsideNever = [regex]::Replace($agentText, '(?s)## Never.*?(?=## Fine without asking)', '')
+$agentRootScripts = @([regex]::Matches($agentOutsideNever, '[A-Za-z][A-Za-z0-9-]*\.ps1') | ForEach-Object { $_.Value } | Select-Object -Unique)
+$agentRootBad = @($agentRootScripts | Where-Object {
+        $takesRoot = (Get-Content -Raw -Encoding UTF8 -LiteralPath (Join-Path $src $_)) -cmatch '\[string\]\$AIRoot\s*='
+        $namedInIntro = $agentIntro -match [regex]::Escape($_)
+        $viaEnv = $agentIntro -match ('(?s)' + [regex]::Escape($_) + '.{0,200}LOCALAI_ROOT')
+        -not ($namedInIntro -and ($takesRoot -or $viaEnv))
+    })
+Assert-That ($agentIntro -match [regex]::Escape('-AIRoot <that folder>') -and $agentRootScripts.Count -ge 5 -and $agentRootBad.Count -eq 0) "the rules tell the agent to pass -AIRoot to the scripts that take it and to use LOCALAI_ROOT for the toolkit update ($($agentRootScripts.Count) scripts named outside Never; not covered: $($agentRootBad -join ', '))"
 
 # ---- phase 2: resume after "reboot" ----------------------------------------------------------
 # ---- phase 1b: the (non-elevated) resume task at sign-in asks for admin rights --------------
@@ -306,7 +314,7 @@ $igSaveAt = $text.IndexOf('Save-LaiIntegrityBaseline -AIRoot $AIRoot -Reason ''i
 $igHealth = Get-Content -Raw -Encoding UTF8 (Join-Path $copy 'Test-LocalAI.ps1')
 Assert-That ($igLockAt -ge 0 -and $igVerifyAt -gt $igLockAt -and $igSaveAt -gt $igVerifyAt) 'the installer holds the setup lock, runs the health check in its own process and records the baseline only after it'
 Assert-That ($igHealth -match 'Get-Variable -Name SetupLock' -and $igHealth -match "Skip 'an install, update or model update is running") 'and the health check, called by an installer that holds the lock, skips the integrity line instead of advising on findings against the old baseline'
-$tok2 =Connect-LaiWebUI -BaseUrl 'http://127.0.0.1:3000' -Email $Email -Password $Password
+$tok2 = Connect-LaiWebUI -BaseUrl 'http://127.0.0.1:3000' -Email $Email -Password $Password
 $nbTool = $null; try { $nbTool = Invoke-LaiApi -Uri 'http://127.0.0.1:3000/api/v1/tools/id/localai_skill_notebook' -Token $tok2 } catch { $nbTool = $null }
 $mainP = Get-LaiWebUIModel -BaseUrl 'http://127.0.0.1:3000' -Token $tok2 -Id 'local-main'
 Assert-That ($nbTool -and [string]$nbTool.content -notmatch '__LOCALAI_PRESETS__' -and @($mainP.meta.toolIds) -contains 'localai_skill_notebook' -and @($mainP.meta.skillIds) -contains 'research-with-sources') 'the skill notebook is installed with the presets filled in, and it and the starter skills are offered in Local Main'
