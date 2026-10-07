@@ -2848,6 +2848,7 @@ function Get-LaiShortcutSpecs {
         @{ Name = 'ComfyUI (free GPU first)'; Script = 'Start-ComfyUI.ps1'; Extra = ''; Log = $true }
         @{ Name = 'Local AI - Diagnostics (redacted zip)'; Script = 'Get-LocalAIDiagnostics.ps1'; Extra = ' -RunTests' }
         @{ Name = 'Local AI - Sync skills'; Script = 'Sync-LocalAISkills.ps1'; Extra = ''; Log = $true }
+        @{ Name = 'Local AI - Security check'; Script = 'Test-PCSecurity.ps1'; Extra = ''; Log = $true }
         @{ Name = 'Local AI - Update toolkit'; Script = 'Get-LocalAI.ps1'; Extra = ''; Env = 'LOCALAI_ROOT' }
     )
     $specs = @([pscustomobject]@{ Name = 'Local AI (Open WebUI)'; Kind = 'url'; Script = ''; Target = "http://localhost:$WebUIPort/"; Arguments = ''; TooLong = $false })

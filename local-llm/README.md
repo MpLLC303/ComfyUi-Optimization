@@ -352,6 +352,7 @@ The exit code is the number of failures.
 | Health watch | Task `LocalAI-Watch` runs `C:\AI\Scripts\Watch-LocalAI.ps1` every 15 minutes while you're signed in: checks Ollama, the Docker engine (one that stopped answering, as Docker Desktop can after sleep, is reported instead of hanging the check), Open WebUI, SearXNG, the render guard, whether Open WebUI can actually reach Ollama (the path chats take), backup freshness, the backup mirror (when you set one) and free disk space (models, backups, Docker data; warns under 10 GB), restarts a stopped container or Ollama (never Docker Desktop itself, in case you quit it on purpose), and shows a Windows notification only when a problem persists for two checks in a row, again every 24 hours while it lasts, and once when it's fixed. A problem that persists is also shown as a banner at the top of Open WebUI (so you see it on the phone too, and when Windows has notifications switched off for PowerShell), and the banner goes away when it's fixed; banners you add yourself are kept. The health check warns when the watch has not run for two hours or Windows is dropping its notifications. When Ollama has updated itself since the presets were tuned, it only notes in its log that the nightly re-check will measure them; it notifies only when that re-check could not put a preset back fully on the GPU, or could not run for 3 days (then close ComfyUI and games and use Start menu → Local AI → Re-check models). On an install without that task it notifies once per new Ollama version instead. History in `C:\AI\Logs\watch.log`; run it by hand with `-NoHeal -Verbose`; silence it with `-PauseMinutes 240` (gaming, stack stopped on purpose) and `-Unpause` |
 | Gaming / long render: free everything | `C:\AI\Scripts\Stop-LocalAI.ps1` unloads the models, stops the containers (data kept) and pauses the health watch for 12 h. Add `-QuitDocker` to also release the WSL VM's RAM (up to 16 GB), or `-QuitOllama`. `Start-LocalAI.ps1` brings it all back and resumes the watch |
 | Something's wrong / asking for help | `C:\AI\Scripts\Get-LocalAIDiagnostics.ps1 -RunTests` (or Start menu → Local AI → Diagnostics) writes `C:\AI\Logs\diagnostics-<time>.zip` and copies a short summary to the clipboard. It covers versions, GPU/VRAM, Ollama, containers, logs and test results. The admin password, secret keys, tokens, your Windows user name and the admin e-mail are redacted. Nothing is uploaded. The last run of each Start-menu shortcut (Gaming mode, Start again, Health check, Re-check models, ComfyUI) is kept in `C:\AI\Logs\shortcut-<script>.log` and included, and so are the nightly re-check's `model-recheck.json` and `model-recheck.log`, so an error from a window you already closed can still be read |
+| Security check | Start menu → Local AI → *Security check* (or `C:\AI\Scripts\Test-PCSecurity.ps1`) checks this PC's own security and changes nothing; see [Keeping the PC safe](#keeping-the-pc-safe). For every check: right-click the shortcut > More > Run as administrator. The report is `C:\AI\Logs\pc-security-<time>.md` (`-ReportPath` to put it elsewhere) |
 | Uninstall | Start Docker Desktop first, then `C:\AI\Scripts\Uninstall-LocalAI.ps1` (elevated; `-WhatIf` first to preview; it asks you to type YES). It takes a verified final backup (`...-pre-uninstall.tar.gz`), then removes the scheduled tasks (backup, health watch, nightly model re-check), containers, Tailscale mapping, `localai-*` aliases, the shortcuts, the Start-menu folder and `C:\Program Files\LocalAI`. Chats and models are kept unless you add `-RemoveData` / `-RemoveModels`, and `-ResetOllamaSettings` also drops the OLLAMA_* variables (a value you had set yourself before the install, e.g. `OLLAMA_NUM_PARALLEL=4` for another tool, is put back instead; the first install logs each one it finds, and installs from before this toolkit version only remove). If the final backup fails, nothing is removed; with Docker not running, `-RemoveData` refuses. The Backups folder is kept, and the final backup is never pruned, even after a reinstall: get your chats back with `Restore-OpenWebUI.ps1 -Archive <that file>` |
 | After restoring an older backup | The restore puts this install's Ollama connection back. If the backup had a different admin password, run `Set-OpenWebUIPassword.ps1 -PromptCurrent` (type the old one; it then sets a new random password and prints it, add `-Prompt` to choose your own), then re-run the installer to re-apply presets. `Test-LocalAI.ps1` warns if the connection is wrong |
 | Restore a backup | `C:\AI\Scripts\Restore-OpenWebUI.ps1` (newest daily backup) or `-Archive <file>` (local, NAS or UNC path). It takes a verified safety backup first, swaps the data only after the archive checks out, and rolls back automatically if anything fails (deep research: add `-DeepResearch`; its replaced data is kept as `deep-research-<time>-pre-restore.tar.gz`). If even the rollback fails, Open WebUI is **kept stopped on purpose** so nothing writes to half-restored data: Start again, the installer, updates and nightly backups refuse until you run the recovery command the restore printed (also in the health-watch notification and `C:\AI\open-webui-hold.json`) |
@@ -393,6 +394,39 @@ deliberately not inside the backup archives.
 | Installer interrupted | Power loss, closed window | Run it again. It's idempotent, and tuning results are reused. |
 | "Another Local AI installer run or model update is already running" | An installer window (often the Administrator one) or `Update-Models.ps1` is still open | Let it finish or close that window, then try again |
 | "Open WebUI is kept stopped after a failed restore" | A restore and its automatic rollback both failed | Run the recovery command shown in the message (also in `C:\AI\open-webui-hold.json`), then Start again |
+
+## Keeping the PC safe
+
+The stack itself is locked down (next section), but it is only as safe as the PC under it. Start menu →
+Local AI → *Security check* (`C:\AI\Scripts\Test-PCSecurity.ps1`) looks at the PC and, for every problem,
+names one next step you can do yourself (a Settings path or a download page). It **only reads**: no
+setting is changed, nothing is started, stopped or uninstalled, and nothing is sent anywhere. It checks:
+
+- antivirus on and current (Microsoft Defender, or the product Windows Security knows), Tamper Protection;
+- Windows Update installed something in the last 35 days, and no restart is pending;
+- the firewall is on for every network type; User Account Control is on and asks;
+- Core isolation's memory integrity, the Microsoft vulnerable driver blocklist, Secure Boot and the TPM;
+- drive encryption (BitLocker, or *Device encryption* on Windows 11 Home) for the Windows drive and the
+  drives holding `C:\AI` and the Ollama models;
+- Smart App Control (for information) and SmartScreen for apps;
+- known-vulnerable kernel drivers that RGB, fan and overclocking tools install: WinRing0 (many fan and
+  RGB tools; Microsoft Defender flags it since 2025), RTCore64 (MSI Afterburner), CorsairLLAccess64
+  (iCUE before 3.25.60), ASUS AsIO2/AsIO3 and GIGABYTE gdrv; each with the app it usually comes with
+  and whether updating or uninstalling that app fixes it;
+- Remote Desktop and SMBv1, and programs listening beyond this PC; Ollama, Open WebUI, SearXNG,
+  ComfyUI (8188/8000) or Docker (2375) reachable from the network is a failure;
+- Docker Desktop at 4.44.3 or newer (CVE-2025-9074) and its *Expose daemon on tcp://localhost:2375
+  without TLS* setting off;
+- ComfyUI: the custom nodes you have (they run with your full user rights; one called
+  ComfyUI_LLMVISION stole browser passwords in 2024) and model files in the pickle format
+  (`.ckpt`, `.pt`, `.pth`, `.bin`), which can run code when loaded: prefer `.safetensors`;
+- `C:\AI\Secrets` readable only by you, Administrators and SYSTEM;
+- whether you use an administrator account day to day (a standard account is safer).
+
+It works in a normal window; the TPM, drive encryption and SMBv1 checks need *Run as administrator*
+and say so. The report in `C:\AI\Logs\pc-security-<time>.md` leaves out your user name, the computer
+name and e-mail addresses, so it can be shared when asking for help. The exit code is the number of
+failures.
 
 ## Security model (unchanged from the guide's Part 19-26 intent)
 

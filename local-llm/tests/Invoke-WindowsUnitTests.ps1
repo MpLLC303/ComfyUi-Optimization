@@ -13,6 +13,8 @@
     - Uninstall-LocalAI -WhatIf and Stop-LocalAI on an empty AI root must not throw.
     - Scheduled tasks: the no-window launch (conhost --headless), the daily-time math, and native
       calls with a time limit (a CLI that never answers is stopped, not waited on).
+    - Test-PCSecurity: its helpers (driver matcher, redaction, ACL/port verdicts, ComfyUI scan), that
+      it runs no changing command, and a full read-only run in a child process.
     Exit code = number of failed assertions.
 #>
 param([string]$Work = (Join-Path ([System.IO.Path]::GetTempPath()) 'lai-wintest'))
@@ -203,9 +205,10 @@ Assert-That ($free -eq 'FREE') "and as free after release (got '$free')"
 # ---- shortcuts -----------------------------------------------------------------------------------
 Write-Host "`n=== Start-menu shortcuts ===" -ForegroundColor Cyan
 $specs = @(Get-LaiShortcutSpecs -AIRoot ("C:\It's Dad" + [char]0x2019 + 's AI') -WebUIPort 3001)
-Assert-That ($specs.Count -eq 9) "nine shortcut specs (got $($specs.Count))"
+Assert-That ($specs.Count -eq 10) "ten shortcut specs (got $($specs.Count))"
 $rc = $specs | Where-Object { $_.Name -eq 'Local AI - Re-check models' }
 Assert-That ($rc -and $rc.Arguments -match "Update-Models\.ps1' -AIRoot '" -and $rc.Arguments -match "' -RecheckOnly \}" -and $rc.Arguments -notmatch '-Scheduled' -and $rc.Arguments -match 'shortcut-Update-Models\.log') "Re-check models runs Update-Models.ps1 -RecheckOnly (no downloads), logged ($($rc.Arguments))"
+Assert-That (@($specs | Where-Object { $_.Name -eq 'Local AI - Security check' -and $_.Script -eq 'Test-PCSecurity.ps1' -and $_.Arguments -match 'Start-Transcript' }).Count -eq 1) 'a logged Security check shortcut runs Test-PCSecurity.ps1'
 $upd = $specs | Where-Object { $_.Name -like '*Update toolkit*' }
 Assert-That ($upd -and $upd.Arguments -match 'LOCALAI_ROOT' -and $upd.Arguments -notmatch '-AIRoot') 'Update toolkit passes the AI root via LOCALAI_ROOT'
 foreach ($sc in ($specs | Where-Object { $_.Kind -eq 'lnk' })) {
@@ -237,7 +240,7 @@ $updPayload = ($specs | Where-Object { $_.Name -like '*Update toolkit*' }).Argum
 Assert-That ($updPayload -notmatch 'Start-Transcript') 'Update toolkit is not logged (an installer in that window prints the admin password)'
 $longSpecs = @(Get-LaiShortcutSpecs -AIRoot ('D:\' + ('x' * 120) + '\AI') | Where-Object { $_.Kind -eq 'lnk' })
 $maxLen = ($longSpecs | ForEach-Object { $_.Arguments.Length } | Measure-Object -Maximum).Maximum
-Assert-That ($maxLen -lt 1024 -and @($longSpecs | Where-Object { $_.TooLong }).Count -eq 0 -and @($longSpecs | Where-Object { $_.Arguments -match 'Start-Transcript' }).Count -eq 6) "a 125-char AI root: every shortcut fits the 1024-char .lnk limit, logs included ($maxLen)"
+Assert-That ($maxLen -lt 1024 -and @($longSpecs | Where-Object { $_.TooLong }).Count -eq 0 -and @($longSpecs | Where-Object { $_.Arguments -match 'Start-Transcript' }).Count -eq 7) "a 125-char AI root: every shortcut fits the 1024-char .lnk limit, logs included ($maxLen)"
 $longSpecs = @(Get-LaiShortcutSpecs -AIRoot ('D:\' + ('y' * 200) + '\AI') | Where-Object { $_.Kind -eq 'lnk' })
 Assert-That (@($longSpecs | Where-Object { -not $_.TooLong -and $_.Arguments.Length -ge 1024 }).Count -eq 0 -and @($longSpecs | Where-Object { $_.Arguments -match 'Start-Transcript' }).Count -eq 0 -and @($longSpecs | Where-Object { -not $_.TooLong }).Count -ge 6) 'a 205-char AI root: the log is dropped so the shortcuts still fit; none over the limit is offered as usable'
 $longSpecs = @(Get-LaiShortcutSpecs -AIRoot ('D:\' + ('z' * 400) + '\AI') | Where-Object { $_.Kind -eq 'lnk' })
@@ -1455,6 +1458,127 @@ foreach ($pc in $portCases) {
     }
     Assert-That ($gotPort -eq $pc.Want) "port 3000 held by Docker for $($pc.What) -> $gotPort (want $($pc.Want))"
 }
+
+Write-Host "`n=== Test-PCSecurity: read-only PC security check ===" -ForegroundColor Cyan
+# The script's own helpers, taken from its source (not a copy).
+$pcsAst = [System.Management.Automation.Language.Parser]::ParseFile((Join-Path $src 'Test-PCSecurity.ps1'), [ref]$null, [ref]$null)
+foreach ($fd in @($pcsAst.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -like '*-Pcs*' }, $true))) { . ([scriptblock]::Create($fd.Extent.Text)) }
+Assert-That ((Test-PcsVersionBelow '4.44.2' '4.44.3') -eq $true -and (Test-PcsVersionBelow '4.44.3' '4.44.3') -eq $false -and (Test-PcsVersionBelow '4.45.0.20123' '4.44.3') -eq $false -and
+    (Test-PcsVersionBelow '5' '4.44.3') -eq $false -and $null -eq (Test-PcsVersionBelow 'unknown' '4.44.3')) 'version compare: the Docker Desktop 4.44.3 cut-off, a 4-part build, a bare major, unreadable text'
+
+$drvIn = @(
+    [pscustomobject]@{ Name = 'WinRing0_1_2_0'; PathName = '\??\C:\Program Files\FanTool\WinRing0x64.sys'; State = 'Running' }
+    [pscustomobject]@{ Name = 'RTCore64'; PathName = 'C:\Program Files (x86)\MSI Afterburner\RTCore64.sys'; State = 'Stopped' }
+    [pscustomobject]@{ Name = 'CorsairLLAccess64'; PathName = '"C:\Program Files\Corsair\CORSAIR iCUE 5 Software\CorsairLLAccess64.sys"'; State = 'Running' }
+    [pscustomobject]@{ Name = 'Asusgio3'; PathName = 'C:\Windows\system32\drivers\AsIO3.sys'; State = 'Running' }
+    [pscustomobject]@{ Name = 'gdrv'; PathName = 'system32\drivers\gdrv.sys'; State = 'Stopped' }
+    [pscustomobject]@{ Name = 'nvlddmkm'; PathName = 'C:\Windows\System32\DriverStore\FileRepository\nv_dispi.inf_amd64\nvlddmkm.sys'; State = 'Running' }
+    [pscustomobject]@{ Name = 'AsIO'; PathName = 'C:\Windows\system32\drivers\AsIO.sys'; State = 'Running' }
+)
+$hits = @(Find-PcsRiskyDriver -Drivers $drvIn -Apps @([pscustomobject]@{ Name = 'iCUE'; Version = '5.25.95' }))
+Assert-That ($hits.Count -eq 5 -and @($hits | Where-Object { $_.Driver -eq 'nvlddmkm.sys' -or $_.Driver -eq 'AsIO.sys' }).Count -eq 0) "drivers: the five listed ones found; the GPU driver and the uncited AsIO.sys not ($(@($hits | ForEach-Object { $_.Driver }) -join ', '))"
+$w0 = $hits | Where-Object { $_.Driver -eq 'WinRing0x64.sys' }
+Assert-That ($w0 -and $w0.Running -and -not $w0.Fixed -and $w0.Cve -match 'CVE-2020-14979' -and $w0.Fix -match 'uninstall' -and $w0.App -match 'fan') 'WinRing0: loaded, named with the CVE, the usual apps and the fix'
+$cor = $hits | Where-Object { $_.Driver -eq 'CorsairLLAccess64.sys' }
+Assert-That ($cor -and $cor.Fixed -and $cor.FixedBy -match '5\.25') 'CorsairLLAccess64 from iCUE 5 counts as the fixed driver (CVE-2020-8808 fixed in 3.25.60)'
+$old = @(Find-PcsRiskyDriver -Drivers @($drvIn[2]) -Apps @([pscustomobject]@{ Name = 'Corsair iCUE Software'; Version = '3.20.80' }))
+$unk = @(Find-PcsRiskyDriver -Drivers @($drvIn[2]))
+Assert-That ($old.Count -eq 1 -and -not $old[0].Fixed -and $unk.Count -eq 1 -and -not $unk[0].Fixed) 'and from iCUE 3.20, or with no iCUE version known, it is reported'
+$byName = @(Find-PcsRiskyDriver -Drivers @([pscustomobject]@{ Name = 'WinRing0_1_2_0'; PathName = ''; State = 'Stopped' }))
+Assert-That ($byName.Count -eq 1 -and -not $byName[0].Running -and $byName[0].Driver -eq 'WinRing0_1_2_0') 'a driver is also matched by its service name when the path is empty'
+
+$hex = 'ab' * 32
+$red = Protect-PcsText -Text ("models in C:\Users\JohnDoe\.ollama and C:\Users\JohnDoe2\x; temp C:\Users\JOHNDO~1\AppData; user JOHNDOE on DESKTOP-AB12CD; Johnny stays; mail john.doe@example.com; password=Hunter2-secret; key $hex") `
+    -UserNames @('JohnDoe') -ComputerNames @('DESKTOP-AB12CD') -Paths @('C:\Users\JohnDoe')
+Assert-That ($red.Contains('%USERPROFILE%\.ollama') -and $red.Contains('C:\Users\<user>\x') -and $red.Contains('C:\Users\<user>\AppData')) "profile paths: yours -> %USERPROFILE%, any other (or its 8.3 short form) -> C:\Users\<user> ($red)"
+Assert-That ($red.Contains('user <user> on <computer>') -and $red.Contains('Johnny stays') -and $red.Contains('<email>') -and $red -notmatch 'Hunter2' -and -not $red.Contains($hex)) 'user and computer name (any case, whole words), e-mail, password and key redacted'
+
+$s1 = ConvertFrom-PcsAvState 397568; $s2 = ConvertFrom-PcsAvState 393472; $s3 = ConvertFrom-PcsAvState 397584
+Assert-That ($s1.Enabled -and $s1.UpToDate -and -not $s2.Enabled -and $s3.Enabled -and -not $s3.UpToDate) 'Security Center antivirus state: on and current / off / on but out of date'
+
+$meSid = 'S-1-5-21-1-2-3-1001'
+$okRules = @(@{ Sid = 'S-1-5-18'; Type = 'Allow'; Who = 'SYSTEM' }, @{ Sid = 'S-1-5-32-544'; Type = 'Allow'; Who = 'Administrators' }, @{ Sid = $meSid; Type = 'Allow'; Who = 'PC\me' }) | ForEach-Object { [pscustomobject]$_ }
+$va = Get-PcsAclVerdict -Rules $okRules -CurrentSid $meSid -OwnerSid 'S-1-5-32-544'
+$vb = Get-PcsAclVerdict -Rules ($okRules + [pscustomobject]@{ Sid = 'S-1-5-11'; Type = 'Allow'; Who = 'Authenticated Users' }) -CurrentSid $meSid
+$vc = Get-PcsAclVerdict -Rules ($okRules + [pscustomobject]@{ Sid = 'S-1-5-21-1-2-3-1002'; Type = 'Allow'; Who = 'PC\other' }) -CurrentSid $meSid
+$vd = Get-PcsAclVerdict -Rules @($okRules[0], $okRules[1], [pscustomobject]@{ Sid = 'S-1-5-21-1-2-3-1002'; Type = 'Allow'; Who = 'PC\installer' }) -CurrentSid $meSid
+$ve = Get-PcsAclVerdict -Rules ($okRules + [pscustomobject]@{ Sid = 'S-1-1-0'; Type = 'Deny'; Who = 'Everyone' }) -CurrentSid $meSid
+Assert-That ($va.Status -eq 'PASS' -and $vb.Status -eq 'FAIL' -and @($vb.Bad) -contains 'Authenticated Users' -and $vc.Status -eq 'FAIL' -and $vd.Status -eq 'WARN' -and $ve.Status -eq 'PASS') "Secrets ACL: private PASS, Authenticated Users FAIL, another account FAIL, run from another account WARN, a deny rule ignored ($($va.Status) $($vb.Status) $($vc.Status) $($vd.Status) $($ve.Status))"
+
+$lis = @(
+    [pscustomobject]@{ Port = 11434; Address = '0.0.0.0'; Process = 'ollama' }
+    [pscustomobject]@{ Port = 3000; Address = '127.0.0.1'; Process = 'com.docker.backend' }
+    [pscustomobject]@{ Port = 3000; Address = '::1'; Process = 'com.docker.backend' }
+    [pscustomobject]@{ Port = 8188; Address = '::ffff:127.0.0.1'; Process = 'python' }
+    [pscustomobject]@{ Port = 8000; Address = '::'; Process = 'python' }
+    [pscustomobject]@{ Port = 135; Address = '0.0.0.0'; Process = 'svchost' }
+    [pscustomobject]@{ Port = 445; Address = '::'; Process = 'System' }
+    [pscustomobject]@{ Port = 27036; Address = '0.0.0.0'; Process = 'steam' }
+    [pscustomobject]@{ Port = 27036; Address = '0.0.0.0'; Process = 'steam' }
+)
+$ex = Get-PcsExposedPort -Listeners $lis -CriticalPorts @(11434, 3000, 8888, 8188, 8000, 2375)
+Assert-That (@($ex.Critical).Count -eq 2 -and ($ex.Critical -join ' ') -match '11434@0\.0\.0\.0 \(ollama\)' -and ($ex.Critical -join ' ') -match '8000@:: \(python\)') "AI ports: all-interfaces listeners caught, loopback ones (IPv4, IPv6, mapped) not ($($ex.Critical -join '; '))"
+Assert-That (@($ex.Other).Count -eq 1 -and @($ex.Other)[0] -eq '27036@0.0.0.0 (steam)') 'other listeners: Windows itself left out, each program listed once'
+
+$j1 = '{"ExposeDockerAPIOnTCP2375": true, "AutoStart": false}' | ConvertFrom-Json
+$j2 = '{"exposeDockerAPIOnTCP2375": false}' | ConvertFrom-Json
+$j3 = '{"exposeDockerAPIOnTCP2375": {"locked": true, "value": true}}' | ConvertFrom-Json
+Assert-That ((Get-PcsJsonFlag $j1 'exposeDockerAPIOnTCP2375') -eq $true -and (Get-PcsJsonFlag $j2 'exposeDockerAPIOnTCP2375') -eq $false -and (Get-PcsJsonFlag $j3 'exposeDockerAPIOnTCP2375') -eq $true -and $null -eq (Get-PcsJsonFlag $j2 'missing')) 'Docker settings: the 2375 flag is read whatever the key case, also in the admin { value } form'
+
+$cfRoot = Join-Path $Work 'pcs-comfy'
+$cfAppData = Join-Path $cfRoot 'AppData'
+$cfBase = Join-Path $cfRoot 'ComfyBase'
+$cfPortable = Join-Path $cfRoot 'ComfyUI_windows_portable'
+foreach ($d in @((Join-Path $cfAppData 'ComfyUI'), (Join-Path (Join-Path $cfBase 'custom_nodes') 'ComfyUI-Manager'), (Join-Path (Join-Path $cfPortable 'ComfyUI') 'custom_nodes'))) { New-Item -ItemType Directory -Force -Path $d | Out-Null }
+ConvertTo-Json @{ basePath = $cfBase; installState = 'installed' } | Set-Content -LiteralPath (Join-Path (Join-Path $cfAppData 'ComfyUI') 'config.json') -Encoding UTF8
+$cfFound = @(Find-PcsComfyRoot -AppData $cfAppData -UserProfile (Join-Path $cfRoot 'nobody') -Remembered (Join-Path $cfPortable 'run_nvidia_gpu.bat'))
+Assert-That ($cfFound.Count -eq 2 -and $cfFound[0] -eq (Resolve-Path -LiteralPath $cfBase).Path -and $cfFound[1] -eq (Resolve-Path -LiteralPath (Join-Path $cfPortable 'ComfyUI')).Path) "ComfyUI found from Comfy Desktop's config.json basePath and the remembered portable start file ($($cfFound -join '; '))"
+
+$mRoot = Join-Path $cfBase 'models'
+foreach ($sub in 'checkpoints', 'upscale_models', 'loras') { New-Item -ItemType Directory -Force -Path (Join-Path $mRoot $sub) | Out-Null }
+foreach ($f in @(@('checkpoints', 'old.ckpt'), @('checkpoints', 'new.safetensors'), @('upscale_models', 'x4.pth'), @('loras', 'style.PT'), @('loras', 'notes.bin.txt'))) { Set-Content -LiteralPath (Join-Path (Join-Path $mRoot $f[0]) $f[1]) -Value 'x' }
+$deep = $mRoot; foreach ($i in 1..10) { $deep = Join-Path $deep "d$i" }
+New-Item -ItemType Directory -Force -Path $deep | Out-Null
+Set-Content -LiteralPath (Join-Path $deep 'buried.pt') -Value 'x'
+$scan = Get-PcsPickleFile -Root $mRoot -MaxDepth 8
+$leafs = @($scan.Files | ForEach-Object { Split-Path -Leaf $_ } | Sort-Object)
+Assert-That (($leafs -join ',') -eq 'old.ckpt,style.PT,x4.pth' -and $scan.Truncated) "pickle files found (any case), .safetensors and look-alikes not, the depth limit holds and is reported ($($leafs -join ','))"
+Assert-That ((Get-PcsPickleFile -Root $mRoot -MaxEntries 1).Truncated -and @((Get-PcsPickleFile -Root (Join-Path $cfRoot 'missing')).Files).Count -eq 0) 'the entry limit stops the scan; a missing folder is no error'
+
+# Every command the script runs reads: none that sets, removes, starts or stops anything.
+$changeVerbs = @('Set', 'Remove', 'Enable', 'Disable', 'Clear', 'Start', 'Stop', 'Restart', 'Install', 'Uninstall', 'Register', 'Unregister', 'Update', 'Suspend', 'Resume',
+    'Rename', 'Move', 'Copy', 'Grant', 'Revoke', 'Reset', 'Repair', 'Mount', 'Dismount', 'Lock', 'Unlock', 'Invoke', 'Send', 'Publish', 'Initialize', 'Block', 'Unblock')
+$changeTools = @('icacls', 'reg', 'netsh', 'sc', 'schtasks', 'bcdedit', 'manage-bde', 'wmic', 'powercfg', 'dism', 'takeown', 'docker', 'wsl', 'winget', 'cmd', 'ollama')
+$pcsCmds = @($pcsAst.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] }, $true) | ForEach-Object { [string]$_.GetCommandName() } | Where-Object { $_ } | Select-Object -Unique)
+$changing = @($pcsCmds | Where-Object { ($_ -match '^([A-Za-z]+)-' -and $changeVerbs -contains $Matches[1]) -or $changeTools -contains ($_.ToLowerInvariant() -replace '\.exe$', '') })
+Assert-That ($pcsCmds.Count -gt 20 -and $changing.Count -eq 0) "Test-PCSecurity.ps1 runs no command that changes the PC ($($pcsCmds.Count) commands; changing: $($changing -join ', '))"
+
+# The whole script in its own process: runs to the end, never throws, writes a report without names.
+$pcsRoot = Join-Path $Work 'pcs-root'
+New-Item -ItemType Directory -Force -Path (Join-Path $pcsRoot 'Secrets') | Out-Null
+ConvertTo-Json @{ WebUIPort = 39996; SearxngPort = 39995 } | Set-Content -LiteralPath (Join-Path $pcsRoot 'localai-config.json')
+$pcsReport = Join-Path (Join-Path $pcsRoot 'Logs') 'pc-security-test.md'
+$pcsSw = [System.Diagnostics.Stopwatch]::StartNew()
+$r = Invoke-Child 'Test-PCSecurity.ps1' @('-AIRoot', $pcsRoot, '-ReportPath', $pcsReport)
+$pcsSecs = [int]$pcsSw.Elapsed.TotalSeconds
+$checkLines = @($r.Text -split "`n" | Where-Object { $_ -match '\[(OK|WARN|FAIL|INFO) *\] (PASS|WARN|FAIL|SKIP) ' })
+$failLines = @($checkLines | Where-Object { $_ -match '\] FAIL ' })
+Assert-That ($r.Text -match 'PC SECURITY CHECK COMPLETE: \d+ checks, \d+ warnings, \d+ failures' -and $checkLines.Count -ge 20) "the security check runs to its summary line ($($checkLines.Count) checks, $pcsSecs s)"
+Assert-That ($r.Text -notmatch 'FullyQualifiedErrorId|ParentContainsErrorRecordException') 'and never throws'
+Assert-That ($r.Code -is [int] -and $r.Code -ge 0 -and $r.Code -eq $failLines.Count) "exit code = number of FAILs (exit $($r.Code), $($failLines.Count) FAIL line(s))"
+$pcsText = ''; if (Test-Path -LiteralPath $pcsReport) { $pcsText = [System.IO.File]::ReadAllText($pcsReport) }
+Assert-That ($pcsText -match 'PC SECURITY CHECK COMPLETE' -and $pcsText -match '\| Result \| Check \| Details \| What to do \|') 'the Markdown report is written'
+$names = @(@($env:USERNAME, [Environment]::UserName, $env:COMPUTERNAME, [Environment]::MachineName) | Where-Object { $_ -and $_.Length -ge 2 } | Select-Object -Unique)
+$leaks = @($names | Where-Object { $pcsText -match ('(?i)(?<![\p{L}\p{N}])' + [regex]::Escape($_) + '(?![\p{L}\p{N}])') })
+Assert-That ($names.Count -ge 1 -and $leaks.Count -eq 0) "the report names neither the user nor the computer ($($names.Count) name(s) checked, $($leaks.Count) found)"
+if ($env:USERPROFILE) { Assert-That (-not $pcsText.ToLowerInvariant().Contains($env:USERPROFILE.ToLowerInvariant())) 'and shows no profile path' }
+if ($onWindows) {
+    Assert-That (@($checkLines | Where-Object { $_ -notmatch '\] SKIP ' }).Count -ge 8) "on Windows the checks really run ($(@($checkLines | Where-Object { $_ -notmatch '\] SKIP ' }).Count) not skipped)"
+} else {
+    $notSkipped = @($checkLines | Where-Object { $_ -notmatch '\] SKIP ' })
+    Assert-That ($notSkipped.Count -le 2 -and $r.Code -eq 0) "off Windows the checks are skipped, none fails ($($notSkipped.Count) of $($checkLines.Count) not skipped)"
+}
+if ($failures -gt 0) { Write-Host ($r.Text -split "`n" | Select-Object -Last 40 | Out-String) }
 
 if ($failures -eq 0) { Write-Host "`nWINDOWS UNIT TESTS PASSED" -ForegroundColor Green } else { Write-Host "`nWINDOWS UNIT TESTS FAILED ($failures)" -ForegroundColor Red }
 exit $failures

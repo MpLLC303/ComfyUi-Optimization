@@ -210,7 +210,7 @@ $OllamaDir = Find-LaiOllamaDir -OrDefault
 $DockerExe = Find-LaiDockerDesktopExe -OrDefault
 $DockerBin = Join-Path (Split-Path -Parent $DockerExe) 'resources\bin'
 $ResumeTask = 'LocalAI-Install-Resume'
-$ToolkitItems = @('Install-LocalAI.ps1', 'Install-LocalAI.cmd', 'Test-LocalAI.ps1', 'Backup-OpenWebUI.ps1', 'Update-OpenWebUI.ps1', 'Release-GPU.ps1', 'Set-OpenWebUIPassword.ps1', 'Restore-OpenWebUI.ps1', 'Update-Models.ps1', 'Start-ComfyUI.ps1', 'Enable-TailscaleAccess.ps1', 'Watch-LocalAI.ps1', 'Uninstall-LocalAI.ps1', 'Stop-LocalAI.ps1', 'Start-LocalAI.ps1', 'Get-LocalAIDiagnostics.ps1', 'Get-LocalAI.ps1', 'Sync-LocalAISkills.ps1', 'VERSION', 'README.md', 'lib', 'config', 'stack', 'skills')
+$ToolkitItems = @('Install-LocalAI.ps1', 'Install-LocalAI.cmd', 'Test-LocalAI.ps1', 'Backup-OpenWebUI.ps1', 'Update-OpenWebUI.ps1', 'Release-GPU.ps1', 'Set-OpenWebUIPassword.ps1', 'Restore-OpenWebUI.ps1', 'Update-Models.ps1', 'Start-ComfyUI.ps1', 'Enable-TailscaleAccess.ps1', 'Watch-LocalAI.ps1', 'Uninstall-LocalAI.ps1', 'Stop-LocalAI.ps1', 'Start-LocalAI.ps1', 'Get-LocalAIDiagnostics.ps1', 'Get-LocalAI.ps1', 'Sync-LocalAISkills.ps1', 'Test-PCSecurity.ps1', 'VERSION', 'README.md', 'lib', 'config', 'stack', 'skills')
 if ($ToolkitCommit) { $ToolkitItems += 'COMMIT' }
 # After a reboot the resume task (not elevated) starts this copy, which asks for admin rights with a
 # UAC prompt. The prompt names powershell.exe, not the script, so the script it runs must be one
