@@ -148,6 +148,14 @@ used by the desktop and open apps):
 | Uncensored Code | Qwen3-Coder 30B-A3B | 65,536 | 20.6 GiB | 178.5 tok/s |
 | Uncensored Vision | Qwen3-VL 30B-A3B | 32,768 | 19.2 GiB | 184.8 tok/s |
 | Uncensored Fast | Qwen3 14B (dense) | 40,960 (its maximum) | 11.6 GiB | 79 tok/s |
+| Official Main | Gemma 4 26B-A4B (QAT) | 65,536 | 14.3 GiB | 143.6 tok/s |
+| Official Deep | Qwen3.8 27B (dense) | 65,536 | 16.3 GiB | 79.2 tok/s |
+| Official Fast | Qwen3.5 9B (dense) | 65,536 (now tuned up to 131,072) | 6.8 GiB | 111.1 tok/s |
+
+The official rows are from the first update that installed them (same PC, toolkit 2026.10.06).
+Official Fast keeps very little cache per token, so it is the one preset allowed past 65,536: at
+131,072 it should need about 8.5 GiB. Its tuned size and speed are in `install-report.md` after
+the next run.
 
 The speeds are measured with a short prompt, so the context is nearly empty. Each new token reads
 the whole KV cache, so generation slows as a chat grows: expect roughly a fifth slower at about 16K

@@ -7,7 +7,9 @@
 #   Preset      Open WebUI workspace model id that users pick in the chat selector.
 #   MaxContext  Upper bound for the context auto-tuner. The tuner also never exceeds the
 #               model's trained context (Qwen3-14B: 40960) and stops at the largest value
-#               that stays 100% on the GPU.
+#               that stays 100% on the GPU. Most presets stop at 65,536; Official Fast
+#               (Qwen3.5 9B) measured 5.3 GiB at 8,192 and 6.8 GiB at 65,536 (about 26 KB of
+#               q8_0 cache per token) with 14 GB to spare, so it may go to 131,072.
 #   Parameters  Sampling defaults from the Qwen model cards (instruct: 0.7/0.8/20,
 #               thinking: 0.6/0.95/20, coder adds repeat_penalty 1.05).
 #   Think       $false = preset sends think:false (no reasoning trace, faster first token). Set when
@@ -30,7 +32,7 @@
     DefaultPreset          = 'local-main'
     # New chats start here when it is installed (falls back to DefaultPreset otherwise).
     PreferredDefaultPreset = 'official-main'
-    ContextCandidates      = @(65536, 57344, 49152, 40960, 32768, 24576, 16384, 12288, 8192)
+    ContextCandidates      = @(131072, 98304, 65536, 57344, 49152, 40960, 32768, 24576, 16384, 12288, 8192)
 
     Models                 = @(
         # ---- official releases (the model makers' own, from the Ollama library; see Official above) --
@@ -81,7 +83,7 @@
             Optional        = $true
             Official        = $true
             DownloadGB      = 6.6
-            MaxContext      = 65536
+            MaxContext      = 131072
             Vision          = $true
             Think           = $false
             MinTokensPerSec = 50

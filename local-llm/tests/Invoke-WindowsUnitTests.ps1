@@ -681,6 +681,9 @@ $spill = $good.Clone(); $spill['GpuPercent'] = 93
 Assert-That (-not (& $runSetup $spill)['Reused']) 'a result that was partly on the CPU is measured again'
 $cand = $good.Clone(); $cand['Candidates'] = '4096'
 Assert-That (-not (& $runSetup $cand)['Reused']) 'an edited candidate list takes effect'
+$mmCap = @(@{ Key = 'main'; Display = 'Main'; Source = 'src:1'; Alias = 'localai-main'; MaxContext = 8192; MinTokensPerSec = 40; Parameters = @{} })
+$capGood = $good.Clone(); $capGood['MaxContext'] = 8192
+Assert-That ((Invoke-LaiModelSetup -Models $mmCap -Candidates @(16384, 8192) -SystemPrompt 'x' -Previous @{ main = $capGood } -Fingerprint 'fp')['main']['Reused']) 'a larger size added for another model does not re-tune a model capped below it'
 $old = $good.Clone(); $old.Remove('Candidates')
 Assert-That ((& $runSetup $old)['Reused']) 'a result from before candidates were recorded is still reused (no forced re-tune)'
 & $mod { function script:Invoke-LaiApi { param($Method, $Uri, $Body, $Token, $TimeoutSec) $null = $Method, $Uri, $Body, $Token, $TimeoutSec; [pscustomobject]@{ filenames = @('', $null) } } }
