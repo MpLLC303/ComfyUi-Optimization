@@ -18,16 +18,31 @@
 # on this PC but not in the AI folder named here is asked about as well.
 # When GitHub's API does not answer (its hourly limit, a proxy), the commit is read from its page on
 # github.com instead, which the API does not serve (whether that page has a limit of its own is not
-# known here): it is shown and asked about as usual, and the file list is said to be missing. Only an
-# update whose commit neither of the two can name (offline, or both refuse) is not offered at all:
-# nothing is shown as agreed that could not be shown. Try again later, or set LOCALAI_REF to a full
-# commit id.
+# known here), and shown with the file list said to be missing. An update still stops then, before
+# the question: the list of the commit's files, which the download is compared with (see below), comes
+# from the API alone. An update whose commit neither of the two can name (offline, or both refuse) is
+# not offered at all: nothing is shown as agreed that could not be shown. Try again later. Setting
+# LOCALAI_REF to a full commit id names the commit without GitHub, but not the files it holds.
 # The one way to skip the question, for a run nobody watches: name the commit you reviewed, in full:
 #
 #   $env:LOCALAI_REVIEWED_COMMIT = '<its 40-character id>'
 #
 # It counts for exactly that commit. When the branch has moved on, the question is asked as usual, and
 # without a typed OK nothing is installed.
+#
+# What is installed is the commit that was shown:
+# - The download is asked for by that commit's full id, never by branch name, and compared with the
+#   list of files GitHub's API gives for that commit: every file under local-llm by its git id, no
+#   file more and none less. A download that differs is refused and nothing is installed. Without
+#   that list an update stops; it is never installed unchecked.
+# - A first install was not reviewed: it says that its download cannot be compared with a reviewed
+#   commit, and goes on.
+# - The installer runs with administrator rights (Windows asks once) from a folder under Program
+#   Files that only administrators can change. The step that has those rights makes that folder,
+#   unpacks the download there and compares it again, so files swapped in your temp folder after the
+#   first comparison are refused too. The folder and the downloaded files are removed at the end,
+#   also after a refusal.
+# The threat model and exactly what is compared stand above Get-Sha256Hex further down.
 #
 # What the review does not cover:
 # - It is only as trustworthy as the copy of this file that runs it. Start menu > Local AI > Update
@@ -37,7 +52,8 @@
 # - It lists the names of the files that differ, not what changed inside them (it prints the address
 #   of the full comparison). GitHub lists at most 300 files; a longer list is said to be cut off.
 # - It is no defence against a program that already runs under your Windows account: the installed
-#   copy of this file sits in a folder such a program can write to.
+#   copy of this file sits in a folder such a program can write to. (The comparison above keeps such
+#   a program from swapping the downloaded files, not from changing this file.)
 # - A commit id in LOCALAI_REF is not checked to be on a branch of this repository (GitHub also
 #   answers at this address for commits that exist only in a fork); the review says so.
 & {
@@ -508,6 +524,286 @@
         return [pscustomobject]@{ Go = $false; Why = 'OK was not typed.' }
     }
 
+    # ---- What runs with administrator rights is the commit that was shown -------------------------
+    # Threat model.
+    # Written against two attackers:
+    #   A. Someone able to push to the branch after the review was read (or to have another archive
+    #      handed over than the commit shown). The download is asked for by the full id of the commit
+    #      the review showed, never by branch name, and installed only when it compares equal to the
+    #      list of files GitHub's tree API gives for that id.
+    #   B. A program that runs under the same Windows account, without administrator rights. The
+    #      download sits in the user's temp folder, which such a program can rewrite at any moment up
+    #      to the click on Yes. So the installer is not started from there: the step that has
+    #      administrator rights (Invoke-ElevatedInstall) makes a folder under Program Files, gives it
+    #      to Administrators and SYSTEM alone, reads those rules back, copies the archive in, unpacks
+    #      it there and compares the result again before it starts anything from it. That step is
+    #      itself handed over as text in a file in the temp folder: the window with administrator
+    #      rights is started with that text's SHA-256 on its command line, reads the file once, and
+    #      runs what it read only when the two agree (Get-ElevatedLauncher).
+    # Out of scope: an attacker who is already administrator (or SYSTEM) on this PC. Such a program
+    # can change Program Files, this check and Windows itself; nothing here is written against it.
+    # Not covered either, and said so that it is not taken for granted:
+    #   - Attacker B changing what is run before this point: the installed copy of this file, or the
+    #     command that was pasted. The header of this file says the same about the review.
+    #   - What Windows PowerShell itself reads from the user's folders when it starts with
+    #     administrator rights (it looks for modules in the user's Documents folder before the
+    #     system's), and what the installer reads from the AI folder, which the user owns.
+    #   - GitHub itself: the list of files and the archive both come from it, over TLS.
+    #
+    # What is compared (Compare-ToolkitTree, Get-ToolkitDigest):
+    #   - Every file under local-llm, on both sides: the paths the commit's tree lists and the files
+    #     the unpacked archive holds. A file whose content differs, a file the tree does not list
+    #     and a file that is missing each refuse the download. Names are compared letter for letter.
+    #   - Content by git blob id: SHA-1 over 'blob <length>', a zero byte and the bytes
+    #     (Get-GitBlobId). It is the 'sha' the tree API gives for each file; SHA-1 is git's choice,
+    #     not one made here.
+    #   - One rule for line ends: local-llm/.gitattributes marks *.cmd 'text eol=crlf', so GitHub's
+    #     archive holds those files with CRLF while the tree lists the id of their LF form. For a
+    #     path that ends in .cmd, CRLF is read as LF before the id is taken (Get-ToolkitFileId). No
+    #     other file is touched: a .ps1 that arrives with CRLF does not compare equal.
+    #   - Nothing outside local-llm: the rest of the archive is neither compared nor unpacked, and
+    #     the installer runs from local-llm alone.
+    #   - A tree that cannot be compared exactly is not used at all (Get-TreeManifest): one GitHub
+    #     cut off, a path that is no plain file (a link, a submodule), two paths that differ in
+    #     capitals only, a path Windows would store elsewhere than git says (Test-PlainRepoPath).
+    #   - Without a usable tree an update stops, before the question and before any download: it
+    #     is never installed unchecked (Get-DownloadCheck).
+    #   - A first install has no reviewed commit: nothing it downloads is compared with one, and it
+    #     says so. It is compared with the tree of the commit it shows when GitHub hands that over,
+    #     and with nothing when not. Either way the step with administrator rights still makes sure
+    #     that it runs exactly the files that were downloaded.
+    # The step with administrator rights is told one number, the digest (Get-ToolkitDigest): of the
+    # tree's list when the download was compared with it, else of the files as they were downloaded.
+    # It works the same number out from what it unpacked, and starts the installer only when the two
+    # are equal.
+    # The functions down to Get-ElevatedLauncher are pure, like the review's (the tests run them as
+    # they are); the ones that touch this PC follow under "Bootstrap".
+
+    function Get-Sha256Hex {
+        # SHA-256 of -Bytes as 64 lower-case hex digits.
+        param([byte[]]$Bytes)
+        if ($null -eq $Bytes) { $Bytes = [byte[]]@() }
+        $sha = New-Object System.Security.Cryptography.SHA256CryptoServiceProvider
+        try { return ([System.BitConverter]::ToString($sha.ComputeHash($Bytes))).Replace('-', '').ToLowerInvariant() }
+        finally { $sha.Dispose() }
+    }
+
+    function Get-GitBlobId {
+        # The id git gives a file with this content: SHA-1 over 'blob <length>', a zero byte and the
+        # bytes, as 40 lower-case hex digits. GitHub's tree API lists it as 'sha' for every file.
+        param([byte[]]$Bytes)
+        if ($null -eq $Bytes) { $Bytes = [byte[]]@() }
+        $head = [System.Text.Encoding]::ASCII.GetBytes('blob ' + $Bytes.Length + [char]0)
+        $sha = New-Object System.Security.Cryptography.SHA1CryptoServiceProvider
+        try {
+            [void]$sha.TransformBlock($head, 0, $head.Length, $null, 0)
+            [void]$sha.TransformFinalBlock($Bytes, 0, $Bytes.Length)
+            return ([System.BitConverter]::ToString($sha.Hash)).Replace('-', '').ToLowerInvariant()
+        } finally { $sha.Dispose() }
+    }
+
+    function Get-ToolkitFileId {
+        # The id a downloaded file must have in the commit's tree, from its path in the repository
+        # and its bytes as they arrived. A path that ends in .cmd (small letters, as the pattern in
+        # local-llm/.gitattributes reads on GitHub) is in the archive with CRLF and in the tree with
+        # LF: its CRLF is read as LF first. Every other file is taken byte for byte.
+        param([string]$Path, [byte[]]$Bytes)
+        if ($null -eq $Bytes) { $Bytes = [byte[]]@() }
+        if ($Path -cmatch '\.cmd\z') {
+            # Latin-1 maps every byte to one character and back, whatever the file holds.
+            $latin = [System.Text.Encoding]::GetEncoding(28591)
+            $Bytes = $latin.GetBytes($latin.GetString($Bytes).Replace("`r`n", "`n"))
+        }
+        return (Get-GitBlobId -Bytes $Bytes)
+    }
+
+    function Get-TreeManifest {
+        # The files of a commit under local-llm as a list of Path ('local-llm/...', as git writes it)
+        # and Id (git blob id), from GitHub's answer to git/trees/<commit>?recursive=1. $null when
+        # the answer cannot be compared exactly with what Windows unpacks:
+        #   - it is no tree answer, or GitHub cut the list off ('truncated' must be there and false)
+        #   - a path (anywhere in the tree) that Windows may store elsewhere than written, or that
+        #     holds a '\': it could land under local-llm, or on another file there
+        #   - two paths that differ in capitals only: on Windows the second replaces the first
+        #   - an entry that is neither a folder nor a plain file (a symbolic link, a submodule), or
+        #     whose id is no git id
+        #   - no file under local-llm at all
+        param($Tree)
+        $truncated = Get-ReviewField -Object $Tree -Path 'truncated'
+        $entries = Get-ReviewField -Object $Tree -Path 'tree'
+        if ($truncated -isnot [bool] -or $truncated -or $null -eq $entries -or $entries -is [string]) { return $null }
+        $seen = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+        $files = New-Object System.Collections.Generic.List[object]
+        foreach ($entry in @($entries)) {
+            $path = [string](Get-ReviewField -Object $entry -Path 'path')
+            $type = [string](Get-ReviewField -Object $entry -Path 'type')
+            if ($path.Contains('\') -or -not (Test-PlainRepoPath -Path $path) -or -not $seen.Add($path)) { return $null }
+            if ($type -ceq 'tree') { continue }
+            $id = [string](Get-ReviewField -Object $entry -Path 'sha')
+            $mode = [string](Get-ReviewField -Object $entry -Path 'mode')
+            if ($type -cne 'blob' -or @('100644', '100755') -notcontains $mode -or $id -cnotmatch '^[0-9a-f]{40}\z') { return $null }
+            if ($path.StartsWith('local-llm/', [System.StringComparison]::Ordinal)) { $files.Add([pscustomobject]@{ Path = $path; Id = $id }) }
+        }
+        if ($files.Count -eq 0) { return $null }
+        return , $files.ToArray()
+    }
+
+    function Compare-ToolkitTree {
+        # What differs between the commit's files (-Manifest: Get-TreeManifest) and the files that
+        # were unpacked (-Files: Get-ToolkitFileList), as lines to print; none when the two lists
+        # hold the same paths with the same ids. Paths are compared letter for letter.
+        param($Manifest, $Files)
+        $want = New-Object 'System.Collections.Generic.Dictionary[string,string]' ([System.StringComparer]::Ordinal)
+        foreach ($m in @($Manifest)) { $want[[string]$m.Path] = [string]$m.Id }
+        $seen = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::Ordinal)
+        $found = New-Object System.Collections.Generic.List[string]
+        foreach ($f in @($Files)) {
+            $path = [string]$f.Path
+            if (-not $seen.Add($path)) { $found.Add("there twice: $path") }
+            elseif (-not $want.ContainsKey($path)) { $found.Add("not in the commit: $path") }
+            elseif ($want[$path] -cne [string]$f.Id) { $found.Add("not as in the commit: $path") }
+        }
+        foreach ($path in $want.Keys) { if (-not $seen.Contains($path)) { $found.Add("missing: $path") } }
+        return , $found.ToArray()
+    }
+
+    function Get-ToolkitDigest {
+        # One number for a whole list of files (Path, Id): SHA-256 over its lines '<id> <path>',
+        # sorted by character code (the same on every PC, whatever its language), as 64 lower-case
+        # hex digits. Two lists have the same digest when they hold the same paths with the same ids.
+        param($Files)
+        $lines = New-Object System.Collections.Generic.List[string]
+        foreach ($f in @($Files)) { $lines.Add(([string]$f.Id) + ' ' + ([string]$f.Path)) }
+        $sorted = $lines.ToArray()
+        [System.Array]::Sort($sorted, [System.StringComparer]::Ordinal)
+        return (Get-Sha256Hex -Bytes ([System.Text.Encoding]::UTF8.GetBytes(($sorted -join "`n"))))
+    }
+
+    function Test-AdminOnlyRule {
+        # Whether only administrators can change a folder, from its owner and access rules as plain
+        # data (-Rule: Owner, a SID as text, and Rules, each with Sid, Rights as a number, Allow and
+        # InheritOnly; Get-FolderRule reads them). '' when so, else the first reason why not.
+        # SYSTEM, Administrators and TrustedInstaller may own it and hold any right. Everyone else
+        # may read and run only: any other right is a no, the generic ones included (generic write
+        # and generic all are rights as well, though no file right is named in them). Rules that deny
+        # are left out: they take away, never give.
+        # -Parent: the folder is the one the new folder is made in. Rules that are inherit-only say
+        # nothing about the folder itself (Program Files carries one for CREATOR OWNER) and are left
+        # out; for the new folder itself every rule counts.
+        param($Rule, [switch]$Parent)
+        $trusted = @('S-1-5-18', 'S-1-5-32-544', 'S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464')
+        # ReadAndExecute with Synchronize (0x1200A9), generic read (0x80000000), generic execute
+        # (0x20000000). Counted as unsigned 32-bit numbers: the top bit must not turn the sum negative.
+        $readBits = [long]0x1200A9 + 2147483648 + 536870912
+        $otherBits = 4294967295 - $readBits
+        if ($null -eq $Rule -or $null -eq $Rule.Rules) { return 'its access rules could not be read' }
+        $owner = [string]$Rule.Owner
+        if ($trusted -notcontains $owner) { return "its owner is not SYSTEM, Administrators or TrustedInstaller (owner: $(ConvertTo-ReviewText -Text $owner -Max 80))" }
+        foreach ($r in @($Rule.Rules)) {
+            $sid = [string]$r.Sid
+            if ($r.Allow -isnot [bool] -or $r.InheritOnly -isnot [bool] -or -not $sid -or ($r.Rights -isnot [int] -and $r.Rights -isnot [long])) { return 'one of its access rules could not be read' }
+            if (-not $r.Allow -or ($Parent -and $r.InheritOnly) -or $trusted -contains $sid) { continue }
+            $rights = [long]$r.Rights
+            if ($rights -lt 0) { $rights += 4294967296 }
+            if (($rights -band $otherBits) -ne 0) { return ('{0} may change it (rights 0x{1:X8})' -f (ConvertTo-ReviewText -Text $sid -Max 80), $rights) }
+        }
+        return ''
+    }
+
+    function Get-DownloadCheck {
+        # Whether what is about to be downloaded can be compared with the commit the review showed,
+        # from data that was already fetched:
+        #   -Review         Get-UpdateReview's answer
+        #   -Manifest       Get-TreeManifest's answer for the review's commit; $null when there is
+        #                   none (-ManifestError: why)
+        # Returns Lines (Text, Color) to print under the review; Compare: the download is compared
+        # with -Manifest; and Stop: when not empty, why this run ends here, before any question and
+        # before any download. An update goes on only with a manifest. No answer from GitHub, an
+        # answer that is cut off and one that cannot be read all stop it, and nothing turns that
+        # into a go: no typed OK, no LOCALAI_REVIEWED_COMMIT. Whatever is not plainly a first
+        # install counts as an update. Only a first install goes on without a manifest, and says
+        # that its download cannot be compared with a reviewed commit. A review that says Stop
+        # itself is left to the gate (Get-UpdateConsent), which stops it.
+        param($Review, $Manifest, [string]$ManifestError)
+        $lines = New-Object System.Collections.Generic.List[object]
+        $say = { param($Text, $Color) $lines.Add([pscustomobject]@{ Text = [string]$Text; Color = [string]$Color }) }
+        $pad = ' ' * 18
+        $count = @($Manifest).Count
+        $usable = ($null -ne $Manifest -and $count -gt 0)
+        $why = ConvertTo-ReviewText -Text $ManifestError -Max 200 -AllowUnicode
+        if (-not $why) { $why = 'GitHub gave no answer' }
+        if ([string](Get-ReviewField -Object $Review -Path 'Stop')) { return [pscustomobject]@{ Stop = ''; Compare = $false; Lines = $lines.ToArray() } }
+        $commit = [string](Get-ReviewField -Object $Review -Path 'Commit')
+        if ([string](Get-ReviewField -Object $Review -Path 'Kind') -ceq 'first') {
+            & $say '  Download check: a first install was not reviewed, so this download cannot be compared with a reviewed commit.' 'Yellow'
+            if ($usable -and $commit) { & $say ($pad + "It is compared with the $count file(s) GitHub lists under local-llm for the commit above.") 'Gray' }
+            elseif ($commit) { & $say ($pad + "GitHub's list of that commit's files could not be used either ($why): it is installed as it arrives.") 'Yellow' }
+            else { & $say ($pad + 'Without a commit there is no list of its files either: it is installed as it arrives.') 'Yellow' }
+            return [pscustomobject]@{ Stop = ''; Compare = ($usable -and [bool]$commit); Lines = $lines.ToArray() }
+        }
+        if ($usable -and $commit) {
+            & $say "  Download check: what is downloaded must hold exactly the $count file(s) GitHub lists under local-llm for this commit, or it is not installed." 'Gray'
+            return [pscustomobject]@{ Stop = ''; Compare = $true; Lines = $lines.ToArray() }
+        }
+        $stop = "GitHub's list of the files of this commit could not be used ($why), so the download could not be compared with the commit shown above. An update is never installed unchecked. Try again later (GitHub's API answers 60 questions an hour for everyone behind one address)."
+        return [pscustomobject]@{ Stop = $stop; Compare = $false; Lines = $lines.ToArray() }
+    }
+
+    function Get-ElevatedFunctionList {
+        # The functions of this file that the step with administrator rights is made of: it is
+        # handed their text (Get-ElevatedStage), because that window has nothing else of this file.
+        # Every function one of them calls has to be in this list too (the tests check that).
+        return @('ConvertTo-ReviewText', 'Test-PlainRepoPath', 'Get-Sha256Hex', 'Get-GitBlobId', 'Get-ToolkitFileId', 'Get-ToolkitDigest', 'Test-AdminOnlyRule',
+            'Get-ToolkitFileList', 'ConvertTo-FolderRule', 'Get-FolderRule', 'Set-AdminOnlyRule', 'Expand-ToolkitArchive', 'Remove-ToolkitTree', 'Remove-HandedOverFile', 'Invoke-ElevatedInstall')
+    }
+
+    function Get-ElevatedStage {
+        # The text of the step that runs with administrator rights: the functions it is made of
+        # (-Definitions: name and body of each, as this file defines them) and one line that calls
+        # Invoke-ElevatedInstall. Every value in that line travels as base64 and is turned back by
+        # the text itself, so no folder name, however it is spelled (a quote, a '$', a space), can
+        # become part of the command.
+        param([System.Collections.IDictionary]$Definitions, [string]$Zip, [string]$StageFile, [string]$Digest, [string]$Commit, [string]$Root, [string[]]$Extra)
+        $value = { param([string]$Text) '(& $plain ''' + [System.Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($Text)) + ''')' }
+        $lines = New-Object System.Collections.Generic.List[string]
+        $lines.Add('$ErrorActionPreference = ''Stop''')
+        $lines.Add('$ProgressPreference = ''SilentlyContinue''')
+        foreach ($name in @($Definitions.Keys)) { $lines.Add('function ' + $name + ' {' + [string]$Definitions[$name] + '}') }
+        $lines.Add('$plain = { param([string]$Text) [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($Text)) }')
+        $words = @($Extra | Where-Object { $_ } | ForEach-Object { & $value $_ }) -join ', '
+        $lines.Add('Invoke-ElevatedInstall -Zip ' + (& $value $Zip) + ' -StageFile ' + (& $value $StageFile) + ' -Digest ' + (& $value $Digest) + ' -Commit ' + (& $value $Commit) + ' -Root ' + (& $value $Root) + ' -Extra @(' + $words + ')')
+        return ($lines -join "`n")
+    }
+
+    function Get-ElevatedLauncher {
+        # The command the window with administrator rights is started with: it reads the file with
+        # the step's text (Get-ElevatedStage) once, and runs what it read only when its SHA-256 is
+        # -Hash. The hash is part of the command Windows was asked to start with administrator
+        # rights, where a program of the user can no longer change it; the file is in the user's
+        # temp folder, where it can. A file that was changed or removed is refused, and both files
+        # in the temp folder are removed (only as plain files in a folder that is no link: with
+        # administrator rights nothing is removed through a link).
+        # One line, without a double quote and without two spaces in a row: Start-Process hands its
+        # arguments over joined by spaces, and powershell.exe puts the command together from the
+        # pieces again. The two paths travel as base64 for the same reason.
+        param([string]$StageFile, [string]$Zip, [string]$Hash)
+        $value = { param([string]$Text) "[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('" + [System.Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($Text)) + "'))" }
+        $refuse = @(
+            'Write-Host ''Stopped: the file that carries the step with administrator rights was changed or removed after this window was asked for (a program running under your Windows account can do that).'' -ForegroundColor Red'
+            'Write-Host ''Nothing was installed or changed: your Local AI keeps working as it is.'' -ForegroundColor Yellow'
+            'foreach($p in $f,$z){try{$i=New-Object IO.FileInfo($p);if($i.Exists -and -not(($i.Attributes -bor $i.Directory.Attributes) -band 1024)){$i.Delete()}}catch{$i=$null}}'
+        ) -join ';'
+        $steps = @(
+            ('$f=' + (& $value $StageFile))
+            ('$z=' + (& $value $Zip))
+            '$b=[byte[]]@()'
+            'try{$b=[IO.File]::ReadAllBytes($f)}catch{$b=[byte[]]@()}'
+            '$h=[BitConverter]::ToString((New-Object Security.Cryptography.SHA256CryptoServiceProvider).ComputeHash($b)).Replace(''-'','''')'
+            ('if($h -eq ''' + $Hash + '''){& ([scriptblock]::Create([Text.Encoding]::UTF8.GetString($b)))}else{' + $refuse + '}')
+        )
+        return ($steps -join ';')
+    }
+
     # ---- Bootstrap -------------------------------------------------------------------------------
 
     function Get-GitHubText {
@@ -518,6 +814,243 @@
         if ($Accept) { $headers['Accept'] = $Accept }
         $answer = Invoke-WebRequest -Uri $Uri -UseBasicParsing -Headers $headers -TimeoutSec 60
         return (ConvertTo-ReviewBody -Content $answer.Content)
+    }
+
+    function Get-ToolkitFileList {
+        # Every file under <Top>\local-llm of an unpacked archive as Path ('local-llm/...', as git
+        # writes it) and Id (Get-ToolkitFileId): what Compare-ToolkitTree and Get-ToolkitDigest take.
+        # A link among them is an error: nothing is read through one.
+        param([string]$Top)
+        $list = New-Object System.Collections.Generic.List[object]
+        $todo = New-Object System.Collections.Generic.Queue[object]
+        $todo.Enqueue([pscustomobject]@{ Folder = [System.IO.Path]::Combine($Top, 'local-llm'); Name = 'local-llm' })
+        while ($todo.Count -gt 0) {
+            $at = $todo.Dequeue()
+            $folder = New-Object System.IO.DirectoryInfo($at.Folder)
+            if (-not $folder.Exists) { continue }
+            if ($folder.Attributes -band [System.IO.FileAttributes]::ReparsePoint) { throw "$($at.Name) is a link in the unpacked archive" }
+            foreach ($item in $folder.GetFileSystemInfos()) {
+                $name = $at.Name + '/' + $item.Name
+                if ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) { throw "$name is a link in the unpacked archive" }
+                if ($item -is [System.IO.DirectoryInfo]) { $todo.Enqueue([pscustomobject]@{ Folder = $item.FullName; Name = $name }); continue }
+                $list.Add([pscustomobject]@{ Path = $name; Id = (Get-ToolkitFileId -Path $name -Bytes ([System.IO.File]::ReadAllBytes($item.FullName))) })
+            }
+        }
+        return , $list.ToArray()
+    }
+
+    function ConvertTo-FolderRule {
+        # A folder's security descriptor as the plain data Test-AdminOnlyRule takes: Owner (a SID as
+        # text) and Rules, one for each access rule, inherited ones included (Sid, Rights as a
+        # number, Allow, InheritOnly). A folder without any list of rules is open to everyone;
+        # Windows hands that over as one rule for Everyone with every right.
+        param($Security)
+        $sidType = [System.Security.Principal.SecurityIdentifier]
+        $rules = New-Object System.Collections.Generic.List[object]
+        foreach ($r in $Security.GetAccessRules($true, $true, $sidType)) {
+            $rules.Add([pscustomobject]@{
+                    Sid         = [string]$r.IdentityReference.Value
+                    Rights      = [int]$r.FileSystemRights
+                    Allow       = ($r.AccessControlType -eq [System.Security.AccessControl.AccessControlType]::Allow)
+                    InheritOnly = (([int]$r.PropagationFlags -band 2) -ne 0)
+                })
+        }
+        return [pscustomobject]@{ Owner = [string]$Security.GetOwner($sidType).Value; Rules = $rules.ToArray() }
+    }
+
+    function Get-FolderRule {
+        # Owner and access rules of the folder -Path as plain data (ConvertTo-FolderRule).
+        param([string]$Path)
+        return (ConvertTo-FolderRule -Security (Get-Acl -LiteralPath $Path))
+    }
+
+    function Set-AdminOnlyRule {
+        # Gives the folder -Path to Administrators and lets SYSTEM and Administrators alone into it
+        # and into all that is made in it; nothing is inherited from the folder above. Windows
+        # PowerShell only, which is what the step with administrator rights runs in.
+        param([string]$Path)
+        $security = New-Object System.Security.AccessControl.DirectorySecurity
+        $security.SetOwner((New-Object System.Security.Principal.SecurityIdentifier('S-1-5-32-544')))
+        $security.SetAccessRuleProtection($true, $false)
+        $inherit = [System.Security.AccessControl.InheritanceFlags]'ContainerInherit, ObjectInherit'
+        foreach ($sid in @('S-1-5-18', 'S-1-5-32-544')) {
+            $who = New-Object System.Security.Principal.SecurityIdentifier($sid)
+            $security.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($who, [System.Security.AccessControl.FileSystemRights]::FullControl, $inherit, [System.Security.AccessControl.PropagationFlags]::None, [System.Security.AccessControl.AccessControlType]::Allow)))
+        }
+        (New-Object System.IO.DirectoryInfo($Path)).SetAccessControl($security)
+    }
+
+    function Expand-ToolkitArchive {
+        # Unpacks the toolkit from the archive -Zip (as GitHub sends it: one top folder, local-llm in
+        # it) into the folder -Destination and returns the top folder there. Only what lies under
+        # local-llm is written: the rest of the archive is neither compared nor run.
+        # Not Expand-Archive: this also runs with administrator rights, on an archive that was not
+        # compared yet, and no name in it may decide where a file lands. Every name has to be one
+        # Windows stores as written (Test-PlainRepoPath: no '..', no drive, no stream) and to stay
+        # inside -Destination; no file is written over another; and no more than -MaxBytes of
+        # unpacked content is taken. Anything else is an error, and the caller stops.
+        param([string]$Zip, [string]$Destination, [long]$MaxBytes = 268435456)
+        Add-Type -AssemblyName System.IO.Compression
+        Add-Type -AssemblyName System.IO.Compression.FileSystem
+        $separator = [string][System.IO.Path]::DirectorySeparatorChar
+        $base = [System.IO.Path]::GetFullPath($Destination).TrimEnd('\', '/')
+        $top = ''
+        $total = [long]0
+        $buffer = New-Object byte[] 65536
+        $archive = [System.IO.Compression.ZipFile]::OpenRead($Zip)
+        try {
+            foreach ($entry in $archive.Entries) {
+                # Compress-Archive of Windows PowerShell 5.1 writes '\' between the parts, GitHub '/'.
+                $name = ([string]$entry.FullName).Replace('\', '/')
+                $isFolder = $name.EndsWith('/')
+                if ($isFolder) { $name = $name.Substring(0, $name.Length - 1) }
+                if (-not (Test-PlainRepoPath -Path $name)) { throw "the archive holds a name Windows may store elsewhere than written: $(ConvertTo-ReviewText -Text $entry.FullName -Max 120)" }
+                $parts = $name.Split('/')
+                if (-not $top) { $top = $parts[0] }
+                if ($parts[0] -cne $top -or ($parts.Count -eq 1 -and -not $isFolder)) { throw 'the archive does not hold one top folder with everything in it' }
+                if ($isFolder -or $parts.Count -lt 3 -or $parts[1] -ine 'local-llm') { continue }
+                $target = [System.IO.Path]::GetFullPath([System.IO.Path]::Combine($base, $name.Replace('/', $separator)))
+                if (-not $target.StartsWith($base + $separator, [System.StringComparison]::OrdinalIgnoreCase)) { throw 'a file of the archive would land outside the folder it is unpacked into' }
+                [void][System.IO.Directory]::CreateDirectory([System.IO.Path]::GetDirectoryName($target))
+                $from = $entry.Open()
+                try {
+                    $to = New-Object System.IO.FileStream($target, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
+                    try {
+                        $read = $from.Read($buffer, 0, $buffer.Length)
+                        while ($read -gt 0) {
+                            $total += $read
+                            if ($total -gt $MaxBytes) { throw 'the archive unpacks to far more than a toolkit holds' }
+                            $to.Write($buffer, 0, $read)
+                            $read = $from.Read($buffer, 0, $buffer.Length)
+                        }
+                    } finally { $to.Dispose() }
+                } finally { $from.Dispose() }
+            }
+        } finally { $archive.Dispose() }
+        if (-not $top) { throw 'the archive is empty' }
+        return [System.IO.Path]::Combine($base, $top)
+    }
+
+    function Remove-ToolkitTree {
+        # Removes the folder -Path with all that is in it; nothing happens when it is not there.
+        # Not Remove-Item -Recurse: Windows PowerShell 5.1 walks into a junction with it and empties
+        # what the junction points at. Here a link is removed as a link and never walked into.
+        param([string]$Path)
+        if ([System.IO.File]::Exists($Path)) { [System.IO.File]::Delete($Path); return }
+        $folder = New-Object System.IO.DirectoryInfo($Path)
+        if (-not $folder.Exists) { return }
+        if (-not ($folder.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) {
+            foreach ($item in $folder.GetFileSystemInfos()) {
+                if ($item -is [System.IO.DirectoryInfo]) { Remove-ToolkitTree -Path $item.FullName; continue }
+                # A read-only file is not removed as it is; a link keeps the marks it has.
+                if (-not ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) { $item.Attributes = [System.IO.FileAttributes]::Normal }
+                $item.Delete()
+            }
+        }
+        $folder.Delete()
+    }
+
+    function Remove-HandedOverFile {
+        # Removes a file the step with administrator rights was handed in the user's temp folder.
+        # That folder is the user's, and this runs with administrator rights: the file is removed
+        # only as a plain file in a folder that is no link, by its own name, so that the name cannot
+        # be made to stand for a file somewhere else. What is left in place is named.
+        param([string]$Path)
+        if (-not $Path) { return }
+        try {
+            $file = New-Object System.IO.FileInfo($Path)
+            if (-not $file.Exists) { return }
+            if (($file.Attributes -bor $file.Directory.Attributes) -band [System.IO.FileAttributes]::ReparsePoint) {
+                Write-Host "Left in place, because it or its folder is a link: $Path" -ForegroundColor Yellow
+                return
+            }
+            $file.Delete()
+        } catch { Write-Host "Could not remove $Path ($(ConvertTo-ReviewText -Text $_.Exception.Message -Max 200 -AllowUnicode))." -ForegroundColor Yellow }
+    }
+
+    function Invoke-ElevatedInstall {
+        # The step that runs with administrator rights (the threat model stands above
+        # Get-Sha256Hex). It is handed the downloaded archive (-Zip, in the user's temp folder) and
+        # the digest the files under local-llm must have (-Digest), and takes nothing from the temp
+        # folder on trust. In this order, and every "no" ends the step before the installer starts:
+        #   1. Program Files itself must be a folder only administrators can change.
+        #   2. What an earlier run left there is removed, and the folder LocalAI-Update is made anew.
+        #      (Not Program Files\LocalAI: the installer keeps its copy for the resume after a
+        #      restart there, and removes that folder when it runs from anywhere else.)
+        #   3. The folder is given to Administrators and SYSTEM alone, and its rules are read back.
+        #   4. The archive is copied in and unpacked there; it must hold one top folder.
+        #   5. The digest of what was unpacked must be -Digest.
+        #   6. Only then: COMMIT is written next to the installer, which records it, and the
+        #      installer is started from that folder, by the full path of Windows PowerShell.
+        # At the end, whatever happened, the folder is removed again, and so are the two files in
+        # the temp folder (-Zip, and -StageFile: the file this step's text was read from). A run
+        # that is cut off (the window closed) leaves them; the next one removes them.
+        param([string]$Zip, [string]$StageFile, [string]$Digest, [string]$Commit, [string]$Root, [string[]]$Extra)
+        # Windows is asked where its folders are: a variable of this session could name others.
+        $programFiles = [Environment]::GetFolderPath('ProgramFiles')
+        $shell = [System.IO.Path]::Combine([Environment]::GetFolderPath('System'), 'WindowsPowerShell', 'v1.0', 'powershell.exe')
+        $stage = [System.IO.Path]::Combine($programFiles, 'LocalAI-Update')
+        $lockFile = [System.IO.Path]::Combine($stage, 'in-use')
+        $lock = $null
+        $made = $false
+        $started = $false
+        try {
+            Write-Host 'Checking the download once more, in a folder only administrators can change...' -ForegroundColor Cyan
+            if ($Digest -cnotmatch '^[0-9a-f]{64}\z' -or ($Commit -and $Commit -cnotmatch '^[0-9a-f]{40}\z')) { throw 'this step was not told what the download has to be' }
+            $me = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
+            if (-not $me.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { throw 'this step did not get administrator rights' }
+            if (-not $programFiles -or -not [System.IO.File]::Exists($shell)) { throw 'Windows did not name its Program Files folder, or Windows PowerShell is not where Windows keeps it' }
+            $parentWhy = Test-AdminOnlyRule -Rule (Get-FolderRule -Path $programFiles) -Parent
+            if ($parentWhy) { throw "$programFiles is not a folder only administrators can change: $parentWhy" }
+            # A run that is still installing holds this file open: its folder is not taken away.
+            if ([System.IO.File]::Exists($lockFile)) {
+                try { [System.IO.File]::Delete($lockFile) } catch { throw "another Local AI update is still running ($stage is in use). Let it finish, then run this again" }
+            }
+            Remove-ToolkitTree -Path $stage
+            $made = $true
+            [void][System.IO.Directory]::CreateDirectory($stage)
+            Set-AdminOnlyRule -Path $stage
+            $stageWhy = Test-AdminOnlyRule -Rule (Get-FolderRule -Path $stage)
+            if ($stageWhy) { throw "$stage could not be made a folder only administrators can change: $stageWhy" }
+            if ((New-Object System.IO.DirectoryInfo($stage)).Attributes -band [System.IO.FileAttributes]::ReparsePoint) { throw "$stage is a link, not a folder" }
+            $lock = New-Object System.IO.FileStream($lockFile, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
+            $zipCopy = [System.IO.Path]::Combine($stage, 'download.zip')
+            # The file in the temp folder is whatever a program of the user left there: no more of it
+            # is copied than a toolkit can be.
+            if ((New-Object System.IO.FileInfo($Zip)).Length -gt 268435456) { throw 'the archive in the temp folder is far larger than a toolkit: it is not the download that was compared' }
+            [System.IO.File]::Copy($Zip, $zipCopy)
+            $top = Expand-ToolkitArchive -Zip $zipCopy -Destination $stage
+            $found = Get-ToolkitDigest -Files (Get-ToolkitFileList -Top $top)
+            if ($found -cne $Digest) { throw 'the archive in the temp folder is not the download that was compared: it was changed while Windows asked for administrator rights' }
+            $installer = [System.IO.Path]::Combine($top, 'local-llm', 'Install-LocalAI.ps1')
+            if (-not [System.IO.File]::Exists($installer)) { throw 'the download holds no installer (Install-LocalAI.ps1 under local-llm)' }
+            # Recorded by the installer (localai-config.json, diagnostics), so it is known what code runs.
+            if ($Commit) { [System.IO.File]::WriteAllText([System.IO.Path]::Combine($top, 'local-llm', 'COMMIT'), $Commit) }
+            Write-Host 'It is the download that was compared. Starting the installer from that folder...' -ForegroundColor Cyan
+            $started = $true
+            & $shell -NoProfile -ExecutionPolicy Bypass -File $installer -AIRoot $Root @Extra
+            $code = $LASTEXITCODE
+            Write-Host ''
+            if ($code -eq 3010) { Write-Host 'A restart is needed; the installer resumes after you sign in again (click Yes when Windows asks).' -ForegroundColor Cyan }
+            elseif ($code -ne 0) { Write-Host "The installer stopped with an error (code $code); see the messages above." -ForegroundColor Red }
+        } catch {
+            Write-Host "Stopped: $(ConvertTo-ReviewText -Text $_.Exception.Message -Max 400 -AllowUnicode)" -ForegroundColor Red
+            if ($started) { Write-Host 'The installer had been started already: see its messages above.' -ForegroundColor Yellow }
+            else { Write-Host 'Nothing was installed or changed: your Local AI keeps working as it is.' -ForegroundColor Yellow }
+        } finally {
+            if ($lock) { $lock.Dispose() }
+            if ($made) {
+                # A virus scanner may still hold a file it is reading: tried a few times.
+                $notRemoved = 'not tried'
+                for ($attempt = 1; $attempt -le 4 -and $notRemoved; $attempt++) {
+                    try { Remove-ToolkitTree -Path $stage; $notRemoved = '' }
+                    catch { $notRemoved = $_.Exception.Message; Start-Sleep -Milliseconds 500 }
+                }
+                if ($notRemoved) { Write-Host "Could not remove $stage ($(ConvertTo-ReviewText -Text $notRemoved -Max 200 -AllowUnicode)); the next update removes it." -ForegroundColor Yellow }
+            }
+            Remove-HandedOverFile -Path $Zip
+            Remove-HandedOverFile -Path $StageFile
+        }
     }
 
     $ref = $env:LOCALAI_REF
@@ -532,10 +1065,14 @@
     $root = $env:LOCALAI_ROOT
     if (-not $root) { $root = 'C:\AI' }
     $repo = 'MpLLC303/ComfyUi-Optimization'
-    # Unpacked in the user's temp folder; the installer copies itself into AI\Scripts (and, before a
-    # reboot, into Program Files\LocalAI for the resume).
+    # Downloaded into the user's temp folder and unpacked there only to be compared and to read the
+    # version: nothing is run from there. The installer is started by the step with administrator
+    # rights, from its own folder under Program Files (Invoke-ElevatedInstall); that step is handed
+    # over as text in $stageFile. The installer copies itself into AI\Scripts (and, before a reboot,
+    # into Program Files\LocalAI for the resume).
     $dest = Join-Path $env:TEMP 'LocalAI-Installer'
     $zip = Join-Path $env:TEMP 'localai-installer.zip'
+    $stageFile = Join-Path $env:TEMP 'localai-elevated-step.txt'
     # The ref is resolved to one commit first: what is downloaded is exactly what is shown here, and a
     # re-run after a failure (or the resume after a reboot) installs the same code even if the branch
     # moved meanwhile. Without GitHub's API (rate limit, proxy) the commit's page on github.com names
@@ -582,6 +1119,23 @@
     $review = Get-UpdateReview -Repo $repo -Root $root -Ref $ref -Installed $installed -Incoming $incoming -IncomingError $incomingError -Compare $compare -CompareError $compareError -ReviewedCommit $env:LOCALAI_REVIEWED_COMMIT
     Write-Host ''
     foreach ($line in $review.Lines) { Write-Host -Object $line.Text -ForegroundColor $line.Color }
+    # The files of that commit, as GitHub's tree API lists them: what the download is compared with.
+    # Asked for by the commit's id, like the download. Without a list that can be used, an update
+    # stops here, before the question (Get-DownloadCheck); only a first install goes on.
+    $manifest = $null; $manifestError = ''
+    if ($review.Commit) {
+        try {
+            $manifest = Get-TreeManifest -Tree (ConvertFrom-ReviewJson -Text (Get-GitHubText -Uri "https://api.github.com/repos/$repo/git/trees/$($review.Commit)?recursive=1" -Accept 'application/vnd.github+json'))
+            if ($null -eq $manifest) { $manifestError = 'its answer is no complete list of plain files: cut off, not readable, or with a name Windows stores elsewhere than git says' }
+        } catch { $manifest = $null; $manifestError = $_.Exception.Message; if (-not $manifestError) { $manifestError = 'no answer' } }
+    }
+    $check = Get-DownloadCheck -Review $review -Manifest $manifest -ManifestError $manifestError
+    foreach ($line in $check.Lines) { Write-Host -Object $line.Text -ForegroundColor $line.Color }
+    if ($check.Stop) {
+        Write-Host "Stopped: $($check.Stop)" -ForegroundColor Yellow
+        Write-Host 'Nothing was downloaded or changed: your Local AI keeps working as it is.' -ForegroundColor Yellow
+        return
+    }
     # Only an OK typed after the review goes on: no keyboard, no answer or an error is not consent.
     $redirected = $true
     try { $redirected = [bool][Console]::IsInputRedirected } catch { $redirected = $true }
@@ -600,38 +1154,92 @@
     # zip/<ref> accepts a branch, a tag or a commit, so a reviewed version can be pinned.
     $url = $review.Url
 
-    Write-Host "Downloading installer ($ref$(if ($commit) { ', commit ' + $commit.Substring(0, 7) }))..." -ForegroundColor Cyan
-    try { Invoke-WebRequest -Uri $url -OutFile $zip -UseBasicParsing }
-    catch {
-        Write-Host "The download failed: $($_.Exception.Message)" -ForegroundColor Red
-        Write-Host "Nothing was changed: your Local AI keeps working as it is. Check the internet connection and run the command again; to repair the installed copy instead, double-click $root\Scripts\Install-LocalAI.cmd." -ForegroundColor Yellow
-        return
-    }
-    if (Test-Path -LiteralPath $dest) { Remove-Item -LiteralPath $dest -Recurse -Force }
-    New-Item -ItemType Directory -Force -Path $dest | Out-Null
-    Expand-Archive -LiteralPath $zip -DestinationPath $dest -Force
-    Remove-Item -LiteralPath $zip -Force
-
-    $top = Get-ChildItem -LiteralPath $dest -Directory | Select-Object -First 1
-    $installer = Join-Path $top.FullName 'local-llm\Install-LocalAI.ps1'
-    if (-not (Test-Path -LiteralPath $installer)) { throw "Installer not found in the downloaded archive ($installer)." }
-    Get-ChildItem -LiteralPath $top.FullName -Recurse -File | Unblock-File
-    # Recorded by the installer (localai-config.json, diagnostics), so it is known what code runs.
-    if ($commit) { [System.IO.File]::WriteAllText((Join-Path (Split-Path -Parent $installer) 'COMMIT'), $commit) }
-    $version = ''; $vf = Join-Path (Split-Path -Parent $installer) 'VERSION'
-    if (Test-Path -LiteralPath $vf) { $version = ([System.IO.File]::ReadAllText($vf)).Trim() }
-    Write-Host "Installing Local AI toolkit $version$(if ($commit) { ' (commit ' + $commit.Substring(0, 7) + ')' }). Windows asks for administrator rights next." -ForegroundColor Cyan
-
     # Options for the installer, e.g. -OfficialModels none: plain words only (no quotes or scripts).
+    # Looked at before anything is downloaded.
     $extra = @()
     if ($env:LOCALAI_ARGS) { $extra = @($env:LOCALAI_ARGS -split '\s+' | Where-Object { $_ }) }
     $bad = @($extra | Where-Object { $_ -notmatch '^[A-Za-z0-9_:,.\\-]+$' })
-    if ($bad.Count) { Write-Host "LOCALAI_ARGS may hold only plain options such as -OfficialModels none; not used: $($bad -join ' ')" -ForegroundColor Red; return }
-    & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $installer -AIRoot $root @extra
-    $code = $LASTEXITCODE
-    Write-Host ''
-    if ($code -eq 10) { Write-Host 'The installer continues in the Administrator window that opened.' -ForegroundColor Cyan }
-    elseif ($code -eq 1223) { Write-Host 'Administrator rights were declined; run the command again and click Yes.' -ForegroundColor Red }
-    elseif ($code -eq 3010) { Write-Host 'A restart is needed; the installer resumes after you sign in again (click Yes when Windows asks).' -ForegroundColor Cyan }
-    elseif ($code -ne 0) { Write-Host "The installer stopped with an error (code $code); see the messages above." -ForegroundColor Red }
+    if ($bad.Count) {
+        Write-Host "LOCALAI_ARGS may hold only plain options such as -OfficialModels none; not used: $($bad -join ' ')" -ForegroundColor Red
+        Write-Host 'Nothing was downloaded or changed.' -ForegroundColor Yellow
+        return
+    }
+
+    # Whatever happens from here on, nothing of this run stays behind in the temp folder: what was
+    # unpacked there goes in any case, and the archive and the step's text go too unless the window
+    # with administrator rights was started (it removes them itself, once it has read them).
+    $handedOver = $false
+    try {
+        Write-Host "Downloading installer ($ref$(if ($commit) { ', commit ' + $commit.Substring(0, 7) }))..." -ForegroundColor Cyan
+        try { Invoke-WebRequest -Uri $url -OutFile $zip -UseBasicParsing }
+        catch {
+            Write-Host "The download failed: $($_.Exception.Message)" -ForegroundColor Red
+            Write-Host "Nothing was changed: your Local AI keeps working as it is. Check the internet connection and run the command again; to repair the installed copy instead, double-click $root\Scripts\Install-LocalAI.cmd." -ForegroundColor Yellow
+            return
+        }
+        $top = ''; $files = @(); $unpackError = ''
+        try {
+            Remove-ToolkitTree -Path $dest
+            $top = Expand-ToolkitArchive -Zip $zip -Destination $dest
+            $files = Get-ToolkitFileList -Top $top
+        } catch { $unpackError = $_.Exception.Message; if (-not $unpackError) { $unpackError = 'no reason given' } }
+        if ($unpackError) {
+            Write-Host "Stopped: the download could not be unpacked ($(ConvertTo-ReviewText -Text $unpackError -Max 300 -AllowUnicode))." -ForegroundColor Red
+            Write-Host 'Nothing was installed or changed: your Local AI keeps working as it is.' -ForegroundColor Yellow
+            return
+        }
+        # The first comparison, before Windows is asked for administrator rights: what arrived has to
+        # be the commit that was shown. The step with administrator rights compares again.
+        if ($check.Compare) {
+            $differences = Compare-ToolkitTree -Manifest $manifest -Files $files
+            if ($differences.Count) {
+                Write-Host "Stopped: what was downloaded is not commit $commit as GitHub lists it ($($differences.Count) difference(s) under local-llm):" -ForegroundColor Red
+                foreach ($difference in @($differences | Select-Object -First 10)) { Write-Host "  $(ConvertTo-ReviewText -Text $difference -Max 150)" -ForegroundColor Red }
+                if ($differences.Count -gt 10) { Write-Host "  ... and $($differences.Count - 10) more" -ForegroundColor Red }
+                Write-Host 'Nothing was installed or changed: your Local AI keeps working as it is. Run the command again; a download that is refused again should not be installed by hand either.' -ForegroundColor Yellow
+                return
+            }
+            $digest = Get-ToolkitDigest -Files $manifest
+        } else {
+            # A first install without a list of the commit's files: there is nothing to compare with,
+            # but what runs with administrator rights has to be exactly what was downloaded here.
+            $digest = Get-ToolkitDigest -Files $files
+        }
+        $installer = [System.IO.Path]::Combine($top, 'local-llm', 'Install-LocalAI.ps1')
+        if (-not (Test-Path -LiteralPath $installer)) { throw "Installer not found in the downloaded archive ($installer)." }
+        $version = ''; $vf = [System.IO.Path]::Combine($top, 'local-llm', 'VERSION')
+        if (Test-Path -LiteralPath $vf) { $version = ConvertTo-ReviewText -Text ([System.IO.File]::ReadAllText($vf)) -Max 40 }
+        Write-Host "Installing Local AI toolkit $version$(if ($commit) { ' (commit ' + $commit.Substring(0, 7) + ')' }). Windows asks for administrator rights next." -ForegroundColor Cyan
+
+        # The step with administrator rights: its functions as this file defines them and the values
+        # of this run, written to one file; and the window that reads it, started with the SHA-256
+        # the file must have (Get-ElevatedStage, Get-ElevatedLauncher). Windows PowerShell by its full
+        # path: no folder on the PATH decides what gets the administrator rights.
+        $definitions = [ordered]@{}
+        foreach ($name in (Get-ElevatedFunctionList)) { $definitions[$name] = [string](Get-Command -Name $name -CommandType Function).Definition }
+        $stageBytes = [System.Text.Encoding]::UTF8.GetBytes((Get-ElevatedStage -Definitions $definitions -Zip $zip -StageFile $stageFile -Digest $digest -Commit $commit -Root $root -Extra $extra))
+        [System.IO.File]::WriteAllBytes($stageFile, $stageBytes)
+        $launcher = Get-ElevatedLauncher -StageFile $stageFile -Zip $zip -Hash (Get-Sha256Hex -Bytes $stageBytes)
+        $shell = [System.IO.Path]::Combine([Environment]::GetFolderPath('System'), 'WindowsPowerShell', 'v1.0', 'powershell.exe')
+        # -NoExit: the window stays open with the installer's messages, as the installer's own does.
+        try { Start-Process -FilePath $shell -Verb RunAs -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-NoExit', '-Command', $launcher) -ErrorAction Stop }
+        catch {
+            # 'No' at the prompt of Windows (or closing it) lands here.
+            Write-Host ''
+            Write-Host 'Administrator rights were declined; run the command again and click Yes.' -ForegroundColor Red
+            Write-Host "($(ConvertTo-ReviewText -Text $_.Exception.Message -Max 200 -AllowUnicode))" -ForegroundColor DarkGray
+            Write-Host 'Nothing was installed or changed: your Local AI keeps working as it is.' -ForegroundColor Yellow
+            return
+        }
+        $handedOver = $true
+        Write-Host ''
+        Write-Host 'The installer continues in the Administrator window that opened.' -ForegroundColor Cyan
+    } finally {
+        try { Remove-ToolkitTree -Path $dest } catch { $null = $_ }
+        if (-not $handedOver) {
+            foreach ($leftover in @($zip, $stageFile)) {
+                try { if (Test-Path -LiteralPath $leftover) { Remove-Item -LiteralPath $leftover -Force } } catch { $null = $_ }
+            }
+        }
+    }
 }
