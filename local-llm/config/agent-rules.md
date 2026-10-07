@@ -5,7 +5,10 @@ not a test machine. The toolkit's own code arrives here only through the toolkit
 Local AI - Update toolkit), never through edits made in a session.
 
 The install folder is written as C:\AI below. The installer's -AIRoot may have put it somewhere
-else: then read C:\AI as the folder this file is in.
+else: then read C:\AI as the folder this file is in, and pass -AIRoot <that folder> to every toolkit
+script you run (Test-LocalAI.ps1, Test-PCSecurity.ps1, Start-LocalAI.ps1 and Stop-LocalAI.ps1 all
+default to C:\AI: left out, they check an install that is not there or write into a folder that
+is not this one).
 
 The installer placed this file only because none existed, and never overwrites or merges it. The
 owner may edit it freely.
@@ -26,7 +29,8 @@ owner may edit it freely.
 ## Fine without asking
 
 - The quick health check: Test-LocalAI.ps1 -Quick (Scripts folder).
-- The security check: Test-PCSecurity.ps1 (Scripts folder). It only reads.
+- The security check: Test-PCSecurity.ps1 (Scripts folder). It changes nothing on the PC; it only
+  writes its report into Logs.
 - Reading Logs, install-report.md and localai-config.json.
 - docker ps
 - docker logs --tail 100 <container>

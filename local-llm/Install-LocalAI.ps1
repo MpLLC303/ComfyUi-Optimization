@@ -915,11 +915,13 @@ function Repair-LegacyInstall {
 
 function Install-AgentRuleFile {
     # <AIRoot>\CLAUDE.md: the rules an AI coding agent reads when it is opened in the install folder
-    # (the template is config\CLAUDE.md). Placed only when nothing of that name is there: the owner
+    # (the template is config\agent-rules.md). Placed only when nothing of that name is there: the owner
     # may have written one, or edited the one an earlier run placed, so it is never overwritten and
     # never merged. A convenience like the starter skills: a failure is a warning, not a stopped install.
+    # The template is not named CLAUDE.md on purpose: an agent that reads a file in config\ would load
+    # a CLAUDE.md there as rules too (every toolkit copy has one, and the owner cannot edit the one in Scripts).
     $dest = Join-Path $P.Root 'CLAUDE.md'
-    $template = Join-Path (Join-Path $SourceRoot 'config') 'CLAUDE.md'
+    $template = Join-Path (Join-Path $SourceRoot 'config') 'agent-rules.md'
     try {
         # Get-Item, not Test-Path: a link whose target is gone is still something that is there.
         if (Get-Item -LiteralPath $dest -Force -ErrorAction SilentlyContinue) {
