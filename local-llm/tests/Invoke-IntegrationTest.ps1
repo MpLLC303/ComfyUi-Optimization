@@ -27,6 +27,8 @@ param(
     [string]$SandboxTextSplitter = ''
 )
 $ErrorActionPreference = 'Stop'
+# Refuses to run anywhere but a throwaway test machine (it would delete a real install's data).
+if (-not (& (Join-Path $PSScriptRoot 'Assert-LaiSandbox.ps1'))) { exit 99 }
 $root = Split-Path -Parent $PSScriptRoot
 Import-Module (Join-Path $root 'lib/LocalAI.psm1') -Force
 

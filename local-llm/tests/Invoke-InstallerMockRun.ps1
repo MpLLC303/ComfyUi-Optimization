@@ -19,6 +19,8 @@ param(
     [string]$Password = 'Test-Password-123'
 )
 $ErrorActionPreference = 'Stop'
+# Refuses to run anywhere but a throwaway test machine (it would delete a real install's data).
+if (-not (& (Join-Path $PSScriptRoot 'Assert-LaiSandbox.ps1'))) { exit 99 }
 $src = Split-Path -Parent $PSScriptRoot
 $failures = 0
 function Assert-That([bool]$Condition, [string]$Message) {

@@ -4,6 +4,14 @@ These harnesses check the scripts before they ever run on Windows. CI runs them 
 PowerShell 7 on Linux against **real** servers. The only stand-in is a small Qwen3 model (same
 architecture family and chat template as the real ones), so the tests fit on a CPU-only box.
 
+**Never run these on a PC with a real install.** They create, rename and delete the containers and
+volumes named `open-webui`, `searxng` and `deep-research`, change the admin password and unload
+models. Every script that touches Docker, Ollama or Open WebUI therefore stops at once (exit 99,
+nothing changed) unless the machine is marked as a throwaway sandbox: `LAI_SANDBOX=1` in the
+environment (the CI workflows set it) or a file `~/.lai-sandbox` (create it once on the sandbox).
+On Windows a real install (`C:\AI\install-state.json`) refuses even with the marker, except in
+GitHub Actions. `Invoke-StaticChecks.ps1` only reads files and runs anywhere.
+
 | Script | What it proves |
 |---|---|
 | `Invoke-IntegrationTest.ps1` | The API layer (`lib/LocalAI.psm1`) against Ollama v0.35.1 and Open WebUI v0.11.4: it covers the context tuner, the tuned aliases, presets, hiding raw models, admin/RAG/web-search config (run twice to check it's idempotent), knowledge collections, and the chat/memory/RAG/web-search smoke tests, plus the health check's direct SearXNG probe against the real image (it finds pages or names every failed engine). Last, it runs the real render guard in front of that Ollama with a faked ComfyUI: a chat sent to the CPU during a "render" must be followed, after the hold, by a fresh load (`load_duration`), not the reused CPU runner. |

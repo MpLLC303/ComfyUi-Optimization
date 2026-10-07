@@ -15,6 +15,8 @@ param(
     [string]$Work = (Join-Path ([System.IO.Path]::GetTempPath()) 'lai-modelupdate')
 )
 $ErrorActionPreference = 'Stop'
+# Refuses to run anywhere but a throwaway test machine (it would delete a real install's data).
+if (-not (& (Join-Path $PSScriptRoot 'Assert-LaiSandbox.ps1'))) { exit 99 }
 $src = Split-Path -Parent $PSScriptRoot
 Import-Module (Join-Path (Join-Path $src 'lib') 'LocalAI.psm1') -Force
 $failures = 0

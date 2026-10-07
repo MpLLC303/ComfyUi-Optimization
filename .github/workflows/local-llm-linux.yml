@@ -14,6 +14,10 @@ on:
 permissions:
   contents: read
 
+# The test scripts refuse to run on machines not marked as throwaway sandboxes.
+env:
+  LAI_SANDBOX: '1'
+
 jobs:
   linux-e2e:
     runs-on: ubuntu-latest

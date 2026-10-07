@@ -17,6 +17,8 @@
 #>
 param([string]$Work = (Join-Path ([System.IO.Path]::GetTempPath()) 'lai-wintest'))
 $ErrorActionPreference = 'Stop'
+# Refuses to run anywhere but a throwaway test machine (it would delete a real install's data).
+if (-not (& (Join-Path $PSScriptRoot 'Assert-LaiSandbox.ps1'))) { exit 99 }
 $src = Split-Path -Parent $PSScriptRoot
 $onWindows = ($env:OS -eq 'Windows_NT')
 $failures = 0
@@ -329,6 +331,27 @@ if ($onWindows -and $isAdmin -and $PSVersionTable.PSEdition -eq 'Desktop') {
         try { Set-ExecutionPolicy $savedCu -Scope CurrentUser -Force -ErrorAction Stop } catch { Write-Verbose 'restore' }
     }
 } else { Skip 'real execution-policy change needs elevated Windows PowerShell (runs in Windows CI)' }
+
+# ---- the tests refuse to run outside a throwaway sandbox -------------------------------------------
+Write-Host "`n=== a test script refuses to run on a machine not marked as a sandbox ===" -ForegroundColor Cyan
+$probe = Join-Path $PSScriptRoot ('zz-sandbox-probe-' + [guid]::NewGuid().ToString('N').Substring(0, 8) + '.ps1')
+Set-Content -LiteralPath $probe -Value @("`$ErrorActionPreference = 'Stop'", "if (-not (& (Join-Path `$PSScriptRoot 'Assert-LaiSandbox.ps1'))) { exit 99 }", "Write-Host 'PROBE-RAN'")
+$savedSandbox = $env:LAI_SANDBOX; $savedHome = $env:HOME
+$probeHome = Join-Path ([System.IO.Path]::GetTempPath()) ('lai-nosandbox-' + [guid]::NewGuid().ToString('N').Substring(0, 8))
+New-Item -ItemType Directory -Force -Path $probeHome | Out-Null
+try {
+    $env:LAI_SANDBOX = ''
+    # Linux: the marker is looked up in $HOME. Windows: the CI runner's profile has no marker.
+    if ($env:OS -ne 'Windows_NT') { $env:HOME = $probeHome }
+    $prevPref = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
+    $probeOut = (& $childExe -NoProfile -ExecutionPolicy Bypass -File $probe 2>&1 | ForEach-Object { "$_" }) -join "`n"
+    $probeCode = $LASTEXITCODE; $ErrorActionPreference = $prevPref
+} finally {
+    $env:LAI_SANDBOX = $savedSandbox; $env:HOME = $savedHome
+    Remove-Item -LiteralPath $probe -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $probeHome -Recurse -Force -ErrorAction SilentlyContinue
+}
+Assert-That ($probeCode -eq 99 -and $probeOut -match 'REFUSED' -and $probeOut -notmatch 'PROBE-RAN') "without LAI_SANDBOX=1 or a .lai-sandbox file the test stops before doing anything (exit $probeCode)"
 
 # ---- scripts that must run on a machine with nothing installed -------------------------------------
 Write-Host "`n=== Watch / Uninstall / Stop smoke runs ===" -ForegroundColor Cyan

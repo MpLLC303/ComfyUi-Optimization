@@ -36,6 +36,8 @@ param(
     [switch]$SelfTest
 )
 $ErrorActionPreference = 'Stop'
+# Refuses to run anywhere but a throwaway test machine (it would delete a real install's data).
+if (-not (& (Join-Path $PSScriptRoot 'Assert-LaiSandbox.ps1'))) { exit 99 }
 $src = Split-Path -Parent $PSScriptRoot
 $t = $PSScriptRoot
 $script:VerdictPattern = '^\s*ASSERT FAIL|^(PARSE|NONASCII|PSSA|CANARY|PS51|FORMAT|MATCHES|BOUND|ENCODING|ELEVATED|NOSILENT|HELP|DOCPARAM|NATIVEQUOTE|COMPOSELOG|RECURSE|SETTINGS|HANG|HIDDENTASK|ENVFIRST|LOCATOR|MDTABLE|OLLAMAAPP|SERVERLOG|DRIFT|DEPSKIP|ENVRESTORE|NETCATCH|INSTEXIT)\s'
