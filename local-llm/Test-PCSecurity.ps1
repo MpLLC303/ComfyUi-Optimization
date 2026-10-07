@@ -9,7 +9,8 @@
     tools, and says for every problem one next step you can follow yourself:
 
       antivirus (Microsoft Defender or the product Windows Security knows; an antivirus that is
-      registered but snoozed or expired while Defender stands back counts as none), Windows Update and
+      registered but snoozed or expired while Defender stands back counts as none, and one left
+      behind snoozed, expired or out of date while Defender protects is named), Windows Update and
       a pending restart, the firewall, User Account Control, Core isolation (memory integrity) and the
       Microsoft vulnerable driver blocklist, Secure Boot and the TPM, drive encryption (system drive,
       the install folder's drive, the Ollama models' drive), Smart App Control and SmartScreen, known
@@ -158,6 +159,68 @@ function ConvertFrom-PcsAvState {
     return [pscustomobject]@{ State = $name; Enabled = ($name -eq 'On'); UpToDate = (($State -band 0x10) -eq 0) }
 }
 
+function Group-PcsAvProduct {
+    <#
+    Windows Security Center's antivirus list (displayName, productState, pathToSignedProductExe),
+    sorted by what each product reports about itself. Output: On (the names of those that are on),
+    Stale (of these, the ones whose definitions Windows reports out of date), Idle (one sentence
+    for each that is snoozed, expired or switched off), IdleNames (their names, Microsoft
+    Defender's own left out) and Unknown (name and number of each state ConvertFrom-PcsAvState does
+    not know). SkipOwn leaves Microsoft Defender's own entry out altogether.
+    #>
+    param([object[]]$Products = @(), [bool]$SkipOwn = $false)
+    $on = @(); $stale = @(); $idle = @(); $idleNames = @(); $unknown = @()
+    foreach ($p in @($Products)) {
+        if ($null -eq $p) { continue }
+        $name = [string]$p.displayName
+        if (-not $name) { $name = 'an antivirus without a name' }
+        $own = ($name -match '(?i)^(windows|microsoft) defender') -or ([string]$p.pathToSignedProductExe -match '(?i)^windowsdefender:')
+        if ($own -and $SkipOwn) { continue }
+        $raw = [string]$p.productState
+        $state = 'Unknown'; $current = $true
+        if ($raw -match '^\d+$') {
+            $st = ConvertFrom-PcsAvState -State ([long]$raw)
+            $state = $st.State; $current = $st.UpToDate
+        }
+        if ($state -eq 'On') {
+            $on += $name
+            if (-not $current) { $stale += $name }
+        } elseif ($state -eq 'Snoozed' -or $state -eq 'Expired' -or $state -eq 'Off') {
+            $said = "$name is switched off"
+            if ($state -eq 'Snoozed') { $said = "$name reports itself snoozed (its protection is paused)" }
+            if ($state -eq 'Expired') { $said = "$name reports itself expired" }
+            $idle += $said
+            if (-not $own) { $idleNames += $name }
+        } else {
+            $unknown += "$name (productState $raw)"
+        }
+    }
+    return [pscustomobject]@{ On = $on; Stale = $stale; Idle = $idle; IdleNames = $idleNames; Unknown = $unknown }
+}
+
+function Get-PcsAvLeftoverNote {
+    <#
+    What the Antivirus row adds when Microsoft Defender is plainly the antivirus in charge and
+    Windows Security Center still lists another one that is not doing its part: snoozed, expired or
+    switched off (what a trial that ran out leaves behind once Defender has taken over), on but
+    with definitions out of date, or in a state this check cannot read. Products and ProductsRead
+    as for Get-PcsAvVerdict; Defender's own entry is left out. Output: the text to append to the
+    row's detail, '' when there is nothing to say. It never changes the row's result (Defender is
+    doing the protecting). A list or a state that could not be read is named as not checked.
+    #>
+    param([object[]]$Products = @(), [bool]$ProductsRead = $true)
+    if (-not $ProductsRead) { return '; not checked: Windows Security Center could not be asked whether another antivirus is still registered' }
+    $g = Group-PcsAvProduct -Products $Products -SkipOwn $true
+    $idle = @($g.Idle); $idleNames = @($g.IdleNames); $stale = @($g.Stale); $unknown = @($g.Unknown)
+    $note = ''
+    if ($idle.Count) {
+        $note += "; also registered with Windows but not protecting: $($idle -join '; '). Microsoft Defender is doing the protecting instead. If you no longer use $($idleNames -join ', '), uninstall it completely (Settings > Apps > Installed apps; if it stays listed, use its maker's removal tool); if you do, open it and switch its protection back on (renew it if it has expired)"
+    }
+    if ($stale.Count) { $note += "; $($stale -join ', ') is on as well, but Windows reports its definitions out of date: open it and run its update, or uninstall it if you no longer use it" }
+    if ($unknown.Count) { $note += "; not checked: Windows Security Center reports a state this check cannot read for $($unknown -join ', ')" }
+    return $note
+}
+
 function Get-PcsAvVerdict {
     <#
     Who protects this PC when Microsoft Defender is not plainly the antivirus in charge.
@@ -193,32 +256,8 @@ function Get-PcsAvVerdict {
         }
         if (-not $defWhy) { $defWhy = $defText }
     }
-    $on = @(); $stale = @(); $idle = @(); $idleNames = @(); $unknown = @()
-    foreach ($p in @($Products)) {
-        if ($null -eq $p) { continue }
-        $name = [string]$p.displayName
-        if (-not $name) { $name = 'an antivirus without a name' }
-        $own = ($name -match '(?i)^(windows|microsoft) defender') -or ([string]$p.pathToSignedProductExe -match '(?i)^windowsdefender:')
-        if ($own -and $null -ne $Defender) { continue }
-        $raw = [string]$p.productState
-        $state = 'Unknown'; $current = $true
-        if ($raw -match '^\d+$') {
-            $st = ConvertFrom-PcsAvState -State ([long]$raw)
-            $state = $st.State; $current = $st.UpToDate
-        }
-        if ($state -eq 'On') {
-            $on += $name
-            if (-not $current) { $stale += $name }
-        } elseif ($state -eq 'Snoozed' -or $state -eq 'Expired' -or $state -eq 'Off') {
-            $said = "$name is switched off"
-            if ($state -eq 'Snoozed') { $said = "$name reports itself snoozed (its protection is paused)" }
-            if ($state -eq 'Expired') { $said = "$name reports itself expired" }
-            $idle += $said
-            if (-not $own) { $idleNames += $name }
-        } else {
-            $unknown += "$name (productState $raw)"
-        }
-    }
+    $g = Group-PcsAvProduct -Products $Products -SkipOwn ($null -ne $Defender)
+    $on = @($g.On); $stale = @($g.Stale); $idle = @($g.Idle); $idleNames = @($g.IdleNames); $unknown = @($g.Unknown)
     $also = ''
     if ($idle.Count) { $also = "; also registered with Windows but not protecting: $($idle -join '; ')" }
     if ($unknown.Count) { $also += "; state not readable for $($unknown -join ', ')" }
@@ -611,12 +650,17 @@ function Get-PcsSyncVerdict {
     BackupFolders: the folders the toolkit writes backups to. Clients: one object per sync program
     with Name, Process (its process name, without .exe), Folders (its sync folders), StartEntry (its
     start-with-Windows command, '' when it has none) and StartRead ($false when that was not
-    readable). Processes: the names of the running processes; ProcessesRead = $false when unknown.
-    Output: Status, Detail, Fix.
+    readable). Processes: the names of the processes running in the session that asks (what
+    Select-PcsSessionProcess keeps); ProcessesRead = $false when unknown. Output: Status, Detail, Fix.
     Reported only for a client whose folder holds a backup folder. "Inside" compares whole folder
-    names, so a folder next to it that only starts with the same letters ("OneDrive - Work" beside
+    names, so a folder next to it that only starts with the same letters ("OneDriveArchive" beside
     "OneDrive") does not count. Paths are compared as text (this also runs on the non-Windows test
     job). The text names the place below the sync folder only, not the profile path above it.
+    The client's folders are those of the account this check runs as. In a window opened with
+    another account's administrator password that is the administrator, not the everyday account
+    whose folder holds the backups. So a backup folder that is none of the client's folders but lies
+    in a folder named like one, directly under a user profile (<drive>:\Users\<name>\OneDrive, or
+    "OneDrive - <organisation>" as work accounts have it), is not checked: SKIP, never "not inside".
     #>
     param([string[]]$BackupFolders = @(), [object[]]$Clients = @(), [string[]]$Processes = @(), [bool]$ProcessesRead = $true)
     $ic = [System.StringComparison]::OrdinalIgnoreCase
@@ -627,10 +671,11 @@ function Get-PcsSyncVerdict {
         if ($null -eq $c) { continue }
         $name = [string]$c.Name
         $known += $name
-        $places = @()
+        $places = @(); $alike = @()
         foreach ($b in @($BackupFolders)) {
             $bp = & $clean $b
             if (-not $bp) { continue }
+            $held = $false
             foreach ($f in @($c.Folders)) {
                 $fp = & $clean ([string]$f)
                 if ($fp.Length -lt 3) { continue }
@@ -639,8 +684,19 @@ function Get-PcsSyncVerdict {
                 $place = "the $name folder itself"
                 if (-not $same) { $place = $name + '\' + $bp.Substring($fp.Length + 1) }
                 if ($places -notcontains $place) { $places += $place }
+                $held = $true
                 break
             }
+            if ($held -or -not $name) { continue }
+            # None of this account's sync folders. Named like one, directly under a user profile?
+            $like = [regex]::Match($bp, '(?i)^[A-Za-z]:\\Users\\[^\\]+\\' + [regex]::Escape($name) + '(?: - [^\\]+)?(\\.+)?$')
+            if (-not $like.Success) { continue }
+            $place = "the $name folder itself"
+            if ($like.Groups[1].Success) { $place = $name + $like.Groups[1].Value }
+            if ($alike -notcontains $place) { $alike += $place }
+        }
+        if ($alike.Count) {
+            $unread += "the backups lie in $($alike -join ', ') under a user profile; that looks like a $name folder, but not one of the account this check runs as. If it is another account's, run this check from that account in a normal window (without Run as administrator)"
         }
         if ($places.Count -eq 0) { continue }
         $inside = $places -join ', '
@@ -664,6 +720,33 @@ function Get-PcsSyncVerdict {
     $which = 'a cloud-sync folder'
     if ($known.Count) { $which = "a cloud-sync folder this check knows ($($known -join ', '))" }
     return [pscustomobject]@{ Status = 'PASS'; Detail = "the backup folders are not inside $which, so no sync program has to run for them"; Fix = '' }
+}
+
+function Select-PcsSessionProcess {
+    <#
+    The names of the processes that run in one Windows session (one signed-in account's desktop).
+    Windows lists the processes of every session, so with two accounts signed in (fast user
+    switching) the other account's OneDrive would pass for this account's.
+    Processes: objects with ProcessName and SessionId, as Get-Process gives them. SessionId: the
+    session to keep. Output: Read, Names. Read = $false when no process of that session was found:
+    whoever asks runs in it, so an empty answer means the session numbers were not readable, and
+    the caller must count the list as not read.
+    Session 0 is answered the same way, as not read. Since Windows Vista it is the session of the
+    services, without a desktop, and the first account to sign in gets session 1 (Microsoft,
+    "Session 0 isolation"). A check started there (over SSH, by a service) cannot see from its own
+    session whether the account's sync program runs on the desktop.
+    #>
+    param([object[]]$Processes = @(), $SessionId = $null)
+    $names = @()
+    $want = [string]$SessionId
+    if ($want -match '^\d+$' -and $want.Trim('0') -ne '') {
+        foreach ($p in @($Processes)) {
+            if ($null -eq $p -or $null -eq $p.SessionId) { continue }
+            if ([string]$p.SessionId -ne $want) { continue }
+            if ([string]$p.ProcessName) { $names += [string]$p.ProcessName }
+        }
+    }
+    return [pscustomobject]@{ Read = ($names.Count -gt 0); Names = $names }
 }
 
 #endregion
@@ -881,12 +964,17 @@ Add-Check 'Antivirus' {
         if (-not $mp.RealTimeProtectionEnabled) {
             return (Fail 'Microsoft Defender is installed, but real-time protection is OFF' 'Windows Security > Virus & threat protection > Manage settings > turn Real-time protection On')
         }
+        # Defender is in charge. Windows Security Center may still list another antivirus that is
+        # snoozed, expired or out of date (a trial that ran out, a half-removed product): the row
+        # names it and keeps its result. This only reads; Get-PcsAvLeftoverNote judges.
+        $left = Get-PcsAvProduct
+        $also = Get-PcsAvLeftoverNote -Products $left.Products -ProductsRead $left.Read
         $age = [int]$mp.AntivirusSignatureAge
         $issues = @(); $fixes = @()
         if ($age -gt 3) { $issues += "virus definitions are $age days old"; $fixes += 'Windows Security > Virus & threat protection > Protection updates > Check for updates' }
         if (-not $mp.IsTamperProtected) { $issues += 'Tamper Protection is off (malware can switch Defender off)'; $fixes += 'Windows Security > Virus & threat protection > Manage settings > Tamper Protection On' }
-        if ($issues.Count) { return (Warn ('Microsoft Defender real-time protection is on, but ' + ($issues -join '; ')) ($fixes -join '; then ')) }
-        return (Pass "Microsoft Defender on (real-time protection, Tamper Protection, definitions $age day(s) old)")
+        if ($issues.Count) { return (Warn ('Microsoft Defender real-time protection is on, but ' + ($issues -join '; ') + $also) ($fixes -join '; then ')) }
+        return (Pass "Microsoft Defender on (real-time protection, Tamper Protection, definitions $age day(s) old)$also")
     }
     # Defender is not the antivirus in charge (passive, switched off, or its status gave no answer):
     # Windows Security Center knows the others. This only reads; Get-PcsAvVerdict judges. What
@@ -1267,8 +1355,14 @@ Add-Check 'Cloud sync the backups rely on' {
     if (-not $onWindows) { return (Skip $winOnly) }
     $folders = @((Join-Path $AIRoot 'Backups'))
     if ($config.ContainsKey('BackupMirror') -and $config['BackupMirror']) { $folders += [string]$config['BackupMirror'] }
-    $procs = @(); $procsRead = $true
-    try { $procs = @(Get-Process -ErrorAction Stop | ForEach-Object { [string]$_.ProcessName }) } catch { $procsRead = $false }
+    # Only what runs in this session counts: Get-Process also lists the processes of every other
+    # signed-in account, and another account's OneDrive uploads nothing for this one. Where this
+    # session's processes cannot be told (Select-PcsSessionProcess says when), the row is not checked.
+    $procs = @(); $procsRead = $false
+    try {
+        $mine = Select-PcsSessionProcess -Processes @(Get-Process -ErrorAction Stop) -SessionId ([System.Diagnostics.Process]::GetCurrentProcess().SessionId)
+        $procs = @($mine.Names); $procsRead = [bool]$mine.Read
+    } catch { $procsRead = $false }
     Convert-Verdict (Get-PcsSyncVerdict -BackupFolders $folders -Clients @(Get-PcsSyncClient) -Processes $procs -ProcessesRead $procsRead)
 }
 

@@ -17,7 +17,8 @@
       judges for what a real PC audit found (a snoozed or expired antivirus behind a passive Defender,
       a hardware-access driver any program can open, firewall openings for script runners, a stopped
       cloud-sync program the backups lie in) on canned input, their readers on Windows, that it runs
-      no changing command, and a full read-only run in a child process.
+      no changing command and compiles no code that does more than open and close a device, and a
+      full read-only run in a child process.
     Exit code = number of failed assertions.
 #>
 param([string]$Work = (Join-Path ([System.IO.Path]::GetTempPath()) 'lai-wintest'))
@@ -2120,20 +2121,80 @@ $avI = Get-PcsAvVerdict -Defender $avPassive -Products @($avOwn, (& $avOther 0x0
 $avJ = Get-PcsAvVerdict -Defender $avOddMode -Products @((& $avOther 397568))
 $avK = Get-PcsAvVerdict -Defender $null -Products @() -ProductsRead $false
 Assert-That ($avH.Status -eq 'SKIP' -and $avI.Status -eq 'SKIP' -and $avI.Detail -match 'Example Antivirus \(productState' -and $avJ.Status -eq 'SKIP' -and $avK.Status -eq 'SKIP') "antivirus could not be read: Security Center unreadable, an unknown state nibble, a running mode this check does not know, nothing readable at all ($($avH.Status) $($avI.Status) $($avJ.Status) $($avK.Status))"
+# Defender plainly in charge (the usual PC): the row keeps its result and names the antivirus that is
+# left behind, which is what a trial that ran out looks like once Defender has taken over.
+$avN1 = Get-PcsAvLeftoverNote -Products @($avOwn, (& $avOther 0x063000))
+$avN2 = Get-PcsAvLeftoverNote -Products @($avOwn, (& $avOther 0x062000))
+$avN3 = Get-PcsAvLeftoverNote -Products @($avOwn, (& $avOther 397584))
+Assert-That ($avN1 -match '^; also registered with Windows but not protecting: Example Antivirus reports itself expired' -and $avN1 -match 'If you no longer use Example Antivirus, uninstall it completely' -and $avN2 -match 'Example Antivirus reports itself snoozed' -and
+    $avN3 -match '^; Example Antivirus is on as well, but .* out of date' -and "$avN1 $avN2 $avN3" -notmatch 'Windows Defender') "antivirus left behind flagged: with Defender in charge an expired, a snoozed and an on-but-out-of-date antivirus are each named, with what to do; Defender's own entry is not ($avN1)"
+$avN4 = Get-PcsAvLeftoverNote -Products @($avOwn, (& $avOther 397568))
+$avN5 = Get-PcsAvLeftoverNote -Products @($avOwn)
+$avN6 = Get-PcsAvLeftoverNote -Products @()
+Assert-That ($avN4 -is [string] -and $avN4 -eq '' -and $avN5 -eq '' -and $avN6 -eq '') "antivirus left behind not flagged: another antivirus that is on and current, Defender's own entry alone, an empty list add nothing to the row ('$avN4' '$avN5' '$avN6')"
+$avN7 = Get-PcsAvLeftoverNote -Products @() -ProductsRead $false
+$avN8 = Get-PcsAvLeftoverNote -Products @($avOwn, (& $avOther 0x064000))
+Assert-That ($avN7 -match '^; not checked: Windows Security Center could not be asked' -and $avN8 -match '^; not checked: .* Example Antivirus \(productState' -and "$avN7 $avN8" -notmatch 'not protecting') "antivirus left behind could not be read: an unreadable Security Center and an unknown state nibble are said as not checked, never passed over ($avN7 | $avN8)"
+# Each row's own code (the scriptblock Add-Check is given), to see what a row calls and how it ends.
+$pcsRows = @{}
+foreach ($cmd in @($pcsAst.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] -and $n.GetCommandName() -eq 'Add-Check' }, $true))) {
+    if ($cmd.CommandElements.Count -ge 3 -and $cmd.CommandElements[2] -is [System.Management.Automation.Language.ScriptBlockExpressionAst]) { $pcsRows[[string]$cmd.CommandElements[1].Value] = $cmd.CommandElements[2] }
+}
+$avRowText = ''; if ($pcsRows.ContainsKey('Antivirus')) { $avRowText = [string]$pcsRows['Antivirus'].Extent.Text }
+$avOnLines = @($avRowText -split "`n" | Where-Object { $_ -match 'Microsoft Defender real-time protection is on, but|Microsoft Defender on \(real-time protection, Tamper Protection' })
+$avOnNoted = @($avOnLines | Where-Object { $_.Contains('$also') })
+Assert-That ($avRowText -match '\$also = Get-PcsAvLeftoverNote -Products \$\w+\.Products -ProductsRead \$\w+\.Read' -and $avOnLines.Count -eq 2 -and $avOnNoted.Count -eq 2) "and the Antivirus row asks Security Center on the Defender-on path too: its PASS and its WARN both carry the note ($($avOnNoted.Count) of $($avOnLines.Count) lines)"
 
 $syClient = { param([string]$Entry, [bool]$Read) [pscustomobject]@{ Name = 'OneDrive'; Process = 'OneDrive'; Folders = @('C:\Users\JohnDoe\OneDrive\'); StartEntry = $Entry; StartRead = $Read } }
 $syEntry = '"C:\Program Files\Microsoft OneDrive\OneDrive.exe" /background'
 $syInside = @('C:\AI\Backups', 'C:\Users\JohnDoe\OneDrive\AI-Backups\')
-$syBeside = @('C:\AI\Backups', 'C:\Users\JohnDoe\OneDrive - Work\AI-Backups')
+$syBeside = @('C:\AI\Backups', 'C:\Users\JohnDoe\OneDriveArchive\AI-Backups')
 $syA = Get-PcsSyncVerdict -BackupFolders $syInside -Clients @(& $syClient $syEntry $true) -Processes @('explorer', 'svchost')
 Assert-That ($syA.Status -eq 'WARN' -and $syA.Detail -match 'OneDrive has a start-with-Windows entry but is not running' -and $syA.Detail -match 'OneDrive\\AI-Backups' -and $syA.Detail -notmatch 'JohnDoe' -and $syA.Fix -match 'start OneDrive') "cloud sync flagged: OneDrive has its start entry, no OneDrive process, and the backup copy lies in its folder; the text shows no profile path ($($syA.Status): $($syA.Detail))"
 $syB = Get-PcsSyncVerdict -BackupFolders $syInside -Clients @(& $syClient $syEntry $true) -Processes @('explorer', 'onedrive.exe')
 $syC = Get-PcsSyncVerdict -BackupFolders $syBeside -Clients @(& $syClient $syEntry $true) -Processes @('explorer')
 $syD = Get-PcsSyncVerdict -BackupFolders $syInside -Clients @(& $syClient '' $true) -Processes @('explorer')
-Assert-That ($syB.Status -eq 'PASS' -and $syC.Status -eq 'PASS' -and $syC.Detail -match 'not inside' -and $syD.Status -eq 'PASS' -and $syD.Detail -match 'no start-with-Windows entry') "cloud sync not flagged: OneDrive running; a backup folder in the sibling 'OneDrive - Work' folder; no start entry ($($syB.Status) $($syC.Status) $($syD.Status))"
+Assert-That ($syB.Status -eq 'PASS' -and $syC.Status -eq 'PASS' -and $syC.Detail -match 'not inside' -and $syD.Status -eq 'PASS' -and $syD.Detail -match 'no start-with-Windows entry') "cloud sync not flagged: OneDrive running; a backup folder in 'OneDriveArchive', which only starts with the same letters; no start entry ($($syB.Status) $($syC.Status) $($syD.Status))"
 $syE = Get-PcsSyncVerdict -BackupFolders $syInside -Clients @(& $syClient $syEntry $true) -Processes @() -ProcessesRead $false
 $syF = Get-PcsSyncVerdict -BackupFolders $syInside -Clients @(& $syClient '' $false) -Processes @('explorer')
 Assert-That ($syE.Status -eq 'SKIP' -and $syF.Status -eq 'SKIP') "cloud sync could not be read: the running programs or the start entry unreadable while the backups lie in the OneDrive folder ($($syE.Status) $($syF.Status))"
+# The check may run as another account than the one whose OneDrive holds the backups (a window opened
+# with a second administrator's password: that account's folders and start entries are the ones read).
+# A backup folder named like a OneDrive folder under a user profile, but none of this account's, is
+# not checked; it used to read "not inside a cloud-sync folder".
+$syNone = [pscustomobject]@{ Name = 'OneDrive'; Process = 'OneDrive'; Folders = @(); StartEntry = ''; StartRead = $true }
+$syG = Get-PcsSyncVerdict -BackupFolders @('C:\AI\Backups', 'C:\Users\OtherUser\OneDrive\AI-Backups') -Clients @($syNone) -Processes @('explorer')
+$syH = Get-PcsSyncVerdict -BackupFolders @('C:\AI\Backups', 'c:/users/JohnDoe/OneDrive - Work/AI-Backups/') -Clients @(& $syClient $syEntry $true) -Processes @('explorer', 'OneDrive')
+Assert-That ($syG.Status -eq 'SKIP' -and $syG.Detail -match 'OneDrive\\AI-Backups under a user profile' -and $syG.Detail -match 'run this check from that account in a normal window' -and $syG.Detail -notmatch 'OtherUser' -and $syH.Status -eq 'SKIP' -and $syH.Detail -notmatch 'Work|JohnDoe') "cloud sync could not be read: the backups lie in another account's OneDrive folder, or in a folder named 'OneDrive - <organisation>' that this account's OneDrive does not name; the text shows neither name ($($syG.Status): $($syG.Detail))"
+$syI = Get-PcsSyncVerdict -BackupFolders @('C:\AI\Backups', 'D:\Backups\OneDrive\AI', 'C:\Users\JohnDoe\Documents\OneDrive\AI') -Clients @($syNone) -Processes @('explorer')
+Assert-That ($syI.Status -eq 'PASS' -and $syI.Detail -match 'not inside') "cloud sync not flagged: a folder merely called OneDrive on another drive or deeper inside a profile is not taken for a OneDrive folder ($($syI.Status))"
+$syJ = Get-PcsSyncVerdict -BackupFolders @('C:\Users\JohnDoe\OneDrive\AI-Backups', 'C:\Users\OtherUser\OneDrive\More') -Clients @(& $syClient $syEntry $true) -Processes @('explorer')
+Assert-That ($syJ.Status -eq 'WARN' -and $syJ.Detail -match 'has a start-with-Windows entry but is not running' -and $syJ.Detail -match 'Not checked: the backups lie in OneDrive\\More under a user profile') "cloud sync flagged: a stopped OneDrive stays WARN and the folder in another account's OneDrive is added as not checked ($($syJ.Status))"
+# Only this session's processes count. With two accounts signed in (fast user switching) the other
+# account's OneDrive is in the list Windows gives, and it uploads nothing for this account.
+$syProcs = @(
+    [pscustomobject]@{ ProcessName = 'explorer'; SessionId = 1 }
+    [pscustomobject]@{ ProcessName = 'OneDrive'; SessionId = 2 }
+    [pscustomobject]@{ ProcessName = 'svchost'; SessionId = 0 }
+    [pscustomobject]@{ ProcessName = 'unnumbered'; SessionId = $null }
+)
+$syMine = Select-PcsSessionProcess -Processes $syProcs -SessionId 1
+$syTheirs = Select-PcsSessionProcess -Processes $syProcs -SessionId 2
+$syK = Get-PcsSyncVerdict -BackupFolders $syInside -Clients @(& $syClient $syEntry $true) -Processes @($syMine.Names) -ProcessesRead $syMine.Read
+$syL = Get-PcsSyncVerdict -BackupFolders $syInside -Clients @(& $syClient $syEntry $true) -Processes @($syTheirs.Names) -ProcessesRead $syTheirs.Read
+Assert-That ($syMine.Read -and (@($syMine.Names) -join ',') -eq 'explorer' -and $syK.Status -eq 'WARN' -and $syK.Detail -match 'OneDrive has a start-with-Windows entry but is not running') "cloud sync flagged: OneDrive runs in another account's session only, so for this session it is not running ($($syK.Status); this session: $(@($syMine.Names) -join ','))"
+Assert-That ($syTheirs.Read -and (@($syTheirs.Names) -join ',') -eq 'OneDrive' -and $syL.Status -eq 'PASS' -and $syL.Detail -match 'OneDrive is running') "cloud sync not flagged: OneDrive runs in the session that asks ($($syL.Status))"
+$syNoNumber = Select-PcsSessionProcess -Processes $syProcs -SessionId $null
+$syNobody = Select-PcsSessionProcess -Processes $syProcs -SessionId 7
+$syServices = Select-PcsSessionProcess -Processes $syProcs -SessionId 0
+$syM = Get-PcsSyncVerdict -BackupFolders $syInside -Clients @(& $syClient $syEntry $true) -Processes @($syNobody.Names) -ProcessesRead $syNobody.Read
+Assert-That (-not $syNoNumber.Read -and @($syNoNumber.Names).Count -eq 0 -and -not $syNobody.Read -and @($syNobody.Names).Count -eq 0 -and -not $syServices.Read -and @($syServices.Names).Count -eq 0 -and $syM.Status -eq 'SKIP' -and $syM.Detail -match 'running programs was not readable') "cloud sync could not be read: no session number, no process at all in the session that asks (it runs there itself), or a check started in the services' session 0 is an unread list and SKIP, never 'not running' ($($syM.Status))"
+$syRowText = ''; $syRowReads = @()
+if ($pcsRows.ContainsKey('Cloud sync the backups rely on')) {
+    $syRowText = [string]$pcsRows['Cloud sync the backups rely on'].Extent.Text
+    $syRowReads = @($pcsRows['Cloud sync the backups rely on'].FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] -and $n.GetCommandName() -eq 'Get-Process' }, $true))
+}
+Assert-That ($syRowText -match 'Select-PcsSessionProcess -Processes @\(Get-Process -ErrorAction Stop\) -SessionId \(\[System\.Diagnostics\.Process\]::GetCurrentProcess\(\)\.SessionId\)' -and $syRowText -match '-Processes \$procs -ProcessesRead \$procsRead' -and $syRowReads.Count -eq 1) "and the cloud-sync row hands the judge this session's processes only: its one Get-Process call goes through the session filter ($($syRowReads.Count) Get-Process call(s))"
 
 $odApps = @(
     [pscustomobject]@{ Name = 'Example Lighting Suite'; Version = '2.1'; InstallLocation = 'C:\Program Files\ExampleLighting\' }
@@ -2192,7 +2253,17 @@ if ($onWindows) {
     $avReal = Get-PcsAvProduct
     $syReal = @(Get-PcsSyncClient)
     Assert-That ($avReal.Read -is [bool] -and $syReal.Count -eq 1 -and $syReal[0].Name -eq 'OneDrive' -and $syReal[0].StartRead -is [bool]) "the Security Center and cloud-sync readers answer without an error (Security Center read: $($avReal.Read); OneDrive folders: $(@($syReal[0].Folders).Count))"
-} else { Skip 'device-open, firewall, Security Center and cloud-sync readers: Windows only (the judges above ran on canned input)' }
+    # What the cloud-sync row does: every process Windows lists, cut down to this session's.
+    $spSelf = [System.Diagnostics.Process]::GetCurrentProcess()
+    $spAll = @(Get-Process)
+    $spReal = Select-PcsSessionProcess -Processes $spAll -SessionId $spSelf.SessionId
+    $spNumbered = @($spAll | Where-Object { $null -ne $_.SessionId })
+    # In a desktop session the filter must find this test's own process; in session 0 (a CI agent that
+    # runs as a service) it must answer "not read".
+    $spDesktop = ($spSelf.SessionId -ne 0)
+    $spFound = (@($spReal.Names) -contains $spSelf.ProcessName)
+    Assert-That ($spNumbered.Count -eq $spAll.Count -and $spReal.Read -eq $spDesktop -and $spFound -eq $spDesktop -and @($spReal.Names).Count -le $spAll.Count) "this Windows gives every process its session number, and the session filter finds this test's own process exactly when it runs in a desktop session ($(@($spReal.Names).Count) of $($spAll.Count) processes kept for session $($spSelf.SessionId); read: $($spReal.Read))"
+} else { Skip 'device-open, firewall, Security Center, cloud-sync and session readers: Windows only (the judges above ran on canned input)' }
 
 # Every command the script runs reads: none that sets, removes, starts or stops anything.
 $changeVerbs = @('Set', 'Remove', 'Enable', 'Disable', 'Clear', 'Start', 'Stop', 'Restart', 'Install', 'Uninstall', 'Register', 'Unregister', 'Update', 'Suspend', 'Resume',
@@ -2201,6 +2272,54 @@ $changeTools = @('icacls', 'reg', 'netsh', 'sc', 'schtasks', 'bcdedit', 'manage-
 $pcsCmds = @($pcsAst.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] }, $true) | ForEach-Object { [string]$_.GetCommandName() } | Where-Object { $_ } | Select-Object -Unique)
 $changing = @($pcsCmds | Where-Object { ($_ -match '^([A-Za-z]+)-' -and $changeVerbs -contains $Matches[1]) -or $changeTools -contains ($_.ToLowerInvariant() -replace '\.exe$', '') })
 Assert-That ($pcsCmds.Count -gt 20 -and $changing.Count -eq 0) "Test-PCSecurity.ps1 runs no command that changes the PC ($($pcsCmds.Count) commands; changing: $($changing -join ', '))"
+# That list sees command names only, not what the script's one piece of compiled code calls in Windows
+# itself (the C# in Test-PcsDeviceOpen). So what that code may do is pinned here: one Add-Type, given
+# $members; two imports from kernel32.dll, CreateFileW and CloseHandle, under their own names; one
+# CreateFileW call, asking for no access (dwDesiredAccess 0) to something that exists (OPEN_EXISTING, 3);
+# and no other call: nothing that reads, writes or sends a driver a control code. Whoever changes that
+# code has to change this list with it.
+$pcsSource = [string]$pcsAst.Extent.Text
+$pcsAddType = @($pcsAst.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] -and $n.GetCommandName() -eq 'Add-Type' }, $true))
+$pcsMemberSets = @($pcsAst.FindAll({ param($n) $n -is [System.Management.Automation.Language.AssignmentStatementAst] -and $n.Left.Extent.Text -eq '$members' }, $true))
+$pcsCs = ''
+if ($pcsMemberSets.Count -eq 1) {
+    # The C# lines, without the comment lines among them and without the line break they are joined with.
+    $pcsCs = @($pcsMemberSets[0].Right.FindAll({ param($n) $n -is [System.Management.Automation.Language.StringConstantExpressionAst] }, $true) | ForEach-Object { [string]$_.Value } | Where-Object { $_.Trim() -and -not $_.TrimStart().StartsWith('//') }) -join "`n"
+}
+$pcsAddTypeOk = ($pcsAddType.Count -eq 1 -and $pcsMemberSets.Count -eq 1 -and ([string]$pcsAddType[0].Extent.Text).EndsWith('-MemberDefinition $members'))
+$pcsExterns = @([regex]::Matches($pcsSource, '\bextern\s+[\w\.]+\s+(\w+)\s*\(') | ForEach-Object { $_.Groups[1].Value })
+$pcsImportsOk = ($pcsExterns.Count -eq 2 -and $pcsExterns -ccontains 'CreateFileW' -and $pcsExterns -ccontains 'CloseHandle' -and
+    [regex]::Matches($pcsSource, 'DllImport').Count -eq 2 -and [regex]::Matches($pcsSource, 'DllImport\("kernel32\.dll"').Count -eq 2 -and $pcsSource -notmatch 'EntryPoint')
+$pcsOpens = @([regex]::Matches($pcsCs, 'CreateFileW\s*\([^)]*\)') | ForEach-Object { $_.Value })
+$pcsOpenOk = ($pcsOpens.Count -eq 2 -and
+    $pcsOpens -ccontains 'CreateFileW(string lpFileName, uint dwDesiredAccess, uint dwShareMode, System.IntPtr lpSecurityAttributes, uint dwCreationDisposition, uint dwFlagsAndAttributes, System.IntPtr hTemplateFile)' -and
+    $pcsOpens -ccontains 'CreateFileW(name, 0, 3, System.IntPtr.Zero, 3, 0, System.IntPtr.Zero)')
+$pcsMayCall = @('DllImport', 'CreateFileW', 'CloseHandle', 'TryOpen', 'IntPtr', 'GetLastWin32Error', 'if')
+$pcsCalled = @([regex]::Matches($pcsCs, '([A-Za-z_]\w*)\s*\(') | ForEach-Object { $_.Groups[1].Value } | Select-Object -Unique)
+$pcsStray = @($pcsCalled | Where-Object { $pcsMayCall -cnotcontains $_ })
+$pcsUnseen = @($pcsMayCall | Where-Object { $pcsCalled -cnotcontains $_ })
+Assert-That ($pcsAddTypeOk -and $pcsImportsOk) "the script compiles code once (Add-Type with `$members) and imports CreateFileW and CloseHandle from kernel32.dll, nothing else ($($pcsAddType.Count) Add-Type; imports: $($pcsExterns -join ', '))"
+Assert-That ($pcsOpenOk -and $pcsStray.Count -eq 0 -and $pcsUnseen.Count -eq 0) "and that code makes one CreateFileW call, with no access asked for (name, 0, 3, null, 3, 0, null), closes the handle and calls nothing else ($($pcsOpens.Count) CreateFileW text(s); calls: $($pcsCalled -join ', '); not on the list: $($pcsStray -join ', '); expected and not found: $($pcsUnseen -join ', '))"
+# Add-Check keeps a hashtable; anything else a row's code returns it reads as PASS with no words.
+# Convert-Verdict is what turns a judge's answer into that hashtable, so the four rows must end in it,
+# and a status it does not know must come out as not checked. (Loaded in a scope of its own: the
+# script's Skip is not this file's.)
+$pcsVerdictRows = @('Antivirus', 'Hardware-access drivers any program can open', 'Firewall openings for script runners', 'Cloud sync the backups rely on')
+$pcsLoose = @($pcsVerdictRows | Where-Object {
+        $last = ''
+        if ($pcsRows.ContainsKey($_)) { $st = @($pcsRows[$_].ScriptBlock.EndBlock.Statements); if ($st.Count) { $last = [string]$st[$st.Count - 1].Extent.Text } }
+        $last -notmatch '^Convert-Verdict '
+    })
+$cvFns = @($pcsAst.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and @('Pass', 'Fail', 'Warn', 'Skip', 'Convert-Verdict') -contains $n.Name }, $true))
+$cv = @(& {
+        foreach ($fd in $cvFns) { . ([scriptblock]::Create($fd.Extent.Text)) }
+        Convert-Verdict ([pscustomobject]@{ Status = 'WARN'; Detail = 'the detail'; Fix = 'the fix' })
+        Convert-Verdict ([pscustomobject]@{ Status = 'PASS'; Detail = 'fine'; Fix = '' })
+        Convert-Verdict ([pscustomobject]@{ Status = 'DONE'; Detail = 'a status that is none of the four'; Fix = '' })
+        Convert-Verdict $null
+    })
+Assert-That ($pcsLoose.Count -eq 0 -and $cvFns.Count -eq 5 -and $cv.Count -eq 4 -and @($cv | Where-Object { $_ -is [hashtable] }).Count -eq 4 -and $cv[0].Status -eq 'WARN' -and $cv[0].Detail -eq 'the detail' -and $cv[0].Fix -eq 'the fix' -and
+    $cv[1].Status -eq 'PASS' -and $cv[1].Detail -eq 'fine' -and $cv[2].Status -eq 'SKIP' -and [string]$cv[2].Detail -and $cv[3].Status -eq 'SKIP') "a judge's answer reaches Add-Check as a hashtable with its words; a status that is none of the four, or no answer, is SKIP, never a silent PASS; the four rows end in Convert-Verdict (not: $($pcsLoose -join ', '))"
 
 # The whole script in its own process: runs to the end, never throws, writes a report without names.
 $pcsRoot = Join-Path $Work 'pcs-root'
@@ -2214,9 +2333,13 @@ $checkLines = @($r.Text -split "`n" | Where-Object { $_ -match '\[(OK|WARN|FAIL|
 $failLines = @($checkLines | Where-Object { $_ -match '\] FAIL ' })
 Assert-That ($r.Text -match 'PC SECURITY CHECK COMPLETE: \d+ checks, \d+ warnings, \d+ failures' -and $checkLines.Count -ge 20) "the security check runs to its summary line ($($checkLines.Count) checks, $pcsSecs s)"
 $pcsNewRows = @('Hardware-access drivers any program can open', 'Firewall openings for script runners', 'Cloud sync the backups rely on')
-$pcsMissing = @($pcsNewRows | Where-Object { $r.Text -notmatch ('\] (PASS|WARN|FAIL|SKIP) ' + [regex]::Escape($_) + ': ') })
-$pcsAvRows = @($checkLines | Where-Object { $_ -match '\] (PASS|WARN|FAIL|SKIP) Antivirus: ' })
-Assert-That ($pcsMissing.Count -eq 0 -and $pcsAvRows.Count -eq 1) "the run has the three new rows and still one Antivirus row (missing: $($pcsMissing -join ', '); Antivirus rows: $($pcsAvRows.Count))"
+# Each of them with words after the colon: a row whose code hands Add-Check no verdict prints PASS and
+# nothing else, which would otherwise pass here as a row that is there.
+$pcsMissing = @($pcsNewRows | Where-Object { $r.Text -notmatch ('\] (PASS|WARN|FAIL|SKIP) ' + [regex]::Escape($_) + ': \S') })
+$pcsAvRows = @($checkLines | Where-Object { $_ -match '\] (PASS|WARN|FAIL|SKIP) Antivirus: \S' })
+$pcsWordlessRx = '\] (PASS|WARN|FAIL|SKIP) (Antivirus|' + (@($pcsNewRows | ForEach-Object { [regex]::Escape($_) }) -join '|') + '):\s*$'
+$pcsWordless = @($checkLines | Where-Object { $_ -match $pcsWordlessRx })
+Assert-That ($pcsMissing.Count -eq 0 -and $pcsAvRows.Count -eq 1 -and $pcsWordless.Count -eq 0) "the run has the three new rows and still one Antivirus row, each saying what it found (missing or wordless: $($pcsMissing -join ', '); Antivirus rows with words: $($pcsAvRows.Count); rows with nothing after the colon: $($pcsWordless.Count))"
 # A row whose own code throws is caught by the script and reported as 'could not be read (<error>)': the
 # rows changed here read through their own readers, so that text on one of them is a bug in the row.
 $pcsRowRx = 'Antivirus: |' + (@($pcsNewRows | ForEach-Object { [regex]::Escape($_) + ': ' }) -join '|')
