@@ -405,7 +405,8 @@ setting is changed, nothing is started, stopped or uninstalled, and nothing is s
 - antivirus on and current (Microsoft Defender, or the product Windows Security knows), Tamper Protection;
 - Windows Update installed something in the last 35 days, and no restart is pending;
 - the firewall is on for every network type; User Account Control is on and asks;
-- Core isolation's memory integrity, the Microsoft vulnerable driver blocklist, Secure Boot and the TPM;
+- Core isolation's memory integrity, the Microsoft vulnerable driver blocklist, Local Security Authority
+  protection, ransomware protection (Controlled folder access), Secure Boot and the TPM;
 - drive encryption (BitLocker, or *Device encryption* on Windows 11 Home) for the Windows drive and the
   drives holding `C:\AI` and the Ollama models;
 - Smart App Control (for information) and SmartScreen for apps;

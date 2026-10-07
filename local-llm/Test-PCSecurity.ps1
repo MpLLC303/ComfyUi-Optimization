@@ -505,6 +505,26 @@ Add-Check 'Microsoft vulnerable driver blocklist' {
     Pass 'on'
 }
 
+# https://learn.microsoft.com/en-us/windows-server/security/credentials-protection-and-management/configuring-additional-lsa-protection
+# RunAsPPL 1 = on with a UEFI lock, 2 = on without it (the Windows Security switch). Works on Home.
+Add-Check 'Local Security Authority protection' {
+    if (-not $onWindows) { return (Skip $winOnly) }
+    $v = Get-PcsRegValue 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa' 'RunAsPPL'
+    if ($null -ne $v -and @(1, 2) -contains [int]$v) { return (Pass 'on (password-stealing tools cannot read the sign-in process)') }
+    Warn 'off, so malware running as administrator can copy sign-in secrets out of memory' 'Windows Security > Device security > Core isolation details > Local Security Authority protection On, then restart'
+}
+# Ransomware protection. 0 off, 1 on, 2 audit only (3/4: disk-sector modes).
+Add-Check 'Ransomware protection (Controlled Folder Access)' {
+    if (-not $onWindows) { return (Skip $winOnly) }
+    if (-not (Get-Command Get-MpPreference -ErrorAction SilentlyContinue)) { return (Skip 'Microsoft Defender settings not readable (another antivirus may be in charge)') }
+    $pref = Get-MpPreference -ErrorAction Stop
+    $mode = [int]$pref.EnableControlledFolderAccess
+    $fix = 'Windows Security > Virus & threat protection > Manage ransomware protection > Controlled folder access On; add C:\AI\Backups under Protected folders; if it blocks a program you trust (ComfyUI saving images, a game saving files), allow that program from the same page'
+    if ($mode -eq 1) { return (Pass 'on') }
+    if ($mode -eq 2) { return (Warn 'in audit mode only (it reports but blocks nothing)' $fix) }
+    Warn 'off, so ransomware can encrypt Documents, Pictures and the backups like any other file' $fix
+}
+
 # ---- 6. Secure Boot and TPM ------------------------------------------------------------------------
 Add-Check 'Secure Boot' {
     if (-not $onWindows) { return (Skip $winOnly) }
