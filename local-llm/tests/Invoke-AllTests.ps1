@@ -14,9 +14,23 @@
     Each suite's full output goes to <LogDir>\<suite>.log; exit code = number of failed suites.
     -SelfTest proves each of those checks still catches its failure (no sandbox needed).
 
+    Under CI (GitHub Actions sets GITHUB_ACTIONS to 'true') a suite also fails for every block it
+    skipped: a test that did not run proves nothing, and a block that runs on one system only would
+    drop out unseen the day the runner changes. The only skips allowed there are the ones the
+    workflow job declares in LAI_DECLARED_SKIPS, one skip message per line, exactly as the suite
+    prints it. Outside CI a skip stays what it was: a grey line.
+
+    -Step runs one suite file with that check and nothing else (no sandbox reset, no lock, no log
+    file): the CI workflows start each of their suite steps through it. The suite's output is shown
+    as it comes and its exit code is kept; when that is 0, the exit code is the number of skips the
+    job has not declared. It also runs on Windows PowerShell 5.1 (the Windows job).
+
 .EXAMPLE
     pwsh tests/Invoke-AllTests.ps1
     pwsh tests/Invoke-AllTests.ps1 -Only Static, Mock
+.EXAMPLE
+    pwsh tests/Invoke-AllTests.ps1 -Step tests/Invoke-WatchTest.ps1 -StepArgs '-Work', '/tmp/watch-test'
+    One suite file with its own arguments, as a CI workflow step runs it.
 .EXAMPLE
     pwsh tests/Invoke-AllTests.ps1 -Since origin/main
     Only the suites a change since that git ref can affect: the suites whose test file names a changed
@@ -33,7 +47,11 @@ param(
     [string]$SplitterForSandbox = 'character',
     # Per suite; a hung suite is killed (with its child processes) and counted as failed.
     [int]$TimeoutSec = 1800,
-    [switch]$SelfTest
+    [switch]$SelfTest,
+    # One suite file, run the way a CI workflow step runs it (see the description).
+    [string]$Step = '',
+    # That suite's own arguments, e.g. '-Work', '/tmp/watch-test'.
+    [string[]]$StepArgs = @()
 )
 $ErrorActionPreference = 'Stop'
 # Refuses to run anywhere but a throwaway test machine (it would delete a real install's data).
@@ -46,7 +64,8 @@ function Invoke-Suite {
     # Runs one suite with stdout+stderr in order into its log, under a time limit. Linux/macOS only
     # (the sandbox runner): /bin/sh does the redirection, so a missing program is exit 127, not a
     # PowerShell error that would leave the previous suite's $LASTEXITCODE in place.
-    param([hashtable]$Suite, [string]$Log, [int]$Limit)
+    # -CI and -Declared: see Get-SkipProblem (the self-test passes both, whatever machine it runs on).
+    param([hashtable]$Suite, [string]$Log, [int]$Limit, [bool]$CI, [string[]]$Declared = @())
     $exe = 'pwsh'; $argv = @('-NoProfile', '-File', $Suite.File)
     if ($Suite.ContainsKey('Exe')) { $exe = $Suite.Exe; $argv = @($Suite.File) }
     $psi = New-Object System.Diagnostics.ProcessStartInfo
@@ -78,9 +97,67 @@ function Invoke-Suite {
         if (-not $hint.Count) { $hint = @($lines | Where-Object { $_.Trim() } | Select-Object -Last 3 | ForEach-Object { $_.Trim() }) }
         $why += $hint
     }
+    # Under CI a block the suite skipped fails it, exit 0 and banner or not.
+    $why += @(Get-SkipProblem -Lines $lines -Declared $Declared -CI $CI)
     $result = 'PASS'
     if ($timedOut) { $result = 'TIMEOUT' } elseif ($why.Count) { $result = "FAIL ($code)" }
     return [pscustomobject]@{ Suite = $Suite.Name; Result = $result; Seconds = [int]$sw.Elapsed.TotalSeconds; Log = $Log; First = $why }
+}
+
+# A suite's own skip lines, in the four shapes the suites print them:
+#   '  SKIP        <why>'           Skip in the unit and bootstrap tests, the mock run
+#   'HH:mm:ss [WARN] SKIP <why>'    the integration test
+#   '  (skipped: <why>)'            the uninstall test
+#   '<why>; skipped.'               the static checks without PSScriptAnalyzer
+# Matched case-sensitively, at the start of a line. Never the product's own verdict
+# ('HH:mm:ss [INFO] SKIP <check>: ...' from Test-LocalAI and Test-PCSecurity, also behind the mock
+# run's '    | '), which a passing test may print or quote.
+$script:SkipPattern = '^\s*SKIP\s*$|^\s*SKIP\s+(?<what>\S.*)$|^\d\d:\d\d:\d\d \[WARN\] SKIP (?<what>\S.*)$|^\s*\(skipped: (?<what>.+)\)\s*$|^(?<what>(?!\d\d:\d\d:\d\d )\S.*); skipped\.\s*$'
+# Read here and nowhere else: GitHub Actions sets GITHUB_ACTIONS to 'true'; the workflow job lists the
+# skips that are right for it in LAI_DECLARED_SKIPS, one message (the <why> above) per line.
+$inCI = ($env:GITHUB_ACTIONS -eq 'true')
+$declaredSkips = @("$env:LAI_DECLARED_SKIPS" -split "`r?`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+
+function Get-SkipProblem {
+    # One line per skip in a suite's output that the job has not declared. Nothing outside CI: on a
+    # developer's machine a skip stays a grey line.
+    param([string[]]$Lines = @(), [string[]]$Declared = @(), [bool]$CI)
+    $found = @()
+    if (-not $CI) { return $found }
+    foreach ($line in $Lines) {
+        # Colour codes, should a PowerShell ever write them into redirected output, must not hide a skip.
+        if (($line -replace '\x1b\[[0-9;]*m', '') -cmatch $script:SkipPattern) {
+            $what = ([string]$Matches['what']).Trim()
+            # A skip that gives no reason cannot be declared: it always fails.
+            if (-not $what) { $found += 'ASSERT FAIL skipped under CI without a reason: a skip must say what did not run and why' }
+            elseif ($Declared -cnotcontains $what) { $found += "ASSERT FAIL skipped under CI, not declared for this job: $what" }
+        }
+    }
+    return $found
+}
+
+function Invoke-Step {
+    # Runs one suite file the way a CI workflow step does: in a child PowerShell of the edition that
+    # runs this script (Windows PowerShell 5.1 on the Windows job), its output shown line by line as
+    # it comes (a suite takes up to half an hour, and a job cut off at its time limit must still
+    # show how far it got), its exit code kept. Problems = the skips the job has not declared.
+    param([string]$File, [string[]]$Arguments = @(), [string[]]$Declared = @(), [bool]$CI, [switch]$Quiet)
+    $exe = 'pwsh'
+    if ($PSVersionTable.PSEdition -eq 'Desktop') { $exe = 'powershell.exe' }
+    $argv = @('-NoProfile', '-File', $File) + @($Arguments | Where-Object { $_ })
+    $show = -not $Quiet
+    $out = @(); $code = 127
+    # A child's standard-error lines arrive as error records: they must not stop this script.
+    $prev = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
+    try {
+        $out = @(& $exe @argv 2>&1 | ForEach-Object { $text = "$_"; if ($show) { Write-Host $text }; $text })
+        $code = $LASTEXITCODE
+    } catch {
+        # No such program: without this the previous command's $LASTEXITCODE (0) would stand.
+        $out = @("$exe could not be started: $($_.Exception.Message)")
+        if ($show) { Write-Host $out[0] -ForegroundColor Red }
+    } finally { $ErrorActionPreference = $prev }
+    return [pscustomobject]@{ Code = $code; Problems = @(Get-SkipProblem -Lines $out -Declared $Declared -CI $CI) }
 }
 
 $suites = @(
@@ -128,6 +205,8 @@ if ($SelfTest) {
     $dir = Join-Path ([System.IO.Path]::GetTempPath()) ('lai-runner-selftest-' + [guid]::NewGuid().ToString('N').Substring(0, 8))
     New-Item -ItemType Directory -Force -Path $dir | Out-Null
     $pidFile = Join-Path $dir 'child.pid'
+    $skipWhy = 'fake block runs on another system only'
+    $skipBody = "Write-Host '  SKIP        $skipWhy'; Write-Host 'FAKE PASSED'; exit 0"
     $fakes = @(
         @{ Name = 'missing-exe'; Exe = 'lai-no-such-program'; Body = $null; Want = 'FAIL'; Why = 'program not installed' }
         @{ Name = 'assert-fail-exit-0'; Body = "Write-Host '  ASSERT FAIL something'; Write-Host 'FAKE PASSED'; exit 0"; Want = 'FAIL'; Why = 'a failed assertion despite exit 0 and banner' }
@@ -137,6 +216,17 @@ if ($SelfTest) {
         @{ Name = 'exit-code'; Body = "Write-Host 'FAKE PASSED'; exit 3"; Want = 'FAIL'; Why = 'banner but exit 3' }
         @{ Name = 'hang'; Exe = '/bin/sh'; Body = "sleep 300 &`necho `$! > '$pidFile'`nwait"; Ext = '.sh'; Want = 'TIMEOUT'; Why = 'hangs with a child process' }
         @{ Name = 'good'; Body = "Write-Host 'FAKE PASSED'; exit 0"; Want = 'PASS'; Why = 'a passing suite still passes' }
+        # A skipped block. CI is handed to each fake (never read from this machine), so the same
+        # cases hold on a developer's sandbox and in the CI job that runs this self-test.
+        @{ Name = 'skip-in-ci'; Body = $skipBody; CI = $true; Want = 'FAIL'; Says = $skipWhy; Why = 'a skipped block under CI despite exit 0 and banner' }
+        @{ Name = 'skip-outside-ci'; Body = $skipBody; Want = 'PASS'; Why = 'the same skip outside CI stays a grey line' }
+        @{ Name = 'declared-skip-in-ci'; Body = $skipBody; CI = $true; Declared = @('some other block', $skipWhy); Want = 'PASS'; Why = 'under CI a skip the job declares' }
+        @{ Name = 'changed-skip-in-ci'; Body = $skipBody; CI = $true; Declared = @($skipWhy + ' (reworded)'); Want = 'FAIL'; Says = $skipWhy; Why = 'under CI a skip whose message is not the declared one' }
+        @{ Name = 'quoted-product-skip'; Body = "Write-Host '12:00:00 [INFO] SKIP Integrity watch: an install, update or model update is running'; Write-Host '    | 12:00:01 [INFO] SKIP SearXNG search: the searxng container is not running'; Write-Host '  ASSERT OK   off Windows the checks are skipped, none fails (12:00:02 [INFO] SKIP Firewall: not Windows)'; Write-Host 'FAKE PASSED'; exit 0"; CI = $true; Want = 'PASS'; Why = 'product SKIP verdicts printed or quoted by a passing test, under CI' }
+        @{ Name = 'warn-skip-in-ci'; Body = "Write-Host '12:00:00 [WARN] SKIP deep research: fake image is not on this machine'; Write-Host 'FAKE PASSED'; exit 0"; CI = $true; Want = 'FAIL'; Says = 'deep research: fake image is not on this machine'; Why = "the integration test's skip line under CI" }
+        @{ Name = 'paren-skip-in-ci'; Body = "Write-Host '  (skipped: this machine has a real fake volume)'; Write-Host 'FAKE PASSED'; exit 0"; CI = $true; Want = 'FAIL'; Says = 'this machine has a real fake volume'; Why = "the uninstall test's skip line under CI" }
+        @{ Name = 'tool-skip-in-ci'; Body = "Write-Host 'Fake analyzer not available; skipped.'; Write-Host 'FAKE PASSED'; exit 0"; CI = $true; Want = 'FAIL'; Says = 'Fake analyzer not available'; Why = "the static checks' skip line under CI" }
+        @{ Name = 'bare-skip-in-ci'; Body = "Write-Host '  SKIP'; Write-Host 'FAKE PASSED'; exit 0"; CI = $true; Want = 'FAIL'; Says = 'without a reason'; Why = 'under CI a skip that gives no reason' }
     )
     $bad = 0
     foreach ($f in $fakes) {
@@ -144,9 +234,12 @@ if ($SelfTest) {
         if ($null -ne $f.Body) { Set-Content -LiteralPath $file -Value $f.Body }
         $suite = @{ Name = $f.Name; File = $file; Args = @(); Pass = 'FAKE PASSED' }
         if ($f.Exe) { $suite.Exe = $f.Exe }
+        $fakeDeclared = @(); if ($f.Declared) { $fakeDeclared = @($f.Declared) }
         # A cold pwsh start can take several seconds on CI: only the hang gets a short limit.
-        $r = Invoke-Suite -Suite $suite -Log (Join-Path $dir ($f.Name + '.log')) -Limit $(if ($f.Name -eq 'hang') { 4 } else { 60 })
+        $r = Invoke-Suite -Suite $suite -Log (Join-Path $dir ($f.Name + '.log')) -Limit $(if ($f.Name -eq 'hang') { 4 } else { 60 }) -CI ([bool]$f.CI) -Declared $fakeDeclared
         $ok = $r.Result -like "$($f.Want)*"
+        # A skip must be named in the reasons, so the job log says what did not run and why.
+        if ($f.Says) { $ok = $ok -and (@($r.First) -join ' | ').Contains([string]$f.Says) }
         if ($f.Name -eq 'hang') {
             $childPid = 0
             if (Test-Path -LiteralPath $pidFile) { $childPid = [int](Get-Content -LiteralPath $pidFile -Raw).Trim() }
@@ -164,6 +257,23 @@ if ($SelfTest) {
         if ($ok) { Write-Host ("  ASSERT OK   {0}: {1} -> {2}" -f $f.Name, $f.Why, $r.Result) -ForegroundColor Green }
         else { Write-Host ("  ASSERT FAIL {0}: {1} -> {2} (wanted {3}) {4}" -f $f.Name, $f.Why, $r.Result, $f.Want, ($r.First -join ' | ')) -ForegroundColor Red; $bad++ }
     }
+    # The same skip through -Step, the way the CI workflows start a suite. -Quiet: echoed into this
+    # self-test's own output, the fake's SKIP line would be a skip of the self-test.
+    $stepCases = @(
+        @{ CI = $true; Declared = @(); Want = 1; Why = 'under CI an undeclared skip is a problem that names it' }
+        @{ CI = $false; Declared = @(); Want = 0; Why = 'outside CI the same skip is none' }
+        @{ CI = $true; Declared = @($skipWhy); Want = 0; Why = 'under CI a declared skip is none' }
+    )
+    foreach ($c in $stepCases) {
+        $s = Invoke-Step -File (Join-Path $dir 'skip-in-ci.ps1') -Declared $c.Declared -CI ([bool]$c.CI) -Quiet
+        $ok = ($s.Code -eq 0 -and @($s.Problems).Count -eq $c.Want)
+        if ($c.Want) { $ok = $ok -and (@($s.Problems) -join ' | ').Contains($skipWhy) }
+        if ($ok) { Write-Host ("  ASSERT OK   -Step: {0} -> exit {1}, {2} problem(s)" -f $c.Why, $s.Code, @($s.Problems).Count) -ForegroundColor Green }
+        else { Write-Host ("  ASSERT FAIL -Step: {0} -> exit {1}, {2} problem(s) (wanted exit 0, {3}) {4}" -f $c.Why, $s.Code, @($s.Problems).Count, $c.Want, (@($s.Problems) -join ' | ')) -ForegroundColor Red; $bad++ }
+    }
+    $s = Invoke-Step -File (Join-Path $dir 'exit-code.ps1') -CI $true -Quiet
+    if ($s.Code -eq 3) { Write-Host '  ASSERT OK   -Step: the exit code of the suite is kept -> exit 3' -ForegroundColor Green }
+    else { Write-Host "  ASSERT FAIL -Step: the exit code of the suite is kept -> exit $($s.Code) (wanted 3)" -ForegroundColor Red; $bad++ }
     Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
     # -Since: the suites picked for a change.
     $cases = @(
@@ -185,6 +295,23 @@ if ($SelfTest) {
     }
     if ($bad) { Write-Host "`nHARNESS SELF-TEST FAILED ($bad)" -ForegroundColor Red } else { Write-Host "`nHARNESS SELF-TEST PASSED" -ForegroundColor Green }
     exit $bad
+}
+
+if ($Step) {
+    # One suite file, for a CI workflow step. The suite's own exit code stays the step's; a suite that
+    # exits 0 still fails the step under CI when it skipped a block the job has not declared.
+    if ($Only.Count -or $Since) { Write-Host '-Step cannot be combined with -Only or -Since.' -ForegroundColor Red; exit 100 }
+    if (-not (Test-Path -LiteralPath $Step -PathType Leaf)) { Write-Host "-Step: there is no suite file '$Step'." -ForegroundColor Red; exit 100 }
+    $stepFile = (Resolve-Path -LiteralPath $Step).ProviderPath
+    $r = Invoke-Step -File $stepFile -Arguments $StepArgs -Declared $declaredSkips -CI $inCI
+    if ($r.Problems.Count) {
+        Write-Host ''
+        foreach ($p in $r.Problems) { Write-Host "  $p" -ForegroundColor Red }
+        Write-Host ("{0}: {1} skip(s) this CI job has not declared. A block that did not run proves nothing." -f (Split-Path -Leaf $stepFile), $r.Problems.Count) -ForegroundColor Red
+        Write-Host 'Make it run on this job; if it cannot run here by design, add its message to LAI_DECLARED_SKIPS of this job in the workflow file.' -ForegroundColor Red
+    }
+    if ($r.Code -ne 0) { exit $r.Code }
+    exit $r.Problems.Count
 }
 
 if ($Since) {
@@ -239,7 +366,7 @@ try {
     }
     foreach ($s in $suites) {
         Write-Host ("{0,-12} running..." -f $s.Name) -ForegroundColor Cyan
-        $r = Invoke-Suite -Suite $s -Log (Join-Path $LogDir ($s.Name + '.log')) -Limit $TimeoutSec
+        $r = Invoke-Suite -Suite $s -Log (Join-Path $LogDir ($s.Name + '.log')) -Limit $TimeoutSec -CI $inCI -Declared $declaredSkips
         if ($needsSandbox) {
             # A suite that leaves something behind fails, even if its own checks passed.
             $leakLog = Join-Path $LogDir ($s.Name + '.leaks.log')

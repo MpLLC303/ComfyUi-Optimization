@@ -16,6 +16,12 @@ permissions:
 # The test scripts refuse to run on machines not marked as throwaway sandboxes.
 env:
   LAI_SANDBOX: '1'
+  # The skips this job allows, one skip message per line: none. This job exists for the blocks that
+  # run on Windows PowerShell 5.1 only, so a block that prints SKIP here (a runner without
+  # administrator rights, a suite started by another PowerShell) has lost its only run. The suite
+  # steps below go through tests/Invoke-AllTests.ps1 -Step, which under CI fails a step for every
+  # skip that is not listed here.
+  LAI_DECLARED_SKIPS: ''
 
 jobs:
   windows-ps51:
@@ -27,6 +33,26 @@ jobs:
       - name: PowerShell version
         shell: powershell
         run: $PSVersionTable | Format-Table -AutoSize | Out-String | Write-Host
+
+      # The runner's self-test needs /bin/sh and runs on the Linux job. This is its skip case on
+      # Windows PowerShell 5.1, through -Step as the suite steps below use it: a suite that exits 0
+      # but printed a SKIP line fails the step, and passes once the job declares that skip.
+      - name: A skipped test fails the step (test runner -Step on Windows PowerShell 5.1)
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $fake = Join-Path $env:RUNNER_TEMP 'lai-fake-skip.ps1'
+          Set-Content -LiteralPath $fake -Value @("Write-Host '  SKIP        fake block runs on another system only'", "Write-Host 'FAKE PASSED'", 'exit 0')
+          Write-Host '--- 1. the skip is not declared: an ASSERT FAIL line that names it is wanted here, and exit 1'
+          & .\local-llm\tests\Invoke-AllTests.ps1 -Step $fake
+          $undeclared = $LASTEXITCODE
+          Write-Host '--- 2. the job declares it (second of two lines): no ASSERT FAIL line, and exit 0'
+          $env:LAI_DECLARED_SKIPS = "some other block`nfake block runs on another system only"
+          & .\local-llm\tests\Invoke-AllTests.ps1 -Step $fake
+          $declared = $LASTEXITCODE
+          Write-Host "--- undeclared skip: exit $undeclared (wanted 1); declared skip: exit $declared (wanted 0)"
+          if ($undeclared -ne 1 -or $declared -ne 0) { exit 1 }
+          exit 0
 
       - name: Static checks (5.1 parser, ASCII, PSScriptAnalyzer 5.1 profile, 5.1 pitfall scan)
         shell: powershell
@@ -43,7 +69,7 @@ jobs:
       - name: Windows unit tests (mutex ACL, .lnk, UTF-8 bodies, watch/uninstall/stop smoke)
         shell: powershell
         run: |
-          & .\local-llm\tests\Invoke-WindowsUnitTests.ps1
+          & .\local-llm\tests\Invoke-AllTests.ps1 -Step .\local-llm\tests\Invoke-WindowsUnitTests.ps1
           exit $LASTEXITCODE
 
       # Needs administrator rights (the runner has them): its end-to-end block creates the empty
@@ -51,5 +77,5 @@ jobs:
       - name: Bootstrap update review (Get-LocalAI.ps1)
         shell: powershell
         run: |
-          & .\local-llm\tests\Invoke-GetLocalAITest.ps1
+          & .\local-llm\tests\Invoke-AllTests.ps1 -Step .\local-llm\tests\Invoke-GetLocalAITest.ps1
           exit $LASTEXITCODE
