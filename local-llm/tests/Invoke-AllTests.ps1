@@ -17,10 +17,18 @@
 .EXAMPLE
     pwsh tests/Invoke-AllTests.ps1
     pwsh tests/Invoke-AllTests.ps1 -Only Static, Mock
+.EXAMPLE
+    pwsh tests/Invoke-AllTests.ps1 -Since origin/main
+    Only the suites a change since that git ref can affect: the suites whose test file names a changed
+    script (or, for the installer's own scripts, the mock run), every suite for shared code (lib,
+    config, the compose file, the sandbox reset) or a file no suite names, and Static always. A quick
+    check while working; the full run still decides before main moves.
 #>
 param(
     # Harness, Static, Unit, RenderGuard, Mock, ModelUpdate, UpdateWebUI, Uninstall, Watch, Integration, Acceptance
     [string[]]$Only = @(),
+    # A git ref (e.g. origin/main): run only the suites the changes since then can affect.
+    [string]$Since = '',
     [string]$LogDir = (Join-Path ([System.IO.Path]::GetTempPath()) 'lai-alltests'),
     [string]$SplitterForSandbox = 'character',
     # Per suite; a hung suite is killed (with its child processes) and counted as failed.
@@ -73,6 +81,45 @@ function Invoke-Suite {
     return [pscustomobject]@{ Suite = $Suite.Name; Result = $result; Seconds = [int]$sw.Elapsed.TotalSeconds; Log = $Log; First = $why }
 }
 
+$suites = @(
+    @{ Name = 'Harness'; File = $PSCommandPath; Args = @('-SelfTest'); Pass = 'HARNESS SELF-TEST PASSED' }
+    @{ Name = 'Static'; File = (Join-Path $t 'Invoke-StaticChecks.ps1'); Args = @(); Pass = 'Static checks: \d+ files, 0 problem' }
+    @{ Name = 'Unit'; File = (Join-Path $t 'Invoke-WindowsUnitTests.ps1'); Args = @(); Pass = 'WINDOWS UNIT TESTS PASSED' }
+    @{ Name = 'RenderGuard'; Exe = 'python3'; File = (Join-Path $t 'test_render_guard.py'); Args = @(); Pass = 'RENDER GUARD TEST PASSED' }
+    @{ Name = 'Mock'; File = (Join-Path $t 'Invoke-InstallerMockRun.ps1'); Args = @(); Pass = 'MOCK RUN PASSED' }
+    @{ Name = 'ModelUpdate'; File = (Join-Path $t 'Invoke-ModelUpdateTest.ps1'); Args = @(); Pass = 'MODEL UPDATE TEST PASSED' }
+    @{ Name = 'UpdateWebUI'; File = (Join-Path $t 'Invoke-UpdateWebUITest.ps1'); Args = @(); Pass = 'UPDATE WEBUI TEST PASSED' }
+    @{ Name = 'Uninstall'; File = (Join-Path $t 'Invoke-UninstallTest.ps1'); Args = @(); Pass = 'UNINSTALL TEST PASSED' }
+    @{ Name = 'Watch'; File = (Join-Path $t 'Invoke-WatchTest.ps1'); Args = @(); Pass = 'WATCH TEST PASSED' }
+    @{ Name = 'Integration'; File = (Join-Path $t 'Invoke-IntegrationTest.ps1'); Args = @('-SandboxTextSplitter', $SplitterForSandbox); Pass = 'INTEGRATION TEST PASSED' }
+    @{ Name = 'Acceptance'; File = (Join-Path $src 'Test-LocalAI.ps1'); Args = @('-AIRoot', (Join-Path $LogDir 'acceptance-root'), '-CatalogPath', (Join-Path $t 'models.test.psd1'), '-NoContainers'); Pass = 'V1 COMPLETE' }
+)
+
+function Get-SuitesForChange {
+    # Suite names (in run order) that changed files can affect. Paths are relative to local-llm.
+    param([string[]]$Files, [object[]]$Suites, [string]$Root)
+    $all = @($Suites | ForEach-Object { $_.Name })
+    $pick = @('Static')
+    $texts = @{}
+    # Not this runner itself: its self-test names scripts as data.
+    foreach ($su in $Suites) { if ($su.Name -ne 'Harness' -and $su.File -match '\.ps1$' -and (Test-Path -LiteralPath $su.File)) { $texts[$su.Name] = Get-Content -LiteralPath $su.File -Raw } }
+    $installer = ''; $ip = Join-Path $Root 'Install-LocalAI.ps1'; if (Test-Path -LiteralPath $ip) { $installer = Get-Content -LiteralPath $ip -Raw }
+    foreach ($f in @($Files | ForEach-Object { ($_ -replace '\\', '/').Trim() } | Where-Object { $_ })) {
+        # Shared by every suite: no narrower answer is safe.
+        if ($f -match '^(lib/|config/|stack/docker-compose\.yml$|stack/searxng/|stack/openwebui-tools/|tests/Reset-Sandbox\.ps1$|tests/models\.test\.psd1$)') { return $all }
+        if ($f -match '\.md$') { continue }   # documentation: the static checks read it
+        if ($f -eq 'tests/Invoke-AllTests.ps1') { $pick += 'Harness'; continue }
+        if ($f -like 'stack/render-guard/*' -or $f -eq 'tests/test_render_guard.py') { $pick += @('RenderGuard', 'Mock'); continue }
+        $leaf = Split-Path -Leaf $f
+        $hit = @($Suites | Where-Object { (Split-Path -Leaf $_.File) -eq $leaf } | ForEach-Object { $_.Name })
+        $hit += @($texts.Keys | Where-Object { $texts[$_] -match [regex]::Escape($leaf) })
+        if ($installer -and $leaf -ne 'Install-LocalAI.ps1' -and $installer -match [regex]::Escape($leaf)) { $hit += 'Mock' }
+        if (@($hit | Where-Object { $_ -ne 'Static' }).Count -eq 0) { return $all }   # nothing names it: unknown reach
+        $pick += $hit
+    }
+    return @($all | Where-Object { $pick -contains $_ })
+}
+
 if ($SelfTest) {
     # Each fake suite is a way a broken suite could slip through as PASS.
     $dir = Join-Path ([System.IO.Path]::GetTempPath()) ('lai-runner-selftest-' + [guid]::NewGuid().ToString('N').Substring(0, 8))
@@ -115,23 +162,38 @@ if ($SelfTest) {
         else { Write-Host ("  ASSERT FAIL {0}: {1} -> {2} (wanted {3}) {4}" -f $f.Name, $f.Why, $r.Result, $f.Want, ($r.First -join ' | ')) -ForegroundColor Red; $bad++ }
     }
     Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
+    # -Since: the suites picked for a change.
+    $cases = @(
+        @{ Files = @('README.md'); Want = 'Static'; Why = 'documentation only' }
+        @{ Files = @('lib/LocalAI.psm1'); Want = (@($suites | ForEach-Object { $_.Name }) -join ','); Why = 'shared module: everything' }
+        @{ Files = @('Watch-LocalAI.ps1'); Has = @('Static', 'Unit', 'Watch', 'Mock'); Not = @('Integration', 'ModelUpdate'); Why = 'the watch: its suite, the unit smoke runs, the mock run (the installer registers it)' }
+        @{ Files = @('Update-Models.ps1'); Has = @('ModelUpdate', 'Mock'); Why = 'a script the installer runs: its suite and the mock run' }
+        @{ Files = @('Test-LocalAI.ps1'); Has = @('Acceptance'); Why = 'the checklist is the Acceptance suite' }
+        @{ Files = @('No-Such-Script.ps1'); Want = (@($suites | ForEach-Object { $_.Name }) -join ','); Why = 'a file no suite names: everything' }
+    )
+    foreach ($c in $cases) {
+        $got = @(Get-SuitesForChange -Files $c.Files -Suites $suites -Root $src)
+        $ok = $true
+        if ($c.Want) { $ok = (($got -join ',') -eq $c.Want) }
+        if ($c.Has) { $ok = $ok -and @($c.Has | Where-Object { $got -notcontains $_ }).Count -eq 0 }
+        if ($c.Not) { $ok = $ok -and @($c.Not | Where-Object { $got -contains $_ }).Count -eq 0 }
+        if ($ok) { Write-Host ("  ASSERT OK   -Since {0}: {1} -> {2}" -f ($c.Files -join ','), $c.Why, ($got -join ',')) -ForegroundColor Green }
+        else { Write-Host ("  ASSERT FAIL -Since {0}: {1} -> {2}" -f ($c.Files -join ','), $c.Why, ($got -join ',')) -ForegroundColor Red; $bad++ }
+    }
     if ($bad) { Write-Host "`nHARNESS SELF-TEST FAILED ($bad)" -ForegroundColor Red } else { Write-Host "`nHARNESS SELF-TEST PASSED" -ForegroundColor Green }
     exit $bad
 }
 
-$suites = @(
-    @{ Name = 'Harness'; File = $PSCommandPath; Args = @('-SelfTest'); Pass = 'HARNESS SELF-TEST PASSED' }
-    @{ Name = 'Static'; File = (Join-Path $t 'Invoke-StaticChecks.ps1'); Args = @(); Pass = 'Static checks: \d+ files, 0 problem' }
-    @{ Name = 'Unit'; File = (Join-Path $t 'Invoke-WindowsUnitTests.ps1'); Args = @(); Pass = 'WINDOWS UNIT TESTS PASSED' }
-    @{ Name = 'RenderGuard'; Exe = 'python3'; File = (Join-Path $t 'test_render_guard.py'); Args = @(); Pass = 'RENDER GUARD TEST PASSED' }
-    @{ Name = 'Mock'; File = (Join-Path $t 'Invoke-InstallerMockRun.ps1'); Args = @(); Pass = 'MOCK RUN PASSED' }
-    @{ Name = 'ModelUpdate'; File = (Join-Path $t 'Invoke-ModelUpdateTest.ps1'); Args = @(); Pass = 'MODEL UPDATE TEST PASSED' }
-    @{ Name = 'UpdateWebUI'; File = (Join-Path $t 'Invoke-UpdateWebUITest.ps1'); Args = @(); Pass = 'UPDATE WEBUI TEST PASSED' }
-    @{ Name = 'Uninstall'; File = (Join-Path $t 'Invoke-UninstallTest.ps1'); Args = @(); Pass = 'UNINSTALL TEST PASSED' }
-    @{ Name = 'Watch'; File = (Join-Path $t 'Invoke-WatchTest.ps1'); Args = @(); Pass = 'WATCH TEST PASSED' }
-    @{ Name = 'Integration'; File = (Join-Path $t 'Invoke-IntegrationTest.ps1'); Args = @('-SandboxTextSplitter', $SplitterForSandbox); Pass = 'INTEGRATION TEST PASSED' }
-    @{ Name = 'Acceptance'; File = (Join-Path $src 'Test-LocalAI.ps1'); Args = @('-AIRoot', (Join-Path $LogDir 'acceptance-root'), '-CatalogPath', (Join-Path $t 'models.test.psd1'), '-NoContainers'); Pass = 'V1 COMPLETE' }
-)
+if ($Since) {
+    if ($Only.Count) { Write-Host '-Since and -Only cannot be combined.' -ForegroundColor Red; exit 100 }
+    $prevPref = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
+    $changed = @(& git -C $src diff --relative --name-only $Since 2>&1) + @(& git -C $src ls-files --others --exclude-standard 2>&1)
+    $gitCode = $LASTEXITCODE; $ErrorActionPreference = $prevPref
+    if ($gitCode -ne 0) { Write-Host "git could not list the changes since '$Since': $($changed -join ' ')" -ForegroundColor Red; exit 100 }
+    $changed = @($changed | ForEach-Object { "$_" } | Where-Object { $_ } | Sort-Object -Unique)
+    $Only = @(Get-SuitesForChange -Files $changed -Suites $suites -Root $src)
+    Write-Host ("Changed since {0}: {1} file(s) -> {2}" -f $Since, $changed.Count, ($Only -join ', ')) -ForegroundColor Cyan
+}
 # 'pwsh -File' hands "Static,Mock" over as one string, so split here (and validate by hand).
 $Only = @($Only | ForEach-Object { $_ -split ',' } | ForEach-Object { $_.Trim() } | Where-Object { $_ })
 $unknown = @($Only | Where-Object { @($suites | ForEach-Object { $_.Name }) -notcontains $_ })
