@@ -255,7 +255,9 @@ Assert-That ($sel -notcontains 'trial-missing') 'trial model with a missing tag 
 Assert-That ((Get-Content -Raw (Get-ChildItem (Join-Path $aiRoot 'Logs') -Filter 'install-*.log' | Sort-Object LastWriteTime | Select-Object -Last 1).FullName) -match 'Trial Trial: missing tag .* skipped') 'the skip came from the failed pull (Models stage), not the disk planner'  # lai-ok: objects
 Assert-That ($null -ne $state.tuning.'trial-ok') 'trial model was tuned like the others'
 function Get-TestPreset([string]$Id) {
-    $tok = (Invoke-RestMethod -Method Post -Uri 'http://127.0.0.1:3000/api/v1/auths/signin' -ContentType 'application/json' -Body (ConvertTo-Json @{ email = $Email; password = $Password })).token
+    # Sign in through the module, which waits out Open WebUI's sign-in limit (15 per 3 minutes).
+    # A raw sign-in here failed a CI run with HTTP 429 on a commit that had just passed.
+    $tok = Connect-LaiWebUI -BaseUrl 'http://127.0.0.1:3000' -Email $Email -Password $Password
     try { return Invoke-RestMethod -Uri "http://127.0.0.1:3000/api/v1/models/model?id=$Id" -Headers @{ Authorization = "Bearer $tok" } } catch { return $null }
 }
 $tp = Get-TestPreset 'trial-standin'
