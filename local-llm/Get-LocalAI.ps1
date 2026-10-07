@@ -16,8 +16,11 @@
 # between the two, and have typed OK at the keyboard (an OK piped in, or pasted ahead of the question,
 # does not count). A first install has nothing to compare and is not asked. An install that is found
 # on this PC but not in the AI folder named here is asked about as well.
-# An update whose commit GitHub cannot name (offline, rate limit) is not offered at all: nothing is
-# shown as agreed that could not be shown. Try again later, or set LOCALAI_REF to a full commit id.
+# When GitHub's API does not answer (its hourly limit, a proxy), the commit is read from its page on
+# github.com instead, which is not counted against that limit: it is shown and asked about as usual,
+# and the file list is said to be missing. Only an update whose commit neither of the two can name
+# (offline) is not offered at all: nothing is shown as agreed that could not be shown. Try again
+# later, or set LOCALAI_REF to a full commit id.
 # The one way to skip the question, for a run nobody watches: name the commit you reviewed, in full:
 #
 #   $env:LOCALAI_REVIEWED_COMMIT = '<its 40-character id>'
@@ -64,11 +67,47 @@
         $o = $Object
         foreach ($name in $Path) {
             if ($null -eq $o) { return $null }
+            # An answer read by ConvertFrom-ReviewJson's second reader is made of dictionaries.
+            if ($o -is [System.Collections.IDictionary]) {
+                $there = $false
+                foreach ($key in $o.Keys) { if ($key -ceq $name) { $there = $true; break } }
+                if (-not $there) { return $null }
+                $o = $o[$name]
+                continue
+            }
             $prop = $o.PSObject.Properties[$name]
             if ($null -eq $prop) { return $null }
             $o = $prop.Value
         }
         return , $o
+    }
+
+    function ConvertTo-ReviewBody {
+        # The body of a web answer as text: Invoke-WebRequest hands it over as text or, for some
+        # content types on Windows PowerShell 5.1, as bytes. Anything else is no text.
+        param($Content)
+        if ($Content -is [string]) { return $Content }
+        if ($Content -is [byte[]]) { return [System.Text.Encoding]::UTF8.GetString($Content) }
+        return ''
+    }
+
+    function ConvertFrom-ReviewJson {
+        # GitHub's answer (JSON text) as an object; $null when it is not JSON. A comparison carries a
+        # patch for each of up to 300 files and runs to millions of characters. Invoke-RestMethod of
+        # Windows PowerShell 5.1 hands an answer of more than about 2 million back unread, so the text
+        # is fetched as it is and read here. Should ConvertFrom-Json of an older 5.1 refuse the
+        # length as well, .NET's reader takes it without a limit; that one yields dictionaries and
+        # arrays (Get-ReviewField reads both).
+        param([string]$Text)
+        if (-not $Text) { return $null }
+        try { return (ConvertFrom-Json -InputObject $Text -ErrorAction Stop) } catch { $null = $_ }
+        if ($PSVersionTable.PSVersion.Major -ge 6) { return $null }
+        try {
+            Add-Type -AssemblyName System.Web.Extensions -ErrorAction Stop
+            $reader = New-Object System.Web.Script.Serialization.JavaScriptSerializer
+            $reader.MaxJsonLength = [int]::MaxValue
+            return , $reader.DeserializeObject($Text)
+        } catch { return $null }
     }
 
     function ConvertTo-ReviewDate {
@@ -118,19 +157,53 @@
         # answers for such a commit also when it exists only in a fork, so the review says that it
         # was not checked to be on a branch of this repository.
         param([string]$Ref)
-        if ($Ref -match '^[0-9a-f]{7,40}\z') { return $true }
+        # From 4 characters: the shortest id git itself takes. A branch named like one ('beef') gets
+        # the remark too, which costs a line and nothing else.
+        if ($Ref -match '^[0-9a-f]{4,40}\z') { return $true }
         if ($Ref -match '(^|/)pull/') { return $true }
         return ($Ref -match '^refs/' -and $Ref -notmatch '^refs/(heads|tags)/')
     }
 
+    function Get-PatchCommit {
+        # Id, date and subject line from the head of a commit's page in patch form
+        # (github.com/<repository>/commit/<ref>.patch): 'From <id> ...', then 'Date:' and 'Subject:'
+        # before the first empty line. $null when the text does not start with a full commit id.
+        # The date is the day its author wrote down, not turned into UTC.
+        param([string]$Text)
+        $head = $Text
+        if ($head.Length -gt 8000) { $head = $head.Substring(0, 8000) }
+        $lines = @($head -split "`r?`n")
+        if ($lines[0] -notmatch '^From ([0-9a-f]{40}) ') { return $null }
+        $sha = $Matches[1].ToLowerInvariant()
+        $months = @{ Jan = '01'; Feb = '02'; Mar = '03'; Apr = '04'; May = '05'; Jun = '06'; Jul = '07'; Aug = '08'; Sep = '09'; Oct = '10'; Nov = '11'; Dec = '12' }
+        $date = ''; $subject = ''
+        for ($i = 1; $i -lt $lines.Count; $i++) {
+            $line = $lines[$i]
+            if ($line -eq '') { break }
+            if (-not $date -and $line -match '^Date:\s+(?:[A-Za-z]{3},\s+)?(\d{1,2})\s+([A-Za-z]{3})\s+(\d{4})\s') {
+                $day = [int]$Matches[1]; $month = $Matches[2]; $year = $Matches[3]
+                if ($months.ContainsKey($month) -and $day -ge 1 -and $day -le 31) { $date = $year + '-' + $months[$month] + '-' + $day.ToString('00') }
+            } elseif (-not $subject -and $line -match '^Subject:\s*(.*)\z') {
+                $subject = $Matches[1] -replace '^\[PATCH[^\]]*\]\s*', ''
+            }
+        }
+        return [pscustomobject]@{ Sha = $sha; Date = $date; Subject = (ConvertTo-ReviewText -Text $subject -Max 100) }
+    }
+
     function Get-IncomingCommit {
-        # The commit -Ref points to: GitHub's answer when it names one. When it does not, a -Ref that
-        # is itself a full commit id (it pins the download by itself; date and subject line stay
-        # empty). Otherwise $null: a branch or tag GitHub does not answer for cannot be pinned.
-        param([string]$Ref, $Answer)
+        # The commit -Ref points to: the answer of GitHub's API when it names one. When it does not
+        # (its hourly limit, a proxy): the commit's page in patch form, -PatchText (Get-PatchCommit).
+        # When that names none either, a -Ref that is itself a full commit id (it pins the download by
+        # itself; date and subject line stay empty). Otherwise $null: a branch or tag GitHub does not
+        # answer for cannot be pinned. A page that names another commit than a full id in -Ref is not
+        # used: the id in -Ref is the one asked for.
+        param([string]$Ref, $Answer, [string]$PatchText)
         $summary = Get-CommitSummary -Commit $Answer
         if ($summary) { return $summary }
-        if ($Ref -match '^[0-9a-f]{40}\z') { return [pscustomobject]@{ Sha = $Ref.ToLowerInvariant(); Date = ''; Subject = '' } }
+        $full = ($Ref -match '^[0-9a-f]{40}\z')
+        $page = Get-PatchCommit -Text $PatchText
+        if ($page -and (-not $full -or $page.Sha -eq $Ref.ToLowerInvariant())) { return $page }
+        if ($full) { return [pscustomobject]@{ Sha = $Ref.ToLowerInvariant(); Date = ''; Subject = '' } }
         return $null
     }
 
@@ -279,7 +352,8 @@
         # What the update review shows and decides, from data that was already fetched:
         #   -Installed       Get-InstalledToolkit's answer for the AI folder -Root
         #   -Incoming        Get-IncomingCommit's answer for -Ref; $null when GitHub could not name
-        #                    the commit (-IncomingError: why)
+        #                    the commit. -IncomingError: why GitHub's API did not name it (the commit
+        #                    may then still be known: from its page, or from a full id in -Ref)
         #   -Compare         GitHub's comparison of the installed commit with the incoming one; $null
         #                    when there is none (-CompareError: why)
         #   -ReviewedCommit  LOCALAI_REVIEWED_COMMIT, the one way to skip the question
@@ -323,8 +397,10 @@
         if ($commit) {
             & $say "  To install    : commit $commit (from '$refShown')" 'Gray'
             $described = ($Incoming.Date + '  ' + $Incoming.Subject).Trim()
-            if ($described) { & $say ($pad + $described) 'Gray' }
-            else { & $say ($pad + "GitHub could not describe it ($notNamed): no date or subject line.") 'Yellow' }
+            if ($described) {
+                & $say ($pad + $described) 'Gray'
+                if ($notNamed) { & $say ($pad + "GitHub's API did not answer ($notNamed): this was read from the commit's page on github.com instead.") 'Yellow' }
+            } else { & $say ($pad + "GitHub could not describe it ($notNamed): no date or subject line.") 'Yellow' }
             if (Test-DirectCommitRef -Ref $Ref) { & $say ($pad + "Not checked to be on a branch of this repository: '$refShown' names a commit directly, and GitHub also answers here for commits that exist only in a fork.") 'Yellow' }
         } elseif ($first) {
             & $say "  To install    : whatever '$refShown' is on GitHub when the download starts." 'Yellow'
@@ -355,7 +431,7 @@
             $files = Get-ReviewField -Object $Compare -Path 'files'
             $why = ConvertTo-ReviewText -Text $CompareError -Max 200 -AllowUnicode
             if (-not $why -and $null -eq $Compare) { $why = 'GitHub gave no answer' }
-            if (-not $why -and (@('ahead', 'behind', 'diverged', 'identical') -notcontains $status -or $null -eq $files)) { $why = 'its answer could not be read (too large, or not a comparison)' }
+            if (-not $why -and (@('ahead', 'behind', 'diverged', 'identical') -notcontains $status -or $null -eq $files)) { $why = 'its answer could not be read (not a comparison)' }
             if ($why) {
                 $kind = 'nocompare'
                 & $say "  The list of changed files could not be fetched from GitHub: $why" 'Yellow'
@@ -429,6 +505,16 @@
 
     # ---- Bootstrap -------------------------------------------------------------------------------
 
+    function Get-GitHubText {
+        # What GitHub answers at -Uri, as text. Not Invoke-RestMethod: on Windows PowerShell 5.1 it
+        # hands a long JSON answer back unread (ConvertFrom-ReviewJson reads it instead).
+        param([string]$Uri, [string]$Accept)
+        $headers = @{}
+        if ($Accept) { $headers['Accept'] = $Accept }
+        $answer = Invoke-WebRequest -Uri $Uri -UseBasicParsing -Headers $headers -TimeoutSec 60
+        return (ConvertTo-ReviewBody -Content $answer.Content)
+    }
+
     $ref = $env:LOCALAI_REF
     if (-not $ref) { $ref = 'main' }
     # The ref goes into the addresses GitHub is asked for: a plain name only, checked before any of them is built.
@@ -447,13 +533,17 @@
     $zip = Join-Path $env:TEMP 'localai-installer.zip'
     # The ref is resolved to one commit first: what is downloaded is exactly what is shown here, and a
     # re-run after a failure (or the resume after a reboot) installs the same code even if the branch
-    # moved meanwhile. Without GitHub's API (rate limit, proxy) only a first install goes on, with the
-    # ref itself; an update stops, because its commit could not be shown.
+    # moved meanwhile. Without GitHub's API (rate limit, proxy) the commit's page on github.com names
+    # it. Without both, only a first install goes on, with the ref itself; an update stops, because
+    # its commit could not be shown.
     $lookup = $null; $incomingError = ''
-    try { $lookup = Invoke-RestMethod -Uri "https://api.github.com/repos/$repo/commits/$ref" -UseBasicParsing -Headers @{ Accept = 'application/vnd.github+json' } }
+    try { $lookup = ConvertFrom-ReviewJson -Text (Get-GitHubText -Uri "https://api.github.com/repos/$repo/commits/$ref" -Accept 'application/vnd.github+json') }
     catch { $incomingError = $_.Exception.Message; if (-not $incomingError) { $incomingError = 'no answer' } }
     if (-not $incomingError -and $null -eq (Get-CommitSummary -Commit $lookup)) { $incomingError = 'its answer holds no commit id' }
-    $incoming = Get-IncomingCommit -Ref $ref -Answer $lookup
+    # The API's hourly limit (60 questions for everyone behind one address) does not count for pages.
+    $patchText = ''
+    if ($incomingError) { try { $patchText = Get-GitHubText -Uri "https://github.com/$repo/commit/$($ref).patch" } catch { $patchText = '' } }
+    $incoming = Get-IncomingCommit -Ref $ref -Answer $lookup -PatchText $patchText
 
     # What is installed now. Trouble reading it means "an install whose commit is unknown", never
     # "nothing installed": only a folder without a trace of an install goes on without the question.
@@ -465,16 +555,22 @@
     } catch { $configText = '' }
     # An install in another folder than $root (the command in the README does not know LOCALAI_ROOT)
     # is no first install either. The installer's Start-menu folder is for all users, wherever the AI
-    # folder is, and only an administrator can remove it. Not readable counts as "it is there".
-    $startMenu = $false
-    try { if ($env:ProgramData) { $startMenu = Test-Path -LiteralPath ([System.IO.Path]::Combine($env:ProgramData, 'Microsoft\Windows\Start Menu\Programs\Local AI')) } }
-    catch { $startMenu = $true }
+    # folder is, and only an administrator can remove it. Windows is asked where the all-users Start
+    # menu is: a variable of this session (ProgramData) could be pointed somewhere else, and would
+    # then be a second way around the question. No answer, or not readable, counts as "it is there".
+    $startMenu = $true
+    try {
+        $allUsersPrograms = [Environment]::GetFolderPath('CommonPrograms')
+        if ($allUsersPrograms) { $startMenu = Test-Path -LiteralPath ([System.IO.Path]::Combine($allUsersPrograms, 'Local AI')) }
+    } catch { $startMenu = $true }
     $installed = Get-InstalledToolkit -ConfigText $configText -OtherSigns $otherSigns -StartMenu $startMenu
     # The files that differ between the two commits (GitHub's compare API; the repository is public).
     $compare = $null; $compareError = ''
     if ($installed.State -eq 'known' -and $incoming -and $installed.Commit -ne $incoming.Sha) {
-        try { $compare = Invoke-RestMethod -Uri "https://api.github.com/repos/$repo/compare/$($installed.Commit)...$($incoming.Sha)" -UseBasicParsing -Headers @{ Accept = 'application/vnd.github+json' } -TimeoutSec 60 }
-        catch { $compareError = $_.Exception.Message; if (-not $compareError) { $compareError = 'no answer' } }
+        try {
+            $compare = ConvertFrom-ReviewJson -Text (Get-GitHubText -Uri "https://api.github.com/repos/$repo/compare/$($installed.Commit)...$($incoming.Sha)" -Accept 'application/vnd.github+json')
+            if ($null -eq $compare) { $compareError = 'its answer could not be read (not JSON)' }
+        } catch { $compareError = $_.Exception.Message; if (-not $compareError) { $compareError = 'no answer' } }
     }
     $review = Get-UpdateReview -Repo $repo -Root $root -Ref $ref -Installed $installed -Incoming $incoming -IncomingError $incomingError -Compare $compare -CompareError $compareError -ReviewedCommit $env:LOCALAI_REVIEWED_COMMIT
     Write-Host ''
