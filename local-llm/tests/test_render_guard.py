@@ -1,12 +1,13 @@
 """Behaviour tests for stack/render-guard/render_guard.py (stdlib only, no GPU, no ComfyUI).
 
 A fake ComfyUI (switchable queue, VRAM held, records /free) and a fake Ollama upstream (records
-request bodies, streams NDJSON) run in this process; the guard runs as a subprocess, exactly as in
-its container. Exit code = number of failed checks.
+request bodies, streams NDJSON, takes uploads piece by piece) run in this process; the guard runs
+as a subprocess, exactly as in its container. Exit code = number of failed checks.
 
     python3 tests/test_render_guard.py
 """
 import base64
+import hashlib
 import http.client
 import http.server
 import json
@@ -116,6 +117,12 @@ RESIDENT = {}    # loaded model -> num_gpu it was loaded with (-1 = Ollama's aut
 SHOW = {'hits': 0}
 VISION = set()   # models (with tag) that /api/show reports with 'vision', besides 'vl*'
 FAIL = {'ps': 0, 'unload': 0}    # answer the next N /api/ps or unload calls with HTTP 500
+SEEN = {'n': 0}  # every request that reached the fake Ollama, whatever it asked for
+# The last upload to /api/blobs/ (a model file): 'length' counts the bytes as they arrive, so a test
+# can see how much is here while the client is still sending; 'sha256' and 'complete' (False: the
+# connection ended before the body did) are set at the end; 'chunked' and 'content_length' say how
+# the guard framed it.
+BLOB = {'length': 0, 'sha256': None, 'complete': None, 'chunked': None, 'content_length': None}
 OLLAMA_LOCK = threading.Lock()
 
 
@@ -131,6 +138,8 @@ def reset_ollama():
         VISION.clear()
         SHOW['hits'] = 0
         FAIL.update(ps=0, unload=0)
+        SEEN['n'] = 0
+        BLOB.update(length=0, sha256=None, complete=None, chunked=None, content_length=None)
 
 
 class OllamaHandler(http.server.BaseHTTPRequestHandler):
@@ -147,7 +156,54 @@ class OllamaHandler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(d)
 
+    def _blob(self):
+        """An upload: read piece by piece in either framing and never held whole, like Ollama
+        writing a model file to disk. Answers 201 only for a body that arrived to its end."""
+        chunked = 'chunked' in (self.headers.get('Transfer-Encoding') or '').lower()
+        digest = hashlib.sha256()
+        with OLLAMA_LOCK:
+            BLOB.update(length=0, sha256=None, complete=None, chunked=chunked,
+                        content_length=self.headers.get('Content-Length'))
+
+        def take(left):
+            while left > 0:
+                data = self.rfile.read1(min(65536, left))
+                if not data:
+                    return False    # the connection ended inside the body
+                digest.update(data)
+                left -= len(data)
+                with OLLAMA_LOCK:
+                    BLOB['length'] += len(data)
+            return True
+
+        complete = True
+        try:
+            if chunked:
+                while complete:
+                    line = self.rfile.readline()
+                    if not line.endswith(b'\n'):
+                        complete = False    # the connection ended where a chunk size belongs
+                        break
+                    size = int(line.split(b';')[0].strip(), 16)
+                    if size == 0:
+                        while self.rfile.readline() not in (b'\r\n', b'\n', b''):
+                            pass
+                        break
+                    complete = take(size) and self.rfile.readline() == b'\r\n'
+            else:
+                complete = take(int(self.headers.get('Content-Length') or 0))
+        except (OSError, ValueError):
+            complete = False
+        with OLLAMA_LOCK:
+            BLOB.update(sha256=digest.hexdigest(), complete=complete)
+        if complete:
+            self._json({}, 201)
+        else:
+            self.close_connection = True
+
     def do_GET(self):
+        with OLLAMA_LOCK:
+            SEEN['n'] += 1
         if self.path == '/api/ps':
             with OLLAMA_LOCK:
                 fail = FAIL['ps'] > 0
@@ -162,6 +218,11 @@ class OllamaHandler(http.server.BaseHTTPRequestHandler):
             self._json({'version': 'fake'})
 
     def do_POST(self):
+        with OLLAMA_LOCK:
+            SEEN['n'] += 1
+        if self.path.startswith('/api/blobs/'):
+            self._blob()
+            return
         n = int(self.headers.get('Content-Length') or 0)
         raw = self.rfile.read(n)
         body = json.loads(raw or b'{}')
@@ -275,6 +336,80 @@ def post(port, path, obj):
     return data
 
 
+def send(port, path, body, chunked=False, headers=None):
+    """POST raw bytes to the guard, with a Content-Length or (chunked) in chunks of 100000 bytes
+    without one. Returns (HTTP status, the answer's bytes); status 0: the connection broke before
+    an answer could be read."""
+    c = http.client.HTTPConnection('127.0.0.1', port, timeout=60)
+    h = {'Content-Type': 'application/json'}
+    h.update(headers or {})
+    try:
+        if chunked:
+            h['Transfer-Encoding'] = 'chunked'
+            parts = (body[i:i + 100000] for i in range(0, len(body), 100000))
+            c.request('POST', path, body=parts, headers=h, encode_chunked=True)
+        else:
+            c.request('POST', path, body=body, headers=h)
+        r = c.getresponse()
+        return r.status, r.read()
+    except (OSError, http.client.HTTPException) as e:
+        return 0, str(e).encode()
+    finally:
+        c.close()
+
+
+def upload(port, path, data, chunked=False):
+    """POST data to the guard in two halves. Between them (the first half is sent, none of the
+    second is) it waits up to 10 s for the fake Ollama to hold that half, less at most one of the
+    guard's 64 KiB pieces. Returns (HTTP status, bytes the fake Ollama held at that moment);
+    status 0: the connection broke. chunked: the first half is a single chunk, far larger than a
+    piece; the second goes in chunks of 48 KiB with a chunk extension, and a trailer follows."""
+    half = len(data) // 2
+    early = 0
+    c = http.client.HTTPConnection('127.0.0.1', port, timeout=60)
+    try:
+        c.putrequest('POST', path)
+        c.putheader('Content-Type', 'application/octet-stream')
+        if chunked:
+            c.putheader('Transfer-Encoding', 'chunked')
+        else:
+            c.putheader('Content-Length', str(len(data)))
+        c.endheaders()
+        c.send(b'%x\r\n%s\r\n' % (half, data[:half]) if chunked else data[:half])
+        wait_for(lambda: BLOB['length'] >= half - 65536, 10)
+        early = BLOB['length']
+        if chunked:
+            for i in range(half, len(data), 48 * 1024):
+                part = data[i:i + 48 * 1024]
+                c.send(b'%x;note=1\r\n%s\r\n' % (len(part), part))
+            c.send(b'0\r\nX-Note: none\r\n\r\n')
+        else:
+            c.send(data[half:])
+        r = c.getresponse()
+        r.read()
+        return r.status, early
+    except (OSError, http.client.HTTPException):
+        return 0, early
+    finally:
+        c.close()
+
+
+def refusal(answer):
+    """The 'error' text of a JSON answer, or '' when the answer is anything else."""
+    try:
+        obj = json.loads(answer)
+    except ValueError:
+        return ''
+    return str(obj.get('error') or '') if isinstance(obj, dict) else ''
+
+
+def chat_of(nbytes, model='m'):
+    """A chat request whose JSON is exactly nbytes long (plain text, no images)."""
+    def build(text):
+        return json.dumps({'model': model, 'messages': [{'role': 'user', 'content': text}]})
+    return build('x' * (nbytes - len(build('')))).encode()
+
+
 def last_num_gpu():
     return (BODIES[-1].get('options') or {}).get('num_gpu')
 
@@ -306,6 +441,8 @@ def main():
         lines = chat(gport)
         check(len(lines) == 6 and lines[-1].get('done') is True, 'streamed answer relayed completely (%d lines)' % len(lines))
         check(last_num_gpu() is None, 'idle ComfyUI: no num_gpu added')
+        cap = status(gport)['config'].get('max_body_bytes')
+        check(cap == 256 * 1048576, 'status page: without RENDER_GUARD_MAX_BODY_MIB a chat may be 256 MiB (%s bytes)' % cap)
 
         print('\n=== busy ComfyUI: chats go to the CPU, then back after the hold ===', flush=True)
         COMFY['running'] = 1
@@ -505,6 +642,99 @@ def main():
         sent = image_chat('direct')
         chat(gport, body=sent)
         check(RAW[-1] == sent.encode(), 'a list without vision expires after CAPS_NO_VISION_TTL_SEC: the images now reach the model')
+    finally:
+        guard.terminate()
+        guard.wait(10)
+
+    print('\n=== request bodies: an upload passes through piece by piece, a chat over the size cap gets HTTP 413 ===', flush=True)
+    reset_ollama()
+    # RENDER_GUARD_MAX_BODY_MIB=1: a cap small enough to test at (it applies to chat and generate
+    # calls only). RENDER_GUARD_MODE=off: none of this depends on the GPU routing mode, and with it
+    # off the guard asks Ollama nothing on its own, so every request counted there is one of these.
+    cap = 1048576
+    guard, gport = run_guard(comfy, up_port, {'RENDER_GUARD_MODE': 'off', 'RENDER_GUARD_MAX_BODY_MIB': '1'})
+    try:
+        check(status(gport)['config'].get('max_body_bytes') == cap, 'status page: RENDER_GUARD_MAX_BODY_MIB=1 is a cap of %d bytes' % cap)
+        # A model file sent to Ollama (8 MiB here, eight times the cap: the cap is not for uploads).
+        blob = os.urandom(8 * cap)
+        half = len(blob) // 2
+        digest = hashlib.sha256(blob).hexdigest()
+        for chunked in (False, True):
+            how = 'chunked' if chunked else 'with a Content-Length'
+            reset_ollama()
+            code, early = upload(gport, '/api/blobs/sha256:' + digest, blob, chunked=chunked)
+            check(half - 65536 <= early <= half,
+                  'upload %s: Ollama holds the first half before the client sends the second, so the guard is not '
+                  'keeping it (%d of %d bytes there)' % (how, early, half))
+            check(code == 201 and BLOB['complete'] is True and BLOB['length'] == len(blob) and BLOB['sha256'] == digest,
+                  'upload %s: all %d bytes arrive, byte for byte (HTTP %d, %d bytes, same sha256: %s)' % (
+                      how, len(blob), code, BLOB['length'], BLOB['sha256'] == digest))
+            if chunked:
+                check(BLOB['chunked'] is True and BLOB['content_length'] is None,
+                      'a chunked upload reaches Ollama chunked, without a Content-Length (%s)' % BLOB['content_length'])
+            else:
+                check(BLOB['chunked'] is False and BLOB['content_length'] == str(len(blob)),
+                      "an upload with a Content-Length reaches Ollama with the client's Content-Length (%s)" % BLOB['content_length'])
+
+        # A client that hangs up in the middle of an upload.
+        reset_ollama()
+        arrived = False
+        c = http.client.HTTPConnection('127.0.0.1', gport, timeout=60)
+        try:
+            c.putrequest('POST', '/api/blobs/sha256:' + digest)
+            c.putheader('Transfer-Encoding', 'chunked')
+            c.endheaders()
+            c.send(b'%x\r\n%s\r\n' % (200000, blob[:200000]))
+            arrived = wait_for(lambda: BLOB['length'] == 200000, 10)
+        except OSError:
+            pass
+        finally:
+            c.close()
+        check(arrived and wait_for(lambda: BLOB['complete'] is not None, 10) and BLOB['complete'] is False,
+              'the client hangs up in the middle of an upload: Ollama sees a body cut short, not a complete shorter one '
+              '(%d bytes there, complete: %s)' % (BLOB['length'], BLOB['complete']))
+
+        # Chat and generate calls: the guard holds these whole, so these have the cap.
+        reset_ollama()
+        code, answer = send(gport, '/api/chat', chat_of(cap + 1))
+        err = refusal(answer)
+        check(code == 413 and err.startswith('render-guard:') and 'RENDER_GUARD_MAX_BODY_MIB' in err and '\n' not in err,
+              'a chat one byte over the cap: HTTP 413 with one line that names the setting (HTTP %d: %s)' % (code, err[:90]))
+        code, answer = send(gport, '/api/chat', chat_of(8 * cap))
+        check(code == 413 and refusal(answer).startswith('render-guard:'),
+              'a chat of 8 MiB: HTTP 413, and the client can read it after sending all of the chat (HTTP %d)' % code)
+        code, answer = send(gport, '/api/generate', json.dumps({'model': 'm', 'prompt': 'x' * (cap + 1)}).encode())
+        check(code == 413 and refusal(answer).startswith('render-guard:'), 'a generate call over the cap: HTTP 413 as well (HTTP %d)' % code)
+        check(SEEN['n'] == 0, 'none of the three refused requests reached Ollama (%d request(s) there)' % SEEN['n'])
+        check(status(gport)['inflight'] == 0, 'a refused request is not counted as a chat in flight')
+        lines = chat(gport)
+        check(bool(lines) and lines[-1].get('done') is True, 'the next chat is answered')
+
+        # Sent chunked there is no length to judge a chat by: it is read up to the cap, then refused.
+        seen = SEEN['n']
+        code, answer = send(gport, '/api/chat', chat_of(8 * cap), chunked=True)
+        check(code == 413 and refusal(answer).startswith('render-guard:'), 'a chat of 8 MiB sent chunked: HTTP 413 (HTTP %d)' % code)
+        code, answer = send(gport, '/api/chat', chat_of(cap + 1), chunked=True)
+        check(code == 413 and refusal(answer).startswith('render-guard:'), 'a chunked chat one byte over the cap: HTTP 413 (HTTP %d)' % code)
+        check(SEEN['n'] == seen, 'neither refused chunked chat reached Ollama (%d request(s) there)' % (SEEN['n'] - seen))
+        code, answer = send(gport, '/api/chat', image_chat('text').encode(), chunked=True)
+        first = BODIES[-1]['messages'][0] if BODIES else {}
+        check(code == 200 and 'images' not in first and 'image omitted' in str(first.get('content')),
+              'a chunked chat under the cap is still read whole and rewritten: a model without vision gets no images (HTTP %d)' % code)
+
+        # Exactly the cap is allowed, in both framings.
+        at_cap = chat_of(cap)
+        for chunked in (False, True):
+            n = len(RAW)
+            code, answer = send(gport, '/api/chat', at_cap, chunked=chunked)
+            check(len(at_cap) == cap and code == 200 and len(RAW) == n + 1 and RAW[-1] == at_cap,
+                  'a chat of exactly the cap (%d bytes)%s is passed on byte for byte (HTTP %d)' % (
+                      len(at_cap), ', sent chunked,' if chunked else '', code))
+
+        seen = SEEN['n']
+        code, answer = send(gport, '/api/chat', b'', headers={'Content-Length': 'lots'})
+        check(code == 400 and refusal(answer).startswith('render-guard:') and SEEN['n'] == seen,
+              'a Content-Length that is not a number: HTTP 400 from the guard, nothing sent to Ollama (HTTP %d)' % code)
     finally:
         guard.terminate()
         guard.wait(10)

@@ -25,7 +25,9 @@ What it does:
 Model list, pulls, embeddings and unload calls always pass through unchanged. Unlike an Open
 WebUI filter function, this also covers Open WebUI's background calls (titles, tags, web-search
 queries), which go straight to Ollama. Any error inside the guard passes the request through
-unchanged: the guard must never break a chat.
+unchanged: the guard must never break a chat. Only a chat or generate request is held in memory,
+up to RENDER_GUARD_MAX_BODY_MIB (a larger one is refused with HTTP 413); every other request
+body, a model file sent to /api/blobs for one, is passed on piece by piece as it arrives.
 
 Standard library only. Configuration via environment variables (see CONFIG below).
 Status page: GET /render-guard/status
@@ -68,8 +70,20 @@ CONFIG = {
     'caps_ttl_sec': float(os.environ.get('CAPS_TTL_SEC', '600')),
     # A list without 'vision' is re-read sooner: kept stale, it would strip a vision model's images.
     'caps_no_vision_ttl_sec': float(os.environ.get('CAPS_NO_VISION_TTL_SEC', '60')),
+    # Largest chat or generate request the guard takes; a larger one gets HTTP 413. These are
+    # the requests it holds whole, several times over at the worst: the bytes, the decoded text,
+    # the parsed request and, when it rewrites, the new text and its bytes. 256 MiB keeps those
+    # five copies (1280 MiB) well inside the container's 2 GB. It still fits (six copies, 1536
+    # MiB) when the body holds a character beyond U+FFFF that is not written as an escape: Python
+    # then keeps the decoded text at four bytes per character. The limit is per request: it does
+    # not add up the chats that arrive at the same moment.
+    'max_body_bytes': int(os.environ.get('RENDER_GUARD_MAX_BODY_MIB', '256')) * 1048576,
 }
 GUARDED_PATHS = ('/api/chat', '/api/generate')
+BODY_PIECE = 65536           # most bytes of a request body read from the client in one go
+BODY_LINE_MAX = 4096         # longest chunk-size or trailer line taken from a chunked request body
+BODY_TRAILER_MAX = 64        # most trailer lines taken after a chunked request body
+DRAIN_SEC = 30               # longest a client may go on sending a request the guard has answered
 MODEL_CHANGE_PATHS = ('/api/pull', '/api/create', '/api/delete', '/api/copy')
 IMAGE_NOTE = '[image omitted: this model cannot see images; switch this chat to a preset that sees images (Uncensored Vision, or an Official one if installed) or start a new chat]'
 HOP_BY_HOP = {'connection', 'keep-alive', 'proxy-authenticate', 'proxy-authorization', 'te',
@@ -502,6 +516,13 @@ def _render_watcher():
             log('render watcher: %s' % e)
 
 
+class BodyError(OSError):
+    """A request body that cannot be read to its end: the client closed the connection or went
+    silent, or the body is not framed the way its headers say. An OSError, so the request ends
+    like any other with a lost client; a class of its own, so it is never taken for an error on
+    the connection to Ollama."""
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = 'HTTP/1.1'
     server_version = 'render-guard'
@@ -510,20 +531,85 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):  # quiet default access log
         pass
 
-    def _read_body(self):
-        if 'chunked' in (self.headers.get('Transfer-Encoding') or '').lower():
-            data = b''
-            while True:
-                line = self.rfile.readline().strip()
-                size = int(line.split(b';')[0], 16) if line else 0
-                if size == 0:
-                    while self.rfile.readline() not in (b'\r\n', b'\n', b''):
-                        pass
-                    return data
-                data += self.rfile.read(size)
-                self.rfile.readline()
-        n = int(self.headers.get('Content-Length') or 0)
-        return self.rfile.read(n) if n > 0 else b''
+    def _body_bytes(self, n, whole=False):
+        """Bytes of the request body from the client: up to n as soon as some have arrived (one
+        read of the socket at most), or exactly n with whole=True."""
+        try:
+            data = self.rfile.read(n) if whole else self.rfile.read1(n)
+        except OSError as e:
+            raise BodyError('the request body could not be read: %s' % e)
+        if len(data) < (n if whole else 1):
+            raise BodyError('the client closed the connection before the end of the request body')
+        return data
+
+    def _body_line(self):
+        """One line of the framing of a chunked request body (a chunk size or a trailer), with
+        its line end. Never longer than BODY_LINE_MAX: a body without a line end in it would
+        otherwise be read whole into memory right here."""
+        try:
+            line = self.rfile.readline(BODY_LINE_MAX)
+        except OSError as e:
+            raise BodyError('the request body could not be read: %s' % e)
+        if not line.endswith(b'\n'):
+            if len(line) >= BODY_LINE_MAX:
+                raise BodyError('the chunked request body has a chunk-size or trailer line of more than %d bytes' % BODY_LINE_MAX)
+            raise BodyError('the client closed the connection before the end of the request body')
+        return line
+
+    def _body_pieces(self, chunked, length):
+        """The request body as a generator of pieces of at most BODY_PIECE bytes, for both ways a
+        client can send one (a Content-Length, or chunked). A piece is read from the client only
+        when the caller asks for the next one, and none is kept here: whoever passes each piece
+        on before asking again never holds more than one. Raises BodyError when the body cannot
+        be read to its end."""
+        if not chunked:
+            while length > 0:
+                piece = self._body_bytes(min(BODY_PIECE, length))
+                length -= len(piece)
+                yield piece
+            return
+        while True:
+            size = self._body_line().split(b';', 1)[0].strip()      # 'size;extension'
+            if not size or size.strip(b'0123456789abcdefABCDEF'):
+                raise BodyError('the chunked request body has a chunk size that is not a hexadecimal number')
+            left = int(size, 16)
+            if left == 0:
+                break
+            while left > 0:     # a chunk can be far larger than a piece
+                piece = self._body_bytes(min(BODY_PIECE, left))
+                left -= len(piece)
+                yield piece
+            if self._body_bytes(2, whole=True) != b'\r\n':
+                raise BodyError('the chunked request body has a chunk that does not end where its size says')
+        for _ in range(BODY_TRAILER_MAX):   # trailers are not passed on; the empty line ends the body
+            if self._body_line() in (b'\r\n', b'\n'):
+                return
+        raise BodyError('the chunked request body has more than %d trailer lines' % BODY_TRAILER_MAX)
+
+    def _drain(self, pieces):
+        """Read and drop what the client is still sending of a request the guard has already
+        answered, for DRAIN_SEC at most. Closing the connection on a client that is still
+        sending resets it, and the client then never gets to read the answer."""
+        deadline = time.time() + DRAIN_SEC
+        try:
+            self.connection.settimeout(DRAIN_SEC)
+            for _ in pieces:
+                left = deadline - time.time()
+                if left <= 0:
+                    break
+                self.connection.settimeout(left)
+        except OSError:
+            pass    # the client is gone, or has stopped sending
+
+    def _refuse(self, path, code, why, pieces):
+        """Answer a request the guard does not pass on to Ollama, then let the client finish
+        sending it (pieces: what is left of its body)."""
+        log('%s %s refused with HTTP %d: %s' % (self.command, path, code, why))
+        try:
+            self._send_json(code, {'error': 'render-guard: ' + why})
+        except OSError:
+            return      # the client is gone
+        self._drain(pieces)
 
     def _send_json(self, code, obj):
         data = json.dumps(obj).encode('utf-8')
@@ -572,8 +658,43 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(200, {'config': CONFIG, 'stats': stats, 'comfyui': comfy_state(fresh=True),
                                   'holding_cpu': recently_busy(), 'inflight': inflight, 'on_cpu': on_cpu})
             return
-        body = self._read_body()
+        chunked = 'chunked' in (self.headers.get('Transfer-Encoding') or '').lower()
+        try:
+            length = 0 if chunked else max(int(self.headers.get('Content-Length') or 0), 0)
+        except ValueError:
+            self._refuse(path_only, 400, 'the Content-Length of this request is not a number', ())
+            return
+        # Nothing is read yet: the generator reads from the client only as it is asked for pieces.
+        pieces = self._body_pieces(chunked, length)
         guarded = self.command == 'POST' and path_only in GUARDED_PATHS
+        body = b''
+        if guarded:
+            # Only these requests are held whole (the guard may have to rewrite them), so only
+            # these have a size limit. A Content-Length says before a byte is read that the body
+            # is too large; a chunked body has no length to go by and is read until it passes
+            # the limit. A body of exactly the limit passes.
+            cap = CONFIG['max_body_bytes']
+            too_large = length > cap
+            parts, held = [], 0
+            try:
+                if not too_large:
+                    for piece in pieces:
+                        held += len(piece)
+                        if held > cap:
+                            too_large = True
+                            break
+                        parts.append(piece)
+            except BodyError as e:
+                log('%s %s: %s' % (self.command, path_only, e))
+                return
+            if too_large:
+                del parts[:]
+                self._refuse(path_only, 413, 'this request is larger than %d MiB, the most the guard takes for one chat '
+                             '(RENDER_GUARD_MAX_BODY_MIB). A chat sends all its pictures again at every turn: start a new '
+                             'chat, or attach fewer or smaller pictures' % (cap // 1048576), pieces)
+                return
+            body = b''.join(parts)
+            del parts[:]
         if guarded and body:
             try:
                 obj = json.loads(body.decode('utf-8'))
@@ -593,6 +714,7 @@ class Handler(BaseHTTPRequestHandler):
                     body = json.dumps(obj).encode('utf-8')
                     for a in actions:
                         _action(a)
+            obj = None      # as large as the body again: not kept for as long as Ollama's answer takes
         # A model change makes cached capabilities stale: clear them now and again once Ollama has
         # answered (an image chat sent during a long pull would otherwise re-cache the old list).
         model_change = path_only in MODEL_CHANGE_PATHS
@@ -611,14 +733,32 @@ class Handler(BaseHTTPRequestHandler):
             headers = {k: v for k, v in self.headers.items() if k.lower() not in HOP_BY_HOP}
             headers['Host'] = up.netloc
             headers['Connection'] = 'close'
-            if body or self.command in ('POST', 'PUT', 'DELETE'):
-                headers['Content-Length'] = str(len(body))
+            if guarded:
+                send, size = body or None, len(body)    # held whole above, perhaps rewritten
+            else:
+                # Passed on as it arrives: http.client takes one piece from the generator, sends
+                # it to Ollama and only then takes the next, so the guard never holds more than
+                # BODY_PIECE bytes of it, however large the body is.
+                send, size = (pieces if chunked or length > 0 else None), length
+            # A chunked body has no length to announce: it goes on to Ollama chunked as well.
+            relay_chunked = chunked and not guarded
+            if relay_chunked:
+                headers['Transfer-Encoding'] = 'chunked'
+            elif size > 0 or self.command in ('POST', 'PUT', 'DELETE'):
+                headers['Content-Length'] = str(size)
             try:
                 conn.connect()
                 conn.sock.settimeout(900)
-                conn.request(self.command, self.path, body=body if body else None, headers=headers)
+                conn.request(self.command, self.path, body=send, headers=headers, encode_chunked=relay_chunked)
+            except BodyError as e:
+                # The client stopped in the middle of its own request. That is not Ollama failing
+                # (no 502), and Ollama must see the body cut short, never one that looks complete:
+                # the upstream connection is closed below with the body left unfinished.
+                log('%s %s: %s' % (self.command, path_only, e))
+                raise
             except Exception as e:
                 self._send_json(502, {'error': 'render-guard: Ollama at %s is not reachable: %s' % (CONFIG['upstream'], e)})
+                self._drain(pieces)     # a client still sending its body would not get to read the 502
                 return
             threading.Thread(target=self._watch_client, args=(conn, done), daemon=True).start()
             try:
