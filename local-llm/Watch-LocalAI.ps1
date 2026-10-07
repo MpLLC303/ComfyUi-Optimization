@@ -20,6 +20,13 @@
     (Update-Models.ps1 -RecheckOnly -Scheduled) measures them again; the watch notifies only when a
     preset could not be put back fully on the GPU, or the re-check could not run for 3 days (once per
     new version without that task).
+    About once an hour it also compares the installed scripts (<AIRoot>\Scripts), the Stack folder, the
+    LocalAI-* scheduled tasks and the programs that listen for network connections with the record
+    the last successful install or update left (<AIRoot>\integrity-baseline.json), and notifies
+    once, naming what changed, when a second look still finds the difference. Changes you made
+    yourself: -AcceptBaseline records the current state as the new baseline. That record sits in a
+    folder you can write yourself, so this notices accidents, other software and clumsy tampering,
+    not an attacker who already runs as you and rewrites the record too.
 
 .EXAMPLE
     .\Watch-LocalAI.ps1              # one check, as the scheduled task runs it
@@ -29,6 +36,8 @@
     .\Watch-LocalAI.ps1 -PauseMinutes 240   # quiet for 4 hours (gaming, stack stopped on purpose)
 .EXAMPLE
     .\Watch-LocalAI.ps1 -Unpause
+.EXAMPLE
+    .\Watch-LocalAI.ps1 -AcceptBaseline     # the reported changes are yours: make them the new baseline
 #>
 [CmdletBinding()]
 param(
@@ -41,7 +50,10 @@ param(
     [int]$MinFreeGB = 10,
     # Silence the watch (no checks, restarts or notifications) for this many minutes, then exit.
     [int]$PauseMinutes = 0,
-    [switch]$Unpause
+    [switch]$Unpause,
+    # Record the installed scripts, the Stack folder, the LocalAI-* tasks and the listeners as they
+    # are now as the integrity baseline (after changes you made yourself), then exit.
+    [switch]$AcceptBaseline
 )
 $ErrorActionPreference = 'Stop'
 Import-Module (Join-Path (Join-Path $PSScriptRoot 'lib') 'LocalAI.psm1') -Force
@@ -60,6 +72,9 @@ $healAllowed = -not $NoHeal
 # A problem that persists is announced again after this many hours (a single toast is easy to miss:
 # Focus Assist during a game, a busy morning), until it is fixed.
 $remindHours = 24
+# The integrity comparison (hash every installed file, read the tasks and the listeners) runs when
+# the last one is this old: on every 15-minute run it would be the slowest thing the watch does.
+$integrityMinutes = 60
 # Windows' notification switch for PowerShell, as last seen by a toast ('' = no toast tried this run).
 $script:toastSetting = ''
 
@@ -169,6 +184,21 @@ if ($PauseMinutes -gt 0 -or $Unpause) {
     }
     Save-LaiState -State $st -Path $statePath
     Write-WatchLog ('{0} {1}' -f (Get-Date -Format 's'), $msg)
+    Write-LaiLog OK $msg
+    exit 0
+}
+
+# ---- accept the current state as the integrity baseline ---------------------------------------
+if ($AcceptBaseline) {
+    $old = Read-LaiIntegrityBaseline -AIRoot $AIRoot
+    $new = Save-LaiIntegrityBaseline -AIRoot $AIRoot -Reason 'accepted by the owner'
+    if ($old) { foreach ($d in @(Compare-LaiIntegrity -Baseline $old -Current $new)) { Write-LaiLog INFO "accepted: $($d.Text)" } }
+    # The watch starts over with the new baseline: what it found against the old one is settled.
+    $st = Read-LaiState -Path $statePath
+    $st['integrity'] = @{ baseline = [string]$new['id'] }
+    Save-LaiState -State $st -Path $statePath
+    $msg = 'integrity baseline accepted: ' + (Get-LaiIntegritySummary -Baseline $new)
+    Write-WatchLog ('{0} INTEGRITY {1}' -f (Get-Date -Format 's'), $msg)
     Write-LaiLog OK $msg
     exit 0
 }
@@ -402,6 +432,87 @@ if ($ollamaVer -and $recheckKey -and [string]$recheck['ollamaVersion'] -eq $olla
     if (Send-Notification 'Local AI: a preset is off the GPU' $text) { $recheckNotice = $recheckKey }
 }
 
+# ---- integrity: files, tasks and listeners against the baseline -------------------------------
+# The last successful install or update (or the owner, with -AcceptBaseline) recorded what the
+# installed scripts, the Stack folder, the LocalAI-* scheduled tasks and the network listeners looked
+# like. Every $integrityMinutes the PC is compared with that record. Two strikes, as for the checks
+# above: a difference is announced when a second look, on the next run, still finds it, so a file
+# being saved or a port a program opens for a minute raises nothing; each difference is announced
+# once. Not a failed check (nothing is broken): no reminders, no exit code. Announced differences
+# that are still there also go on the Open WebUI banner below, which carries the news when Windows
+# drops the toast. Nothing happens here without a baseline (an install from before this existed
+# gets one from its next Update toolkit).
+# The limit, plainly: the record sits in $AIRoot, which this user can write. This notices accidents,
+# other software and clumsy tampering, not someone who runs as this user and rewrites the record.
+# $null = leave the saved findings as they are.
+$integrityState = $null
+$integrityShown = @()
+try {
+    $ig = @{}; if ($previous['integrity'] -is [hashtable]) { $ig = $previous['integrity'] }
+    $baseline = Read-LaiIntegrityBaseline -AIRoot $AIRoot
+    $knownId = [string]$ig['baseline']
+    if ($baseline -or $knownId) {
+        $baseId = $knownId; if ($baseline) { $baseId = [string]$baseline['id'] }
+        # A new baseline (install, update, -AcceptBaseline): what was found against the old one is settled.
+        if ($baseId -ne $knownId) { $ig = @{} }
+        $told = @($ig['told'] | Where-Object { $_ })
+        $pending = @($ig['pending'] | Where-Object { $_ })
+        $igLast = ConvertTo-WatchDate $ig['checkedAt']
+        # Also due right away for the second look at something seen once, and after the clock was set back.
+        $igDue = (-not $igLast) -or $pending.Count -gt 0 -or [math]::Abs(((Get-Date) - $igLast).TotalMinutes) -ge $integrityMinutes
+        # An installer run or a model update in progress is replacing files right now: next run.
+        if ($igDue -and -not (Test-LaiSetupLockBusy)) {
+            $since = $null
+            if ($baseline) {
+                # The stack's own ports: another program holding one of them is news even on loopback.
+                $igPorts = @($webPort, $searxPort)
+                try { $igPorts += ([uri]$ollamaUrl).Port } catch { $igPorts += 11434 }
+                if ($config.ContainsKey('DeepResearchPort') -and [int]$config['DeepResearchPort'] -gt 0) { $igPorts += [int]$config['DeepResearchPort'] }
+                $diffs = @(Compare-LaiIntegrity -Baseline $baseline -Current (Get-LaiIntegritySnapshot -AIRoot $AIRoot) -WatchedPorts $igPorts)
+                $since = ConvertTo-WatchDate $baseline['recordedAt']
+            } else {
+                # A baseline was there on an earlier run and is not now: that is a change too.
+                $diffs = @([pscustomobject]@{ Key = 'baseline|gone'; Text = 'the baseline itself (' + (Get-LaiIntegrityPath -AIRoot $AIRoot) + ') is gone or cannot be read' })
+            }
+            $keys = @($diffs | ForEach-Object { [string]$_.Key })
+            $wasKeys = @($ig['found'] | Where-Object { $_ -is [hashtable] } | ForEach-Object { [string]$_['Key'] })
+            if (($keys -join "`n") -ne ($wasKeys -join "`n")) {
+                # The whole list goes to the log (a notification has room for three).
+                if ($diffs.Count) { Write-WatchLog ('{0} INTEGRITY {1} difference(s) from the baseline: {2}' -f (Get-Date -Format 's'), $diffs.Count, (Format-LaiIntegrityList -Items @($diffs | ForEach-Object { $_.Text }) -Max 20)) }
+                else { Write-WatchLog ('{0} INTEGRITY matches the baseline again' -f (Get-Date -Format 's')) }
+            }
+            $announce = @($diffs | Where-Object { $pending -contains $_.Key -and $told -notcontains $_.Key })
+            if ($announce.Count) {
+                $list = Format-LaiIntegrityList -Items @($announce | ForEach-Object { $_.Text }) -Max 3
+                $when = ''; if ($since) { $when = ' (' + $since.ToString('yyyy-MM-dd HH:mm') + ')' }
+                $title = 'Local AI: changed outside an update'
+                $text = "Changed since the last install or update${when}: $list. If you did not do this, open Start menu > Local AI - Health check: it lists every change and what to do about it."
+                # An installer run that started after the baseline and never recorded a new one: these
+                # are the changes of an update that is waiting for a restart or failed, and are named so.
+                $unfinished = $null; if ($since) { $unfinished = Get-LaiUnfinishedInstall -AIRoot $AIRoot -Since $since }
+                if ($unfinished) {
+                    $title = 'Local AI: update not finished'
+                    $text = "An install or update started $($unfinished.ToString('yyyy-MM-dd HH:mm')) and has not finished. Different from the last finished one: $list. Start menu > Local AI - Update toolkit finishes it."
+                }
+                # A toast that failed is not counted as told: the difference stays pending and the next run tries again.
+                if (Send-Notification $title $text) { $told = @($told + @($announce | ForEach-Object { [string]$_.Key }) | Select-Object -Last 200) }
+            }
+            $integrityState = @{
+                baseline  = $baseId
+                checkedAt = (Get-Date).ToString('s')
+                told      = $told
+                pending   = @($keys | Where-Object { $told -notcontains $_ })
+                found     = @($diffs | ForEach-Object { @{ Key = [string]$_.Key; Text = [string]$_.Text } })
+            }
+        }
+        $igView = $ig; if ($null -ne $integrityState) { $igView = $integrityState }
+        $integrityShown = @($igView['found'] | Where-Object { $_ -is [hashtable] -and @($igView['told']) -contains [string]$_['Key'] })
+    }
+} catch {
+    # The integrity comparison must never take the health checks down with it.
+    Write-WatchLog ('{0} INTEGRITY not compared: {1}' -f (Get-Date -Format 's'), ($_.Exception.Message -replace '\s+', ' '))
+}
+
 # ---- report ---------------------------------------------------------------------------------
 # Two strikes before a notification: right after sign-in Docker Desktop needs a minute or two, and
 # one failed check would otherwise toast every morning. A failure is reported when it has been seen
@@ -474,7 +585,14 @@ if ($toNotify.Count -gt 0) {
 # The same two strikes as the toast: a problem seen on two runs in a row is also shown at the top of
 # every Open WebUI page (phone included) until it is fixed, so it is seen even when the toast was
 # missed or Windows drops it. Signs in only when the set of problems changes.
-$bannerKeys = (@($failed | Where-Object { $prevFailed -contains $_ } | Sort-Object) -join ', ')
+$failedKeys = (@($failed | Where-Object { $prevFailed -contains $_ } | Sort-Object) -join ', ')
+# Announced integrity differences that are still there share the banner (and change its key, so it is
+# rewritten when they change and removed when they are accepted or undone).
+$bannerKeys = $failedKeys
+if ($integrityShown.Count) {
+    $bannerKeys = 'changed ' + (Get-LaiIntegrityTag -Text (@($integrityShown | ForEach-Object { [string]$_['Key'] }) -join "`n"))
+    if ($failedKeys) { $bannerKeys = $failedKeys + ' | ' + $bannerKeys }
+}
 $prevBanner = ''; if ($previous.ContainsKey('banner')) { $prevBanner = [string]$previous['banner'] }
 $bannerDone = $null
 $credFile = Join-Path (Join-Path $AIRoot 'Secrets') 'openwebui-admin.json'
@@ -484,9 +602,16 @@ if ($bannerKeys -ne $prevBanner -and -not $NoNotify -and $results['Open WebUI'] 
         $webUrl = "http://127.0.0.1:$webPort"
         $tok = Connect-LaiWebUI -BaseUrl $webUrl -Email $cred.email -Password $cred.password
         if ($bannerKeys) {
-            $shownKeys = @($bannerKeys -split ', ')
-            $what = @($shownKeys | ForEach-Object { if ($details.ContainsKey($_)) { '{0} ({1})' -f $_, $details[$_] } else { $_ } }) -join ', '
-            $text = "Health watch ({0}): not working: {1}. {2}" -f (Get-Date -Format 'yyyy-MM-dd HH:mm'), $what, (Get-WatchHint $shownKeys)
+            $parts = @()
+            if ($failedKeys) {
+                $shownKeys = @($failedKeys -split ', ')
+                $what = @($shownKeys | ForEach-Object { if ($details.ContainsKey($_)) { '{0} ({1})' -f $_, $details[$_] } else { $_ } }) -join ', '
+                $parts += ('not working: {0}. {1}' -f $what, (Get-WatchHint $shownKeys))
+            }
+            if ($integrityShown.Count) {
+                $parts += ('changed since the last install or update: {0}. Start menu > Local AI - Health check lists every change and what to do about it.' -f (Format-LaiIntegrityList -Items @($integrityShown | ForEach-Object { [string]$_['Text'] }) -Max 3))
+            }
+            $text = 'Health watch ({0}): {1}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm'), ($parts -join ' Also ')
             Set-LaiWebUIBanner -BaseUrl $webUrl -Token $tok -Text $text | Out-Null
             Write-WatchLog ('{0} BANNER {1}' -f (Get-Date -Format 's'), $text)
         } else {
@@ -510,5 +635,7 @@ if ($script:toastSetting) { if ($script:toastSetting -ne 'Enabled') { $final['to
 if ($null -ne $ollamaNotice) { if ($ollamaNotice) { $final['ollamaNotifiedFor'] = $ollamaNotice } else { $final.Remove('ollamaNotifiedFor') } }
 if ($null -ne $driftSince) { if ($driftSince) { $final['ollamaDriftSince'] = $driftSince } else { $final.Remove('ollamaDriftSince') } }
 if ($recheckNotice) { $final['recheckNotifiedFor'] = $recheckNotice }
+# (A baseline accepted while this run was busy has another id: the next run starts over with it.)
+if ($null -ne $integrityState) { $final['integrity'] = $integrityState }
 Save-LaiState -State $final -Path $statePath
 exit $failed.Count

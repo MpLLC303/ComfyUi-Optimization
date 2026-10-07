@@ -1981,6 +1981,16 @@ if (-not $SkipTests) {
 #region Report ---------------------------------------------------------------------------
 Unregister-ScheduledTask -TaskName $ResumeTask -Confirm:$false -ErrorAction SilentlyContinue
 if ($State.flags.ContainsKey('resumeFailures')) { [void]$State.flags.Remove('resumeFailures'); Save-State }
+# Every stage is done (and the resume task is gone): what this run installed is the new baseline for
+# the health watch's integrity comparison, so an install or update is never reported as a change.
+# Recorded whatever the acceptance tests said (the files and tasks are this run's either way), and a
+# baseline that cannot be written is a warning: it must not fail an install that worked. The file
+# sits in the install folder, which the user can write: it catches accidents, other software and
+# clumsy tampering, not someone who runs as the user and rewrites it.
+try {
+    $integrityBaseline = Save-LaiIntegrityBaseline -AIRoot $AIRoot -Reason 'install'
+    Write-LaiLog OK "Integrity baseline recorded: $(Get-LaiIntegritySummary -Baseline $integrityBaseline). The health watch tells you when they change outside an update (Watch-LocalAI.ps1 -AcceptBaseline accepts changes you made yourself)."
+} catch { Write-LaiLog WARN "The integrity baseline could not be recorded ($($_.Exception.Message)): the health watch may report what this run installed as changed. Watch-LocalAI.ps1 -AcceptBaseline records it." }
 $rows = foreach ($m in ($Catalog.Models | Sort-Object { $_.Order })) {
     $t = $State.tuning[$m.Key]
     '| {0} | `{1}` | {2:N0} | {3}% | {4} |' -f $m.Display, $m.Source, $t['Context'], $t['GpuPercent'], $t['TokensPerSec']

@@ -14,7 +14,8 @@
       upload matching what Ollama reports for the model), no context size set in Open WebUI over
       the tuned aliases, signup off / memories on, RAG + web search settings, a chat per preset, an
       image read by each preset with images (Uncensored Vision), memory recall, document retrieval, web
-      search, backups, and that nothing listens beyond 127.0.0.1.
+      search, backups, the health watch (and what it found changed in the installed scripts, tasks
+      and listeners since the last install or update), and that nothing listens beyond 127.0.0.1.
 
     The functional tests create a temporary memory and a temporary knowledge collection and delete
     both afterwards. Exit code = number of failed checks (0 = V1 complete).
@@ -508,6 +509,25 @@ Add-Check 'Health watch' {
     if ($mins -gt 120) { return (Warn ("last check {0:N1} h ago ({1}); unless the PC was asleep or off since, the LocalAI-Watch task has stopped running - see its History in Task Scheduler, or {2}" -f ($mins / 60), $last.ToString('yyyy-MM-dd HH:mm'), $fix)) }
     if ($ws['toastSetting']) { return (Warn "last check $mins min ago, but Windows has notifications switched off for PowerShell ($($ws['toastSetting'])), so its alerts never pop up: Settings > System > Notifications > Windows PowerShell. Problems that last still show as a banner in Open WebUI") }
     Pass "last check $mins min ago"
+}
+
+Add-Check 'Integrity watch' {
+    # What the health watch found when it last compared the installed scripts, the Stack folder, the
+    # LocalAI-* scheduled tasks and the network listeners with the baseline the last install or update
+    # recorded. Read from the watch's own record: nothing is hashed here, and a difference is a
+    # warning, not a failure (the stack works; something was changed). The baseline sits in a folder
+    # this user can write, so this shows accidents, other software and clumsy tampering, no more.
+    $base = Read-LaiIntegrityBaseline -AIRoot $AIRoot
+    if (-not $base) { return (Skip 'no baseline yet (Start menu > Local AI - Update toolkit records one when it finishes)') }
+    $when = [string]$base['recordedAt']
+    if ($base['recordedAt'] -is [datetime]) { $when = $base['recordedAt'].ToString('yyyy-MM-dd HH:mm') } else { $when = $when.Replace('T', ' ') }
+    $about = "baseline of $when ($(Get-LaiIntegritySummary -Baseline $base))"
+    $ig = (Read-LaiState -Path (Join-Path $AIRoot 'watch-state.json'))['integrity']
+    if (-not ($ig -is [hashtable]) -or [string]$ig['baseline'] -ne [string]$base['id'] -or -not $ig['checkedAt']) { return (Pass "$about; the health watch compares the PC with it on its next run") }
+    $found = @($ig['found'] | Where-Object { $_ -is [hashtable] } | ForEach-Object { [string]$_['Text'] })
+    if ($found.Count -eq 0) { return (Pass "nothing changed since the $about") }
+    $accept = "& $(ConvertTo-LaiPsQuoted (Join-Path (Join-Path $AIRoot 'Scripts') 'Watch-LocalAI.ps1')) -AIRoot $(ConvertTo-LaiPsQuoted $AIRoot) -AcceptBaseline"
+    Warn ("{0} change(s) since the {1}: {2}. If you did not make them: Start menu > Local AI - Update toolkit puts the toolkit's own files and tasks back, and Start menu > Local AI - Security check lists every program that listens. If you did, make them the new baseline by pasting this into PowerShell: {3}" -f $found.Count, $about, (Format-LaiIntegrityList -Items $found -Max 12), $accept)
 }
 
 Add-Check 'Nothing exposed beyond localhost' {
