@@ -230,8 +230,10 @@ function Find-PcsComfyRoot {
     $roots = @()
     foreach ($c in $cands) {
         if (-not $c) { continue }
-        $hasNodes = Test-Path -LiteralPath (Join-Path $c 'custom_nodes')
-        $hasModels = Test-Path -LiteralPath (Join-Path $c 'models')
+        # [IO.Path]::Combine, not Join-Path: Join-Path fails on a drive this system does not have
+        # (the fixed C:\ candidates off Windows).
+        $hasNodes = Test-Path -LiteralPath ([System.IO.Path]::Combine($c, 'custom_nodes'))
+        $hasModels = Test-Path -LiteralPath ([System.IO.Path]::Combine($c, 'models'))
         if (-not ($hasNodes -or $hasModels)) { continue }
         $full = $c
         try { $full = (Resolve-Path -LiteralPath $c -ErrorAction Stop).Path } catch { Write-Verbose "cannot resolve $c" }
