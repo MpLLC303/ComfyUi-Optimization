@@ -1,6 +1,23 @@
 # Runs the local-llm end-to-end harness against real servers on Linux: Ollama 0.35.1 (CPU) with a
-# small Qwen3 stand-in, Open WebUI 0.11.4, SearXNG from the stack's compose file, and Docker.
-# Same suites as tests/README.md describes, rebuilt from scratch on every run.
+# small Qwen3 stand-in, Open WebUI 0.11.4, SearXNG from the stack's compose file, and Docker. Also
+# starts the production stack itself (docker compose, the real images). Same suites as
+# tests/README.md describes, rebuilt from scratch on every run.
+#
+# One job used to run every suite in a row and took about 57 of its 60 minutes. The suites share one
+# Ollama, one Open WebUI and one Docker engine, so they cannot run side by side on one machine; here
+# each job is its own machine with only the services its suites need, and the jobs run in parallel
+# (none should take more than about 30 minutes):
+#   gate         Static checks, runner self-test, render guard behaviour, cross-platform unit tests
+#                (the four suites Invoke-AllTests.ps1 runs without a sandbox)
+#   integration  Integration test, then the health watch test
+#   installer    Installer mock run, then the Open WebUI update / rollback test
+#   models       Model update test, then the uninstall test (Ollama and Docker only)
+#   stack        Production stack from stack/docker-compose.yml with the real images (audit T1)
+#   all-passed   Needs every job above: the one status to require
+# The update / rollback test follows the mock run on purpose: it ends in Test-LocalAI -Quick, which
+# only passes on an Open WebUI the installer (or the integration test) has set up, and Invoke-AllTests
+# runs it in that order. Adding a job? Put it in the needs list of all-passed (that job fails when
+# the list is not the list of jobs in this file).
 name: local-llm (end-to-end on Linux)
 
 on:
@@ -19,9 +36,48 @@ env:
   LAI_SANDBOX: '1'
 
 jobs:
-  linux-e2e:
+  # No sandbox services: none of these four suites touches Ollama, Open WebUI or the containers.
+  gate:
+    name: Static checks and unit tests
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+
+      - name: PSScriptAnalyzer
+        shell: pwsh
+        run: Install-Module PSScriptAnalyzer -Force -Scope CurrentUser
+
+      - name: Static checks
+        shell: pwsh
+        run: |
+          Import-Module PSScriptAnalyzer
+          & ./local-llm/tests/Invoke-StaticChecks.ps1 -PssaPath 'not-used'
+          exit $LASTEXITCODE
+
+      - name: Test runner self-test (missing program, ASSERT FAIL with exit 0, no banner, hang)
+        shell: pwsh
+        run: |
+          & ./local-llm/tests/Invoke-AllTests.ps1 -SelfTest
+          exit $LASTEXITCODE
+
+      - name: Render guard behaviour (fake ComfyUI + fake Ollama)
+        run: python3 local-llm/tests/test_render_guard.py
+
+      - name: Cross-platform unit tests
+        shell: pwsh
+        run: |
+          & ./local-llm/tests/Invoke-WindowsUnitTests.ps1
+          exit $LASTEXITCODE
+
+  integration:
+    name: Integration and health watch tests (real Ollama, Open WebUI, SearXNG)
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v5
 
@@ -89,67 +145,16 @@ jobs:
           for i in $(seq 1 150); do curl -sf localhost:3000/health && break; sleep 4; done
           curl -sf localhost:3000/health || (tail -100 "$RUNNER_TEMP/owui.log"; exit 1)
 
-      - name: PSScriptAnalyzer
-        shell: pwsh
-        run: Install-Module PSScriptAnalyzer -Force -Scope CurrentUser
-
-      - name: Static checks
-        shell: pwsh
-        run: |
-          Import-Module PSScriptAnalyzer
-          & ./local-llm/tests/Invoke-StaticChecks.ps1 -PssaPath 'not-used'
-          exit $LASTEXITCODE
-
-      - name: Test runner self-test (missing program, ASSERT FAIL with exit 0, no banner, hang)
-        shell: pwsh
-        run: |
-          & ./local-llm/tests/Invoke-AllTests.ps1 -SelfTest
-          exit $LASTEXITCODE
-
-      - name: Render guard behaviour (fake ComfyUI + fake Ollama)
-        run: python3 local-llm/tests/test_render_guard.py
-
       - name: Integration test (API layer against the real servers)
         shell: pwsh
         run: |
           & ./local-llm/tests/Invoke-IntegrationTest.ps1
           exit $LASTEXITCODE
 
-      - name: Installer mock run (reboot/resume, migration, trials, re-runs)
-        shell: pwsh
-        run: |
-          & ./local-llm/tests/Invoke-InstallerMockRun.ps1 -Work "$env:RUNNER_TEMP/mockroot"
-          exit $LASTEXITCODE
-
-      - name: Model update test (keep previous version, rollback)
-        shell: pwsh
-        run: |
-          & ./local-llm/tests/Invoke-ModelUpdateTest.ps1
-          exit $LASTEXITCODE
-
-      - name: Open WebUI update / rollback test
-        shell: pwsh
-        run: |
-          docker pull -q alpine:3.19
-          & ./local-llm/tests/Invoke-UpdateWebUITest.ps1
-          exit $LASTEXITCODE
-
-      - name: Uninstall test
-        shell: pwsh
-        run: |
-          & ./local-llm/tests/Invoke-UninstallTest.ps1 -Work "$env:RUNNER_TEMP/uninstall-test"
-          exit $LASTEXITCODE
-
       - name: Health watch test (heal, pause, volume lock)
         shell: pwsh
         run: |
           & ./local-llm/tests/Invoke-WatchTest.ps1 -Work "$env:RUNNER_TEMP/watch-test"
-          exit $LASTEXITCODE
-
-      - name: Cross-platform unit tests
-        shell: pwsh
-        run: |
-          & ./local-llm/tests/Invoke-WindowsUnitTests.ps1
           exit $LASTEXITCODE
 
       - name: Nothing left behind (containers, volumes, helper processes, models, admin password)
@@ -164,3 +169,241 @@ jobs:
           tail -150 "$RUNNER_TEMP/owui.log" || true
           docker logs --tail 80 ollama-test || true
           docker ps -a
+
+  installer:
+    name: Installer mock run and Open WebUI update / rollback test
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Ollama 0.35.1 with the stand-in models
+        run: |
+          docker run -d --name ollama-test -p 127.0.0.1:11434:11434 \
+            -e OLLAMA_FLASH_ATTENTION=1 -e OLLAMA_KV_CACHE_TYPE=q8_0 -e OLLAMA_HOST=0.0.0.0:11434 \
+            ollama/ollama:0.35.1
+          for i in $(seq 1 60); do curl -sf localhost:11434/api/version && break; sleep 2; done
+          docker exec ollama-test ollama pull qwen3:1.7b
+          docker exec ollama-test ollama cp qwen3:1.7b testorg/qwen3-abliterated:1.7b
+          docker exec ollama-test ollama pull nomic-embed-text
+          docker pull -q alpine:3.20
+
+      - name: Local Deep Research image (the optional -DeepResearch service)
+        run: docker pull -q localdeepresearch/local-deep-research:1.10.7
+
+      - name: SearXNG from the stack's compose file
+        working-directory: local-llm/stack
+        env:
+          WEBUI_SECRET_KEY: ci-only
+        run: |
+          docker compose up -d searxng
+          for i in $(seq 1 60); do curl -sf localhost:8888/healthz && break; sleep 2; done
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+          cache: pip
+          cache-dependency-path: .github/workflows/local-llm-linux.yml
+
+      - name: Open WebUI 0.11.4
+        env:
+          # Same settings as stack/docker-compose.yml; ollama embeddings keep the run small.
+          WEBUI_SECRET_KEY: ci-only
+          WEBUI_URL: http://localhost:3000
+          WEBUI_ADMIN_EMAIL: admin@localhost
+          WEBUI_ADMIN_PASSWORD: Test-Password-123
+          WEBUI_ADMIN_NAME: Admin
+          OLLAMA_BASE_URL: http://localhost:11434
+          ENABLE_OPENAI_API: 'false'
+          ENABLE_MEMORIES: 'true'
+          RAG_TEXT_SPLITTER: token
+          ENABLE_MARKDOWN_HEADER_TEXT_SPLITTER: 'true'
+          CHUNK_SIZE: '2000'
+          CHUNK_OVERLAP: '200'
+          RAG_TOP_K: '5'
+          ENABLE_WEB_SEARCH: 'true'
+          WEB_SEARCH_ENGINE: searxng
+          SEARXNG_QUERY_URL: http://localhost:8888/search?q=<query>
+          WEB_SEARCH_RESULT_COUNT: '5'
+          ENABLE_COMMUNITY_SHARING: 'false'
+          ENABLE_VERSION_UPDATE_CHECK: 'false'
+          ANONYMIZED_TELEMETRY: 'false'
+          DO_NOT_TRACK: 'true'
+          SCARF_NO_ANALYTICS: 'true'
+          RAG_EMBEDDING_ENGINE: ollama
+          RAG_EMBEDDING_MODEL: nomic-embed-text:latest
+        run: |
+          python -m venv "$RUNNER_TEMP/owui-venv"
+          "$RUNNER_TEMP/owui-venv/bin/pip" install -q open-webui==0.11.4
+          export DATA_DIR="$RUNNER_TEMP/owui-data"
+          mkdir -p "$DATA_DIR"
+          nohup "$RUNNER_TEMP/owui-venv/bin/open-webui" serve --host 127.0.0.1 --port 3000 > "$RUNNER_TEMP/owui.log" 2>&1 &
+          for i in $(seq 1 150); do curl -sf localhost:3000/health && break; sleep 4; done
+          curl -sf localhost:3000/health || (tail -100 "$RUNNER_TEMP/owui.log"; exit 1)
+
+      - name: Installer mock run (reboot/resume, migration, trials, re-runs)
+        shell: pwsh
+        run: |
+          & ./local-llm/tests/Invoke-InstallerMockRun.ps1 -Work "$env:RUNNER_TEMP/mockroot"
+          exit $LASTEXITCODE
+
+      - name: Open WebUI update / rollback test
+        shell: pwsh
+        run: |
+          docker pull -q alpine:3.19
+          & ./local-llm/tests/Invoke-UpdateWebUITest.ps1
+          exit $LASTEXITCODE
+
+      - name: Nothing left behind (containers, volumes, helper processes, models, admin password)
+        shell: pwsh
+        run: |
+          & ./local-llm/tests/Reset-Sandbox.ps1 -Check
+          exit $LASTEXITCODE
+
+      - name: Logs on failure
+        if: failure()
+        run: |
+          tail -150 "$RUNNER_TEMP/owui.log" || true
+          docker logs --tail 80 ollama-test || true
+          docker ps -a
+
+  # Ollama and Docker only: Update-Models.ps1 never signs in to Open WebUI in its test (the install
+  # root has no admin login) and the uninstall test runs against a fake Ollama and stand-in containers.
+  # The leftover check therefore skips the Open WebUI state and does not count the services this job
+  # does not start (SearXNG, Open WebUI); whatever a suite left behind still counts. -LeftoversOnly
+  # also stops counting an unreachable Ollama, which this job does start and whose test models the
+  # check looks for, so the step requires Ollama itself before the check.
+  models:
+    name: Model update and uninstall tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Ollama 0.35.1 with the stand-in model
+        run: |
+          docker run -d --name ollama-test -p 127.0.0.1:11434:11434 \
+            -e OLLAMA_FLASH_ATTENTION=1 -e OLLAMA_KV_CACHE_TYPE=q8_0 -e OLLAMA_HOST=0.0.0.0:11434 \
+            ollama/ollama:0.35.1
+          for i in $(seq 1 60); do curl -sf localhost:11434/api/version && break; sleep 2; done
+          docker exec ollama-test ollama pull qwen3:1.7b
+          docker exec ollama-test ollama cp qwen3:1.7b testorg/qwen3-abliterated:1.7b
+          docker pull -q alpine:3.20
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+
+      - name: Model update test (keep previous version, rollback)
+        shell: pwsh
+        run: |
+          & ./local-llm/tests/Invoke-ModelUpdateTest.ps1
+          exit $LASTEXITCODE
+
+      - name: Uninstall test
+        shell: pwsh
+        run: |
+          & ./local-llm/tests/Invoke-UninstallTest.ps1 -Work "$env:RUNNER_TEMP/uninstall-test"
+          exit $LASTEXITCODE
+
+      - name: Nothing left behind (containers, volumes, helper processes, models)
+        shell: pwsh
+        run: |
+          # Without this, an Ollama that died during a suite would pass: the check below would print
+          # MISSING and exit 0, and the test models (testorg/update-test*, localai-update-test*) would
+          # never have been looked for.
+          try { Invoke-RestMethod -Uri 'http://127.0.0.1:11434/api/version' -TimeoutSec 10 | Out-Null }
+          catch { Write-Host "Ollama at http://127.0.0.1:11434 is not reachable, so its test models cannot be checked: $($_.Exception.Message)"; exit 1 }
+          & ./local-llm/tests/Reset-Sandbox.ps1 -Check -SkipWebUI -LeftoversOnly
+          exit $LASTEXITCODE
+
+      - name: Logs on failure
+        if: failure()
+        run: |
+          docker logs --tail 80 ollama-test || true
+          docker ps -a
+
+  # The production stack, not the sandbox: its containers have fixed names (open-webui, searxng,
+  # render-guard, deep-research), so it cannot share an engine with the jobs above. Open WebUI and the
+  # render guard run from the images the compose file names; Ollama is the same 0.35.1 stand-in, on
+  # the host network and on all interfaces so the containers reach it as host.docker.internal:11434
+  # (a port published on 127.0.0.1 only is invisible to them on Linux). No models are needed.
+  stack:
+    name: Production stack (docker compose, the real images)
+    runs-on: ubuntu-latest
+    # Expected run time is well under 30 minutes. The smoke step is capped lower than the job so a
+    # stuck pull or start fails that step (and the log step below still runs) instead of the runner
+    # ending the whole job with the container logs unread.
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Free disk space (the Open WebUI, Ollama and research images are large)
+        run: |
+          df -h /
+          sudo rm -rf /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
+
+      - name: Stand-in Ollama 0.35.1 on the host network
+        run: |
+          docker run -d --name ollama-test --network host \
+            -e OLLAMA_FLASH_ATTENTION=1 -e OLLAMA_KV_CACHE_TYPE=q8_0 -e OLLAMA_HOST=0.0.0.0:11434 \
+            ollama/ollama:0.35.1
+          for i in $(seq 1 60); do curl -sf localhost:11434/api/version && break; sleep 2; done
+          curl -sf localhost:11434/api/version
+
+      - name: Stack smoke test (compose up on stack/docker-compose.yml, with deep research)
+        shell: pwsh
+        timeout-minutes: 25
+        run: |
+          & ./local-llm/tests/Invoke-StackSmokeTest.ps1 -DeepResearch
+          exit $LASTEXITCODE
+
+      - name: Nothing left behind (containers, volumes, helper processes, models)
+        shell: pwsh
+        run: |
+          & ./local-llm/tests/Reset-Sandbox.ps1 -Check -SkipWebUI -LeftoversOnly
+          exit $LASTEXITCODE
+
+      - name: Logs on failure
+        if: failure()
+        run: |
+          docker logs --tail 80 ollama-test || true
+          for c in open-webui render-guard searxng deep-research; do
+            echo "=== $c ==="
+            docker logs --tail 80 "$c" || true
+          done
+          docker ps -a
+
+  # Runs even when a job above failed or was skipped (a skipped required check would count as
+  # passed), and fails unless every job in this file succeeded.
+  all-passed:
+    name: local-llm Linux - every job passed
+    if: ${{ always() }}
+    needs: [gate, integration, installer, models, stack]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Every job in this file is waited for, and every one succeeded
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+          SELF: ${{ github.job }}
+        run: |
+          file=.github/workflows/local-llm-linux.yml
+          # Job ids: the keys indented two spaces under the top-level "jobs:".
+          declared=$(awk '/^jobs:/ {in_jobs=1; next} /^[^ #]/ {in_jobs=0} in_jobs && /^  [A-Za-z0-9_-]+:[ ]*$/ {sub(/^  /, ""); sub(/:.*/, ""); print}' "$file" | grep -vxF "$SELF" | sort)
+          waited=$(printf '%s' "$NEEDS" | python3 -c 'import json,sys; print("\n".join(sorted(json.load(sys.stdin))))')
+          echo "jobs in this file:   $(echo $declared)"
+          echo "jobs waited for:     $(echo $waited)"
+          if [ "$declared" != "$waited" ]; then
+            echo "The needs list of $SELF is not the list of jobs in $file."
+            exit 1
+          fi
+          bad=$(printf '%s' "$NEEDS" | python3 -c 'import json,sys; n=json.load(sys.stdin); print(" ".join(k + "=" + v["result"] for k, v in sorted(n.items()) if v["result"] != "success"))')
+          if [ -n "$bad" ]; then
+            echo "Not successful: $bad"
+            exit 1
+          fi
+          echo "Every job succeeded."
