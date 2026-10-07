@@ -23,14 +23,17 @@
     -Step runs one suite file with that check and nothing else (no sandbox reset, no lock, no log
     file): the CI workflows start each of their suite steps through it. The suite's output is shown
     as it comes and its exit code is kept; when that is 0, the exit code is the number of skips the
-    job has not declared. It also runs on Windows PowerShell 5.1 (the Windows job).
+    job has not declared. The step ends when the suite does, also when a helper process the suite
+    left running still holds its output open (the workflow's next step, 'Nothing left behind', is
+    there to name that helper). It also runs on Windows PowerShell 5.1 (the Windows job).
 
 .EXAMPLE
     pwsh tests/Invoke-AllTests.ps1
     pwsh tests/Invoke-AllTests.ps1 -Only Static, Mock
 .EXAMPLE
-    pwsh tests/Invoke-AllTests.ps1 -Step tests/Invoke-WatchTest.ps1 -StepArgs '-Work', '/tmp/watch-test'
-    One suite file with its own arguments, as a CI workflow step runs it.
+    & ./tests/Invoke-AllTests.ps1 -Step ./tests/Invoke-WatchTest.ps1 -StepArgs '-Work', '/tmp/watch-test'
+    One suite file with its own arguments, as a CI workflow step runs it. Typed in a PowerShell
+    session, not started as 'pwsh tests/Invoke-AllTests.ps1 ...': see -StepArgs.
 .EXAMPLE
     pwsh tests/Invoke-AllTests.ps1 -Since origin/main
     Only the suites a change since that git ref can affect: the suites whose test file names a changed
@@ -50,7 +53,10 @@ param(
     [switch]$SelfTest,
     # One suite file, run the way a CI workflow step runs it (see the description).
     [string]$Step = '',
-    # That suite's own arguments, e.g. '-Work', '/tmp/watch-test'.
+    # That suite's own arguments, e.g. '-Work', '/tmp/watch-test'. Only from a PowerShell session
+    # (& ./tests/Invoke-AllTests.ps1 -Step ... -StepArgs '-Work', '/tmp/watch-test'): started as
+    # 'pwsh tests/Invoke-AllTests.ps1 ...' (pwsh -File), a value that begins with '-' is read as a
+    # parameter of this runner, and the run stops before any suite starts.
     [string[]]$StepArgs = @()
 )
 $ErrorActionPreference = 'Stop'
@@ -136,28 +142,93 @@ function Get-SkipProblem {
     return $found
 }
 
+function ConvertTo-StepArg {
+    # One argument for a process command line, the way CommandLineToArgvW and powershell.exe read
+    # it back (.NET on Linux splits ProcessStartInfo.Arguments by the same rules). Quoted only when
+    # it has to be (empty, a space, a quote); backslashes before a quote are then doubled, so a
+    # path with a space and a trailing backslash arrives whole. The rules of ConvertTo-LaiCmdArg
+    # in lib/LocalAI.psm1, which this runner does not load.
+    param([string]$Value)
+    if ($Value -and $Value -notmatch '[\s"]') { return $Value }
+    $sb = New-Object System.Text.StringBuilder
+    [void]$sb.Append('"')
+    $slashes = 0
+    foreach ($ch in $Value.ToCharArray()) {
+        if ($ch -eq [char]'\') { $slashes++; continue }
+        if ($ch -eq [char]'"') { [void]$sb.Append('\', 2 * $slashes + 1); [void]$sb.Append('"') }
+        else { [void]$sb.Append('\', $slashes); [void]$sb.Append($ch) }
+        $slashes = 0
+    }
+    [void]$sb.Append('\', 2 * $slashes)
+    [void]$sb.Append('"')
+    return $sb.ToString()
+}
+
 function Invoke-Step {
     # Runs one suite file the way a CI workflow step does: in a child PowerShell of the edition that
     # runs this script (Windows PowerShell 5.1 on the Windows job), its output shown line by line as
     # it comes (a suite takes up to half an hour, and a job cut off at its time limit must still
     # show how far it got), its exit code kept. Problems = the skips the job has not declared.
-    param([string]$File, [string[]]$Arguments = @(), [string[]]$Declared = @(), [bool]$CI, [switch]$Quiet)
+    # The step ends when the suite's process does, not when its output pipes close. A helper the
+    # suite left running (a lock holder, a fake server) has inherited those pipes, and a pipeline
+    # (& $exe 2>&1 | ...) returns only when their last holder is gone: minutes later, when the
+    # workflow's 'Nothing left behind' step finds nothing left to name, or never. What the suite
+    # wrote is still read to the end: the pipes get -GraceSec after the exit, as in
+    # Invoke-LaiTimedNative. HeldOpen = they were still open after that.
+    param([string]$File, [string[]]$Arguments = @(), [string[]]$Declared = @(), [bool]$CI, [switch]$Quiet, [int]$GraceSec = 5)
     $exe = 'pwsh'
     if ($PSVersionTable.PSEdition -eq 'Desktop') { $exe = 'powershell.exe' }
     $argv = @('-NoProfile', '-File', $File) + @($Arguments | Where-Object { $_ })
     $show = -not $Quiet
-    $out = @(); $code = 127
-    # A child's standard-error lines arrive as error records: they must not stop this script.
-    $prev = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
-    try {
-        $out = @(& $exe @argv 2>&1 | ForEach-Object { $text = "$_"; if ($show) { Write-Host $text }; $text })
-        $code = $LASTEXITCODE
-    } catch {
-        # No such program: without this the previous command's $LASTEXITCODE (0) would stand.
-        $out = @("$exe could not be started: $($_.Exception.Message)")
+    $out = New-Object System.Collections.Generic.List[string]
+    $code = 127; $held = $false
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = $exe
+    # One command-line string, not ArgumentList: Windows PowerShell 5.1 does not have that.
+    $psi.Arguments = (@($argv | ForEach-Object { ConvertTo-StepArg ([string]$_) }) -join ' ')
+    $psi.WorkingDirectory = (Get-Location -PSProvider FileSystem).ProviderPath
+    $psi.UseShellExecute = $false
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    $p = $null
+    try { $p = [System.Diagnostics.Process]::Start($psi) }
+    catch {
+        # No such program: said in the output, and the exit code stays 127 (what a shell gives).
+        $out.Add("$exe could not be started: $($_.Exception.Message)")
         if ($show) { Write-Host $out[0] -ForegroundColor Red }
-    } finally { $ErrorActionPreference = $prev }
-    return [pscustomobject]@{ Code = $code; Problems = @(Get-SkipProblem -Lines $out -Declared $Declared -CI $CI) }
+    }
+    if ($p) {
+        # Both pipes are polled, one pending line each, so that this loop also sees the process end.
+        $readers = @($p.StandardOutput, $p.StandardError)
+        $pending = @($readers[0].ReadLineAsync(), $readers[1].ReadLineAsync())
+        $sinceExit = $null
+        while ($pending[0] -or $pending[1]) {
+            $got = $false
+            for ($i = 0; $i -lt 2; $i++) {
+                # At most 500 lines of one pipe in a row: a helper that floods it after the suite
+                # has ended must not keep this loop from looking at the exit below.
+                for ($n = 0; $n -lt 500 -and $pending[$i] -and $pending[$i].IsCompleted; $n++) {
+                    $line = $null
+                    if ($pending[$i].Status -eq 'RanToCompletion') { $line = $pending[$i].Result }
+                    if ($null -eq $line) { $pending[$i] = $null; break }   # this pipe is closed
+                    $got = $true
+                    $out.Add($line)
+                    if ($show) { Write-Host $line }
+                    $pending[$i] = $readers[$i].ReadLineAsync()
+                }
+            }
+            if ($p.HasExited) {
+                if ($null -eq $sinceExit) { $sinceExit = [System.Diagnostics.Stopwatch]::StartNew() }
+                elseif ($sinceExit.Elapsed.TotalSeconds -ge $GraceSec) { $held = $true; break }
+            }
+            if (-not $got) { Start-Sleep -Milliseconds 50 }
+        }
+        # Both pipes closed while the suite still runs: wait for the suite itself.
+        if (-not $p.HasExited) { $p.WaitForExit() }
+        $code = $p.ExitCode
+        if ($held -and $show) { Write-Host 'The suite has ended, but something it started still holds its output open (a helper process left running?). Not waiting for it: the step ends with the suite.' -ForegroundColor Yellow }
+    }
+    return [pscustomobject]@{ Code = $code; HeldOpen = $held; Problems = @(Get-SkipProblem -Lines ($out.ToArray()) -Declared $Declared -CI $CI) }
 }
 
 $suites = @(
@@ -266,14 +337,33 @@ if ($SelfTest) {
     )
     foreach ($c in $stepCases) {
         $s = Invoke-Step -File (Join-Path $dir 'skip-in-ci.ps1') -Declared $c.Declared -CI ([bool]$c.CI) -Quiet
-        $ok = ($s.Code -eq 0 -and @($s.Problems).Count -eq $c.Want)
+        # Not held open: a suite that left nothing running ends with its pipes, without the wait.
+        $ok = ($s.Code -eq 0 -and @($s.Problems).Count -eq $c.Want -and -not $s.HeldOpen)
         if ($c.Want) { $ok = $ok -and (@($s.Problems) -join ' | ').Contains($skipWhy) }
         if ($ok) { Write-Host ("  ASSERT OK   -Step: {0} -> exit {1}, {2} problem(s)" -f $c.Why, $s.Code, @($s.Problems).Count) -ForegroundColor Green }
-        else { Write-Host ("  ASSERT FAIL -Step: {0} -> exit {1}, {2} problem(s) (wanted exit 0, {3}) {4}" -f $c.Why, $s.Code, @($s.Problems).Count, $c.Want, (@($s.Problems) -join ' | ')) -ForegroundColor Red; $bad++ }
+        else { Write-Host ("  ASSERT FAIL -Step: {0} -> exit {1}, {2} problem(s), output held open: {5} (wanted exit 0, {3}, not held open) {4}" -f $c.Why, $s.Code, @($s.Problems).Count, $c.Want, (@($s.Problems) -join ' | '), $s.HeldOpen) -ForegroundColor Red; $bad++ }
     }
     $s = Invoke-Step -File (Join-Path $dir 'exit-code.ps1') -CI $true -Quiet
     if ($s.Code -eq 3) { Write-Host '  ASSERT OK   -Step: the exit code of the suite is kept -> exit 3' -ForegroundColor Green }
     else { Write-Host "  ASSERT FAIL -Step: the exit code of the suite is kept -> exit $($s.Code) (wanted 3)" -ForegroundColor Red; $bad++ }
+    # A suite that exits 0 and leaves a helper running. The helper is started the way the watch,
+    # model update and uninstall tests start theirs (Start-Process without a redirection), so it
+    # has the suite's output pipes: -Step must end with the suite, not with the helper 300 seconds
+    # later, and must still have read what the suite wrote (its skip line).
+    $leakIdFile = Join-Path $dir 'left-running.pid'
+    $leakFile = Join-Path $dir 'left-running.ps1'
+    Set-Content -LiteralPath $leakFile -Value "`$helper = Start-Process -FilePath 'sleep' -ArgumentList '300' -PassThru; Set-Content -LiteralPath '$leakIdFile' -Value `$helper.Id; $skipBody"
+    $leakWatch = [System.Diagnostics.Stopwatch]::StartNew()
+    $s = Invoke-Step -File $leakFile -CI $true -Quiet
+    $leakWatch.Stop()
+    $leakId = 0
+    if (Test-Path -LiteralPath $leakIdFile) { $leakId = [int](Get-Content -LiteralPath $leakIdFile -Raw).Trim() }
+    # HeldOpen is the proof that the helper did hold the pipes: without it this case tests nothing.
+    # 60 s: a cold pwsh start and the wait after the exit take several seconds on CI, the helper 300.
+    $ok = ($s.Code -eq 0 -and $s.HeldOpen -and $leakWatch.Elapsed.TotalSeconds -lt 60 -and @($s.Problems).Count -eq 1 -and (@($s.Problems) -join ' | ').Contains($skipWhy))
+    if ($ok) { Write-Host ("  ASSERT OK   -Step: a suite that left a helper running, with its output pipes, ends with the suite -> exit {0} after {1} s, {2} problem(s)" -f $s.Code, [int]$leakWatch.Elapsed.TotalSeconds, @($s.Problems).Count) -ForegroundColor Green }
+    else { Write-Host ("  ASSERT FAIL -Step: a suite that left a helper running, with its output pipes, ends with the suite -> exit {0} after {1} s, output held open: {2}, {3} problem(s) (wanted exit 0 within 60 s, held open, 1 problem that names the skip) {4}" -f $s.Code, [int]$leakWatch.Elapsed.TotalSeconds, $s.HeldOpen, @($s.Problems).Count, (@($s.Problems) -join ' | ')) -ForegroundColor Red; $bad++ }
+    if ($leakId) { Stop-Process -Id $leakId -Force -ErrorAction SilentlyContinue }
     Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
     # -Since: the suites picked for a change.
     $cases = @(

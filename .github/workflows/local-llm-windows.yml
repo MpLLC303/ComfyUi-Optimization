@@ -36,22 +36,40 @@ jobs:
 
       # The runner's self-test needs /bin/sh and runs on the Linux job. This is its skip case on
       # Windows PowerShell 5.1, through -Step as the suite steps below use it: a suite that exits 0
-      # but printed a SKIP line fails the step, and passes once the job declares that skip.
+      # but printed a SKIP line fails the step with a line that names the skip, and passes once the
+      # job declares that skip. A suite's own exit code and its arguments come through as they are.
+      # Each run's output is caught (6>&1: the runner prints with Write-Host), shown, and searched.
       - name: A skipped test fails the step (test runner -Step on Windows PowerShell 5.1)
         shell: powershell
         run: |
           $ErrorActionPreference = 'Stop'
           $fake = Join-Path $env:RUNNER_TEMP 'lai-fake-skip.ps1'
           Set-Content -LiteralPath $fake -Value @("Write-Host '  SKIP        fake block runs on another system only'", "Write-Host 'FAKE PASSED'", 'exit 0')
-          Write-Host '--- 1. the skip is not declared: an ASSERT FAIL line that names it is wanted here, and exit 1'
-          & .\local-llm\tests\Invoke-AllTests.ps1 -Step $fake
+          $naming = 'ASSERT FAIL skipped under CI, not declared for this job: fake block runs on another system only'
+          Write-Host '--- 1. the skip is not declared: exit 1, and one ASSERT FAIL line that names the skip'
+          $shown = @(& .\local-llm\tests\Invoke-AllTests.ps1 -Step $fake 6>&1 | ForEach-Object { "$_" })
           $undeclared = $LASTEXITCODE
-          Write-Host '--- 2. the job declares it (second of two lines): no ASSERT FAIL line, and exit 0'
+          $shown | ForEach-Object { Write-Host $_ }
+          $named = @($shown | Where-Object { $_.Trim() -eq $naming }).Count
+          Write-Host '--- 2. the job declares it (second of two lines): exit 0, and no ASSERT FAIL line'
           $env:LAI_DECLARED_SKIPS = "some other block`nfake block runs on another system only"
-          & .\local-llm\tests\Invoke-AllTests.ps1 -Step $fake
+          $shown = @(& .\local-llm\tests\Invoke-AllTests.ps1 -Step $fake 6>&1 | ForEach-Object { "$_" })
           $declared = $LASTEXITCODE
-          Write-Host "--- undeclared skip: exit $undeclared (wanted 1); declared skip: exit $declared (wanted 0)"
-          if ($undeclared -ne 1 -or $declared -ne 0) { exit 1 }
+          $shown | ForEach-Object { Write-Host $_ }
+          $blamed = @($shown | Where-Object { $_ -match 'ASSERT FAIL' }).Count
+          Write-Host '--- 3. a suite in a folder with a space in its name, given an argument with a space, that ends with exit 3: the argument arrives whole, and exit 3'
+          $spaced = Join-Path $env:RUNNER_TEMP 'lai fake suites'
+          New-Item -ItemType Directory -Force -Path $spaced | Out-Null
+          $fakeExit = Join-Path $spaced 'lai-fake-exit.ps1'
+          Set-Content -LiteralPath $fakeExit -Value @('param([string]$Say)', 'Write-Host "said: [$Say]"', 'exit 3')
+          $shown = @(& .\local-llm\tests\Invoke-AllTests.ps1 -Step $fakeExit -StepArgs '-Say', 'two words' 6>&1 | ForEach-Object { "$_" })
+          $kept = $LASTEXITCODE
+          $shown | ForEach-Object { Write-Host $_ }
+          $whole = @($shown | Where-Object { $_ -eq 'said: [two words]' }).Count
+          Write-Host "--- undeclared skip: exit $undeclared (wanted 1), lines that name it: $named (wanted 1)"
+          Write-Host "--- declared skip: exit $declared (wanted 0), ASSERT FAIL lines: $blamed (wanted 0)"
+          Write-Host "--- suite that ends with exit 3: exit $kept (wanted 3), its argument whole: $whole (wanted 1)"
+          if ($undeclared -ne 1 -or $named -ne 1 -or $declared -ne 0 -or $blamed -ne 0 -or $kept -ne 3 -or $whole -ne 1) { exit 1 }
           exit 0
 
       - name: Static checks (5.1 parser, ASCII, PSScriptAnalyzer 5.1 profile, 5.1 pitfall scan)
