@@ -2395,10 +2395,11 @@ function Invoke-LaiModelSetup {
         $sameOllama = $prev -and $prev['OllamaVersion'] -and $prev['OllamaVersion'] -eq $ollamaVer
         # The candidate list counts too (an edited ContextCandidates must take effect); results from
         # before it was recorded still count.
-        # Only the sizes this model may use: adding a larger size for one model must not re-tune
-        # every model capped below it.
-        $candKey = (@($Candidates | Where-Object { [int]$m.MaxContext -le 0 -or $_ -le [int]$m.MaxContext } | Sort-Object -Descending -Unique) -join ',')
-        $sameCandidates = $prev -and (-not $prev['Candidates'] -or [string]$prev['Candidates'] -eq $candKey)
+        # Only the sizes this model may use, on both sides: a size added above a model's cap (and
+        # the full lists recorded before this rule) must not re-tune it.
+        $capList = { param($List) (@($List | ForEach-Object { [int]$_ } | Where-Object { [int]$m.MaxContext -le 0 -or $_ -le [int]$m.MaxContext } | Sort-Object -Descending -Unique) -join ',') }
+        $candKey = & $capList $Candidates
+        $sameCandidates = $prev -and (-not $prev['Candidates'] -or (& $capList @(([string]$prev['Candidates']) -split ',' | Where-Object { $_ })) -eq $candKey)
         $reuse = (-not $Retune) -and $prev -and ($prev['Source'] -eq $m.Source) -and ($prev['Fingerprint'] -eq $Fingerprint) -and
             ($prev['MaxContext'] -eq $m.MaxContext) -and $sameModel -and $sameCandidates -and (Test-LaiOllamaModel -BaseUrl $BaseUrl -Name $m.Alias)
         # A result that was slow or not fully on the GPU when measured is checked again, not trusted forever.
