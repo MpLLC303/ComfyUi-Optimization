@@ -133,14 +133,15 @@ function Send-Notification {
         $appId = '{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\WindowsPowerShell\v1.0\powershell.exe'
         $notifier = [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier($appId)
         # Show() does not fail when Windows has notifications off for PowerShell (or all apps, or by
-        # policy): the toast is dropped silently. Retrying would not help until the switch is turned
-        # back on, so the run goes on as if told; the Open WebUI banner below and the health check
-        # (which reports the switch) carry the news instead.
+        # policy): the toast is dropped silently. It is still shown (should the switch be misread,
+        # nothing is lost), but retrying would not help until the switch is turned back on, so the
+        # run goes on as if told; the Open WebUI banner below and the health check (which reports
+        # the switch) carry the news instead.
         $setting = 'Enabled'
         try { $setting = [string]$notifier.Setting } catch { Write-Verbose "toast setting unknown: $($_.Exception.Message)" }
         $script:toastSetting = $setting
-        if ($setting -ne 'Enabled') { $why = "notifications are off: $setting" }
-        else { $notifier.Show([Windows.UI.Notifications.ToastNotification]::new($xml)); $shown = $true }
+        $notifier.Show([Windows.UI.Notifications.ToastNotification]::new($xml))
+        if ($setting -ne 'Enabled') { $why = "notifications are off: $setting" } else { $shown = $true }
     } catch {
         $why = $_.Exception.Message
         Write-Verbose "toast failed: $why"

@@ -304,8 +304,9 @@ try {
         Invoke-Docker -Arguments @('update', '--restart', 'no', $c.Id) -AllowFail | Out-Null   # keep it down even across a reboot
         Invoke-Docker -Arguments @('stop', '-t', '30', $c.Id) | Out-Null
     }
-    if (@((Invoke-Docker -Arguments @('ps', '-q', '--filter', "volume=$Volume")).Text -split "`n" | Where-Object { $_ }).Count -gt 0) {
-        throw "Something restarted a container on volume '$Volume'; aborting before any change."
+    $back = @((Invoke-Docker -Arguments @('ps', '--filter', "volume=$Volume", '--format', '{{.Names}} ({{.Image}}, {{.Status}})')).Text -split "`n" | Where-Object { $_.Trim() })
+    if ($back.Count -gt 0) {
+        throw "Something restarted a container on volume '$Volume' ($($back -join '; ')); aborting before any change."
     }
     $volumeTouched = $true
     Invoke-Swap $staged

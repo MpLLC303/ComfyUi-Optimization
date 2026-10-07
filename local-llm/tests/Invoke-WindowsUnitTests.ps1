@@ -350,7 +350,11 @@ $r = Invoke-Child 'Watch-LocalAI.ps1' @('-AIRoot', $aiRoot, '-NoHeal', '-MinFree
 $r2 = Invoke-Child 'Watch-LocalAI.ps1' @('-AIRoot', $aiRoot, '-NoHeal', '-MinFreeGB', '1')
 Assert-That ($r.Code -gt 0 -and $r.Text -notmatch 'Exception') "watch with nothing installed reports failures without throwing (exit $($r.Code))"
 $log = Get-Content -LiteralPath (Join-Path (Join-Path $aiRoot 'Logs') 'watch.log')
-Assert-That (@($log | Where-Object { $_ -like '*NOTIFY Local AI: problem detected*' }).Count -eq 1) 'second failing run sends exactly one notification (toast code ran)'
+# A CI runner may have notifications off for PowerShell: then the line says so ('toast not shown, ...').
+$toastLines = @($log | Where-Object { $_ -like '*NOTIFY*Local AI: problem detected*' })
+Assert-That ($toastLines.Count -eq 1 -and $toastLines[0] -notlike '*toast failed*') "second failing run sends exactly one notification (toast code ran: $($toastLines -join ' | '))"
+$wsToast = [string](Read-LaiState -Path (Join-Path $aiRoot 'watch-state.json'))['toastSetting']
+Assert-That (($wsToast -eq '') -eq ($toastLines[0] -notlike '*toast not shown*')) "Windows' notification switch is recorded exactly when the toast was dropped ('$wsToast')"
 Assert-That ($r2.Text -notmatch 'Exception') 'notification path does not throw'
 
 $r = Invoke-Child 'Uninstall-LocalAI.ps1' @('-AIRoot', $aiRoot, '-WhatIf')
