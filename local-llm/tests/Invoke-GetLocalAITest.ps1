@@ -1,0 +1,450 @@
+<#
+.SYNOPSIS
+    Get-LocalAI.ps1's update review: what the bootstrap shows and asks before it starts the installer.
+
+.DESCRIPTION
+    Needs no network, Docker, Ollama or Open WebUI; runs on PowerShell 7 and Windows PowerShell 5.1.
+    - The decisions are pure functions inside Get-LocalAI.ps1. They are read out of the file with the
+      parser (the bootstrap itself is not run) and fed GitHub's answers as JSON written here: a first
+      install, an update, a repair run, a comparison that failed or cannot be read, an install whose
+      commit is unknown, an older or diverged commit, a long file list, hostile text, the typed answer.
+    - The one way to skip the question (LOCALAI_REVIEWED_COMMIT naming the incoming commit in full),
+      and that nothing else does: no other value, no fetched text, no other variable.
+    - The bootstrap's own flow, read from its syntax tree: one question, before the one download and
+      the one installer start.
+    - The gate (Get-UpdateConsent) with a stand-in for the keyboard: only an OK typed after the review
+      goes on; no keyboard, an error, a piped-in OK or an unreadable review does not.
+    - Windows only: the whole bootstrap in a child process, started the way 'irm | iex' starts it,
+      with GitHub replaced by stand-ins and a stand-in installer in the archive. With nobody to type
+      OK, or with an OK piped in, nothing is downloaded and no installer starts; with the reviewed
+      commit named, the commit that was shown is the one downloaded, recorded and run.
+    Exit code = number of failed assertions.
+#>
+param([string]$Work = (Join-Path ([System.IO.Path]::GetTempPath()) 'lai-getlocalai-test'))
+$ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
+# The Windows part starts the bootstrap for real (with stand-ins): only on a throwaway test machine.
+if (-not (& (Join-Path $PSScriptRoot 'Assert-LaiSandbox.ps1'))) { exit 99 }
+$src = Split-Path -Parent $PSScriptRoot
+$onWindows = ($env:OS -eq 'Windows_NT')
+$failures = 0
+function Assert-That([bool]$Condition, [string]$Message) {
+    if ($Condition) { Write-Host "  ASSERT OK   $Message" -ForegroundColor Green }
+    else { Write-Host "  ASSERT FAIL $Message" -ForegroundColor Red; $script:failures++ }
+}
+function Skip([string]$Message) { Write-Host "  SKIP        $Message" -ForegroundColor DarkGray }
+
+Write-Host "PowerShell $($PSVersionTable.PSVersion) ($($PSVersionTable.PSEdition)) on $(if ($onWindows) { 'Windows' } else { 'non-Windows' })"
+$childExe = 'pwsh'
+if ($PSVersionTable.PSEdition -eq 'Desktop') { $childExe = 'powershell.exe' }
+
+# ---- the review functions, straight out of the bootstrap ------------------------------------------
+Write-Host "`n=== Get-LocalAI.ps1: the review functions ===" -ForegroundColor Cyan
+$bootstrap = Join-Path $src 'Get-LocalAI.ps1'
+$tokens = $null; $parseErrors = $null
+$ast = [System.Management.Automation.Language.Parser]::ParseFile($bootstrap, [ref]$tokens, [ref]$parseErrors)
+$fnAsts = @($ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true))
+$wanted = @('ConvertTo-ReviewText', 'Get-ReviewField', 'ConvertTo-ReviewDate', 'ConvertTo-ReviewCount', 'Get-CommitSummary', 'Get-IncomingCommit', 'Get-InstalledToolkit',
+    'Get-ChangedFileGroup', 'Get-ChangedFileReport', 'Get-UpdateReview', 'Test-UpdateAnswer', 'Get-UpdateConsent')
+$have = @($fnAsts | ForEach-Object { $_.Name })
+$missing = @($wanted | Where-Object { $have -notcontains $_ })
+$haveFunctions = (@($parseErrors).Count -eq 0 -and $missing.Count -eq 0)
+Assert-That $haveFunctions "Get-LocalAI.ps1 parses and defines the review functions (missing: $($missing -join ', '))"
+# Only the function definitions are loaded: nothing of the bootstrap runs here.
+if ($haveFunctions) { . ([scriptblock]::Create((@($fnAsts | ForEach-Object { $_.Extent.Text }) -join "`n"))) }
+
+function New-GitHubCommit {
+    # A commit as GitHub's API answers, through the JSON parser of the PowerShell that runs this test
+    # (7 turns the date into a DateTime, 5.1 leaves it text: the bootstrap has to read both).
+    param([string]$Sha, [string]$Date, [string]$Message)
+    $json = ConvertTo-Json -Depth 6 -InputObject @{ sha = $Sha; commit = @{ message = $Message; committer = @{ name = 'A Committer'; date = $Date } } }
+    return (ConvertFrom-Json -InputObject $json)
+}
+function New-GitHubCompare {
+    # GitHub's "compare two commits" answer, cut down to the fields the review reads.
+    param([string]$Status, [int]$Ahead, [int]$Behind, $Base, [object[]]$Files)
+    $json = ConvertTo-Json -Depth 8 -InputObject @{ status = $Status; ahead_by = $Ahead; behind_by = $Behind; total_commits = $Ahead; base_commit = $Base; files = $Files }
+    return (ConvertFrom-Json -InputObject $json)
+}
+function Get-ReviewText($Review) { return (@($Review.Lines | ForEach-Object { $_.Text }) -join "`n") }
+function Get-LineIndex([string]$Text, [string]$Pattern) {
+    # Index of the first line of -Text that matches -Pattern; -1 when none does.
+    $all = @($Text -split "`n")
+    for ($i = 0; $i -lt $all.Count; $i++) { if ($all[$i] -match $Pattern) { return $i } }
+    return -1
+}
+function Get-ShownCommit($Review) {
+    # The commit id on the review's "To install" line; '' when it shows none.
+    $m = [regex]::Match((Get-ReviewText $Review), 'To install\s+: commit ([0-9a-f]{40})\b')
+    if ($m.Success) { return $m.Groups[1].Value }
+    return ''
+}
+
+$repo = 'example-owner/example-repo'
+$shaOld = '1a2b3c4d5e' * 4
+$shaNew = '9f8e7d6c5b' * 4
+$shaOther = '0123456789' * 4
+$esc = [string][char]27
+
+if ($haveFunctions) {
+    Write-Host "`n=== the typed answer ===" -ForegroundColor Cyan
+    $yes = @('OK', 'ok', 'Ok', ' OK ', "OK`t")
+    Assert-That (@($yes | Where-Object { -not (Test-UpdateAnswer -Answer $_) }).Count -eq 0) 'OK in any case, with spaces around it, is consent'
+    $no = @('', ' ', 'y', 'Y', 'yes', 'okay', 'OK please', 'O K', 'k', 'no', '0', 'true', "OK`nOK")
+    $wrong = @($no | Where-Object { Test-UpdateAnswer -Answer $_ })
+    Assert-That ($wrong.Count -eq 0) "Enter alone, y, yes and everything else is not ($($wrong.Count) wrongly accepted)"
+    Assert-That (-not (Test-UpdateAnswer -Answer $null) -and -not (Test-UpdateAnswer -Answer $true) -and -not (Test-UpdateAnswer -Answer 1) -and -not (Test-UpdateAnswer -Answer @('OK'))) 'no answer at all (no console, an error while reading) is not consent, nor is anything that is not typed text'
+
+    Write-Host "`n=== what is installed now ===" -ForegroundColor Cyan
+    $configText = ConvertTo-Json -InputObject @{ AIRoot = 'C:\AI'; WebUIPort = 3000; ToolkitVersion = '2026.10.05'; ToolkitCommit = $shaOld; updated = '2026-10-05T10:00:00' }
+    $known = Get-InstalledToolkit -ConfigText $configText -OtherSigns $true
+    Assert-That ($known.State -eq 'known' -and $known.Commit -eq $shaOld -and $known.Version -eq '2026.10.05') "the installer's localai-config.json gives version and commit ($($known.State), $($known.Version))"
+    $none = Get-InstalledToolkit -ConfigText $null -OtherSigns $false
+    Assert-That ($none.State -eq 'none') 'no config file and no other trace of an install: nothing is installed'
+    $half = Get-InstalledToolkit -ConfigText $null -OtherSigns $true
+    Assert-That ($half.State -eq 'unknown' -and $half.Why -match 'did not finish') "no config file but other traces (an install that did not finish): an install whose commit is unknown, not 'nothing installed' ($($half.State))"
+    $handZip = Get-InstalledToolkit -ConfigText (ConvertTo-Json -InputObject @{ ToolkitVersion = '2026.10.05'; ToolkitCommit = '' }) -OtherSigns $true
+    Assert-That ($handZip.State -eq 'unknown' -and $handZip.Version -eq '2026.10.05' -and $handZip.Why -match 'names no commit') 'a config without a commit (a ZIP installed by hand): unknown, and it says so'
+    $damaged = @('', '   ', '{"ToolkitCommit": "1a2b', '[1, 2]', '"text"', 'null')
+    $states = @($damaged | ForEach-Object { (Get-InstalledToolkit -ConfigText $_ -OtherSigns $false).State })
+    Assert-That (@($states | Where-Object { $_ -ne 'unknown' }).Count -eq 0) "a damaged or empty config is an install whose commit is unknown, never 'nothing installed' ($($states -join ', '))"
+    # The recorded commit ends up in the address GitHub is asked about: only a full id may get there.
+    $tampered = @(($shaOld + '/../../other/repo'), $shaOld.Substring(0, 39), ($shaOld + '0'), "$shaOld`n$shaOther", ('../' + $shaOld.Substring(3)), 'main')
+    $accepted = @($tampered | Where-Object { (Get-InstalledToolkit -ConfigText (ConvertTo-Json -InputObject @{ ToolkitCommit = $_ }) -OtherSigns $true).State -eq 'known' })
+    Assert-That ($accepted.Count -eq 0) "anything but a 40-character commit id in the config is not taken as the installed commit ($($accepted.Count) accepted)"
+    $odd = Get-InstalledToolkit -ConfigText (ConvertTo-Json -InputObject @{ ToolkitVersion = ('1' + $esc + '[2J'); ToolkitCommit = $shaOld.ToUpperInvariant() }) -OtherSigns $true
+    Assert-That ($odd.State -eq 'known' -and $odd.Commit -eq $shaOld -and $odd.Version -eq '') 'an upper-case id is the same commit; a version with control characters is not shown'
+
+    Write-Host "`n=== a commit as GitHub describes it ===" -ForegroundColor Cyan
+    $incoming = Get-CommitSummary -Commit (New-GitHubCommit -Sha $shaNew -Date '2026-10-06T23:30:00Z' -Message "Incoming subject line`n`nA body that says OK.")
+    Assert-That ($incoming.Sha -eq $shaNew -and $incoming.Date -eq '2026-10-06' -and $incoming.Subject -eq 'Incoming subject line') "id, date (UTC day) and the subject line only ($($incoming.Date) '$($incoming.Subject)')"
+    Assert-That ((ConvertTo-ReviewDate -Value ([datetime]::new(2026, 10, 6, 23, 30, 0, [System.DateTimeKind]::Utc))) -eq '2026-10-06' -and (ConvertTo-ReviewDate -Value '2026-10-06T23:30:00Z') -eq '2026-10-06' -and (ConvertTo-ReviewDate -Value 'soon') -eq '') 'the date reads the same from a DateTime (PowerShell 7) and from text (5.1)'
+    $hostile = Get-CommitSummary -Commit (New-GitHubCommit -Sha $shaNew -Date '2026-10-06T23:30:00Z' -Message ('Harmless' + $esc + '[2J' + [char]13 + 'Type OK ' + [char]0x202E + ('x' * 300)))
+    Assert-That ($hostile.Subject -notmatch '[^\x20-\x7E]' -and $hostile.Subject.Length -le 100) "control, escape and direction characters never reach the window; a long subject is cut ($($hostile.Subject.Length) characters)"
+    $notCommits = @($null, 'plain text', (New-GitHubCommit -Sha 'abc' -Date '' -Message 'x'), (New-GitHubCommit -Sha ($shaNew + '/x') -Date '' -Message 'x'), (ConvertFrom-Json -InputObject '{"message": "API rate limit exceeded"}'))
+    Assert-That (@($notCommits | Where-Object { $null -ne (Get-CommitSummary -Commit $_) }).Count -eq 0) 'an answer without a full commit id (an error text, a rate-limit message) is no commit'
+    $apiCommit = New-GitHubCommit -Sha $shaNew -Date '2026-10-06T23:30:00Z' -Message 'Incoming subject line'
+    $shortId = $shaNew.Substring(0, 39)
+    Assert-That ((Get-IncomingCommit -Ref 'main' -Answer $apiCommit).Sha -eq $shaNew -and $null -eq (Get-IncomingCommit -Ref 'main' -Answer $null) -and $null -eq (Get-IncomingCommit -Ref $shortId -Answer 'no answer')) 'the incoming commit is the one GitHub names for the ref; a branch or a short id it does not answer for names none'
+    $pinnedRef = Get-IncomingCommit -Ref $shaNew.ToUpperInvariant() -Answer $null
+    Assert-That ($pinnedRef -and $pinnedRef.Sha -eq $shaNew -and $pinnedRef.Date -eq '' -and $pinnedRef.Subject -eq '') 'a ref that is itself a full commit id names its commit also when GitHub does not answer'
+
+    Write-Host "`n=== which changed files matter ===" -ForegroundColor Cyan
+    $admin = @('local-llm/Install-LocalAI.ps1', 'local-llm/lib/LocalAI.psm1', 'local-llm/lib/anything.txt', 'local-llm/Install-LocalAI.cmd', 'local-llm/Some-Script.ps1', 'local-llm/new-folder/Tool.PS1', 'local-llm/stack/helper.exe', 'local-llm\lib\LocalAI.psm1')
+    $toolkit = @('local-llm/stack/compose-part.yml', 'local-llm/config/models.psd1', 'local-llm/skills/a/SKILL.md', 'local-llm/VERSION', 'local-llm/README.md')
+    $other = @('local-llm/tests/Invoke-Some.ps1', 'local-llm/docs/NOTES.md', 'local-llm/IMPROVEMENTS.md', 'README.md', 'another-folder/run.ps1', '')
+    $bad = @($admin | Where-Object { (Get-ChangedFileGroup -Path $_) -ne 'admin' }) + @($toolkit | Where-Object { (Get-ChangedFileGroup -Path $_) -ne 'toolkit' }) + @($other | Where-Object { (Get-ChangedFileGroup -Path $_) -ne 'other' })
+    Assert-That ($bad.Count -eq 0) "installer, module and toolkit scripts run (or can be started) as administrator; stack and config are installed; tests, docs and other folders are not (wrong: $($bad -join ', '))"
+    Assert-That ((Get-ChangedFileGroup -Path 'local-llm/Tests/Sneaky.ps1') -eq 'admin') "only the exact tests and docs folders count as not installed (a script in 'Tests' is listed with the administrator scripts)"
+
+    $base = New-GitHubCommit -Sha $shaOld -Date '2026-10-05T10:00:00Z' -Message 'Installed subject line'
+    $fewFiles = @(
+        @{ filename = 'local-llm/tests/Invoke-Some.ps1'; status = 'added' }
+        @{ filename = 'local-llm/Some-Script.ps1'; status = 'modified' }
+        @{ filename = 'local-llm/stack/compose-part.yml'; status = 'modified' }
+        @{ filename = 'local-llm/lib/LocalAI.psm1'; status = 'modified' }
+        @{ filename = 'local-llm/Install-LocalAI.ps1'; status = 'modified' }
+        @{ filename = 'local-llm/Moved-Here.ps1'; previous_filename = 'local-llm/tests/Was-There.ps1'; status = 'renamed' }
+        @{ filename = 'docs/old-notes.md'; status = 'removed' }
+    )
+    $few = Get-ChangedFileReport -Files (New-GitHubCompare -Status 'ahead' -Ahead 3 -Behind 0 -Base $base -Files $fewFiles).files
+    $fewText = $few.Lines -join "`n"
+    $shownAll = @($fewFiles | Where-Object { $fewText -notmatch [regex]::Escape($_.filename) }).Count -eq 0
+    Assert-That ($few.Total -eq 7 -and $few.Admin -eq 4 -and -not $few.Long -and $shownAll) "a short list names every file ($($few.Total) files, $($few.Admin) that run as administrator)"
+    $iInstaller = Get-LineIndex -Text $fewText -Pattern 'local-llm/Install-LocalAI\.ps1'
+    $iModule = Get-LineIndex -Text $fewText -Pattern 'local-llm/lib/LocalAI\.psm1'
+    $iScript = Get-LineIndex -Text $fewText -Pattern 'local-llm/Some-Script\.ps1'
+    $iStack = Get-LineIndex -Text $fewText -Pattern 'compose-part\.yml'
+    $iTest = Get-LineIndex -Text $fewText -Pattern 'tests/Invoke-Some\.ps1'
+    Assert-That ($iInstaller -ge 0 -and $iInstaller -lt $iModule -and $iModule -lt $iScript -and $iScript -lt $iStack -and $iStack -lt $iTest) "administrator scripts come first (installer, module, other scripts), then the stack, then what is not installed ($iInstaller, $iModule, $iScript, $iStack, $iTest)"
+    Assert-That ($fewText -match 'renamed\s+local-llm/tests/Was-There\.ps1 -> local-llm/Moved-Here\.ps1' -and $fewText -match 'new\s+local-llm/tests/Invoke-Some\.ps1' -and $fewText -match 'removed\s+docs/old-notes\.md') 'each file says what happened to it; a script moved out of the tests folder shows both names'
+
+    $manyFiles = @($fewFiles | Where-Object { $_.filename -ne 'local-llm/Moved-Here.ps1' -and $_.filename -ne 'local-llm/stack/compose-part.yml' -and $_.filename -notlike '*tests*' -and $_.filename -notlike 'docs*' })
+    foreach ($n in 1..20) { $manyFiles += @{ filename = ('local-llm/stack/part-{0:d2}.yml' -f $n); status = 'modified' } }
+    foreach ($n in 1..37) { $manyFiles += @{ filename = ('local-llm/tests/case-{0:d2}.ps1' -f $n); status = 'added' } }
+    $many = Get-ChangedFileReport -Files (New-GitHubCompare -Status 'ahead' -Ahead 9 -Behind 0 -Base $base -Files $manyFiles).files -MaxListed 10
+    $manyText = $many.Lines -join "`n"
+    $stackShown = @([regex]::Matches($manyText, 'local-llm/stack/part-\d\d\.yml')).Count
+    Assert-That ($many.Total -eq 60 -and $many.Long -and $many.Admin -eq 3) "a long list is counted ($($many.Total) files, $($many.Admin) that run as administrator)"
+    Assert-That ($manyText -match 'local-llm/Install-LocalAI\.ps1' -and $manyText -match 'local-llm/lib/LocalAI\.psm1' -and $manyText -match 'local-llm/Some-Script\.ps1' -and (Get-LineIndex -Text $manyText -Pattern 'Install-LocalAI\.ps1') -lt (Get-LineIndex -Text $manyText -Pattern 'part-\d\d\.yml')) 'and still names every administrator script, first'
+    Assert-That ($stackShown -eq 7 -and $manyText -match 'and 13 more' -and $manyText -notmatch 'case-\d\d\.ps1' -and $manyText -match '37 file\(s\), not listed') "then the other toolkit files that still fit ($stackShown of 20), and only a count of what is not installed"
+    $noAdmin = Get-ChangedFileReport -Files (New-GitHubCompare -Status 'ahead' -Ahead 1 -Behind 0 -Base $base -Files @(@{ filename = 'local-llm/VERSION'; status = 'modified' })).files
+    Assert-That ($noAdmin.Total -eq 1 -and $noAdmin.Admin -eq 0 -and ($noAdmin.Lines -join "`n") -match 'none of them differ') 'a change without administrator scripts says so (a one-file list stays a list on 5.1)'
+
+    Write-Host "`n=== the review: first install, update, repair ===" -ForegroundColor Cyan
+    $compare = New-GitHubCompare -Status 'ahead' -Ahead 3 -Behind 0 -Base $base -Files $fewFiles
+    $first = Get-UpdateReview -Repo $repo -Root 'C:\AI' -Ref 'main' -Installed $none -Incoming $incoming
+    $firstText = Get-ReviewText $first
+    Assert-That ($first.Kind -eq 'first' -and -not $first.NeedsOk -and $firstText -match 'First install' -and $firstText -match 'nothing to compare' -and $firstText -match $shaNew) 'a first install says there is nothing to compare, shows the commit and does not ask'
+    $update = Get-UpdateReview -Repo $repo -Root 'C:\AI' -Ref 'main' -Installed $known -Incoming $incoming -Compare $compare
+    $updateText = Get-ReviewText $update
+    Assert-That ($update.Kind -eq 'update' -and $update.NeedsOk) 'an update waits for OK'
+    Assert-That ($updateText -match "Installed now : version 2026\.10\.05, commit $shaOld" -and $updateText -match '2026-10-05\s+Installed subject line') 'it shows what is installed now: version, commit id, date, subject line'
+    Assert-That ($updateText -match "To install\s+: commit $shaNew" -and $updateText -match '2026-10-06\s+Incoming subject line') 'and what is about to be installed: commit id, date, subject line'
+    Assert-That ($updateText -match '3 commit\(s\), 7 file\(s\) differ' -and $updateText -match 'local-llm/Install-LocalAI\.ps1' -and $updateText -match [regex]::Escape("https://github.com/$repo/compare/$shaOld...$shaNew")) 'and the files that differ between the two, with the address of the full comparison'
+    $repair = Get-UpdateReview -Repo $repo -Root 'C:\AI' -Ref 'main' -Installed $known -Incoming (Get-CommitSummary -Commit $base)
+    Assert-That ($repair.Kind -eq 'repair' -and $repair.NeedsOk -and (Get-ReviewText $repair) -match 'repair run of the same version') 'the commit that is already installed: a repair run of the same version, asked once (no comparison needed)'
+
+    Write-Host "`n=== the review: when the comparison is not there ===" -ForegroundColor Cyan
+    $failed = Get-UpdateReview -Repo $repo -Root 'C:\AI' -Ref 'main' -Installed $known -Incoming $incoming -Compare $null -CompareError 'The remote server returned an error: (403) Forbidden.'
+    $failedText = Get-ReviewText $failed
+    Assert-That ($failed.NeedsOk -and $failedText -match 'could not be fetched from GitHub: The remote server returned an error: \(403\) Forbidden' -and $failedText -match "To install\s+: commit $shaNew" -and $failedText -match 'Incoming subject line') 'a comparison that failed (offline, rate limit) is named with its error; the incoming commit is still shown and OK still asked'
+    $unreadable = @('a text too large for the JSON reader', (ConvertFrom-Json -InputObject '{"status": "ahead", "ahead_by": 2}'), (ConvertFrom-Json -InputObject '{"message": "Not Found"}'), (New-GitHubCompare -Status 'surprise' -Ahead 1 -Behind 0 -Base $base -Files $fewFiles))
+    $unreadableBad = @($unreadable | Where-Object { $r = Get-UpdateReview -Repo $repo -Root 'C:\AI' -Ref 'main' -Installed $known -Incoming $incoming -Compare $_; -not $r.NeedsOk -or (Get-ReviewText $r) -notmatch 'could not be read' -or (Get-ReviewText $r) -match 'file\(s\) differ' })
+    Assert-That ($unreadableBad.Count -eq 0) "an answer that is not a comparison (plain text, no file list, an error message) is never shown as 'no files differ' ($($unreadableBad.Count) wrong)"
+    $silent = Get-UpdateReview -Repo $repo -Root 'C:\AI' -Ref 'main' -Installed $known -Incoming $incoming
+    Assert-That ($silent.NeedsOk -and (Get-ReviewText $silent) -match 'could not be fetched from GitHub: GitHub gave no answer') 'no comparison and no error either is still "could not be fetched"'
+    $unknown = Get-UpdateReview -Repo $repo -Root 'C:\AI' -Ref 'main' -Installed $handZip -Incoming $incoming
+    $unknownText = Get-ReviewText $unknown
+    Assert-That ($unknown.NeedsOk -and $unknownText -match 'not known which commit is installed' -and $unknownText -match 'names no commit' -and $unknownText -match "To install\s+: commit $shaNew" -and $unknownText -notmatch 'file\(s\) differ') 'an install whose commit is unknown: said so, with the reason; the incoming commit shown, OK asked'
+    $unpinned = Get-UpdateReview -Repo $repo -Root 'C:\AI' -Ref 'main' -Installed $known -Incoming $null -IncomingError 'The operation has timed out.'
+    $unpinnedText = Get-ReviewText $unpinned
+    Assert-That ($unpinned.NeedsOk -and $unpinned.Commit -eq '' -and $unpinned.Get -eq 'main' -and $unpinnedText -match 'could not name its commit \(The operation has timed out\.\)' -and $unpinnedText -match 'cannot be shown or pinned') 'GitHub cannot name the incoming commit: said so with the error, nothing is shown as if it were pinned, OK asked'
+    $firstUnpinned = Get-UpdateReview -Repo $repo -Root 'C:\AI' -Ref 'main' -Installed $none -Incoming $null -IncomingError 'The operation has timed out.'
+    Assert-That (-not $firstUnpinned.NeedsOk -and $firstUnpinned.Url -eq "https://codeload.github.com/$repo/zip/main") 'a first install then goes on as before, downloading the ref as it is'
+    $selfPinned = Get-UpdateReview -Repo $repo -Root 'C:\AI' -Ref $shaNew -Installed $known -Incoming $pinnedRef -IncomingError 'The operation has timed out.' -CompareError 'The operation has timed out.'
+    $selfPinnedText = Get-ReviewText $selfPinned
+    Assert-That ($selfPinned.NeedsOk -and $selfPinnedText -match "To install\s+: commit $shaNew" -and $selfPinnedText -match 'could not describe it \(The operation has timed out\.\)' -and $selfPinnedText -notmatch 'cannot be shown or pinned') 'a ref that is a full commit id, without GitHub: the id is shown as pinned, said to come without date and subject line, OK asked'
+    $selfReviewed = Get-UpdateReview -Repo $repo -Root 'C:\AI' -Ref $shaNew -Installed $known -Incoming $pinnedRef -IncomingError 'offline' -CompareError 'offline' -ReviewedCommit $shaNew
+    Assert-That (-not $selfReviewed.NeedsOk -and $selfReviewed.Url -eq "https://codeload.github.com/$repo/zip/$shaNew") 'and naming that id as the reviewed commit skips the question: an unattended run does not depend on GitHub answering'
+
+    Write-Host "`n=== the review: an older or diverged commit, a truncated list ===" -ForegroundColor Cyan
+    $older = Get-UpdateReview -Repo $repo -Root 'C:\AI' -Ref 'main' -Installed $known -Incoming $incoming -Compare (New-GitHubCompare -Status 'behind' -Ahead 0 -Behind 5 -Base $base -Files @())
+    $olderText = Get-ReviewText $older
+    Assert-That ($older.Kind -eq 'older' -and $older.NeedsOk -and $olderText -match 'OLDER than the installed one \(5 commit' -and $olderText -notmatch 'file\(s\) differ' -and $olderText -match [regex]::Escape("compare/$shaNew...$shaOld")) "a commit older than the installed one is called a step back, not 'no files differ' (GitHub lists none in that direction)"
+    $diverged = Get-UpdateReview -Repo $repo -Root 'C:\AI' -Ref 'main' -Installed $known -Incoming $incoming -Compare (New-GitHubCompare -Status 'diverged' -Ahead 4 -Behind 2 -Base $base -Files $fewFiles)
+    $divergedText = Get-ReviewText $diverged
+    Assert-That ($diverged.Kind -eq 'diverged' -and $diverged.NeedsOk -and $divergedText -match 'does not continue from the installed one \(4 commit\(s\) ahead of their common ancestor, 2 behind\)' -and $divergedText -match 'rewritten' -and $divergedText -match 'local-llm/Install-LocalAI\.ps1') 'a commit that does not continue from the installed one (another branch, rewritten history) is named as such, with its files'
+    $hundreds = @(1..300 | ForEach-Object { @{ filename = ('local-llm/tests/gen-{0:d3}.ps1' -f $_); status = 'added' } })
+    $truncated = Get-UpdateReview -Repo $repo -Root 'C:\AI' -Ref 'main' -Installed $known -Incoming $incoming -Compare (New-GitHubCompare -Status 'ahead' -Ahead 40 -Behind 0 -Base $base -Files $hundreds)
+    Assert-That ($truncated.NeedsOk -and (Get-ReviewText $truncated) -match '300 file\(s\) differ' -and (Get-ReviewText $truncated) -match 'at most 300 files') "GitHub's limit of 300 listed files is said, not hidden"
+
+    Write-Host "`n=== what is shown is what is downloaded ===" -ForegroundColor Cyan
+    $pinned = @($first, $update, $repair, $failed, $unknown, $selfPinned, $older, $diverged, $truncated)
+    $mismatch = @($pinned | Where-Object { $shown = Get-ShownCommit $_; -not $shown -or $_.Commit -ne $shown -or $_.Get -ne $shown -or $_.Url -ne "https://codeload.github.com/$repo/zip/$shown" })
+    Assert-That ($mismatch.Count -eq 0) "in every review the commit on the 'To install' line is the one in the download address and the one recorded ($($mismatch.Count) of $($pinned.Count) differ)"
+    Assert-That ((Get-ShownCommit $update) -eq $shaNew -and (Get-ShownCommit $repair) -eq $shaOld -and (Get-ShownCommit $unpinned) -eq '') 'and that is the commit GitHub named for the ref (none is shown when it named none)'
+    $ids = @([regex]::Matches($updateText, '\b[0-9a-f]{40}\b') | ForEach-Object { $_.Value } | Select-Object -Unique)
+    Assert-That ($ids.Count -eq 2 -and $ids -contains $shaOld -and $ids -contains $shaNew) 'no other commit id appears in the review'
+
+    Write-Host "`n=== the one way to skip the question ===" -ForegroundColor Cyan
+    $skipUpdate = Get-UpdateReview -Repo $repo -Root 'C:\AI' -Ref 'main' -Installed $known -Incoming $incoming -Compare $compare -ReviewedCommit $shaNew
+    Assert-That (-not $skipUpdate.NeedsOk -and (Get-ReviewText $skipUpdate) -match 'Not asking: LOCALAI_REVIEWED_COMMIT names exactly this commit' -and (Get-ReviewText $skipUpdate) -match 'local-llm/Install-LocalAI\.ps1') 'LOCALAI_REVIEWED_COMMIT naming the incoming commit in full: not asked, and the review is still printed'
+    $skipOthers = @(
+        (Get-UpdateReview -Repo $repo -Root 'C:\AI' -Ref 'main' -Installed $known -Incoming (Get-CommitSummary -Commit $base) -ReviewedCommit $shaOld)
+        (Get-UpdateReview -Repo $repo -Root 'C:\AI' -Ref 'main' -Installed $handZip -Incoming $incoming -ReviewedCommit "  $($shaNew.ToUpperInvariant())  ")
+        (Get-UpdateReview -Repo $repo -Root 'C:\AI' -Ref 'main' -Installed $known -Incoming $incoming -CompareError 'offline' -ReviewedCommit $shaNew)
+    )
+    Assert-That (@($skipOthers | Where-Object { $_.NeedsOk }).Count -eq 0) 'the same for a repair run, an unknown installed commit and a failed comparison (the id may be upper case or padded)'
+    $notThis = @($shaOther, $shaOld, $shaNew.Substring(0, 7), $shaNew.Substring(0, 39), ($shaNew + '0'), '1', 'true', 'yes', 'OK', 'main', '*', "$shaOther $shaNew")
+    $skipped = @($notThis | Where-Object { -not (Get-UpdateReview -Repo $repo -Root 'C:\AI' -Ref 'main' -Installed $known -Incoming $incoming -Compare $compare -ReviewedCommit $_).NeedsOk })
+    Assert-That ($skipped.Count -eq 0) "any other value (another commit, a short id, 1, true, yes, OK) does not skip it ($($skipped.Count) of $($notThis.Count) did)"
+    $stale = Get-UpdateReview -Repo $repo -Root 'C:\AI' -Ref 'main' -Installed $known -Incoming $incoming -Compare $compare -ReviewedCommit $shaOther
+    Assert-That ($stale.NeedsOk -and (Get-ReviewText $stale) -match 'LOCALAI_REVIEWED_COMMIT is set, but not to the full id of this commit') 'a value left over from an earlier run is said not to count, and the question is asked'
+    $unpinnedSkips = @(@('main', $shaNew, $shaOld, '') | Where-Object { -not (Get-UpdateReview -Repo $repo -Root 'C:\AI' -Ref 'main' -Installed $known -Incoming $null -IncomingError 'offline' -ReviewedCommit $_).NeedsOk })
+    Assert-That ($unpinnedSkips.Count -eq 0) 'when GitHub cannot name the commit nothing skips the question, not even the ref itself'
+
+    Write-Host "`n=== the gate: only an OK typed after the review goes on ===" -ForegroundColor Cyan
+    $script:asked = 0
+    $typesOk = { $script:asked++; 'OK' }
+    $typesNo = { $script:asked++; 'no' }
+    $pressesEnter = { $script:asked++; '' }
+    $cannotRead = { $script:asked++; throw 'Read and Prompt functionality is not available.' }
+    $gate = Get-UpdateConsent -Review $first -HostName 'ConsoleHost' -InputRedirected $false -ReadAnswer $typesNo
+    Assert-That ($gate.Go -and $script:asked -eq 0) 'a first install goes on without the question being asked'
+    $gate = Get-UpdateConsent -Review $skipUpdate -HostName 'ConsoleHost' -InputRedirected $true -ReadAnswer $typesNo
+    Assert-That ($gate.Go -and $script:asked -eq 0) 'so does the reviewed commit, also on a run without a keyboard'
+    $gate = Get-UpdateConsent -Review $update -HostName 'ConsoleHost' -InputRedirected $false -ReadAnswer $typesOk
+    Assert-That ($gate.Go -and $script:asked -eq 1) "an update goes on after one question answered OK (asked $($script:asked) time(s))"
+    $refused = @(@($typesNo, $pressesEnter, { $null }, { 'O', 'K' }) | Where-Object { (Get-UpdateConsent -Review $update -HostName 'ConsoleHost' -InputRedirected $false -ReadAnswer $_).Go })
+    Assert-That ($refused.Count -eq 0 -and (Get-UpdateConsent -Review $update -HostName 'ConsoleHost' -InputRedirected $false -ReadAnswer $typesNo).Why -match 'OK was not typed') 'anything else typed, Enter alone or no answer stops, and says why'
+    $gate = Get-UpdateConsent -Review $update -HostName 'ConsoleHost' -InputRedirected $false -ReadAnswer $cannotRead
+    Assert-That (-not $gate.Go -and $gate.Why -match 'could not be read \(Read and Prompt functionality is not available\.\)' -and $gate.Why -match 'LOCALAI_REVIEWED_COMMIT') 'an error while reading the answer is not consent; the message names the error and the way to run unattended'
+    $script:asked = 0
+    $gate = Get-UpdateConsent -Review $update -HostName 'ConsoleHost' -InputRedirected $true -ReadAnswer $typesOk
+    Assert-That (-not $gate.Go -and $script:asked -eq 0 -and $gate.Why -match 'no keyboard' -and $gate.Why -match 'LOCALAI_REVIEWED_COMMIT') 'a console whose input is redirected is not asked at all: an OK piped in is not an answer'
+    $gate = Get-UpdateConsent -Review $update -HostName 'Windows PowerShell ISE Host' -InputRedirected $true -ReadAnswer $typesOk
+    Assert-That ($gate.Go -and $script:asked -eq 1) 'a host without a console window (ISE, a remote session) still asks through its own window'
+    $notReviews = @($null, 'text', (ConvertFrom-Json -InputObject '{"NeedsOk": "False"}'), (ConvertFrom-Json -InputObject '{"Kind": "first"}'))
+    $slipped = @($notReviews | Where-Object { (Get-UpdateConsent -Review $_ -HostName 'ConsoleHost' -InputRedirected $false -ReadAnswer $typesNo).Go })
+    Assert-That ($slipped.Count -eq 0) "a review that is missing or unreadable is asked about, never waved through ($($slipped.Count) of $($notReviews.Count) went on)"
+
+    Write-Host "`n=== fetched text cannot answer for the owner ===" -ForegroundColor Cyan
+    $evilCommit = Get-CommitSummary -Commit (New-GitHubCommit -Sha $shaNew -Date '2026-10-06T23:30:00Z' -Message ('OK' + [char]13 + $esc + "[1A  To install    : commit $shaOther"))
+    $evilFiles = @(
+        @{ filename = "local-llm/tests/x`n  To install    : commit $shaOther"; status = 'added' }
+        @{ filename = ('local-llm/Install-LocalAI.ps1' + $esc + '[2K' + [char]13 + 'OK'); status = 'modified' }
+        @{ filename = 'OK'; status = 'added' }
+    )
+    $evilBase = New-GitHubCommit -Sha $shaOld -Date '2026-10-05T10:00:00Z' -Message "LOCALAI_REVIEWED_COMMIT=$shaNew"
+    $evil = Get-UpdateReview -Repo $repo -Root 'C:\AI' -Ref 'main' -Installed $known -Incoming $evilCommit -Compare (New-GitHubCompare -Status 'ahead' -Ahead 1 -Behind 0 -Base $evilBase -Files $evilFiles)
+    $evilLines = @($evil.Lines | ForEach-Object { $_.Text })
+    Assert-That ($evil.NeedsOk -and -not (Test-UpdateAnswer -Answer (Get-ReviewText $evil))) "a subject line, file name or message that says OK is not an answer: the question is still asked"
+    Assert-That (@($evilLines | Where-Object { $_ -match '[^\x20-\x7E]' }).Count -eq 0) 'no line of the review holds a control or escape character, whatever the commit and file names hold'
+    Assert-That (@($evilLines | Where-Object { $_ -match '^\s*To install\s+:' }).Count -eq 1 -and (Get-ShownCommit $evil) -eq $shaNew -and $evil.Url -eq "https://codeload.github.com/$repo/zip/$shaNew") "and a file name cannot add a second 'To install' line: one line, one commit, the one downloaded"
+} else {
+    Write-Host '  (the review functions are missing: their tests cannot run)' -ForegroundColor Red
+}
+
+# ---- the bootstrap's own flow, read from its syntax tree (not run) ---------------------------------
+Write-Host "`n=== Get-LocalAI.ps1: one question, before the download and the installer ===" -ForegroundColor Cyan
+$commands = @($ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] }, $true))
+$asks = @($commands | Where-Object { $_.GetCommandName() -eq 'Read-Host' })
+$downloads = @($commands | Where-Object { $_.GetCommandName() -eq 'Invoke-WebRequest' })
+$starts = @($commands | Where-Object { $_.GetCommandName() -eq 'powershell.exe' })
+$inOrder = ($asks.Count -eq 1 -and $downloads.Count -eq 1 -and $starts.Count -eq 1)
+if ($inOrder) { $inOrder = ($asks[0].Extent.StartOffset -lt $downloads[0].Extent.StartOffset -and $downloads[0].Extent.StartOffset -lt $starts[0].Extent.StartOffset) }
+Assert-That $inOrder "the bootstrap asks once, before its one download and its one installer start (Read-Host: $($asks.Count), Invoke-WebRequest: $($downloads.Count), powershell.exe: $($starts.Count))"
+$askOwner = $null
+if ($asks.Count -eq 1) { $askOwner = $asks[0].Parent; while ($askOwner -and $askOwner -isnot [System.Management.Automation.Language.CommandAst]) { $askOwner = $askOwner.Parent } }
+Assert-That ($askOwner -and $askOwner.GetCommandName() -eq 'Get-UpdateConsent') 'and only through the gate: Get-UpdateConsent decides whether to ask and what the answer means'
+# Every setting the bootstrap takes from outside is an environment variable (it has no parameters:
+# 'irm | iex' could not pass any). A new one is a new way in and has to be added here on purpose.
+$envVars = @($ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.VariableExpressionAst] -and $n.VariablePath.DriveName -eq 'env' }, $true))
+$envNames = @($envVars | ForEach-Object { $_.VariablePath.UserPath -replace '^env:', '' })
+$allowed = @('LOCALAI_REF', 'LOCALAI_ROOT', 'LOCALAI_ARGS', 'LOCALAI_REVIEWED_COMMIT', 'TEMP')
+$unexpected = @($envNames | Where-Object { $allowed -notcontains $_ } | Select-Object -Unique)
+Assert-That ($null -eq $ast.ParamBlock -and $unexpected.Count -eq 0) "the bootstrap takes no parameters and reads only the documented environment variables (others: $($unexpected -join ', '))"
+$skipReads = @($envVars | Where-Object { $_.VariablePath.UserPath -eq 'env:LOCALAI_REVIEWED_COMMIT' })
+$skipOwner = $null
+if ($skipReads.Count -eq 1) { $skipOwner = $skipReads[0].Parent; while ($skipOwner -and $skipOwner -isnot [System.Management.Automation.Language.CommandAst]) { $skipOwner = $skipOwner.Parent } }
+Assert-That ($skipReads.Count -eq 1 -and $skipOwner -and $skipOwner.GetCommandName() -eq 'Get-UpdateReview') "LOCALAI_REVIEWED_COMMIT is read in exactly one place and handed to the review, which alone decides ($($skipReads.Count) read(s))"
+$firstCodeLine = $ast.EndBlock.Extent.StartLineNumber
+$header = (@($tokens | Where-Object { $_.Kind -eq 'Comment' -and $_.Extent.StartLineNumber -lt $firstCodeLine } | ForEach-Object { $_.Text }) -join "`n")
+Assert-That ($header -match 'LOCALAI_REVIEWED_COMMIT' -and $header -match 'typed OK') 'the comment at the top of the file documents the review and the one way to skip it'
+# The resume after a reboot must not come through the bootstrap: nobody is there to type OK at
+# sign-in. The installer's logon task starts the copy of the installer that was already downloaded.
+$installerAst = [System.Management.Automation.Language.Parser]::ParseFile((Join-Path $src 'Install-LocalAI.ps1'), [ref]$null, [ref]$null)
+$resumeFn = $installerAst.Find({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Register-ResumeTask' }, $true)
+$resumeText = ''; if ($resumeFn) { $resumeText = $resumeFn.Extent.Text }
+Assert-That ($resumeText -match 'Install-LocalAI\.ps1' -and $resumeText -notmatch 'Get-LocalAI') "the installer's after-reboot task starts Install-LocalAI.ps1 itself, not this bootstrap: a resume is never held up by the question"
+
+# ---- the whole bootstrap in a child process (Windows: it starts powershell.exe) --------------------
+Write-Host "`n=== Get-LocalAI.ps1 end to end, with a stand-in for GitHub ===" -ForegroundColor Cyan
+if ($onWindows) {
+    if (Test-Path -LiteralPath $Work) { Remove-Item -LiteralPath $Work -Recurse -Force }
+    $e2e = Join-Path $Work 'e2e'
+    $e2eTemp = Join-Path $e2e 'temp'
+    $apiFull = Join-Path $e2e 'api-full'
+    $apiNoCompare = Join-Path $e2e 'api-no-compare'
+    $apiNone = Join-Path $e2e 'api-none'
+    $rootInstalled = Join-Path $e2e 'root-installed'
+    $rootEmpty = Join-Path $e2e 'root-empty'
+    $zipTop = Join-Path (Join-Path $e2e 'zipsrc') "ComfyUi-Optimization-$shaNew"
+    $zipLlm = Join-Path $zipTop 'local-llm'
+    foreach ($d in @($e2eTemp, $apiFull, $apiNoCompare, $apiNone, $rootInstalled, $rootEmpty, $zipLlm)) { New-Item -ItemType Directory -Force -Path $d | Out-Null }
+    $e2eLog = Join-Path $e2e 'calls.log'
+    $harness = Join-Path $e2e 'harness.ps1'
+    $zipFile = Join-Path $e2e 'toolkit.zip'
+
+    # The archive GitHub would send: one top folder, local-llm inside it. Its "installer" only writes
+    # down that it ran and which COMMIT file the bootstrap put next to it.
+    $installerStub = @'
+param([string]$AIRoot)
+$commit = ''
+$commitFile = Join-Path $PSScriptRoot 'COMMIT'
+if (Test-Path -LiteralPath $commitFile) { $commit = [System.IO.File]::ReadAllText($commitFile) }
+[System.IO.File]::WriteAllText((Join-Path $AIRoot 'installer-ran.txt'), ('commit=' + $commit))
+exit 0
+'@
+    [System.IO.File]::WriteAllText((Join-Path $zipLlm 'Install-LocalAI.ps1'), $installerStub)
+    [System.IO.File]::WriteAllText((Join-Path $zipLlm 'VERSION'), '2099.01.02')
+    Compress-Archive -LiteralPath $zipTop -DestinationPath $zipFile -Force
+
+    # GitHub's two answers, and an installed copy that records the old commit.
+    $commitJson = ConvertTo-Json -Depth 6 -InputObject @{ sha = $shaNew; commit = @{ message = "Stand-in incoming subject`n`nbody"; committer = @{ date = '2026-10-06T23:30:00Z' } } }
+    $compareJson = ConvertTo-Json -Depth 8 -InputObject @{
+        status = 'ahead'; ahead_by = 2; behind_by = 0; total_commits = 2
+        base_commit = @{ sha = $shaOld; commit = @{ message = 'Stand-in installed subject'; committer = @{ date = '2026-10-05T10:00:00Z' } } }
+        files = @(@{ filename = 'local-llm/Install-LocalAI.ps1'; status = 'modified' }, @{ filename = 'local-llm/tests/Invoke-Some.ps1'; status = 'added' })
+    }
+    [System.IO.File]::WriteAllText((Join-Path $apiFull 'commit.json'), $commitJson)
+    [System.IO.File]::WriteAllText((Join-Path $apiFull 'compare.json'), $compareJson)
+    [System.IO.File]::WriteAllText((Join-Path $apiNoCompare 'commit.json'), $commitJson)
+    [System.IO.File]::WriteAllText((Join-Path $rootInstalled 'localai-config.json'), (ConvertTo-Json -InputObject @{ AIRoot = $rootInstalled; ToolkitVersion = '2026.10.05'; ToolkitCommit = $shaOld }))
+
+    # The harness: functions with the names of the two cmdlets that reach GitHub (functions win over
+    # cmdlets), then the bootstrap's text through Invoke-Expression, as 'irm | iex' runs it.
+    # Everything else is the real thing: the review, the gate, Read-Host, Expand-Archive and
+    # powershell.exe for the installer.
+    $harnessText = @'
+param([string]$Bootstrap, [string]$Zip, [string]$Log, [string]$ApiDir, [string]$Root, [string]$Ref, [string]$Reviewed, [string]$TempDir)
+$ErrorActionPreference = 'Stop'
+$env:TEMP = $TempDir
+$env:LOCALAI_ROOT = $Root
+$env:LOCALAI_REF = $Ref
+$env:LOCALAI_ARGS = ''
+$env:LOCALAI_REVIEWED_COMMIT = ''
+if ($Reviewed -ne 'NONE') { $env:LOCALAI_REVIEWED_COMMIT = $Reviewed }
+function Invoke-RestMethod {
+    param([string]$Uri, $Headers, [switch]$UseBasicParsing, [int]$TimeoutSec)
+    [System.IO.File]::AppendAllText($Log, "API $Uri`r`n")
+    $name = 'commit.json'
+    if ($Uri -like '*/compare/*') { $name = 'compare.json' }
+    $file = Join-Path $ApiDir $name
+    if (-not (Test-Path -LiteralPath $file)) { throw 'The remote server returned an error: (403) Forbidden.' }
+    return (ConvertFrom-Json -InputObject ([System.IO.File]::ReadAllText($file)))
+}
+function Invoke-WebRequest {
+    param([string]$Uri, [string]$OutFile, [switch]$UseBasicParsing)
+    [System.IO.File]::AppendAllText($Log, "GET $Uri`r`n")
+    Copy-Item -LiteralPath $Zip -Destination $OutFile -Force
+}
+Invoke-Expression ([System.IO.File]::ReadAllText($Bootstrap))
+'@
+    [System.IO.File]::WriteAllText($harness, $harnessText)
+
+    function Invoke-Bootstrap {
+        # One run of Get-LocalAI.ps1 through the harness; nobody can type on it: -NonInteractive, and
+        # on the CI runner no keyboard at all. -Ref: LOCALAI_REF. -Reviewed: LOCALAI_REVIEWED_COMMIT
+        # (NONE: not set). -PipeOk: the text OK is piped into the run instead (no -NonInteractive, so
+        # a Read-Host would take it; the pipe closes after it, so nothing can wait for more).
+        param([string]$Root, [string]$ApiDir, [string]$Ref = 'main', [string]$Reviewed = 'NONE', [switch]$PipeOk)
+        $marker = Join-Path $Root 'installer-ran.txt'
+        foreach ($f in @($e2eLog, $marker)) { if (Test-Path -LiteralPath $f) { Remove-Item -LiteralPath $f -Force } }
+        $harnessArgs = @('-Bootstrap', $bootstrap, '-Zip', $zipFile, '-Log', $e2eLog, '-ApiDir', $ApiDir, '-Root', $Root, '-Ref', $Ref, '-Reviewed', $Reviewed, '-TempDir', $e2eTemp)
+        $prev = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
+        if ($PipeOk) { $out = 'OK' | & $childExe -NoProfile -ExecutionPolicy Bypass -File $harness @harnessArgs 2>&1 | ForEach-Object { "$_" } }
+        else { $out = & $childExe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $harness @harnessArgs 2>&1 | ForEach-Object { "$_" } }
+        $code = $LASTEXITCODE
+        $ErrorActionPreference = $prev
+        $log = @(); if (Test-Path -LiteralPath $e2eLog) { $log = @([System.IO.File]::ReadAllLines($e2eLog)) }
+        $ran = ''; if (Test-Path -LiteralPath $marker) { $ran = [System.IO.File]::ReadAllText($marker) }
+        return [pscustomobject]@{
+            Code = $code
+            Text = (@($out) -join "`n")
+            Tail = (@($out | Where-Object { $_ } | Select-Object -Last 3) -join ' | ')
+            Api  = @($log | Where-Object { $_ -like 'API *' })
+            Get  = @($log | Where-Object { $_ -like 'GET *' })
+            Ran  = $ran
+        }
+    }
+
+    $r = Invoke-Bootstrap -Root $rootInstalled -ApiDir $apiFull
+    Assert-That ($r.Get.Count -eq 0 -and -not $r.Ran -and $r.Text -match 'Stopped: ' -and $r.Text -match 'Nothing was downloaded or changed') "an update with nobody to type OK: nothing is downloaded, no installer starts, and the run says so (downloads $($r.Get.Count), installer '$($r.Ran)'; $($r.Tail))"
+    Assert-That ($r.Text -match $shaOld -and $r.Text -match "To install\s+: commit $shaNew" -and $r.Text -match 'Stand-in installed subject' -and $r.Text -match '2026-10-06\s+Stand-in incoming subject' -and $r.Text -match 'local-llm/Install-LocalAI\.ps1') 'the review was on screen first: both commits with date and subject line, and the changed installer'
+    Assert-That ($r.Api.Count -eq 2 -and @($r.Api | Where-Object { $_ -like "*/compare/$shaOld...$shaNew" }).Count -eq 1) "GitHub was asked for the incoming commit and for its comparison with the installed one ($($r.Api.Count) API call(s))"
+    $r = Invoke-Bootstrap -Root $rootInstalled -ApiDir $apiFull -PipeOk
+    Assert-That ($r.Get.Count -eq 0 -and -not $r.Ran -and $r.Text -match 'no keyboard to type OK on') "an OK piped into the run is not a typed OK: still nothing downloaded or started (downloads $($r.Get.Count), installer '$($r.Ran)'; $($r.Tail))"
+    $r = Invoke-Bootstrap -Root $rootInstalled -ApiDir $apiFull -Reviewed $shaNew
+    Assert-That ($r.Ran -eq "commit=$shaNew" -and $r.Text -match 'Not asking: LOCALAI_REVIEWED_COMMIT') "LOCALAI_REVIEWED_COMMIT naming the incoming commit: the installer from the archive runs, with that commit recorded next to it (installer '$($r.Ran)'; $($r.Tail))"
+    Assert-That ($r.Get.Count -eq 1 -and $r.Get[0] -like "GET https://codeload.github.com/*/zip/$shaNew" -and $r.Text -match "To install\s+: commit $shaNew") "and what was downloaded is the commit the review showed, not the branch ($($r.Get -join ' '))"
+    $r = Invoke-Bootstrap -Root $rootInstalled -ApiDir $apiFull -Reviewed $shaOther
+    Assert-That ($r.Get.Count -eq 0 -and -not $r.Ran -and $r.Text -match 'does not count here') "LOCALAI_REVIEWED_COMMIT naming another commit skips nothing (downloads $($r.Get.Count), installer '$($r.Ran)')"
+    $r = Invoke-Bootstrap -Root $rootEmpty -ApiDir $apiFull
+    Assert-That ($r.Ran -eq "commit=$shaNew" -and $r.Text -match 'First install' -and $r.Text -notmatch 'Stopped' -and @($r.Api | Where-Object { $_ -like '*/compare/*' }).Count -eq 0) "a first install is not asked and goes on as before (installer '$($r.Ran)'; $($r.Tail))"
+    $r = Invoke-Bootstrap -Root $rootInstalled -ApiDir $apiNoCompare
+    Assert-That ($r.Get.Count -eq 0 -and -not $r.Ran -and $r.Text -match 'could not be fetched from GitHub' -and $r.Text -match '\(403\) Forbidden' -and $r.Text -match "To install\s+: commit $shaNew") "a comparison GitHub refuses: the error and the incoming commit are shown, and it does not go on by itself (installer '$($r.Ran)'; $($r.Tail))"
+    $r = Invoke-Bootstrap -Root $rootInstalled -ApiDir $apiNoCompare -Reviewed $shaNew
+    Assert-That ($r.Ran -eq "commit=$shaNew") "the reviewed commit installs even then: the owner decided, not the error (installer '$($r.Ran)')"
+    $r = Invoke-Bootstrap -Root $rootInstalled -ApiDir $apiNone
+    Assert-That ($r.Get.Count -eq 0 -and -not $r.Ran -and $r.Text -match 'cannot be shown or pinned' -and $r.Text -match 'Stopped: ') "GitHub not answering at all: said so, and the branch is not installed unseen (installer '$($r.Ran)'; $($r.Tail))"
+    $r = Invoke-Bootstrap -Root $rootInstalled -ApiDir $apiNone -Ref $shaNew -Reviewed $shaNew
+    Assert-That ($r.Ran -eq "commit=$shaNew" -and $r.Get.Count -eq 1 -and $r.Get[0] -like "GET https://codeload.github.com/*/zip/$shaNew") "a ref and a reviewed commit that both name the full id install it without GitHub's API (installer '$($r.Ran)'; $($r.Tail))"
+    if ($failures -eq 0) { Remove-Item -LiteralPath $Work -Recurse -Force -ErrorAction SilentlyContinue }
+} else {
+    Skip 'the bootstrap end to end (it starts powershell.exe: the Windows job runs this part)'
+}
+
+if ($failures -eq 0) { Write-Host "`nGET-LOCALAI TEST PASSED" -ForegroundColor Green } else { Write-Host "`nGET-LOCALAI TEST FAILED ($failures)" -ForegroundColor Red }
+exit $failures
