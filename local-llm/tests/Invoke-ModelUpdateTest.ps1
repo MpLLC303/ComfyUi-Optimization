@@ -69,6 +69,9 @@ $catalogFile = Join-Path $Work 'models.update-test.psd1'
 ConvertTo-Json @{ OllamaUrl = $OllamaUrl; SelectedModels = @('main') } | Set-Content -LiteralPath (Join-Path $aiRoot 'localai-config.json')
 $env:LOCALAI_TEST_CATALOG = $catalogFile
 $env:LOCALAI_TEST_ALLOW_CPU = '1'
+# The nightly re-check skips while a chat answer is being written: the shared sandbox's render guard
+# may be serving one, so the count comes from the hook (and no docker call is made).
+$env:LOCALAI_TEST_CHATS_IN_FLIGHT = '0'
 
 $holder = $null
 try {
@@ -176,11 +179,41 @@ try {
     $aliasParams = (Get-LaiOllamaModelInfo -BaseUrl $OllamaUrl -Name $alias).Parameters
     Assert-That ($aliasParams -match "num_ctx\s+$ctxBefore\b") "the preset's alias is back at its previous context ($ctxBefore)"
 
+    # A chat that started while the model was being measured: the same (the chat slowed the load).
+    $env:LOCALAI_TEST_CHATS_IN_FLIGHT = 'after-load'
+    try { $r = Invoke-Update @('-Scheduled') '' } finally { $env:LOCALAI_TEST_CHATS_IN_FLIGHT = '0' }
+    $rec = Read-LaiState -Path $recheckFile
+    Assert-That ($r.Code -eq 0 -and $r.Text -match 'discarded' -and [string]$rec['result'] -eq 'skipped' -and [string]$rec['reason'] -match 'chat' -and (& $tunedVer) -eq '0.0.1') "a chat that started mid-measurement: result discarded, nothing recorded (exit $($r.Code), $($rec['result']): $($rec['reason']))"
+
+    # The measurement fails with the model still loaded: unloaded before the after-load check (on a
+    # real GPU its own VRAM would read as another program and turn 'failed' into 'skipped').
+    $env:LOCALAI_TEST_SPEED_FAIL = $alias
+    try { $r = Invoke-Update @('-Scheduled') '' } finally { $env:LOCALAI_TEST_SPEED_FAIL = '' }
+    $rec = Read-LaiState -Path $recheckFile
+    $loadedNow = @(Get-LaiOllamaLoaded -BaseUrl $OllamaUrl | ForEach-Object { [string]$_.name })
+    Assert-That ([string]$rec['result'] -eq 'failed' -and $loadedNow -notcontains "${alias}:latest") "a setup that failed with the model loaded is recorded as failed and the model unloaded ($($rec['result']); loaded: $($loadedNow -join ', '))"
+    $r = Invoke-Update @('-RecheckOnly') ''
+    Assert-That ($r.Code -eq 0 -and (& $tunedVer) -eq $ollamaVer) "setup for the next steps: re-checked by hand (exit $($r.Code))"
+
+    # A preset an earlier check left partly on the CPU is searched again from the largest context,
+    # not reloaded at its stored, shrunken one (which on a quiet card would load at 100% and stay small).
+    $s2 = Read-LaiState -Path $stPath; $s2['tuning']['main']['GpuPercent'] = 50; $s2['tuning']['main']['Context'] = 4096; Save-LaiState -State $s2 -Path $stPath
+    $env:LOCALAI_TEST_ALLOW_CPU = ''
+    try { $r = Invoke-Update @('-RecheckOnly') '' } finally { $env:LOCALAI_TEST_ALLOW_CPU = '1' }
+    Assert-That ($r.Text -match 'Update test' -and $r.Text -notmatch 'reusing tuned context' -and $r.Text -match 'ctx\s+8192:') "a preset left partly on the CPU is re-tuned from the top, not reused at 4096 (exit $($r.Code))"
+    $s2 = Read-LaiState -Path $stPath; $s2['tuning']['main']['GpuPercent'] = 100; Save-LaiState -State $s2 -Path $stPath
+    & $setOld
+
     # The re-check runs but the preset cannot be set up on this Ollama: recorded for the watch's notice.
     $env:LOCALAI_TEST_LOAD_FAIL = $alias
     try { $r = Invoke-Update @('-Scheduled') '' } finally { $env:LOCALAI_TEST_LOAD_FAIL = '' }
     $rec = Read-LaiState -Path $recheckFile
     Assert-That ($r.Code -ne 0 -and [string]$rec['result'] -eq 'failed' -and [string]$rec['ollamaVersion'] -eq $ollamaVer -and (@($rec['presets']) -join ' ') -match 'Update test' -and [string]$rec['reason'] -match 'incompatible') "a preset that cannot be set up: model-recheck.json says failed and names it (exit $($r.Code), $($rec['result']): $(@($rec['presets']) -join ', '))"
+    # The next night is skipped (GPU in use): the failed record stays, so the health check keeps warning.
+    $env:LOCALAI_TEST_GPU_BUSY = 'GPU in use by Game.exe (test)'
+    try { $r = Invoke-Update @('-Scheduled') '' } finally { $env:LOCALAI_TEST_GPU_BUSY = '' }
+    $rec = Read-LaiState -Path $recheckFile
+    Assert-That ($r.Code -eq 0 -and [string]$rec['result'] -eq 'failed' -and [string]$rec['lastSkip'] -match 'Game\.exe') "a later skip does not replace the failed record; the skip is noted on it ($($rec['result']), last skip: $($rec['lastSkip']))"
     $r = Invoke-Update @('-RecheckOnly') ''
     $rec = Read-LaiState -Path $recheckFile
     Assert-That ($r.Code -eq 0 -and [string]$rec['result'] -eq 'ok' -and (& $tunedVer) -eq $ollamaVer) "the Start-menu re-check fixes it once the cause is gone (exit $($r.Code))"
@@ -238,10 +271,31 @@ try {
     Assert-That ($r.Code -ne 0 -and $r.Text -match 'already running') "a second update refuses while another holds the lock (exit $($r.Code))"
     $rec = Read-LaiState -Path (Join-Path $aiRoot 'model-recheck.json')
     Assert-That ($rs.Code -eq 0 -and [string]$rec['result'] -eq 'skipped' -and [string]$rec['reason'] -match 'another installer run or model update') "the nightly re-check skips instead (exit $($rs.Code), $($rec['result']): $($rec['reason']))"
+
+    Write-Host "`n=== 5b. a finished run frees the setup lock, even while its window stays open ===" -ForegroundColor Cyan
+    # The Start-menu shortcut runs the script inside a PowerShell that waits for Enter afterwards; a
+    # mutex stays owned while its thread lives, so the script must release it itself (also on an error).
+    $stayScript = Join-Path $Work 'stay-open.ps1'
+    $stayReady = Join-Path $Work 'stay.ready'
+    $lockFreeAfter = {
+        param([string]$ScriptArgs)
+        Remove-Item -LiteralPath $stayReady -Force -ErrorAction SilentlyContinue
+        Set-Content -LiteralPath $stayScript -Value ("try {{ & '{0}' -AIRoot '{1}' -SkipTests {2} }} catch {{ Write-Host `$_.Exception.Message }}; Set-Content -LiteralPath '{3}' -Value x; Start-Sleep -Seconds 60" -f (Join-Path $src 'Update-Models.ps1'), $aiRoot, $ScriptArgs, $stayReady)
+        $stay = Start-Process -FilePath 'pwsh' -ArgumentList @('-NoProfile', '-File', $stayScript) -PassThru
+        for ($i = 0; $i -lt 600 -and -not (Test-Path -LiteralPath $stayReady) -and -not $stay.HasExited; $i++) { Start-Sleep -Milliseconds 200 }
+        $free = $false
+        if (Test-Path -LiteralPath $stayReady) { try { $l = Enter-LaiSetupLock; $free = $true; Exit-LaiVolumeLock $l } catch { $free = $false } }
+        if (-not $stay.HasExited) { $stay.Kill() }
+        return $free
+    }
+    Assert-That (& $lockFreeAfter '-RecheckOnly') 'after a -RecheckOnly run (nothing to re-check), another run can take the lock while the window is still open'
+    Assert-That (& $lockFreeAfter '-Rollback main') 'also after a run that ended with an error (nothing to roll back)'
 } finally {
     if ($holder -and -not $holder.HasExited) { $holder.Kill() }
     foreach ($n in @($tag, $variant, $prev, "$tag-prevnew", $alias)) { try { Remove-IfThere $n } catch { Write-Verbose "cleanup $n" } }
     $env:LOCALAI_TEST_CATALOG = ''
+    $env:LOCALAI_TEST_CHATS_IN_FLIGHT = ''
+    $env:LOCALAI_TEST_ALLOW_CPU = ''
 }
 
 if ($failures -eq 0) { Write-Host "`nMODEL UPDATE TEST PASSED" -ForegroundColor Green } else { Write-Host "`nMODEL UPDATE TEST FAILED ($failures)" -ForegroundColor Red }

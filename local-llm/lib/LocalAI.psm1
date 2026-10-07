@@ -178,7 +178,13 @@ function Get-LaiChatsInFlight {
     # not answering, a guard that is off the chat path): then nothing waits. The status page probes
     # every ComfyUI first; a busy or firewalled one can make that take ~10 s, exactly while chats run
     # slowly on the CPU: 15 s (tests/test_render_guard.py checks the margin), within -TimeoutSec.
-    param([int]$TimeoutSec = 30)
+    # LOCALAI_TEST_CHATS_IN_FLIGHT: test hook, the count to report; 'after-load' reports 1 only with
+    # -AfterLoad (a chat that started while the nightly re-check measured a model), else 0.
+    param([int]$TimeoutSec = 30, [switch]$AfterLoad)
+    if ($env:LOCALAI_TEST_CHATS_IN_FLIGHT) {
+        if ($env:LOCALAI_TEST_CHATS_IN_FLIGHT -eq 'after-load') { if ($AfterLoad) { return 1 }; return 0 }
+        return [int]$env:LOCALAI_TEST_CHATS_IN_FLIGHT
+    }
     $py = "import json,urllib.request as u;print(json.load(u.urlopen('http://127.0.0.1:11434/render-guard/status',timeout=15))['inflight'])"
     try { $r = Invoke-LaiTimedNative -File 'docker' -Arguments @('exec', 'render-guard', 'python3', '-c', $py) -TimeoutSec $TimeoutSec } catch { return -1 }
     $m = [regex]::Match([string]$r.Out, '(?m)^\s*(\d+)\s*$')
@@ -1152,6 +1158,10 @@ function Find-LaiMaxContext {
 function Measure-LaiOllamaSpeed {
     # Generation speed in tokens/s at the model's configured context (load time excluded).
     param([string]$BaseUrl = 'http://127.0.0.1:11434', [Parameter(Mandatory)][string]$Name, [int]$Tokens = 128)
+    # Test hook (tests/Invoke-ModelUpdateTest.ps1): a measurement that fails with the model loaded.
+    if ($env:LOCALAI_TEST_SPEED_FAIL -and (Resolve-LaiModelName $Name) -eq (Resolve-LaiModelName $env:LOCALAI_TEST_SPEED_FAIL)) {
+        throw 'the speed measurement failed (test hook)'
+    }
     $info = Get-LaiOllamaModelInfo -BaseUrl $BaseUrl -Name $Name
     $body = @{
         model   = $Name

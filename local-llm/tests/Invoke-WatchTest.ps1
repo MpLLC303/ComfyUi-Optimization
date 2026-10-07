@@ -268,6 +268,14 @@ services:
     $offLine = ''; if ($offGpu.Count) { $offLine = [string]$offGpu[-1] }
     Assert-That ($offGpu.Count -eq 1 -and $offLine -match 'Uncensored Main' -and $offLine -match 'Re-check models' -and $offLine -match 'model-recheck\.log') "a failed re-check: exactly one notice over two runs, naming the preset and the Re-check models shortcut ($offLine)"
     Assert-That (@(& $presetNotices 'presets not re-checked').Count -eq 0) "and no 'could not run' notice for a re-check that did run"
+    # The preset keeps failing: the next night records the same result again, at a new time. No new notice.
+    Save-LaiState -State @{ ollamaVersion = $realVer; at = (Get-Date).AddMinutes(-1).ToString('s'); result = 'failed'; presets = @('Uncensored Main (could not be set up)'); reason = 'this model may be incompatible with your version of Ollama (test)' } -Path $recheckFile
+    Invoke-Watch @('-NoHeal') | Out-Null
+    Assert-That (@(& $presetNotices 'a preset is off the GPU').Count -eq 1) 'the same failure found again the next night: no second notice'
+    # Something new (another preset) is told.
+    Save-LaiState -State @{ ollamaVersion = $realVer; at = (Get-Date).ToString('s'); result = 'failed'; presets = @('Uncensored Main (could not be set up)', 'Uncensored Fast (could not be set up)'); reason = 'x' } -Path $recheckFile
+    Invoke-Watch @('-NoHeal') | Out-Null
+    Assert-That (@(& $presetNotices 'a preset is off the GPU').Count -eq 2) 'a different result (another preset) is a new notice'
     # Still waiting 3 days after the new version was first seen (the PC was busy every night): one notice.
     Save-LaiState -State @{ ollamaVersion = $realVer; at = (Get-Date).AddHours(-2).ToString('s'); result = 'skipped'; reason = 'GPU in use by python.exe' } -Path $recheckFile
     $ws6 = Read-LaiState -Path $statePath; $ws6['ollamaDriftSince'] = @{ version = $realVer; time = (Get-Date).AddHours(-73).ToString('s') }; Save-LaiState -State $ws6 -Path $statePath

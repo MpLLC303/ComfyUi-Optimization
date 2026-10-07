@@ -338,10 +338,16 @@ $driftSince = $null
 $recheckNotice = $null
 $prevNotice = ''; if ($previous.ContainsKey('ollamaNotifiedFor')) { $prevNotice = [string]$previous['ollamaNotifiedFor'] }
 $recheckAt = ''; if ($config.ContainsKey('ModelRecheckAt') -and $config['ModelRecheckAt']) { $recheckAt = [string]$config['ModelRecheckAt'] }
-# What the last re-check found (Update-Models.ps1 writes it). Its time is the key for 'told once'.
+# What the last re-check found (Update-Models.ps1 writes it). 'Told once' is keyed on what it found,
+# not on its time: a preset that keeps failing is re-checked (and recorded) again every night.
 $recheck = Read-LaiState -Path (Join-Path $AIRoot 'model-recheck.json')
-$recheckWhen = ConvertTo-WatchDate $recheck['at']
-$recheckKey = ''; if ($recheckWhen) { $recheckKey = $recheckWhen.ToString('s') }
+$recheckKey = ''
+if ($recheck['result']) { $recheckKey = '{0}|{1}|{2}' -f $recheck['ollamaVersion'], $recheck['result'], (@($recheck['presets'] | Where-Object { $_ } | ForEach-Object { [string]$_ } | Sort-Object) -join ', ') }
+# The newest skip and its reason, for the 3-day notice: a skip is its own record, or noted on an
+# off-GPU/failed record it must not replace.
+$skipWhy = ''; $skipWhen = $null
+if ([string]$recheck['result'] -eq 'skipped') { $skipWhy = [string]$recheck['reason']; $skipWhen = ConvertTo-WatchDate $recheck['at'] }
+elseif ($recheck['lastSkip']) { $skipWhy = [string]$recheck['lastSkip']; $skipWhen = ConvertTo-WatchDate $recheck['lastSkipAt'] }
 $recheckShortcut = 'Close ComfyUI and games, then Start menu > Local AI - Re-check models.'
 if ($ollamaVer) {
     $inst = Read-LaiState -Path (Join-Path $AIRoot 'install-state.json')
@@ -363,7 +369,7 @@ if ($ollamaVer) {
                 $ranHere = ([string]$recheck['ollamaVersion'] -eq $ollamaVer -and @('failed', 'off-gpu') -contains [string]$recheck['result'])
                 if ($t0 -and ((Get-Date) - $t0).TotalHours -ge 72 -and $prevNotice -ne $ollamaVer -and -not $ranHere) {
                     $why = " (the PC was off or asleep at $recheckAt)"
-                    if ([string]$recheck['result'] -eq 'skipped' -and $recheck['reason'] -and $recheckWhen -and $recheckWhen -ge $t0) { $why = " (last attempt skipped: $($recheck['reason']))" }
+                    if ($skipWhy -and $skipWhen -and $skipWhen -ge $t0) { $why = " (last attempt skipped: $skipWhy)" }
                     $text = "Ollama updated itself to $ollamaVer 3 days ago, and the nightly re-check of $which (measured on $was) could not run since$why. $recheckShortcut"
                     if (Send-Notification 'Local AI: presets not re-checked' $text) { $ollamaNotice = $ollamaVer }
                 }
@@ -388,8 +394,7 @@ if ($ollamaVer) {
 }
 # The re-check ran on this Ollama and a preset stayed (partly) off the GPU, or could not be set up:
 # the one case that needs the owner. Once per re-check result.
-$toldAt = ConvertTo-WatchDate $previous['recheckNotifiedAt']
-$toldKey = ''; if ($toldAt) { $toldKey = $toldAt.ToString('s') }
+$toldKey = ''; if ($previous.ContainsKey('recheckNotifiedFor')) { $toldKey = [string]$previous['recheckNotifiedFor'] }
 if ($ollamaVer -and $recheckKey -and [string]$recheck['ollamaVersion'] -eq $ollamaVer -and @('off-gpu', 'failed') -contains [string]$recheck['result'] -and $recheckKey -ne $toldKey) {
     $presets = @($recheck['presets'] | Where-Object { $_ }) -join ', '
     $why = ''; if ($recheck['reason']) { $why = " ($($recheck['reason']))" }
@@ -504,6 +509,6 @@ if ($null -ne $bannerDone) { if ($bannerDone) { $final['banner'] = $bannerDone }
 if ($script:toastSetting) { if ($script:toastSetting -ne 'Enabled') { $final['toastSetting'] = $script:toastSetting } else { $final.Remove('toastSetting') } }
 if ($null -ne $ollamaNotice) { if ($ollamaNotice) { $final['ollamaNotifiedFor'] = $ollamaNotice } else { $final.Remove('ollamaNotifiedFor') } }
 if ($null -ne $driftSince) { if ($driftSince) { $final['ollamaDriftSince'] = $driftSince } else { $final.Remove('ollamaDriftSince') } }
-if ($recheckNotice) { $final['recheckNotifiedAt'] = $recheckNotice }
+if ($recheckNotice) { $final['recheckNotifiedFor'] = $recheckNotice }
 Save-LaiState -State $final -Path $statePath
 exit $failed.Count

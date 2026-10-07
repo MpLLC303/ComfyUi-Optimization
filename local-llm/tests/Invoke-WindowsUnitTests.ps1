@@ -1363,6 +1363,12 @@ $env:LOCALAI_TEST_GPU_BUSY = 'after-load'
 try { Assert-That ((Get-LaiGpuBusyReason -MaxUsedMiB 3500) -eq '' -and (Get-LaiGpuBusyReason -MaxUsedMiB 3500 -AfterLoad) -ne '') "test hook 'after-load': busy only once a model was measured" } finally { $env:LOCALAI_TEST_GPU_BUSY = '' }
 $env:LOCALAI_TEST_GPU_BUSY = 'GPU in use by Game.exe'
 try { Assert-That ((Get-LaiGpuBusyReason) -eq 'GPU in use by Game.exe') 'test hook: any other value is the reason reported' } finally { $env:LOCALAI_TEST_GPU_BUSY = '' }
+# A chat answer in flight (the render guard's count): the same hook shape, so the sandbox suites do
+# not depend on chats the shared render guard happens to serve.
+$env:LOCALAI_TEST_CHATS_IN_FLIGHT = '0'
+try { Assert-That ((Get-LaiChatsInFlight) -eq 0 -and (Get-LaiChatsInFlight -AfterLoad) -eq 0) 'chats-in-flight hook: a count is reported as is' } finally { $env:LOCALAI_TEST_CHATS_IN_FLIGHT = '' }
+$env:LOCALAI_TEST_CHATS_IN_FLIGHT = 'after-load'
+try { Assert-That ((Get-LaiChatsInFlight) -eq 0 -and (Get-LaiChatsInFlight -AfterLoad) -eq 1) "chats-in-flight hook 'after-load': a chat only once a model was measured" } finally { $env:LOCALAI_TEST_CHATS_IN_FLIGHT = '' }
 Import-Module (Join-Path (Join-Path $src 'lib') 'LocalAI.psm1') -Force
 
 Write-Host "`n=== the Ollama app's own settings (server.log) ===" -ForegroundColor Cyan

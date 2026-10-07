@@ -85,16 +85,41 @@ if ($Scheduled) {
         $script:transcriptOn = $true
     } catch { Write-Verbose "no transcript: $($_.Exception.Message)" }
 }
+function Close-Run {
+    # The setup lock stays owned as long as this thread lives, and the Start-menu window keeps it
+    # alive at 'press Enter to close': release it, or that open window would block the nightly
+    # re-check and the installer.
+    if ($script:SetupLock) { Exit-LaiVolumeLock $script:SetupLock; $script:SetupLock = $null }
+    if ($script:transcriptOn) { try { Stop-Transcript | Out-Null } catch { Write-Verbose 'transcript already stopped' }; $script:transcriptOn = $false }
+}
 function Stop-Run([int]$Code) {
-    if ($script:transcriptOn) { try { Stop-Transcript | Out-Null } catch { Write-Verbose 'transcript already stopped' } }
+    Close-Run
     exit $Code
+}
+# The same for an error that ends the run ('break' still ends it, with the error shown). Written
+# out, not Close-Run: a trap covers the whole script, also errors raised before that is defined.
+trap {
+    if ($script:SetupLock) { Exit-LaiVolumeLock $script:SetupLock; $script:SetupLock = $null }
+    if ($script:transcriptOn) { try { Stop-Transcript | Out-Null } catch { Write-Verbose 'transcript already stopped' }; $script:transcriptOn = $false }
+    break
 }
 function Save-Recheck {
     # What the last re-check found, for the health watch: it notifies only when a preset could not be
     # put back fully on the GPU, or when the nightly run keeps being skipped.
     param([string]$Result, [string[]]$Presets = @(), [string]$Reason = '', [string]$Version = '')
     $rec = @{ ollamaVersion = $Version; at = (Get-Date).ToString('s'); result = $Result; presets = @($Presets); reason = $Reason }
-    try { Save-LaiState -State $rec -Path $recheckPath } catch { Write-LaiLog WARN "Could not write $recheckPath : $($_.Exception.Message)" }
+    try {
+        # A skip must not hide a preset the last re-check left off the GPU on this Ollama (the health
+        # check warns about it): that record stays, with the skip noted for the watch's 3-day notice.
+        # No version (the setup lock was busy before Ollama was asked) counts as the same one.
+        $old = Read-LaiState -Path $recheckPath
+        if ($Result -eq 'skipped' -and @('off-gpu', 'failed') -contains [string]$old['result'] -and (-not $Version -or [string]$old['ollamaVersion'] -eq $Version)) {
+            $rec = $old
+            $rec['lastSkip'] = $Reason
+            $rec['lastSkipAt'] = (Get-Date).ToString('s')
+        }
+        Save-LaiState -State $rec -Path $recheckPath
+    } catch { Write-LaiLog WARN "Could not write $recheckPath : $($_.Exception.Message)" }
 }
 function Exit-Skipped([string]$Reason, [string]$Version = '') {
     # -Scheduled only: nothing is measured or recorded in the tuning, and tomorrow night tries again.
@@ -188,14 +213,14 @@ if ($Unpin.Count -gt 0) {
     if ($Unpin -contains 'all') { $script:pinned = @() } else { $script:pinned = @($pinned | Where-Object { $Unpin -notcontains $_ }) }
     Save-Pins
     Write-LaiLog OK "Updates may change these again: $($Unpin -join ', ')"
-    exit 0
+    Stop-Run 0
 }
 if ($DropPrevious) {
     foreach ($m in $catalog.Models) {
         $pn = Get-PrevName $m.Source
         if (Test-LaiOllamaModel -BaseUrl $ollamaUrl -Name $pn) { Remove-Model $pn; Write-LaiLog OK "Deleted $pn" }
     }
-    exit 0
+    Stop-Run 0
 }
 if ($Rollback.Count -gt 0) {
     foreach ($m in $catalog.Models) {
@@ -357,17 +382,28 @@ if ($ollamaNow -and $toVerify.Count -gt 0) {
             if ($busy) { $recheckWhy = $busy; Write-LaiLog WARN "Re-check stopped: $busy"; break }
         }
         $prevEntry = $state['tuning'][$m.Key]
-        $ok = Invoke-ModelSetup -Model $m -SetupArgs @{ Previous = $state['tuning']; Fingerprint = $vfp }
+        $setupArgs = @{ Previous = $state['tuning']; Fingerprint = $vfp }
+        # Left partly on the CPU by an earlier check: search the context again from the top. Reusing
+        # the stored (shrunken) one would load at 100% on a quiet card and never grow back.
+        if ($offKeys -contains $m.Key) { $setupArgs['Retune'] = $true }
+        $ok = Invoke-ModelSetup -Model $m -SetupArgs $setupArgs
         if ($Scheduled) {
-            # A program that took the GPU while this model was measured (a game started at night) makes
-            # the result meaningless: put back what was there (recorded under the old Ollama, so the
-            # next run measures it again) and stop.
+            # A program that took the GPU, or a chat that started, while this model was measured (a
+            # game started at night) makes the result meaningless: put back what was there (recorded
+            # under the old Ollama, so the next run measures it again) and stop. A failed setup can
+            # leave the model loaded: unloaded first, so its own VRAM does not count as another program.
+            try { Stop-LaiOllamaModels -BaseUrl $ollamaUrl } catch { Write-Verbose "could not unload: $($_.Exception.Message)" }
             $busy = Get-LaiGpuBusyReason -MaxUsedMiB $maxBusy -AfterLoad
+            if (-not $busy -and (Get-LaiChatsInFlight -TimeoutSec (Get-LaiDockerTimeout) -AfterLoad) -gt 0) { $busy = 'a chat answer started' }
             if ($busy) {
                 if ($prevEntry) { $state['tuning'][$m.Key] = $prevEntry } else { $state['tuning'].Remove($m.Key) }
                 Save-LaiState -State $state -Path $statePath
                 $failedSetups = @($failedSetups | Where-Object { $_ -ne $m.Display })
-                if ($prevEntry -and $prevEntry['Context']) {
+                if ($recheckFailed.Count -eq 0) { $script:setupWhy = '' }
+                # Not after a failed setup whose source model is gone: /api/create would download it.
+                $haveSource = $ok
+                if (-not $haveSource) { try { $haveSource = Test-LaiOllamaModel -BaseUrl $ollamaUrl -Name $m.Source } catch { $haveSource = $false } }
+                if ($prevEntry -and $prevEntry['Context'] -and $haveSource) {
                     try { Set-LaiOllamaDerivedModel -BaseUrl $ollamaUrl -Name $m.Alias -From $m.Source -NumCtx ([int]$prevEntry['Context']) -Parameters $m.Parameters -System $system }
                     catch { Write-LaiLog WARN "  could not rebuild $($m.Alias) at its previous context: $($_.Exception.Message)" }
                 }
