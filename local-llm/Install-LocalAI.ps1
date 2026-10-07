@@ -913,6 +913,31 @@ function Repair-LegacyInstall {
     }
 }
 
+function Install-AgentRuleFile {
+    # <AIRoot>\CLAUDE.md: the rules an AI coding agent reads when it is opened in the install folder
+    # (the template is config\CLAUDE.md). Placed only when nothing of that name is there: the owner
+    # may have written one, or edited the one an earlier run placed, so it is never overwritten and
+    # never merged. A convenience like the starter skills: a failure is a warning, not a stopped install.
+    $dest = Join-Path $P.Root 'CLAUDE.md'
+    $template = Join-Path (Join-Path $SourceRoot 'config') 'CLAUDE.md'
+    try {
+        # Get-Item, not Test-Path: a link whose target is gone is still something that is there.
+        if (Get-Item -LiteralPath $dest -Force -ErrorAction SilentlyContinue) {
+            Write-LaiLog INFO "$dest already exists: left as it is (the rules for an AI agent are never overwritten or merged)"
+            return
+        }
+        if (-not (Test-Path -LiteralPath $template -PathType Leaf)) {
+            Write-LaiLog WARN "No rules file placed: the template $template is missing from this toolkit copy"
+            return
+        }
+        # overwrite = $false: if the file appears between the check and the copy, the copy refuses.
+        [System.IO.File]::Copy($template, $dest, $false)
+        Write-LaiLog OK "Rules for an AI agent opened in this folder placed: $dest (edit it freely; it is never overwritten)"
+    } catch {
+        Write-LaiLog WARN "No rules file placed at ${dest}: $($_.Exception.Message -replace '\s+', ' ')"
+    }
+}
+
 try {
 Repair-LegacyInstall
 
@@ -1140,6 +1165,8 @@ Invoke-Stage 'Preflight' {
         $w = Join-Path $P.Workspace $d
         if (-not (Test-Path -LiteralPath $w)) { New-Item -ItemType Directory -Force -Path $w | Out-Null }
     }
+    # Before the permissions below, so a file placed now gets them like everything else in the folder.
+    Install-AgentRuleFile
     # The whole AI folder belongs to this user (folders under C:\ otherwise let every account change
     # them): backups hold every chat, logs the install transcript. The scripts that the backup and
     # resume tasks run as administrator are read-only even for the user. Skipped when the AI root is
