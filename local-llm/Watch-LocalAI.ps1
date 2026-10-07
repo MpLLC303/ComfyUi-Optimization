@@ -16,8 +16,10 @@
     docker call has a time limit). Shows a Windows notification once when a check has failed on two
     runs in a row (and once when it recovers), so neither a slow Docker start nor a lasting outage
     spams you. Log: <AIRoot>\Logs\watch.log.
-    Also notifies once when Ollama has updated itself since the presets were tuned (Update-Models.ps1
-    re-checks them on the GPU).
+    When Ollama has updated itself since the presets were tuned, the nightly LocalAI-Recheck-Models task
+    (Update-Models.ps1 -RecheckOnly -Scheduled) measures them again; the watch notifies only when a
+    preset could not be put back fully on the GPU, or the re-check could not run for 3 days (once per
+    new version without that task).
 
 .EXAMPLE
     .\Watch-LocalAI.ps1              # one check, as the scheduled task runs it
@@ -325,35 +327,74 @@ if ($diskProblem) { $details['Disk space'] = $diskProblem }
 # ---- Ollama replaced by its own updater -------------------------------------------------------
 # The Ollama app downloads updates by itself and installs them at the next sign-in (on by default).
 # The presets' contexts were measured on one version; a new one can place layers differently, so a
-# preset may now spill to the CPU. Not a failure (everything still answers): one notice per new
-# version, outside the two-strike/reminder logic. $null = leave the record as it is.
+# preset may now spill to the CPU. Not a failure (everything still answers), so outside the
+# two-strike/reminder logic. With the nightly re-check set up (the installer's LocalAI-Recheck-Models
+# task; ModelRecheckAt in the config) this only notes it in watch.log: the task measures the presets
+# again without downloading anything, and a notification follows only when one could not be put
+# back fully on the GPU, or when the re-check could not run for 3 days. Without it (an install that
+# has not run Update toolkit since): one notice per new version. $null = leave the record as it is.
 $ollamaNotice = $null
+$driftSince = $null
+$recheckNotice = $null
 $prevNotice = ''; if ($previous.ContainsKey('ollamaNotifiedFor')) { $prevNotice = [string]$previous['ollamaNotifiedFor'] }
+$recheckAt = ''; if ($config.ContainsKey('ModelRecheckAt') -and $config['ModelRecheckAt']) { $recheckAt = [string]$config['ModelRecheckAt'] }
+# What the last re-check found (Update-Models.ps1 writes it). Its time is the key for 'told once'.
+$recheck = Read-LaiState -Path (Join-Path $AIRoot 'model-recheck.json')
+$recheckWhen = ConvertTo-WatchDate $recheck['at']
+$recheckKey = ''; if ($recheckWhen) { $recheckKey = $recheckWhen.ToString('s') }
+$recheckShortcut = 'Close ComfyUI and games, then Start menu > Local AI - Re-check models.'
 if ($ollamaVer) {
     $inst = Read-LaiState -Path (Join-Path $AIRoot 'install-state.json')
     $tun = @{}; if ($inst['tuning'] -is [hashtable]) { $tun = $inst['tuning'] }
     $sel = @(); if ($config.ContainsKey('SelectedModels') -and $config['SelectedModels']) { $sel = @($config['SelectedModels']) }
     $drift = @(Get-LaiTuningDrift -Tuning $tun -OllamaVersion $ollamaVer -Keys $sel)
-    if ($drift.Count -eq 0) { $ollamaNotice = '' }
-    elseif ($prevNotice -ne $ollamaVer) {
+    if ($drift.Count -eq 0) { $ollamaNotice = ''; $driftSince = '' }
+    else {
         $was = @($drift | ForEach-Object { $_.Was } | Select-Object -Unique) -join ', '
         $which = @($drift | ForEach-Object { $_.Key }) -join ', '
-        $updScript = Join-Path (Join-Path $AIRoot 'Scripts') 'Update-Models.ps1'
-        $text = "Ollama updated itself to $ollamaVer; $which were measured on $was and may now run slower. Run $updScript to check them on the GPU again (about a minute each)."
-        # Its settings too (a file read, no model load): a new version may no longer apply them.
-        if ($onWindows -and $env:LOCALAPPDATA) {
-            $kv = 'q8_0'
-            foreach ($t in $tun.Values) { if ($t -is [hashtable] -and [string]$t['Fingerprint'] -match '(^|;)kv=([^;]+)') { $kv = $Matches[2]; break } }
-            $srvLog = Join-Path $env:LOCALAPPDATA 'Ollama\server.log'
-            $cfgLine = $null
-            try { $cfgLine = Select-String -LiteralPath $srvLog -Pattern 'msg="server config"' -Encoding UTF8 -ErrorAction Stop | Select-Object -Last 1 } catch { Write-Verbose 'no server.log' }
-            if ($cfgLine) {
-                $chk = Test-LaiOllamaServerSettings -Line $cfgLine.Line -KvCacheType $kv
-                if ($chk.Status -eq 'wrong') { $text += ' Its log also shows ' + ($chk.Wrong -join ', ') + ': Start menu > Local AI - Update toolkit applies the settings again.' }
+        if ($recheckAt) {
+            $since = $previous['ollamaDriftSince']
+            if (-not ($since -is [hashtable]) -or [string]$since['version'] -ne $ollamaVer) {
+                $driftSince = @{ version = $ollamaVer; time = (Get-Date).ToString('s') }
+                Write-WatchLog ('{0} Ollama updated itself to {1}; {2} measured on {3}: re-check scheduled tonight at {4} (no downloads, only while the GPU is idle)' -f (Get-Date -Format 's'), $ollamaVer, $which, $was, $recheckAt)
+            } else {
+                $t0 = ConvertTo-WatchDate $since['time']
+                # A re-check that ran on this version and failed has its own notice (below).
+                $ranHere = ([string]$recheck['ollamaVersion'] -eq $ollamaVer -and @('failed', 'off-gpu') -contains [string]$recheck['result'])
+                if ($t0 -and ((Get-Date) - $t0).TotalHours -ge 72 -and $prevNotice -ne $ollamaVer -and -not $ranHere) {
+                    $why = " (the PC was off or asleep at $recheckAt)"
+                    if ([string]$recheck['result'] -eq 'skipped' -and $recheck['reason'] -and $recheckWhen -and $recheckWhen -ge $t0) { $why = " (last attempt skipped: $($recheck['reason']))" }
+                    $text = "Ollama updated itself to $ollamaVer 3 days ago, and the nightly re-check of $which (measured on $was) could not run since$why. $recheckShortcut"
+                    if (Send-Notification 'Local AI: presets not re-checked' $text) { $ollamaNotice = $ollamaVer }
+                }
             }
+        } elseif ($prevNotice -ne $ollamaVer) {
+            $text = "Ollama updated itself to $ollamaVer; $which were measured on $was and may now run slower. $recheckShortcut It checks them on the GPU again (no downloads, about a minute each)."
+            # Its settings too (a file read, no model load): a new version may no longer apply them.
+            if ($onWindows -and $env:LOCALAPPDATA) {
+                $kv = 'q8_0'
+                foreach ($t in $tun.Values) { if ($t -is [hashtable] -and [string]$t['Fingerprint'] -match '(^|;)kv=([^;]+)') { $kv = $Matches[2]; break } }
+                $srvLog = Join-Path $env:LOCALAPPDATA 'Ollama\server.log'
+                $cfgLine = $null
+                try { $cfgLine = Select-String -LiteralPath $srvLog -Pattern 'msg="server config"' -Encoding UTF8 -ErrorAction Stop | Select-Object -Last 1 } catch { Write-Verbose 'no server.log' }
+                if ($cfgLine) {
+                    $chk = Test-LaiOllamaServerSettings -Line $cfgLine.Line -KvCacheType $kv
+                    if ($chk.Status -eq 'wrong') { $text += ' Its log also shows ' + ($chk.Wrong -join ', ') + ': Start menu > Local AI - Update toolkit applies the settings again.' }
+                }
+            }
+            if (Send-Notification 'Local AI: Ollama was updated' $text) { $ollamaNotice = $ollamaVer }
         }
-        if (Send-Notification 'Local AI: Ollama was updated' $text) { $ollamaNotice = $ollamaVer }
     }
+}
+# The re-check ran on this Ollama and a preset stayed (partly) off the GPU, or could not be set up:
+# the one case that needs the owner. Once per re-check result.
+$toldAt = ConvertTo-WatchDate $previous['recheckNotifiedAt']
+$toldKey = ''; if ($toldAt) { $toldKey = $toldAt.ToString('s') }
+if ($ollamaVer -and $recheckKey -and [string]$recheck['ollamaVersion'] -eq $ollamaVer -and @('off-gpu', 'failed') -contains [string]$recheck['result'] -and $recheckKey -ne $toldKey) {
+    $presets = @($recheck['presets'] | Where-Object { $_ }) -join ', '
+    $why = ''; if ($recheck['reason']) { $why = " ($($recheck['reason']))" }
+    $text = "After Ollama updated itself to {0}: {1}{2}. {3} Details: {4}." -f $ollamaVer, $presets, $why, $recheckShortcut, (Join-Path $logDir 'model-recheck.log')
+    if (Send-Notification 'Local AI: a preset is off the GPU' $text) { $recheckNotice = $recheckKey }
 }
 
 # ---- report ---------------------------------------------------------------------------------
@@ -462,5 +503,7 @@ if ($recoveryFailed) { $final['pendingRecovered'] = @($recovered) } else { $fina
 if ($null -ne $bannerDone) { if ($bannerDone) { $final['banner'] = $bannerDone } else { $final.Remove('banner') } }
 if ($script:toastSetting) { if ($script:toastSetting -ne 'Enabled') { $final['toastSetting'] = $script:toastSetting } else { $final.Remove('toastSetting') } }
 if ($null -ne $ollamaNotice) { if ($ollamaNotice) { $final['ollamaNotifiedFor'] = $ollamaNotice } else { $final.Remove('ollamaNotifiedFor') } }
+if ($null -ne $driftSince) { if ($driftSince) { $final['ollamaDriftSince'] = $driftSince } else { $final.Remove('ollamaDriftSince') } }
+if ($recheckNotice) { $final['recheckNotifiedAt'] = $recheckNotice }
 Save-LaiState -State $final -Path $statePath
 exit $failed.Count

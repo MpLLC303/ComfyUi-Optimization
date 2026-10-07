@@ -119,6 +119,7 @@ $global:ConsoleUser = 'MOCKPC\testuser'
 $global:TaskPrincipals = @{}
 $global:TaskExec = @{}
 $global:TaskTriggerArgs = @{}
+$global:TaskSettingsArgs = @{}
 $global:WslInstalled = $false
 function global:Record([string]$s) { [void]$global:Calls.Add($s) }
 # Other hardware for the later phases: $global:MockGpu = nvidia-smi line(s) or 'none' (no GPU, exit 6),
@@ -185,6 +186,7 @@ function global:Register-ScheduledTask {
     param($TaskName, $Action, $Trigger, $Principal, $Settings, [switch]$Force)
     $global:Tasks[$TaskName] = $Action.Argument; $global:TaskPrincipals[$TaskName] = [string]$Principal.Args; $global:TaskExec[$TaskName] = [string]$Action.Execute
     $global:TaskTriggerArgs[$TaskName] = (@($Trigger) | ForEach-Object { [string]$_.Args }) -join ' | '
+    $global:TaskSettingsArgs[$TaskName] = [string]$Settings.Args
     Record "Register-ScheduledTask $TaskName"
 }
 function global:Unregister-ScheduledTask { param($TaskName, $Confirm) $global:Tasks.Remove($TaskName); Record "Unregister-ScheduledTask $TaskName" }
@@ -295,12 +297,20 @@ Assert-That (@($global:Calls | Where-Object { $_ -like ('icacls ' + $elevated + 
 Assert-That ([string]$global:TaskPrincipals['LocalAI-Backup-OpenWebUI'] -match 'Limited' -and [string]$global:TaskPrincipals['LocalAI-Backup-OpenWebUI'] -notmatch 'Highest') 'nightly backup task runs non-elevated'
 # Windows Terminal (Windows 11's default console) shows a window despite -WindowStyle Hidden, and
 # closing it kills the run: both tasks go through conhost --headless.
-foreach ($tn in 'LocalAI-Backup-OpenWebUI', 'LocalAI-Watch') {
+foreach ($tn in 'LocalAI-Backup-OpenWebUI', 'LocalAI-Watch', 'LocalAI-Recheck-Models') {
     Assert-That ([string]$global:TaskExec[$tn] -like '*conhost.exe' -and [string]$global:Tasks[$tn] -like '--headless powershell.exe *-WindowStyle Hidden*') "$tn runs with no window at all ($($global:TaskExec[$tn]) $($global:Tasks[$tn]))"
 }
 $bArgs = [string]$global:Tasks['LocalAI-Backup-OpenWebUI']
 Assert-That ($bArgs -match '-WaitForChatsSec [1-9]\d*' -and $bArgs -match '-DailyAt 03:30') "the backup task waits for a chat answer being written and knows its daily time ($bArgs)"
 Assert-That ([string]$global:TaskTriggerArgs['LocalAI-Backup-OpenWebUI'] -match '-Daily' -and [string]$global:TaskTriggerArgs['LocalAI-Backup-OpenWebUI'] -match '-AtLogOn') "the backup task also runs at sign-in, to catch up a night missed while signed out ($($global:TaskTriggerArgs['LocalAI-Backup-OpenWebUI']))"
+# The nightly re-check after Ollama updated itself: an hour after the backup, never at sign-in or as
+# a catch-up after wake (both are when the owner starts using the GPU), never elevated.
+$rcTask = 'LocalAI-Recheck-Models'
+Assert-That ($global:Tasks.ContainsKey($rcTask) -and [string]$global:Tasks[$rcTask] -like '*Update-Models.ps1*' -and [string]$global:Tasks[$rcTask] -match ' -RecheckOnly -Scheduled') "nightly model re-check task registered with -RecheckOnly -Scheduled ($($global:Tasks[$rcTask]))"
+Assert-That ([string]$global:TaskPrincipals[$rcTask] -match 'Limited' -and [string]$global:TaskPrincipals[$rcTask] -notmatch 'Highest') 'the re-check task runs non-elevated'
+Assert-That ([string]$global:TaskTriggerArgs[$rcTask] -match '-Daily' -and [string]$global:TaskTriggerArgs[$rcTask] -match '04:30' -and [string]$global:TaskTriggerArgs[$rcTask] -notmatch 'AtLogOn') "the re-check runs daily an hour after the backup, with no sign-in trigger ($($global:TaskTriggerArgs[$rcTask]))"
+Assert-That ([string]$global:TaskSettingsArgs[$rcTask] -match 'IgnoreNew' -and [string]$global:TaskSettingsArgs[$rcTask] -notmatch 'StartWhenAvailable|WakeToRun') "no catch-up start after a missed night and no waking the PC ($($global:TaskSettingsArgs[$rcTask]))"
+Assert-That ([string](Get-Content -Encoding UTF8 -Raw (Join-Path $aiRoot 'localai-config.json') | ConvertFrom-Json).ModelRecheckAt -eq '04:30') 'the config records the re-check time, so the health watch waits for it instead of notifying'
 Assert-That (@($global:Calls | Where-Object { $_ -like 'docker compose*pull*' }).Count -ge 1 -and @($global:Calls | Where-Object { $_ -like 'docker compose*pull*' -and $_ -notlike '*--policy missing*' }).Count -eq 0) 'image pulls reuse local images (--policy missing)'
 Assert-That ((Test-Path (Join-Path $env:USERPROFILE '.wslconfig')) -and (Get-Content -Raw -Encoding UTF8 -LiteralPath (Join-Path $env:USERPROFILE '.wslconfig')) -match 'memory=16GB') '.wslconfig created, with the 16 GB WSL cap on this 64 GB PC'
 Assert-That ((Get-Content -Encoding UTF8 -Raw (Join-Path $aiRoot 'Stack/searxng/settings.yml')) -notmatch '__SEARXNG_SECRET__') 'SearXNG secret filled in'

@@ -137,6 +137,54 @@ try {
     $st5 = Read-LaiState -Path $stPath
     Assert-That ($r.Code -eq 0 -and [string]$st5['tuning']['main']['OllamaVersion'] -eq (Get-LaiOllamaVersion -BaseUrl $OllamaUrl)) "the next run re-checks it and records this Ollama (exit $($r.Code))"
 
+    Write-Host "`n=== 2e. -RecheckOnly / -Scheduled: the re-check after Ollama updated itself, no downloads ===" -ForegroundColor Cyan
+    $ollamaVer = [string](Get-LaiOllamaVersion -BaseUrl $OllamaUrl)
+    $recheckFile = Join-Path $aiRoot 'model-recheck.json'
+    $recheckLog = Join-Path (Join-Path $aiRoot 'Logs') 'model-recheck.log'
+    $setOld = { $s = Read-LaiState -Path $stPath; $s['tuning']['main']['OllamaVersion'] = '0.0.1'; Save-LaiState -State $s -Path $stPath }
+    $tunedVer = { [string](Read-LaiState -Path $stPath)['tuning']['main']['OllamaVersion'] }
+    & $setOld
+    $digestBefore = Get-Digest $tag
+    # A pull from a model that does not exist would fail loudly: the run must not try one.
+    $r = Invoke-Update @('-RecheckOnly') 'testorg/does-not-exist:1b'
+    $rec = Read-LaiState -Path $recheckFile
+    Assert-That ($r.Code -eq 0 -and $r.Text -notmatch 'download failed' -and $r.Text -notmatch 'Checking testorg/update-test' -and (Get-Digest $tag) -eq $digestBefore) "-RecheckOnly downloads nothing (exit $($r.Code))"
+    Assert-That ($r.Text -match 'Ollama is now' -and (& $tunedVer) -eq $ollamaVer) "the preset is re-checked and the running Ollama recorded ($(& $tunedVer))"
+    Assert-That ([string]$rec['result'] -eq 'ok' -and [string]$rec['ollamaVersion'] -eq $ollamaVer) "model-recheck.json: ok on $ollamaVer ($($rec['result']), $($rec['ollamaVersion']))"
+    $r = Invoke-Update @('-RecheckOnly') ''
+    $rec2 = Read-LaiState -Path $recheckFile
+    Assert-That ($r.Code -eq 0 -and $r.Text -match 'Nothing to re-check' -and "$($rec2['at'])" -eq "$($rec['at'])") 'nothing left to re-check: says so and leaves the record alone'
+    $r = Invoke-Update @('-RecheckOnly', '-Rollback', 'main') ''
+    Assert-That ($r.Code -ne 0 -and $r.Text -match 'cannot be combined' -and (Get-Digest $tag) -eq $digestBefore -and (Test-LaiOllamaModel -BaseUrl $OllamaUrl -Name $prev)) "-RecheckOnly -Rollback is refused and rolls nothing back (exit $($r.Code))"
+
+    # The nightly run with the GPU in use: skipped, nothing measured, exit 0 (the task shows no error).
+    & $setOld
+    $env:LOCALAI_TEST_GPU_BUSY = 'GPU in use by Game.exe (test)'
+    try { $r = Invoke-Update @('-Scheduled') '' } finally { $env:LOCALAI_TEST_GPU_BUSY = '' }
+    $rec = Read-LaiState -Path $recheckFile
+    Assert-That ($r.Code -eq 0 -and [string]$rec['result'] -eq 'skipped' -and [string]$rec['reason'] -match 'Game\.exe') "-Scheduled with the GPU in use: skipped with the reason, exit 0 (exit $($r.Code), $($rec['result']): $($rec['reason']))"
+    Assert-That ((& $tunedVer) -eq '0.0.1') 'nothing measured: the preset still waits for its re-check'
+    Assert-That ((Test-Path -LiteralPath $recheckLog) -and (Get-Content -Raw -LiteralPath $recheckLog) -match 'Re-check skipped') 'the nightly run keeps its log in Logs\model-recheck.log'
+
+    # A program took the GPU while the model was being measured: that result is not kept.
+    $ctxBefore = [int](Read-LaiState -Path $stPath)['tuning']['main']['Context']
+    $env:LOCALAI_TEST_GPU_BUSY = 'after-load'
+    try { $r = Invoke-Update @('-Scheduled') '' } finally { $env:LOCALAI_TEST_GPU_BUSY = '' }
+    $rec = Read-LaiState -Path $recheckFile
+    Assert-That ($r.Code -eq 0 -and $r.Text -match 'discarded' -and [string]$rec['result'] -eq 'skipped') "a measurement the GPU was taken from mid-way is discarded (exit $($r.Code), $($rec['result']))"
+    Assert-That ((& $tunedVer) -eq '0.0.1' -and [int](Read-LaiState -Path $stPath)['tuning']['main']['Context'] -eq $ctxBefore) 'and not recorded under the new Ollama: the next night measures it again'
+    $aliasParams = (Get-LaiOllamaModelInfo -BaseUrl $OllamaUrl -Name $alias).Parameters
+    Assert-That ($aliasParams -match "num_ctx\s+$ctxBefore\b") "the preset's alias is back at its previous context ($ctxBefore)"
+
+    # The re-check runs but the preset cannot be set up on this Ollama: recorded for the watch's notice.
+    $env:LOCALAI_TEST_LOAD_FAIL = $alias
+    try { $r = Invoke-Update @('-Scheduled') '' } finally { $env:LOCALAI_TEST_LOAD_FAIL = '' }
+    $rec = Read-LaiState -Path $recheckFile
+    Assert-That ($r.Code -ne 0 -and [string]$rec['result'] -eq 'failed' -and [string]$rec['ollamaVersion'] -eq $ollamaVer -and (@($rec['presets']) -join ' ') -match 'Update test' -and [string]$rec['reason'] -match 'incompatible') "a preset that cannot be set up: model-recheck.json says failed and names it (exit $($r.Code), $($rec['result']): $(@($rec['presets']) -join ', '))"
+    $r = Invoke-Update @('-RecheckOnly') ''
+    $rec = Read-LaiState -Path $recheckFile
+    Assert-That ($r.Code -eq 0 -and [string]$rec['result'] -eq 'ok' -and (& $tunedVer) -eq $ollamaVer) "the Start-menu re-check fixes it once the cause is gone (exit $($r.Code))"
+
     Write-Host "`n=== 3. -Rollback main ===" -ForegroundColor Cyan
     $r = Invoke-Update @('-Rollback', 'main') ''
     Assert-That ($r.Code -eq 0) "rollback exits 0 (got $($r.Code))"
@@ -184,8 +232,12 @@ try {
     for ($i = 0; $i -lt 150 -and -not (Test-Path -LiteralPath $ready) -and -not $holder.HasExited; $i++) { Start-Sleep -Milliseconds 200 }
     Assert-That (Test-Path -LiteralPath $ready) 'setup: the other process holds the setup lock'
     $r = Invoke-Update @() ''
+    # The nightly re-check meets the same lock: it skips quietly (exit 0) and says why.
+    $rs = Invoke-Update @('-Scheduled') ''
     if (-not $holder.HasExited) { $holder.Kill() }
     Assert-That ($r.Code -ne 0 -and $r.Text -match 'already running') "a second update refuses while another holds the lock (exit $($r.Code))"
+    $rec = Read-LaiState -Path (Join-Path $aiRoot 'model-recheck.json')
+    Assert-That ($rs.Code -eq 0 -and [string]$rec['result'] -eq 'skipped' -and [string]$rec['reason'] -match 'another installer run or model update') "the nightly re-check skips instead (exit $($rs.Code), $($rec['result']): $($rec['reason']))"
 } finally {
     if ($holder -and -not $holder.HasExited) { $holder.Kill() }
     foreach ($n in @($tag, $variant, $prev, "$tag-prevnew", $alias)) { try { Remove-IfThere $n } catch { Write-Verbose "cleanup $n" } }

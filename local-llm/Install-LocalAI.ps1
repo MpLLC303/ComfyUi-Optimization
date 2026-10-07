@@ -219,6 +219,7 @@ if ($ToolkitCommit) { $ToolkitItems += 'COMMIT' }
 $ElevatedDir = Join-Path $env:ProgramFiles 'LocalAI'
 $BackupTask = 'LocalAI-Backup-OpenWebUI'
 $WatchTask = 'LocalAI-Watch'
+$RecheckTask = 'LocalAI-Recheck-Models'
 $CurrentUser = [Security.Principal.WindowsIdentity]::GetCurrent().Name
 $CurrentUserSid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
 
@@ -1905,6 +1906,26 @@ Invoke-Stage 'Backup' {
     $watchSettings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -MultipleInstances IgnoreNew -ExecutionTimeLimit (New-TimeSpan -Minutes 10)
     Register-ScheduledTask -TaskName $WatchTask -Action $watchAction -Trigger $watchTrigger -Principal $watchPrincipal -Settings $watchSettings -Force | Out-Null
     Write-LaiLog OK "Scheduled task '$WatchTask' checks the stack every 15 minutes (log: $(Join-Path $P.Logs 'watch.log'))"
+
+    # Nightly re-check after the Ollama app has updated itself (Update-Models.ps1 -RecheckOnly
+    # -Scheduled): no downloads, does nothing when no preset was measured on another Ollama, and skips
+    # while the PC is in use. An hour after the backup, so the two never meet. No -StartWhenAvailable
+    # (a missed night would run right after sign-in, while you start using the GPU), no -WakeToRun
+    # and no sign-in trigger: a night the PC is off waits for the next one.
+    $recheckTime = [datetime]::Today.AddHours(4).AddMinutes(30)
+    try { $recheckTime = ([datetime]::Parse($BackupTime, [Globalization.CultureInfo]::InvariantCulture)).AddHours(1) } catch { Write-Verbose "BackupTime '$BackupTime' not read as a time of day" }
+    $recheckAt = $recheckTime.ToString('HH:mm', [Globalization.CultureInfo]::InvariantCulture)
+    $recheckArgs = Get-LaiScriptCommandLine -ScriptPath (Join-Path $P.Scripts 'Update-Models.ps1') -AIRoot $AIRoot -Extra '-RecheckOnly -Scheduled' -Hidden
+    $recheckLaunch = Get-LaiHiddenTaskLaunch -PsArgs $recheckArgs -Build ([Environment]::OSVersion.Version.Build)
+    $recheckAction = New-ScheduledTaskAction -Execute $recheckLaunch.Execute -Argument $recheckLaunch.Argument
+    $recheckTrigger = New-ScheduledTaskTrigger -Daily -At $recheckAt
+    $recheckPrincipal = New-ScheduledTaskPrincipal -UserId $CurrentUser -LogonType Interactive -RunLevel Limited
+    $recheckSettings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -MultipleInstances IgnoreNew -ExecutionTimeLimit (New-TimeSpan -Hours 2)
+    Register-ScheduledTask -TaskName $RecheckTask -Action $recheckAction -Trigger $recheckTrigger -Principal $recheckPrincipal -Settings $recheckSettings -Force | Out-Null
+    # Tells the health watch that the re-check is armed: it then waits for it instead of notifying.
+    $config['ModelRecheckAt'] = $recheckAt
+    Save-LaiState -State $config -Path $P.Config
+    Write-LaiLog OK "Scheduled task '$RecheckTask' re-checks the presets at $recheckAt on nights after Ollama has updated itself (no downloads; skipped while the GPU is in use; log: $(Join-Path $P.Logs 'model-recheck.log'))"
 
     # Start-menu folder with one-click shortcuts (all users: the installer runs elevated and may
     # be a different admin account than the person who signs in).

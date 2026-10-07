@@ -173,6 +173,19 @@ function Test-LaiDockerEngine {
     return 'down'
 }
 
+function Get-LaiChatsInFlight {
+    # Chat answers the render guard is forwarding right now; -1 when it cannot tell (no guard, Docker
+    # not answering, a guard that is off the chat path): then nothing waits. The status page probes
+    # every ComfyUI first; a busy or firewalled one can make that take ~10 s, exactly while chats run
+    # slowly on the CPU: 15 s (tests/test_render_guard.py checks the margin), within -TimeoutSec.
+    param([int]$TimeoutSec = 30)
+    $py = "import json,urllib.request as u;print(json.load(u.urlopen('http://127.0.0.1:11434/render-guard/status',timeout=15))['inflight'])"
+    try { $r = Invoke-LaiTimedNative -File 'docker' -Arguments @('exec', 'render-guard', 'python3', '-c', $py) -TimeoutSec $TimeoutSec } catch { return -1 }
+    $m = [regex]::Match([string]$r.Out, '(?m)^\s*(\d+)\s*$')
+    if ($r.ExitCode -ne 0 -or -not $m.Success) { return -1 }
+    return [int]$m.Groups[1].Value
+}
+
 function ConvertTo-LaiHashtable {
     # PS 5.1 has no ConvertFrom-Json -AsHashtable; this converts PSCustomObject trees recursively.
     param($InputObject)
@@ -685,6 +698,27 @@ function Wait-LaiGpuIdle {
         }
         Start-Sleep -Seconds $PollSec
     }
+}
+
+function Get-LaiGpuBusyReason {
+    # Why the GPU is not free for measuring models right now, or '' when it is: for unattended runs
+    # (the nightly model re-check), which skip instead of waiting. Another program holding a CUDA
+    # context (ComfyUI, Forge, a game) counts; Ollama's own processes (ollama*.exe, llama-server.exe)
+    # do not, the caller unloads its models. -MaxUsedMiB > 0 also counts VRAM use above it (only
+    # meaningful once Ollama's models are unloaded). LOCALAI_TEST_GPU_BUSY: test hook, the reason to
+    # report; 'after-load' reports one only with -AfterLoad (a program that started mid-measurement).
+    param([int]$MaxUsedMiB = 0, [switch]$AfterLoad)
+    if ($env:LOCALAI_TEST_GPU_BUSY) {
+        if ($env:LOCALAI_TEST_GPU_BUSY -ne 'after-load') { return [string]$env:LOCALAI_TEST_GPU_BUSY }
+        if ($AfterLoad) { return 'a GPU program started during the measurement (test hook)' }
+    }
+    $apps = @(Get-LaiGpuApps | Where-Object { $_ -and $_ -notmatch '(?i)^(ollama[^\\/]*|llama-server)(\.exe)?$' })
+    if ($apps.Count) { return "GPU in use by $($apps -join ', ')" }
+    if ($MaxUsedMiB -gt 0) {
+        $gpu = Get-LaiGpuInfo
+        if ($gpu -and $gpu.UsedMiB -gt $MaxUsedMiB) { return ("{0} MiB of VRAM in use by other programs (limit {1} MiB)" -f $gpu.UsedMiB, $MaxUsedMiB) }
+    }
+    return ''
 }
 
 #endregion
@@ -2800,6 +2834,7 @@ function Get-LaiShortcutSpecs {
         @{ Name = 'Local AI - Gaming mode (free GPU)'; Script = 'Stop-LocalAI.ps1'; Extra = ''; Log = $true }
         @{ Name = 'Local AI - Start again'; Script = 'Start-LocalAI.ps1'; Extra = ''; Log = $true }
         @{ Name = 'Local AI - Health check'; Script = 'Test-LocalAI.ps1'; Extra = ' -Quick'; Log = $true }
+        @{ Name = 'Local AI - Re-check models'; Script = 'Update-Models.ps1'; Extra = ' -RecheckOnly'; Log = $true }
         @{ Name = 'ComfyUI (free GPU first)'; Script = 'Start-ComfyUI.ps1'; Extra = ''; Log = $true }
         @{ Name = 'Local AI - Diagnostics (redacted zip)'; Script = 'Get-LocalAIDiagnostics.ps1'; Extra = ' -RunTests' }
         @{ Name = 'Local AI - Sync skills'; Script = 'Sync-LocalAISkills.ps1'; Extra = ''; Log = $true }

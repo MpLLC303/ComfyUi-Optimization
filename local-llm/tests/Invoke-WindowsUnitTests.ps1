@@ -203,7 +203,9 @@ Assert-That ($free -eq 'FREE') "and as free after release (got '$free')"
 # ---- shortcuts -----------------------------------------------------------------------------------
 Write-Host "`n=== Start-menu shortcuts ===" -ForegroundColor Cyan
 $specs = @(Get-LaiShortcutSpecs -AIRoot ("C:\It's Dad" + [char]0x2019 + 's AI') -WebUIPort 3001)
-Assert-That ($specs.Count -eq 8) "eight shortcut specs (got $($specs.Count))"
+Assert-That ($specs.Count -eq 9) "nine shortcut specs (got $($specs.Count))"
+$rc = $specs | Where-Object { $_.Name -eq 'Local AI - Re-check models' }
+Assert-That ($rc -and $rc.Arguments -match "Update-Models\.ps1' -AIRoot '" -and $rc.Arguments -match "' -RecheckOnly \}" -and $rc.Arguments -notmatch '-Scheduled' -and $rc.Arguments -match 'shortcut-Update-Models\.log') "Re-check models runs Update-Models.ps1 -RecheckOnly (no downloads), logged ($($rc.Arguments))"
 $upd = $specs | Where-Object { $_.Name -like '*Update toolkit*' }
 Assert-That ($upd -and $upd.Arguments -match 'LOCALAI_ROOT' -and $upd.Arguments -notmatch '-AIRoot') 'Update toolkit passes the AI root via LOCALAI_ROOT'
 foreach ($sc in ($specs | Where-Object { $_.Kind -eq 'lnk' })) {
@@ -235,9 +237,9 @@ $updPayload = ($specs | Where-Object { $_.Name -like '*Update toolkit*' }).Argum
 Assert-That ($updPayload -notmatch 'Start-Transcript') 'Update toolkit is not logged (an installer in that window prints the admin password)'
 $longSpecs = @(Get-LaiShortcutSpecs -AIRoot ('D:\' + ('x' * 120) + '\AI') | Where-Object { $_.Kind -eq 'lnk' })
 $maxLen = ($longSpecs | ForEach-Object { $_.Arguments.Length } | Measure-Object -Maximum).Maximum
-Assert-That ($maxLen -lt 1024 -and @($longSpecs | Where-Object { $_.TooLong }).Count -eq 0 -and @($longSpecs | Where-Object { $_.Arguments -match 'Start-Transcript' }).Count -eq 5) "a 125-char AI root: every shortcut fits the 1024-char .lnk limit, logs included ($maxLen)"
+Assert-That ($maxLen -lt 1024 -and @($longSpecs | Where-Object { $_.TooLong }).Count -eq 0 -and @($longSpecs | Where-Object { $_.Arguments -match 'Start-Transcript' }).Count -eq 6) "a 125-char AI root: every shortcut fits the 1024-char .lnk limit, logs included ($maxLen)"
 $longSpecs = @(Get-LaiShortcutSpecs -AIRoot ('D:\' + ('y' * 200) + '\AI') | Where-Object { $_.Kind -eq 'lnk' })
-Assert-That (@($longSpecs | Where-Object { -not $_.TooLong -and $_.Arguments.Length -ge 1024 }).Count -eq 0 -and @($longSpecs | Where-Object { $_.Arguments -match 'Start-Transcript' }).Count -eq 0 -and @($longSpecs | Where-Object { -not $_.TooLong }).Count -ge 5) 'a 205-char AI root: the log is dropped so the shortcuts still fit; none over the limit is offered as usable'
+Assert-That (@($longSpecs | Where-Object { -not $_.TooLong -and $_.Arguments.Length -ge 1024 }).Count -eq 0 -and @($longSpecs | Where-Object { $_.Arguments -match 'Start-Transcript' }).Count -eq 0 -and @($longSpecs | Where-Object { -not $_.TooLong }).Count -ge 6) 'a 205-char AI root: the log is dropped so the shortcuts still fit; none over the limit is offered as usable'
 $longSpecs = @(Get-LaiShortcutSpecs -AIRoot ('D:\' + ('z' * 400) + '\AI') | Where-Object { $_.Kind -eq 'lnk' })
 Assert-That (@($longSpecs | Where-Object { $_.TooLong }).Count -eq $longSpecs.Count) 'a 405-char AI root: every shortcut is marked too long (the installer skips them with a warning)'
 if ($onWindows) {
@@ -394,6 +396,9 @@ Assert-That ($r.Code -eq 0 -and [System.IO.Path]::IsPathRooted($saved) -and $sav
 $r = Invoke-Child 'Release-GPU.ps1' @('-OllamaUrl', 'http://127.0.0.1:1')
 Assert-That ($r.Code -eq 0 -and $r.Text -match 'not running') "Release-GPU with Ollama closed says so and exits 0 (got $($r.Code))"
 if ($r.Code -ne 0 -or $failures -gt 0) { Write-Host $r.Text }
+# Refused before the setup lock or Ollama are touched (both may be in use by another suite).
+$r = Invoke-Child 'Update-Models.ps1' @('-AIRoot', $aiRoot, '-RecheckOnly', '-Rollback', 'main')
+Assert-That ($r.Code -ne 0 -and $r.Text -match 'cannot be combined' -and -not (Test-Path -LiteralPath (Join-Path $aiRoot 'model-recheck.json'))) "Update-Models -RecheckOnly -Rollback is refused, nothing recorded (exit $($r.Code))"
 
 Write-Host "`n=== Enable-TailscaleAccess against a fake tailscale CLI ===" -ForegroundColor Cyan
 $shimDir = Join-Path $Work 'tsshim'
@@ -1333,6 +1338,32 @@ foreach ($c in @(@{ Ram = 8; Want = $null }, @{ Ram = 16; Want = $null }, @{ Ram
     Assert-That ($cap -eq $c.Want) "WSL memory cap for $($c.Ram) GB of RAM: $(if ($null -eq $cap) { 'WSL default (half)' } else { "$cap GB" }) (never above WSL's own default of half the RAM)"
 }
 Assert-That (-not (Test-LaiCpuFallbackFits -DownloadGB $mainGB -RamGB 16) -and (Test-LaiCpuFallbackFits -DownloadGB $mainGB -RamGB 64)) 'the render guard CPU mode: Local Main does not fit 16 GB of RAM, fits 64 GB'
+
+Write-Host "`n=== the nightly model re-check: is the GPU free? ===" -ForegroundColor Cyan
+# Update-Models.ps1 -Scheduled skips instead of waiting while another program uses the GPU. Mocks
+# inside the module: the CUDA programs nvidia-smi lists, and the VRAM in use.
+$mod = Get-Module LocalAI
+& $mod {
+    $script:MockApps = @(); $script:MockUsed = 500
+    function script:Get-LaiGpuApps { @($script:MockApps) }
+    function script:Get-LaiGpuInfo { [pscustomobject]@{ Name = 'NVIDIA GeForce RTX 3090'; DriverVersion = '1.0'; TotalMiB = 24576; UsedMiB = $script:MockUsed; FreeMiB = 24576 - $script:MockUsed } }
+}
+$setGpu = { param($Apps, $Used) & $mod { param($a, $u) $script:MockApps = @($a); $script:MockUsed = $u } $Apps $Used }
+& $setGpu @('ollama.exe', 'ollama app.exe', 'llama-server.exe', 'ollama_llama_server.exe') 900
+$busy = Get-LaiGpuBusyReason -MaxUsedMiB 3500
+Assert-That ($busy -eq '') "Ollama's own processes (ollama*.exe, llama-server.exe) do not make the GPU busy ('$busy')"
+& $setGpu @('ollama.exe', 'python.exe') 900
+$busy = Get-LaiGpuBusyReason
+Assert-That ($busy -match 'python\.exe' -and $busy -notmatch 'ollama') "another CUDA program (ComfyUI's python.exe) is named, Ollama is not ($busy)"
+& $setGpu @() 9000
+$busy = Get-LaiGpuBusyReason -MaxUsedMiB 3500
+Assert-That ((Get-LaiGpuBusyReason) -eq '' -and $busy -match '9000 MiB') "VRAM in use counts only with -MaxUsedMiB: before the unload Ollama's own models fill it ($busy)"
+& $setGpu @() 900
+$env:LOCALAI_TEST_GPU_BUSY = 'after-load'
+try { Assert-That ((Get-LaiGpuBusyReason -MaxUsedMiB 3500) -eq '' -and (Get-LaiGpuBusyReason -MaxUsedMiB 3500 -AfterLoad) -ne '') "test hook 'after-load': busy only once a model was measured" } finally { $env:LOCALAI_TEST_GPU_BUSY = '' }
+$env:LOCALAI_TEST_GPU_BUSY = 'GPU in use by Game.exe'
+try { Assert-That ((Get-LaiGpuBusyReason) -eq 'GPU in use by Game.exe') 'test hook: any other value is the reason reported' } finally { $env:LOCALAI_TEST_GPU_BUSY = '' }
+Import-Module (Join-Path (Join-Path $src 'lib') 'LocalAI.psm1') -Force
 
 Write-Host "`n=== the Ollama app's own settings (server.log) ===" -ForegroundColor Cyan
 # A real Ollama 0.35.1 'server config' line (slog doubles the backslashes); the path has a space and an apostrophe.

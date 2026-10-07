@@ -184,13 +184,14 @@ $owVer = Invoke-Safely { (Invoke-LaiApi -Uri "http://127.0.0.1:$webPort/api/vers
 Add-Summary "Open WebUI: $owVer on port $webPort, health $health"
 
 # ---- files ----------------------------------------------------------------------------------------
-foreach ($f in @('localai-config.json', 'install-state.json', 'install-report.md', 'watch-state.json')) {
+foreach ($f in @('localai-config.json', 'install-state.json', 'install-report.md', 'watch-state.json', 'model-recheck.json')) {
     $p = Join-Path $AIRoot $f
     if (Test-Path -LiteralPath $p) { Save-Part $f (Get-Content -Encoding UTF8 -LiteralPath $p -Raw) }
 }
 $logs = Join-Path $AIRoot 'Logs'
 Save-Part 'watch.log' (Get-Tail (Join-Path $logs 'watch.log') 150)
 Save-Part 'backup.log' (Get-Tail (Join-Path $logs 'backup.log') 150)
+Save-Part 'model-recheck.log' (Get-Tail (Join-Path $logs 'model-recheck.log') 150)
 $inst = Get-ChildItem -LiteralPath $logs -Filter 'install-*.log' -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 1  # lai-ok: objects
 if ($inst) { Save-Part 'install-latest.log' (Get-Tail $inst.FullName 500) }
 # The last run of each Start-menu shortcut (its window's text is gone once closed).

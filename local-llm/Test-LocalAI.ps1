@@ -8,8 +8,8 @@
     Read-mostly checks plus functional tests that go through the real chain
     (browser API -> Open WebUI -> Ollama -> RTX 3090):
 
-      GPU + driver, Ollama, models installed, presets measured on the running Ollama version,
-      models 100% on GPU at their tuned context, a direct SearXNG search (names failed engines),
+      GPU + driver, Ollama, models installed, presets measured on the running Ollama version (and
+      the nightly re-check that keeps them so), models 100% on GPU at their tuned context, a direct SearXNG search (names failed engines),
       Docker, containers, Open WebUI login, presets (system prompt + native tool calling, image
       upload matching what Ollama reports for the model), no context size set in Open WebUI over
       the tuned aliases, signup off / memories on, RAG + web search settings, a chat per preset, an
@@ -107,7 +107,28 @@ Add-Check 'Presets measured on this Ollama' {
     $drift = @(Get-LaiTuningDrift -Tuning $tuning -OllamaVersion $script:ollamaVer -Keys @($catalog.Models | ForEach-Object { $_.Key }))
     if ($drift.Count -eq 0) { return (Pass "all $($known.Count) measured on Ollama $($script:ollamaVer)") }
     $was = @($drift | ForEach-Object { $_.Was } | Select-Object -Unique) -join ', '
-    Warn "Ollama is now $($script:ollamaVer) (it updates itself), but $(@($drift | ForEach-Object { $_.Key }) -join ', ') were measured on $was - run $(Join-Path (Join-Path $AIRoot 'Scripts') 'Update-Models.ps1') to check them on the GPU again"
+    $how = 'Start menu > Local AI - Re-check models checks them on the GPU again (no downloads, about a minute each)'
+    if ($config['ModelRecheckAt']) { $how = "the nightly re-check at $($config['ModelRecheckAt']) does that by itself while the PC is idle, or Start menu > Local AI - Re-check models checks them now (no downloads, about a minute each)" }
+    Warn "Ollama is now $($script:ollamaVer) (it updates itself), but $(@($drift | ForEach-Object { $_.Key }) -join ', ') were measured on $was - $how"
+}
+
+# The re-check after the Ollama app has updated itself (Update-Models.ps1 -RecheckOnly -Scheduled).
+Add-Check 'Nightly model re-check' {
+    if ($onWindows) {
+        $task = Get-ScheduledTask -TaskName 'LocalAI-Recheck-Models' -ErrorAction SilentlyContinue
+        if (-not $task) { return (Fail 'the LocalAI-Recheck-Models task is missing, so the presets are not re-checked after Ollama updates itself - run Start menu > Local AI - Update toolkit to set it up again') }
+        if ([string]$task.State -eq 'Disabled') { return (Fail 'the LocalAI-Recheck-Models task is disabled - enable it in Task Scheduler (Task Scheduler Library > LocalAI-Recheck-Models > Enable)') }
+    }
+    $rec = Read-LaiState -Path (Join-Path $AIRoot 'model-recheck.json')
+    if (-not $rec['result']) { return (Pass 'not needed yet (it runs only on nights after Ollama has updated itself)') }
+    # PowerShell 7's ConvertFrom-Json already turns the ISO time into a date; 5.1 leaves the string.
+    $at = $rec['at']; if ($at -is [datetime]) { $at = $at.ToString('s') }
+    $what = "last result $($rec['result']) on Ollama $($rec['ollamaVersion']) ($at)"
+    if (@('off-gpu', 'failed') -contains [string]$rec['result'] -and $script:ollamaVer -and [string]$rec['ollamaVersion'] -eq $script:ollamaVer) {
+        return (Warn "${what}: $(@($rec['presets']) -join ', ') ($($rec['reason'])) - close ComfyUI and games, then Start menu > Local AI - Re-check models (details: Logs\model-recheck.log)")
+    }
+    if ([string]$rec['result'] -eq 'skipped') { $what += ": $($rec['reason'])" }
+    Pass $what
 }
 
 foreach ($m in $catalog.Models) {

@@ -238,13 +238,46 @@ services:
     $upd = @(& $updLines)
     Assert-That ($upd.Count -eq $u0 + 1) "two runs, exactly one notice ($($upd.Count - $u0))"
     $updLine = ''; if ($upd.Count) { $updLine = [string]$upd[-1] }
-    Assert-That ($updLine -match [regex]::Escape("Ollama updated itself to $realVer; main were measured on 0.0.1") -and $updLine -match 'Update-Models\.ps1') "it names the new and the measured version, only the preset with a recorded version, and Update-Models ($updLine)"
+    Assert-That ($updLine -match [regex]::Escape("Ollama updated itself to $realVer; main were measured on 0.0.1") -and $updLine -match 'Start menu > Local AI - Re-check models' -and $updLine -notmatch 'Update-Models\.ps1') "it names the new and the measured version, only the preset with a recorded version, and the Re-check models shortcut, not a command to type ($updLine)"
     $ws = Read-LaiState -Path $statePath
     Assert-That ([string]$ws['ollamaNotifiedFor'] -eq $realVer -and @(@($ws['failed']) | Where-Object { "$_" -match 'Ollama|tuning|preset' }).Count -eq 0) 'recorded as told for this version, never as a failed check (no reminders, no exit code)'
     # Update-Models re-checked them: the tuning now records the running version.
     $st6 = Read-LaiState -Path $instPath; $st6['tuning']['main']['OllamaVersion'] = $realVer; Save-LaiState -State $st6 -Path $instPath
     Invoke-Watch @('-NoHeal') | Out-Null
     Assert-That (@(& $updLines).Count -eq $u0 + 1 -and -not (Read-LaiState -Path $statePath).ContainsKey('ollamaNotifiedFor')) 'after the re-check: no further notice, and a later update is announced again'
+
+    Write-Host "`n=== 6b. the nightly re-check is set up: the watch waits for it and tells only what needs the owner ===" -ForegroundColor Cyan
+    $c6 = Read-LaiState -Path $cfgFile; $c6['ModelRecheckAt'] = '04:30'; Save-LaiState -State $c6 -Path $cfgFile
+    $recheckFile = Join-Path $aiRoot 'model-recheck.json'
+    # Only the notices about Ollama and the presets (other checks fail here too and notify on their own).
+    $presetNotices = { param($Title) @((Get-WatchLog) -split "`n" | Where-Object { $_ -match (' NOTIFY [^\n]*Local AI: ' + $Title) }) }
+    $anyPreset = 'Ollama was updated|a preset is off the GPU|presets not re-checked'
+    $st6 = Read-LaiState -Path $instPath; $st6['tuning']['main']['OllamaVersion'] = '0.0.1'; Save-LaiState -State $st6 -Path $instPath
+    $p0 = @(& $presetNotices $anyPreset).Count
+    Invoke-Watch @('-NoHeal') | Out-Null
+    Invoke-Watch @('-NoHeal') | Out-Null
+    $sched = @((Get-WatchLog) -split "`n" | Where-Object { $_ -match [regex]::Escape("Ollama updated itself to $realVer; main measured on 0.0.1: re-check scheduled tonight at 04:30") })
+    Assert-That (@(& $presetNotices $anyPreset).Count -eq $p0 -and $sched.Count -eq 1) "Ollama updated itself: two runs, no notification, one watch.log line that the re-check is scheduled ($($sched.Count))"
+    $ws6 = Read-LaiState -Path $statePath
+    Assert-That ($ws6['ollamaDriftSince'] -is [hashtable] -and [string]$ws6['ollamaDriftSince']['version'] -eq $realVer -and -not $ws6.ContainsKey('ollamaNotifiedFor')) 'the time this version was first seen is kept, nothing counts as told'
+    # The re-check ran on this Ollama and could not set a preset up: exactly one notice, naming it.
+    Save-LaiState -State @{ ollamaVersion = $realVer; at = (Get-Date).AddMinutes(-5).ToString('s'); result = 'failed'; presets = @('Uncensored Main (could not be set up)'); reason = 'this model may be incompatible with your version of Ollama (test)' } -Path $recheckFile
+    Invoke-Watch @('-NoHeal') | Out-Null
+    Invoke-Watch @('-NoHeal') | Out-Null
+    $offGpu = @(& $presetNotices 'a preset is off the GPU')
+    $offLine = ''; if ($offGpu.Count) { $offLine = [string]$offGpu[-1] }
+    Assert-That ($offGpu.Count -eq 1 -and $offLine -match 'Uncensored Main' -and $offLine -match 'Re-check models' -and $offLine -match 'model-recheck\.log') "a failed re-check: exactly one notice over two runs, naming the preset and the Re-check models shortcut ($offLine)"
+    Assert-That (@(& $presetNotices 'presets not re-checked').Count -eq 0) "and no 'could not run' notice for a re-check that did run"
+    # Still waiting 3 days after the new version was first seen (the PC was busy every night): one notice.
+    Save-LaiState -State @{ ollamaVersion = $realVer; at = (Get-Date).AddHours(-2).ToString('s'); result = 'skipped'; reason = 'GPU in use by python.exe' } -Path $recheckFile
+    $ws6 = Read-LaiState -Path $statePath; $ws6['ollamaDriftSince'] = @{ version = $realVer; time = (Get-Date).AddHours(-73).ToString('s') }; Save-LaiState -State $ws6 -Path $statePath
+    Invoke-Watch @('-NoHeal') | Out-Null
+    Invoke-Watch @('-NoHeal') | Out-Null
+    $late = @(& $presetNotices 'presets not re-checked')
+    $lateLine = ''; if ($late.Count) { $lateLine = [string]$late[-1] }
+    Assert-That ($late.Count -eq 1 -and $lateLine -match 'could not run' -and $lateLine -match 'python\.exe' -and $lateLine -match 'Re-check models') "73 h without a re-check: exactly one notice with the last skip reason and the shortcut ($lateLine)"
+    $c6 = Read-LaiState -Path $cfgFile; $c6.Remove('ModelRecheckAt'); Save-LaiState -State $c6 -Path $cfgFile
+    Remove-Item -LiteralPath $recheckFile -Force
     Remove-Item -LiteralPath $instPath -Force
 
     Write-Host "`n=== 7. a Docker Desktop that stopped answering (after sleep): reported, not a silent hang ===" -ForegroundColor Cyan

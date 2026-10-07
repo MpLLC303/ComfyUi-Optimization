@@ -155,7 +155,7 @@ try {
     Assert-That (($del -contains 'localai-main:latest') -and ($del -contains 'localai-fast:latest')) 'tuned aliases deleted'
     Assert-That (($del -notcontains $sourceModel) -and ($del -notcontains 'other/model:latest')) 'source and unrelated models kept'
     $t = @(); if (Test-Path $tasksLog) { $t = @(Get-Content $tasksLog) }
-    Assert-That (($t -contains 'LocalAI-Watch') -and ($t -contains 'LocalAI-Backup-OpenWebUI')) 'scheduled tasks unregistered'
+    Assert-That (($t -contains 'LocalAI-Watch') -and ($t -contains 'LocalAI-Backup-OpenWebUI') -and ($t -contains 'LocalAI-Recheck-Models')) "scheduled tasks unregistered, the nightly model re-check too ($($t -join ', '))"
     Assert-That ((Test-Path (Join-Path $aiRoot 'Stack')) -and (Test-Path (Join-Path $aiRoot 'Secrets'))) 'files kept without -RemoveData'
     Assert-That (-not (Test-Path $menuDir)) 'Start-menu folder removed'
 

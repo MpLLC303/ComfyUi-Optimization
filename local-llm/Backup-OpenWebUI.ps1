@@ -158,17 +158,6 @@ while ($true) {
     Start-Sleep -Seconds 10
 }
 
-function Get-ChatsInFlight {
-    # Chat answers the render guard is forwarding right now; -1 when it cannot tell (no guard, Docker
-    # not answering, a guard that is off the chat path): then nothing waits. The status page probes
-    # every ComfyUI first; a busy or firewalled one can make that take ~10 s, exactly while chats run
-    # slowly on the CPU: 15 s (tests/test_render_guard.py checks the margin), within $dockerLimit.
-    $py = "import json,urllib.request as u;print(json.load(u.urlopen('http://127.0.0.1:11434/render-guard/status',timeout=15))['inflight'])"
-    try { $r = Invoke-LaiTimedNative -File 'docker' -Arguments @('exec', 'render-guard', 'python3', '-c', $py) -TimeoutSec $dockerLimit } catch { return -1 }
-    $m = [regex]::Match([string]$r.Out, '(?m)^\s*(\d+)\s*$')
-    if ($r.ExitCode -ne 0 -or -not $m.Success) { return -1 }
-    return [int]$m.Groups[1].Value
-}
 if ($WaitForChatsSec -gt 0 -and -not $NoStop) {
     # A run that catches up after wake or sign-in starts while you may be chatting: stopping Open
     # WebUI then would cut off the answer being written. Before the volume lock, so Start again or a
@@ -176,7 +165,7 @@ if ($WaitForChatsSec -gt 0 -and -not $NoStop) {
     $poll = 15; if ($env:LOCALAI_TEST_CHAT_POLL_SEC) { $poll = [int]$env:LOCALAI_TEST_CHAT_POLL_SEC }
     $chatStart = Get-Date
     $capped = $false
-    while ((Get-ChatsInFlight) -gt 0) {
+    while ((Get-LaiChatsInFlight -TimeoutSec $dockerLimit) -gt 0) {
         if (((Get-Date) - $chatStart).TotalSeconds -ge $WaitForChatsSec) { $capped = $true; break }
         Start-Sleep -Seconds $poll
     }

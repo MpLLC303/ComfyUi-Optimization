@@ -7,7 +7,8 @@
 .DESCRIPTION
     Default (safe) removal:
       1. Final verified backup of the Open WebUI volume (Backups\open-webui-<ts>-pre-uninstall.tar.gz).
-      2. Scheduled tasks LocalAI-Backup-OpenWebUI, LocalAI-Watch, LocalAI-Install-Resume.
+      2. Scheduled tasks LocalAI-Backup-OpenWebUI, LocalAI-Watch, LocalAI-Recheck-Models,
+         LocalAI-Install-Resume.
       3. The containers (open-webui, searxng, render-guard) and their network (docker compose down).
       4. The Tailscale HTTPS mapping to Open WebUI, if there is one.
       5. The tuned Ollama aliases (localai-*; they share weights with the source models, ~0 GB).
@@ -128,7 +129,7 @@ if (-not $NoBackup -and $volumeExists) {
 
 # ---- 2. scheduled tasks -------------------------------------------------------------------------
 if (Get-Command Unregister-ScheduledTask -ErrorAction SilentlyContinue) {
-    foreach ($t in @('LocalAI-Backup-OpenWebUI', 'LocalAI-Watch', 'LocalAI-Install-Resume')) {
+    foreach ($t in @('LocalAI-Backup-OpenWebUI', 'LocalAI-Watch', 'LocalAI-Recheck-Models', 'LocalAI-Install-Resume')) {
         if (Get-ScheduledTask -TaskName $t -ErrorAction SilentlyContinue) {
             Invoke-Step "scheduled task $t" { Unregister-ScheduledTask -TaskName $t -Confirm:$false; Write-LaiLog OK "Removed scheduled task $t" }
         }
@@ -262,7 +263,7 @@ if ($env:ProgramData) {
 if ($RemoveData) {
     $here = (Resolve-Path -LiteralPath $PSScriptRoot).Path
     $stateFiles = @()
-    foreach ($j in 'install-state.json', 'localai-config.json', 'watch-state.json', 'backup-state.json') { $stateFiles += @($j, "$j.bak", "$j.bad", "$j.tmp") }
+    foreach ($j in 'install-state.json', 'localai-config.json', 'watch-state.json', 'backup-state.json', 'model-recheck.json') { $stateFiles += @($j, "$j.bak", "$j.bad", "$j.tmp") }
     foreach ($item in (@('Stack', 'Secrets', 'Logs', 'Downloads', 'install-report.md', 'open-webui-hold.json') + $stateFiles)) {
         $path = Join-Path $AIRoot $item
         if (-not (Test-Path -LiteralPath $path)) { continue }

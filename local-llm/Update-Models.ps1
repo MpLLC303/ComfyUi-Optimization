@@ -16,8 +16,20 @@
     delete its files right after the pull), so -Rollback can bring it back if the new upload is
     worse. That costs the old model's size on disk until the next update or -DropPrevious.
 
+    -RecheckOnly downloads nothing. It loads, on the Ollama installed now, only the presets measured
+    on another Ollama version (the Ollama app updates itself) or left partly on the CPU by an earlier
+    check, re-tunes any that no longer fit fully on the GPU, and records the result in
+    <AIRoot>\model-recheck.json. Start menu > Local AI - Re-check models runs it. The scheduled task
+    LocalAI-Recheck-Models runs it every night with -Scheduled, which never waits: it skips (exit 0,
+    tomorrow night tries again) while another installer run or model update is going, Gaming mode is
+    on, a chat answer is being written, or another program uses the GPU. Its log is
+    <AIRoot>\Logs\model-recheck.log. The health watch shows a notification only when a preset could
+    not be put back fully on the GPU.
+
 .EXAMPLE
     .\Update-Models.ps1                    # check all models
+.EXAMPLE
+    .\Update-Models.ps1 -RecheckOnly       # no downloads: re-check the presets on the Ollama installed now
 .EXAMPLE
     .\Update-Models.ps1 -UpdateOllama      # upgrade Ollama via winget first
 .EXAMPLE
@@ -40,16 +52,63 @@ param(
     [string[]]$Unpin = @(),
     [switch]$DropPrevious,
     # Do not keep the old version of an updated model as <tag>-prev (saves disk space, no -Rollback).
-    [switch]$NoKeepPrevious
+    [switch]$NoKeepPrevious,
+    # No downloads: only re-check the presets measured on another Ollama version (see above).
+    [switch]$RecheckOnly,
+    # For the nightly task: -RecheckOnly -SkipTests that never waits and skips while the PC is in use.
+    [switch]$Scheduled
 )
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 Import-Module (Join-Path (Join-Path $PSScriptRoot 'lib') 'LocalAI.psm1') -Force
 
+# The nightly task: a re-check nobody watches, so no health check at the end (it would only add a
+# minute of GPU use at night) and no waiting anywhere.
+if ($Scheduled) { $RecheckOnly = [switch]$true; $SkipTests = [switch]$true }
+if ($RecheckOnly -and ($UpdateOllama -or $Retune -or $DropPrevious -or @($Rollback | Where-Object { $_ }).Count -or @($Unpin | Where-Object { $_ }).Count)) {
+    throw '-RecheckOnly (only a re-check, no downloads) cannot be combined with -UpdateOllama, -Retune, -Rollback, -Unpin or -DropPrevious; run those without it.'
+}
+
 $config = Read-LaiState -Path (Join-Path $AIRoot 'localai-config.json')
 $statePath = Join-Path $AIRoot 'install-state.json'
+$recheckPath = Join-Path $AIRoot 'model-recheck.json'
+$script:transcriptOn = $false
+if ($Scheduled) {
+    # No window to read afterwards: the runs are kept in Logs\model-recheck.log (the older ones move to
+    # model-recheck.log.old past 1 MB).
+    $logDir = Join-Path $AIRoot 'Logs'
+    $recheckLog = Join-Path $logDir 'model-recheck.log'
+    try {
+        if (-not (Test-Path -LiteralPath $logDir)) { New-Item -ItemType Directory -Force -Path $logDir | Out-Null }
+        if ((Test-Path -LiteralPath $recheckLog) -and (Get-Item -LiteralPath $recheckLog).Length -gt 1MB) { Move-Item -LiteralPath $recheckLog -Destination "$recheckLog.old" -Force }
+        Start-Transcript -LiteralPath $recheckLog -Append | Out-Null
+        $script:transcriptOn = $true
+    } catch { Write-Verbose "no transcript: $($_.Exception.Message)" }
+}
+function Stop-Run([int]$Code) {
+    if ($script:transcriptOn) { try { Stop-Transcript | Out-Null } catch { Write-Verbose 'transcript already stopped' } }
+    exit $Code
+}
+function Save-Recheck {
+    # What the last re-check found, for the health watch: it notifies only when a preset could not be
+    # put back fully on the GPU, or when the nightly run keeps being skipped.
+    param([string]$Result, [string[]]$Presets = @(), [string]$Reason = '', [string]$Version = '')
+    $rec = @{ ollamaVersion = $Version; at = (Get-Date).ToString('s'); result = $Result; presets = @($Presets); reason = $Reason }
+    try { Save-LaiState -State $rec -Path $recheckPath } catch { Write-LaiLog WARN "Could not write $recheckPath : $($_.Exception.Message)" }
+}
+function Exit-Skipped([string]$Reason, [string]$Version = '') {
+    # -Scheduled only: nothing is measured or recorded in the tuning, and tomorrow night tries again.
+    Write-LaiLog WARN "Re-check skipped: $Reason. The next nightly run tries again (or Start menu > Local AI - Re-check models)."
+    Save-Recheck -Result 'skipped' -Reason $Reason -Version $Version
+    Stop-Run 0
+}
+
 # Not while the installer or another model update runs: both tune the same models.
-$script:SetupLock = Enter-LaiSetupLock
+try { $script:SetupLock = Enter-LaiSetupLock }
+catch {
+    if ($Scheduled) { Exit-Skipped 'another installer run or model update was running' }
+    throw
+}
 $state = Read-LaiState -Path $statePath
 if (-not $state.ContainsKey('tuning') -or $null -eq $state['tuning']) { $state['tuning'] = @{} }
 $ollamaUrl = 'http://127.0.0.1:11434'
@@ -151,7 +210,8 @@ if ($Rollback.Count -gt 0) {
     }
     if ($changed.Count -eq 0) { throw "Nothing to roll back for: $($Rollback -join ', ')" }
     Save-Pins
-} else {
+} elseif (-not $RecheckOnly) {
+    # (-RecheckOnly: no downloads, so no model counts as changed; only the re-check below runs.)
     $offline = $false
     foreach ($m in $catalog.Models) {
         if ($pinned -contains $m.Key) { Write-LaiLog WARN "$($m.Display): pinned after a rollback, not updated (Update-Models.ps1 -Unpin $($m.Key) to allow it)"; continue }
@@ -198,6 +258,7 @@ if ($Rollback.Count -gt 0) {
 }
 
 $failedSetups = @()
+$script:setupWhy = ''
 function Invoke-ModelSetup {
     # One model at a time: a model that cannot be set up (e.g. a re-published tag this Ollama cannot
     # load) must not lose the others' results, and its own tuned alias stays as it was.
@@ -213,6 +274,7 @@ function Invoke-ModelSetup {
         $why = Get-LaiHttpErrorText $_
         if (-not $why) { $why = $_.Exception.Message }
         $script:failedSetups += $Model.Display
+        if (-not $script:setupWhy) { $script:setupWhy = $why }
         Write-LaiLog FAIL "  $($Model.Display): not set up ($why)"
         $hasPrev = $false
         if ($Changed) {
@@ -222,17 +284,23 @@ function Invoke-ModelSetup {
         return $false
     }
 }
+function Wait-GpuIdle {
+    # A run someone started waits for a quiet card; one that stays busy ends the run with a plain
+    # message instead of an error trace.
+    try { return (Wait-LaiGpuIdle -MaxUsedMiB $maxBusy -TimeoutSec 600) }
+    catch { Write-LaiLog FAIL $_.Exception.Message; Stop-Run 1 }
+}
 
 if ($changed.Count -gt 0) {
     Stop-LaiOllamaModels -BaseUrl $ollamaUrl
-    $gpu = Wait-LaiGpuIdle -MaxUsedMiB $maxBusy -TimeoutSec 600
+    $gpu = Wait-GpuIdle
     $fingerprint = Get-CurrentFingerprint $gpu
     $done = @()
     foreach ($m in $changed) {
         if (Invoke-ModelSetup -Model $m -SetupArgs @{ Fingerprint = $fingerprint; Retune = $true } -Changed) { $done += $m.Display }
     }
     if ($done.Count) { Write-LaiLog OK "Re-tuned: $($done -join ', ')" }
-} else {
+} elseif (-not $RecheckOnly) {
     Write-LaiLog OK 'All models are current; nothing to re-tune.'
 }
 
@@ -240,25 +308,99 @@ if ($changed.Count -gt 0) {
 # differently: load every other tuned model once and re-tune any that no longer fits fully on the GPU.
 $ollamaNow = ''
 try { $ollamaNow = [string](Get-LaiOllamaVersion -BaseUrl $ollamaUrl) } catch { Write-Verbose 'version unknown' }
+if ($RecheckOnly -and -not $ollamaNow) {
+    if ($Scheduled) { Exit-Skipped "Ollama was not running ($ollamaUrl)" }
+    Write-LaiLog FAIL "Ollama is not answering on $ollamaUrl. Start it (Start menu > Local AI - Start again), then re-check again."
+    Stop-Run 1
+}
 $changedKeys = @($changed | ForEach-Object { $_.Key })
 # The same list the health watch and Test-LocalAI report, so running this clears their notice.
 $driftKeys = @(Get-LaiTuningDrift -Tuning $state['tuning'] -OllamaVersion $ollamaNow -Keys @($catalog.Models | ForEach-Object { $_.Key }) | ForEach-Object { $_.Key })
-$toVerify = @($catalog.Models | Where-Object { $changedKeys -notcontains $_.Key -and $driftKeys -contains $_.Key })
+# A re-check someone started (the Start-menu shortcut) also measures again a preset an earlier check
+# left partly on the CPU: closing ComfyUI or a game first is often all it needed. Not the nightly run,
+# which would load it again every night for the same result.
+$offKeys = @()
+if ($RecheckOnly -and -not $Scheduled -and -not $allowCpu) {
+    $offKeys = @($catalog.Models | Where-Object { $state['tuning'][$_.Key] -is [hashtable] -and $null -ne $state['tuning'][$_.Key]['GpuPercent'] -and [int]$state['tuning'][$_.Key]['GpuPercent'] -lt 100 } | ForEach-Object { $_.Key })
+}
+$toVerify = @($catalog.Models | Where-Object { $changedKeys -notcontains $_.Key -and ($driftKeys -contains $_.Key -or $offKeys -contains $_.Key) })
+if ($RecheckOnly -and $toVerify.Count -eq 0) {
+    # Nothing written either: the last re-check's record stays what the health watch reads.
+    Write-LaiLog OK "Nothing to re-check: every preset was measured on Ollama $ollamaNow$(if (-not $allowCpu) { ' and runs fully on the GPU' })."
+    Stop-Run 0
+}
+$recheckOff = @(); $recheckFailed = @(); $recheckWhy = ''
 if ($ollamaNow -and $toVerify.Count -gt 0) {
     Write-LaiLog STEP "Ollama is now ${ollamaNow}: checking that $(($toVerify | ForEach-Object { $_.Display }) -join ', ') still fit fully on the GPU"
+    if ($Scheduled) {
+        # Nobody is watching: never in the way, and never a result measured on a card something else
+        # was using. Skipped (tomorrow night tries again) instead of waiting.
+        $ws = Read-LaiState -Path (Join-Path $AIRoot 'watch-state.json')
+        $paused = $null
+        if ($ws['pausedUntil'] -is [datetime]) { $paused = $ws['pausedUntil'] }
+        elseif ($ws['pausedUntil']) { try { $paused = [datetime]::Parse([string]$ws['pausedUntil'], [Globalization.CultureInfo]::InvariantCulture) } catch { $paused = $null } }
+        if ($paused -and (Get-Date) -lt $paused) { Exit-Skipped ("Gaming mode is on (the health watch is paused until {0:HH:mm})" -f $paused) $ollamaNow }
+        if ((Get-LaiChatsInFlight -TimeoutSec (Get-LaiDockerTimeout)) -gt 0) { Exit-Skipped 'a chat answer was being written' $ollamaNow }
+        # Programs only: before the unload, Ollama's own models still fill the VRAM.
+        $busy = Get-LaiGpuBusyReason
+        if ($busy) { Exit-Skipped $busy $ollamaNow }
+    }
     Stop-LaiOllamaModels -BaseUrl $ollamaUrl
-    $gpu = Wait-LaiGpuIdle -MaxUsedMiB $maxBusy -TimeoutSec 600
+    if ($Scheduled) { $gpu = Get-LaiGpuInfo } else { $gpu = Wait-GpuIdle }
     # Today's driver too: after a driver update the stored fingerprint no longer matches, so those
     # models are measured again instead of keeping a result recorded under the old driver.
     $vfp = Get-CurrentFingerprint $gpu
-    foreach ($m in $toVerify) { Invoke-ModelSetup -Model $m -SetupArgs @{ Previous = $state['tuning']; Fingerprint = $vfp } | Out-Null }
+    foreach ($m in $toVerify) {
+        if ($Scheduled) {
+            # Before each model (the first: right after the unload, when the VRAM in use counts too).
+            $busy = Get-LaiGpuBusyReason -MaxUsedMiB $maxBusy
+            if ($busy) { $recheckWhy = $busy; Write-LaiLog WARN "Re-check stopped: $busy"; break }
+        }
+        $prevEntry = $state['tuning'][$m.Key]
+        $ok = Invoke-ModelSetup -Model $m -SetupArgs @{ Previous = $state['tuning']; Fingerprint = $vfp }
+        if ($Scheduled) {
+            # A program that took the GPU while this model was measured (a game started at night) makes
+            # the result meaningless: put back what was there (recorded under the old Ollama, so the
+            # next run measures it again) and stop.
+            $busy = Get-LaiGpuBusyReason -MaxUsedMiB $maxBusy -AfterLoad
+            if ($busy) {
+                if ($prevEntry) { $state['tuning'][$m.Key] = $prevEntry } else { $state['tuning'].Remove($m.Key) }
+                Save-LaiState -State $state -Path $statePath
+                $failedSetups = @($failedSetups | Where-Object { $_ -ne $m.Display })
+                if ($prevEntry -and $prevEntry['Context']) {
+                    try { Set-LaiOllamaDerivedModel -BaseUrl $ollamaUrl -Name $m.Alias -From $m.Source -NumCtx ([int]$prevEntry['Context']) -Parameters $m.Parameters -System $system }
+                    catch { Write-LaiLog WARN "  could not rebuild $($m.Alias) at its previous context: $($_.Exception.Message)" }
+                }
+                $recheckWhy = "$busy while $($m.Display) was measured"
+                Write-LaiLog WARN "Re-check stopped: $recheckWhy; that result was discarded."
+                break
+            }
+        }
+        if (-not $ok) { $recheckFailed += $m.Display; continue }
+        $t = $state['tuning'][$m.Key]
+        if (-not $allowCpu -and $null -ne $t['GpuPercent'] -and [int]$t['GpuPercent'] -lt 100) { $recheckOff += ('{0} ({1}% GPU)' -f $m.Display, [int]$t['GpuPercent']) }
+    }
+    # For the health watch: a notification only when a preset could not be put back fully on the GPU.
+    $presets = @(@($recheckFailed | ForEach-Object { "$_ (could not be set up)" }) + @($recheckOff))
+    if ($recheckFailed.Count) { Save-Recheck -Result 'failed' -Presets $presets -Reason $script:setupWhy -Version $ollamaNow }
+    elseif ($recheckOff.Count) { Save-Recheck -Result 'off-gpu' -Presets $presets -Reason 'not fully on the GPU even at the smallest context' -Version $ollamaNow }
+    elseif ($recheckWhy) { Save-Recheck -Result 'skipped' -Reason $recheckWhy -Version $ollamaNow }
+    else { Save-Recheck -Result 'ok' -Version $ollamaNow }
+    if ($recheckOff.Count) {
+        Write-LaiLog WARN ("Not fully on the GPU on Ollama {0}: {1}. If ComfyUI, a game or another GPU program was open, close it and re-check (Start menu > Local AI - Re-check models); otherwise this Ollama needs more VRAM for them than the last one did." -f $ollamaNow, ($recheckOff -join ', '))
+    }
 }
 
 # The research agent (Install-LocalAI.ps1 -DeepResearch) asks Ollama for a context of its own: keep
 # it equal to its model's tuned context, or every switch between chats and research reloads the model.
+# Under the volume lock: its container must not be recreated while a backup has it paused.
 try {
-    $drLine = Update-LaiDeepResearchContext -AIRoot $AIRoot -Tuning $state['tuning'] -Models @($catalog.Models)
-    if ($drLine) { Write-LaiLog OK $drLine }
+    $drLock = $null
+    if ($config.ContainsKey('DeepResearchPort') -and [int]$config['DeepResearchPort'] -gt 0) { $drLock = Enter-LaiVolumeLock -TimeoutSec 900 }
+    try {
+        $drLine = Update-LaiDeepResearchContext -AIRoot $AIRoot -Tuning $state['tuning'] -Models @($catalog.Models)
+        if ($drLine) { Write-LaiLog OK $drLine }
+    } finally { Exit-LaiVolumeLock $drLock }
 } catch { Write-LaiLog WARN "Could not update the deep research context: $($_.Exception.Message)" }
 
 if ($failedPulls.Count -gt 0) {
@@ -273,6 +415,6 @@ if ($failedPulls.Count -gt 0) {
 $problems = $failedPulls.Count + $failedSetups.Count
 if (-not $SkipTests) {
     & (Join-Path $PSScriptRoot 'Test-LocalAI.ps1') -AIRoot $AIRoot -Quick
-    exit [Math]::Max($LASTEXITCODE, $problems)
+    Stop-Run ([Math]::Max($LASTEXITCODE, $problems))
 }
-exit $problems
+Stop-Run $problems

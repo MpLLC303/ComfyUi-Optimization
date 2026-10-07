@@ -556,15 +556,16 @@ def main():
         guard.wait(10)
 
     print('\n=== status page with slow ComfyUIs: within the time the nightly backup waits for it ===', flush=True)
-    # Backup-OpenWebUI.ps1 asks /render-guard/status how many chats are being answered before it
-    # stops Open WebUI. The page probes every ComfyUI first; if the backup gives up sooner it does
-    # not wait, which happens exactly while ComfyUI is busy and chats run slowly on the CPU.
+    # Backup-OpenWebUI.ps1 (and the nightly model re-check) ask /render-guard/status, through
+    # Get-LaiChatsInFlight, how many chats are being answered before they stop Open WebUI or unload
+    # the models. The page probes every ComfyUI first; if they give up sooner they do not wait,
+    # which happens exactly while ComfyUI is busy and chats run slowly on the CPU.
     root = os.path.dirname(HERE)
-    with open(os.path.join(root, 'Backup-OpenWebUI.ps1'), encoding='utf-8') as f:
-        m = re.search(r"render-guard/status',timeout=(\d+)", f.read())
-    backup_limit = int(m.group(1)) if m else 0
     with open(os.path.join(root, 'lib', 'LocalAI.psm1'), encoding='utf-8') as f:
-        m = re.search(r'function Get-LaiDockerTimeout \{.*?\$s = (\d+)', f.read(), re.S)
+        lib = f.read()
+    m = re.search(r"render-guard/status',timeout=(\d+)", lib)
+    backup_limit = int(m.group(1)) if m else 0
+    m = re.search(r'function Get-LaiDockerTimeout \{.*?\$s = (\d+)', lib, re.S)
     docker_limit = int(m.group(1)) if m else 0
     _, slow1 = start(SlowComfyHandler)
     _, slow2 = start(SlowComfyHandler)
