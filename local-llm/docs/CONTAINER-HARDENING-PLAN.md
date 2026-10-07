@@ -1,11 +1,14 @@
-# Container hardening (security track item 1): applied to the compose file; digests not started
+# Container hardening (security track item 1): applied to the compose file and passed by the CI job `stack`; digests not started
 
 Status (2026-10-07): the per-service hardening below is in `local-llm/stack/docker-compose.yml`,
 with a static rule (COMPOSESEC) and checks in `tests/Invoke-StackSmokeTest.ps1` that fail when it
-is missing or breaks a service. It was written on a PC where the stack may not be started, so
-**the first run on real containers is the CI job `stack`**: until that job has passed on this
-change, nothing here is proven on running containers. The digest plan is not started. What is
-still open is listed under "Still to do".
+is missing or breaks a service. It was written on a PC where the stack may not be started; **the
+first run on real containers, the CI job `stack`, passed on commit 8340532**. Every hardening
+assertion against the real containers was OK: all capabilities dropped, no new privileges, the
+memory and process limits, SearXNG as user 977 on a read-only root with a settings.yml dated 2020,
+a 64 MB chat through the render guard, and no container killed or restarted. Those are Linux
+containers on a CI machine, so what that job cannot see is still open, as are the digest plan
+(not started) and the request body cap (being built): see "Still to do".
 
 Evidence for the choices comes from the Open WebUI v0.11.4 source and Dockerfile, the SearXNG image
 `searxng/searxng:2026.10.2-19ffbcd30` (inspected, not started) and the compose file.
@@ -33,7 +36,9 @@ Every service: `cap_drop: [ALL]`, `security_opt: ["no-new-privileges:true"]`, a 
     the image, which is the state of every existing install after a SearXNG update (the installer
     writes the file once). A start script may then want to put its newer settings beside the old
     file, into a folder that is now read-only. It was not read from the image; the stack smoke
-    test starts SearXNG in exactly that state and decides it (see "What checks it").
+    test starts SearXNG in exactly that state and decides it (see "What checks it"). The CI job
+    `stack` did so on 8340532 and passed: SearXNG as user 977 on a read-only root with a
+    settings.yml dated 2020.
   - Runtime writes go only to /tmp (SQLite caches sxng_cache_*.db and faviconcache.db:
     searx/cache.py, favicons/cache.py).
   - `read_only` covers the image's own files, not a folder the image declares as a volume: Docker
@@ -134,13 +139,10 @@ matches it with a regex.
   backup's check image all assume `repo:tag`.
 
 ## Still to do
-- **Request bodies in the render guard** (`stack/render-guard/render_guard.py`): pass the body of
-  a path it does not rewrite straight through instead of reading it whole, or answer 413 above a
-  size. Until then a request too big for the guard's memory limit ends the guard.
-- **If the stack job fails on SearXNG's log** with a line about `settings.yml.new` or `Read-only
-  file system`: the image's start script does write beside an older settings.yml. Then decide with
-  that log whether the line is harmless (SearXNG still starts and answers) and may be allowed in
-  the test, or the folder must stay writable.
+- **Request bodies in the render guard** (`stack/render-guard/render_guard.py`), in progress (it
+  is being built as its own change and is not in yet): pass the body of a path it does not rewrite
+  straight through instead of reading it whole, or answer 413 above a size. Until it is in, a
+  request too big for the guard's memory limit ends the guard.
 - **By hand on a real install** (the smoke test has no browser and no model): upload a document
   (embedding and reranking), run a web search from a chat, save the skill notebook tool (that path
   runs pip install), and run one deep research report, all with the hardening on.
