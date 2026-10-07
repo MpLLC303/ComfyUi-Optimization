@@ -581,18 +581,27 @@ Add-Check 'Integrity watch' {
             $settledNamed = @($takenNamed | Where-Object { $_['Settled'] })
             $keptCount = $keptNamed.Count; $settledCount = $settledNamed.Count
             if ($restSettled) { $settledCount += $restCount } else { $keptCount += $restCount }
-            # The sentence that ends in the command to paste comes last.
-            $origin = ''
+            # One sentence for each kind, and with both of them the number in all. Then the advice, once
+            # and for all of them together ($takenAdvice: with a script among them, of either kind, no
+            # shortcut is named; one advice for each kind could say both), and last the command to
+            # paste: the line is a warning in each of these shapes, so each says what ends it.
+            $origin = ''; $subject = ' That install or update'
+            $ifNot = 'If you did not add them,'; $ifSo = 'If you did,'
             if ($settledCount) {
                 $settledList = Format-TakenList -Names @($settledNamed | ForEach-Object { [string]$_['Text'] }) -Count $settledCount
-                $settledAdvice = Get-LaiIntegrityAdvice -Ids @($taken | Where-Object { $_['Settled'] } | ForEach-Object { [string]$_['Id'] }) -AIRoot $AIRoot
-                $origin = " That install or update carried on $settledCount thing(s) already accepted by hand (-AcceptBaseline), which still count as normal: $settledList. If that acceptance was not yours, $settledAdvice"
+                $origin = "$subject carried on $settledCount thing(s) already accepted by hand (-AcceptBaseline), which still count as normal: $settledList."
+                $subject = ' It also'
+                $ifNot = 'If that acceptance was not yours,'; $ifSo = 'If it was,'
             }
             if ($keptCount) {
                 $keptList = Format-TakenList -Names @($keptNamed | ForEach-Object { [string]$_['Text'] }) -Count $keptCount
-                $keptAdvice = Get-LaiIntegrityAdvice -Ids @($taken | Where-Object { -not $_['Settled'] } | ForEach-Object { [string]$_['Id'] }) -AIRoot $AIRoot
-                $origin += " That install or update kept $keptCount thing(s) it did not install, which now count as normal: $keptList. If you did not add them, $keptAdvice If you did, this goes away with: $accept"
+                $origin += "$subject kept $keptCount thing(s) it did not install, which now count as normal: $keptList."
+                if ($settledCount) {
+                    $origin += " That is $takenCount in all."
+                    $ifNot = 'If that acceptance was not yours, or you did not add what was kept,'; $ifSo = 'If both were you,'
+                }
             }
+            $origin += " $ifNot $takenAdvice $ifSo this goes away with: $accept"
         }
     }
     # An update that kept what it did not install is a warning until the owner has looked.
