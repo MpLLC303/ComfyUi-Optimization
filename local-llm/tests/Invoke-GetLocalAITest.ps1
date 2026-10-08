@@ -801,6 +801,7 @@ if ($haveFunctions) {
     $sidUsers = 'S-1-5-32-545'
     $sidInstaller = 'S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464'
     $sidPerson = 'S-1-5-21-1-2-3-1001'
+    $sidBuiltIn = 'S-1-5-21-1-2-3-500'
     # Rights as Windows numbers them: full control, modify, read and run, and the generic ones.
     $full = 2032127
     $modify = 1245631
@@ -829,6 +830,13 @@ if ($haveFunctions) {
         'a user may change the rules'     = (& $withRule (New-TestRule $sidPerson 262144))
         'a user may take it over'         = (& $withRule (New-TestRule $sidPerson 524288))
         'an inherit-only rule for a user' = (& $withRule (New-TestRule $sidPerson $genericAll -InheritOnly))
+        # An account is not the group: full control for the built-in Administrator by its own SID
+        # (as it was still on a folder of the hosted machine of the Windows job after icacls had
+        # closed it), or that account as the owner. A rule for an account lets every program that
+        # account starts write, those without administrator rights too; the group's rule only the
+        # ones that have them.
+        'an administrator''s own account' = (& $withRule (New-TestRule $sidBuiltIn $full))
+        'that account owns it'            = (& $withRule @() $sidBuiltIn)
         'a user owns it'                  = (& $withRule @() $sidPerson)
         'nobody is named as owner'        = (& $withRule @() '')
         'a rule without a right'          = (& $withRule ([pscustomobject]@{ Sid = $sidUsers; Allow = $true; InheritOnly = $false }))
@@ -849,9 +857,9 @@ if ($haveFunctions) {
     }
     $wronglyAccepted = @($writable.Keys | Where-Object { (Test-AdminOnlyRule -Rule $writable[$_]) -eq '' })
     $wronglyRefused = @($adminsOnly.Keys | Where-Object { (Test-AdminOnlyRule -Rule $adminsOnly[$_]) -ne '' })
-    Assert-That ($wronglyAccepted.Count -eq 0) "the check of a folder's rules refuses a folder a normal user can write: modify, full control, a generic write, making files or folders, deleting, changing the rules, owning it; and rules it cannot read ($($writable.Count) cases; wrongly accepted: $($wronglyAccepted -join ', '))"
+    Assert-That ($wronglyAccepted.Count -eq 0) "the check of a folder's rules refuses a folder a normal user can write: modify, full control, a generic write, making files or folders, deleting, changing the rules, owning it; a rule for an administrator's own account, or that account as owner, which is not the group Administrators; and rules it cannot read ($($writable.Count) cases; wrongly accepted: $($wronglyAccepted -join ', '))"
     Assert-That ($wronglyRefused.Count -eq 0) "it accepts a folder that SYSTEM, Administrators and TrustedInstaller alone can change, whoever else may read and run ($($adminsOnly.Count) cases; wrongly refused: $($wronglyRefused -join ', '))"
-    Assert-That ((Test-AdminOnlyRule -Rule $writable['Users may modify']) -match '^S-1-5-32-545 may change it \(rights 0x001301BF\)' -and (Test-AdminOnlyRule -Rule $writable['a user owns it']) -match '^its owner is not SYSTEM, Administrators or TrustedInstaller \(owner: S-1-5-21-1-2-3-1001\)') 'and it says who may change the folder, or that its owner is the trouble'
+    Assert-That ((Test-AdminOnlyRule -Rule $writable['Users may modify']) -match '^S-1-5-32-545 may change it \(rights 0x001301BF\)' -and (Test-AdminOnlyRule -Rule $writable['a user owns it']) -match '^its owner is not SYSTEM, Administrators or TrustedInstaller \(owner: S-1-5-21-1-2-3-1001\)' -and (Test-AdminOnlyRule -Rule $writable['an administrator''s own account']) -match '^S-1-5-21-1-2-3-500 may change it \(rights 0x001F01FF\)') 'and it says who may change the folder, the built-in Administrator by its own SID too, or that its owner is the trouble'
     # The folder above (-Parent): one rule is left out, the one Program Files hands to CREATOR OWNER
     # in folders made later. Every other inherit-only rule decides who may write into a folder
     # that is made there, the step's own included, and counts like any rule.
@@ -2091,13 +2099,48 @@ Install-ToolkitDownload -Url "https://codeload.github.com/example-owner/example-
     # allowed to modify it, and it does not pass any more.
     $probeFolder = Join-Path $e2e 'rules-probe'
     New-Item -ItemType Directory -Force -Path $probeFolder | Out-Null
+    # Who holds a rule on that folder, read with Get-Acl and not with the function under test, and
+    # as text: the account's SID, its rights, and 'own' for a rule the folder holds itself or
+    # 'handed down' for one it has from the folder above. And the whole folder as text: its owner
+    # and the marks of its rule list as Windows writes them (the text before the first rule: O: the
+    # owner, D: with P for a list that takes nothing from above), then the rules.
+    $probeRules = { @((Get-Acl -LiteralPath $probeFolder).GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier])) }
+    $ruleSays = { param($Rules) (@($Rules | Where-Object { $_ } | ForEach-Object { '{0} 0x{1:X8} {2}' -f [string]$_.IdentityReference.Value, [int]$_.FileSystemRights, @('own', 'handed down')[[int][bool]$_.IsInherited] }) -join ', ') }
+    $probeSays = { [regex]::Replace([string](Get-Acl -LiteralPath $probeFolder).Sddl, '\(.*\z', '') + ' ' + (& $ruleSays (& $probeRules)) }
+    $madeSays = & $probeSays
     $icaclsCodes = @()
     & icacls.exe $probeFolder '/setowner' '*S-1-5-32-544' | Out-Null
     $icaclsCodes += $LASTEXITCODE
+    $ownedSays = & $probeSays
     & icacls.exe $probeFolder '/inheritance:r' '/grant:r' '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' | Out-Null
     $icaclsCodes += $LASTEXITCODE
+    # That call takes away what the folder was handed down and sets the two rules; a rule the folder
+    # holds as its own for anybody else it leaves alone. On the hosted machine of the Windows job a
+    # rule for somebody else was still there after it: full control for the account the job runs
+    # as (the built-in Administrator, by its own SID), and the check refused the folder for it. The
+    # check was right: an account is not the group Administrators, and what such a rule lets write
+    # is every program the account starts, those without administrator rights included. What was
+    # wrong is that this test took the folder for closed. So whoever else still holds a rule is
+    # read back and taken out by name, and the assertion holds the folder to its two holders as
+    # well as to the check. What had to be taken out is said with it, with the folder as it was
+    # made, after '/setowner' and after this call: how that rule came to be there on that machine
+    # is not known yet (a folder made and closed the same way on a Windows 11 PC, without
+    # administrator rights and so without the change of owner, has none). A rule that is still
+    # there after the taking out was handed down, which this call should have ended: the
+    # assertion then fails, and its line says so.
+    $leftRules = @(& $probeRules | Where-Object { @('S-1-5-18', 'S-1-5-32-544') -notcontains [string]$_.IdentityReference.Value })
+    $leftSays = 'nothing'
+    if ($leftRules.Count) {
+        $leftVerdict = Test-AdminOnlyRule -Rule (Get-FolderRule -Path $probeFolder)
+        $leftSays = '{0}, of which the check said ''{1}''; the folder as it was made: {2}; after /setowner: {3}; after /inheritance:r /grant:r: {4}' -f (& $ruleSays $leftRules), $leftVerdict, $madeSays, $ownedSays, (& $probeSays)
+        foreach ($other in @($leftRules | ForEach-Object { [string]$_.IdentityReference.Value } | Sort-Object -Unique)) {
+            & icacls.exe $probeFolder '/remove' "*$other" | Out-Null
+            $icaclsCodes += $LASTEXITCODE
+        }
+    }
+    $closedHolders = @(& $probeRules | ForEach-Object { [string]$_.IdentityReference.Value } | Sort-Object -Unique)
     $closedWhy = Test-AdminOnlyRule -Rule (Get-FolderRule -Path $probeFolder)
-    Assert-That ($closedWhy -eq '') "a real folder that SYSTEM and Administrators alone can change passes the check of its rules ('$closedWhy'; icacls exit codes $($icaclsCodes -join ', '))"
+    Assert-That ($closedWhy -eq '' -and ($closedHolders -join ' ') -eq 'S-1-5-18 S-1-5-32-544') "a real folder that SYSTEM and Administrators alone can change passes the check of its rules ('$closedWhy'; rules for: $($closedHolders -join ' '); left by icacls for others and taken out by name first: $leftSays; icacls exit codes $($icaclsCodes -join ', '))"
     & icacls.exe $probeFolder '/grant' '*S-1-5-32-545:(OI)(CI)M' | Out-Null
     $icaclsCodes += $LASTEXITCODE
     $openWhy = Test-AdminOnlyRule -Rule (Get-FolderRule -Path $probeFolder)

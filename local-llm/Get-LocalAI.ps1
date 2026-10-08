@@ -743,6 +743,10 @@
         # may read and run only: any other right is a no, the generic ones included (generic write
         # and generic all are rights as well, though no file right is named in them). Rules that deny
         # are left out: they take away, never give.
+        # Everyone else is also an account that is a member of Administrators, the built-in
+        # Administrator included, when a rule or the owner names it by its own SID. The group's rule
+        # serves only the programs that run with administrator rights; a rule for the account
+        # serves every program the account starts, and those are the ones this check is about.
         # -Parent: the folder is the one the new folder is made in. One rule is left out there: what
         # Program Files hands to CREATOR OWNER (S-1-3-0) in folders made later, inherit-only. It
         # names whoever makes a folder in it, and the other rules say who can do that. Every other
