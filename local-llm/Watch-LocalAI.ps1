@@ -120,6 +120,14 @@ function ConvertTo-WatchDate($Value) {
     if ($Value -is [datetime]) { return $Value }
     try { return [datetime]::Parse([string]$Value, [Globalization.CultureInfo]::InvariantCulture) } catch { return $null }
 }
+function ConvertTo-WatchCount($Value) {
+    # A count from a state file as a whole number from 0 up, or $null when it is none: the file is
+    # one any program of this user can write, and a notice must not print what it holds as a number.
+    if ($null -eq $Value) { return $null }
+    $n = 0
+    if ([int]::TryParse([string]$Value, [ref]$n) -and $n -ge 0) { return $n }
+    return $null
+}
 function Get-WatchStamp($Value) {
     # One spelling of a recorded time, to compare two of them by ('' = none): a state file hands the
     # same value back as a date under PowerShell 7 and as the string under 5.1.
@@ -130,9 +138,10 @@ function Get-WatchStamp($Value) {
 
 # Every docker call has a time limit: a Docker Desktop that stopped answering (it can after sleep)
 # would otherwise hang this run until Task Scheduler ends it, with no log line and no notification.
-# The limit is a constant here, or the test's parameter: the library's Get-LaiDockerTimeout reads
-# LOCALAI_DOCKER_TIMEOUT and casts it to a number, so a value that is none ended every run on this
-# line, before any check, log line or notification.
+# The limit is a constant here, or the test's parameter, so that no variable reaches it: the
+# library's Get-LaiDockerTimeout reads LOCALAI_DOCKER_TIMEOUT. Until batch 4 it cast that value to a
+# number, and a value that is none ended every run on this line, before any check, log line or
+# notification.
 $dockerLimit = 30; if ($TestDockerTimeout -gt 0) { $dockerLimit = $TestDockerTimeout }
 
 function Get-FreeSpaceProblem {
@@ -372,27 +381,42 @@ $futureDaily = @($all | Where-Object { $_.Name -match '^open-webui-\d{8}-\d{6}\.
 $all = @($all | Where-Object { $_.LastWriteTime -le $soon })
 $daily = @($all | Where-Object { $_.Name -match '^open-webui-\d{8}-\d{6}\.tar\.gz$' })
 $bstate = Read-LaiState -Path (Join-Path $AIRoot 'backup-state.json')
+# While the nightly backup has Open WebUI's data marked as wiped ('emptied', told below) it names
+# its archives -EMPTY. Those are then what shows that the nightly task still runs, and what goes to
+# the mirror: while the mark stands they count as nightly ones for freshness and for the mirror
+# row. Left out, a mark that stood for more than two nights added 'no nightly backup in the last
+# 50 h' to every notice although the task ran each night, and a mirror that had stopped still passed.
+$nightly = $daily
+if ($bstate['emptied'] -is [hashtable]) { $nightly = @($all | Where-Object { $_.Name -match '^open-webui-\d{8}-\d{6}(-EMPTY)?\.tar\.gz$' }) }
 $backupBase = @()
 if ($all.Count -gt 0 -and $all[0].Name -like '*-CORRUPT.tar.gz') { $backupBase += 'the newest backup failed its database check' }
-# An -EMPTY archive (the nightly backup found Open WebUI without its users or chats) is no good
-# newest backup either. Its record in backup-state.json says more and is told below; this line is
-# for a newest -EMPTY archive whose record is gone.
-if ($all.Count -gt 0 -and $all[0].Name -like '*-EMPTY.tar.gz' -and -not ($bstate['emptied'] -is [hashtable])) { $backupBase += 'the newest backup is of an Open WebUI without its users or chats' }
-if ($daily.Count -eq 0 -or ((Get-Date) - $daily[0].LastWriteTime).TotalHours -gt 50) { $backupBase += 'no nightly backup in the last 50 h' }
+if ($nightly.Count -eq 0 -or ((Get-Date) - $nightly[0].LastWriteTime).TotalHours -gt 50) { $backupBase += 'no nightly backup in the last 50 h' }
 $results['Backups'] = ($backupBase.Count -eq 0)
 $backupLog = Join-Path $logDir 'backup.log'
 # What else makes the backups something not to rely on, the gravest first. Any one fails the check.
 $backupWhy = @()
-# The nightly backup found Open WebUI without chats where earlier backups have some, and recorded it
+# The nightly backup found Open WebUI's data wiped where earlier backups have it, and recorded it
 # ('emptied': at, archive, lastGood, users, chats, hadUsers, hadChats). The owner may have cleared
-# them, or they are lost. Told on the first run that sees it (the report below): every night that
-# passes is one more backup of the empty state.
+# it, or it is lost. Told on the first run that sees it (the report below): every night that
+# passes is one more backup of the wiped state.
 $emptiedKey = ''
 if ($bstate['emptied'] -is [hashtable]) {
     $emptied = $bstate['emptied']
     $emptiedKey = Get-WatchStamp $emptied['at']; if (-not $emptiedKey) { $emptiedKey = 'undated' }
     $emptiedAt = ConvertTo-WatchDate $emptied['at']
-    $onDate = 'at the last backup'; if ($emptiedAt) { $onDate = 'on ' + $emptiedAt.ToString('yyyy-MM-dd') }
+    # What the record says, in the health check's words. Not 'no chats': the backup also sets the
+    # mark while chats are left (under a tenth of 20 or more) and keeps it until half are back, and
+    # 'no chats' next to an Open WebUI that shows three reads like a false alarm. 'at' is the first
+    # night; the counts are those of the last backup. A record without all four numbers gets none.
+    $emptiedSays = "Open WebUI's data looked wiped at the last nightly backup"
+    if ($emptiedAt) { $emptiedSays = "Open WebUI's data has looked wiped since the nightly backup of " + $emptiedAt.ToString('yyyy-MM-dd') }
+    $nowUsers = ConvertTo-WatchCount $emptied['users']
+    $nowChats = ConvertTo-WatchCount $emptied['chats']
+    $goodUsers = ConvertTo-WatchCount $emptied['hadUsers']
+    $goodChats = ConvertTo-WatchCount $emptied['hadChats']
+    if ($null -ne $nowUsers -and $null -ne $nowChats -and $null -ne $goodUsers -and $null -ne $goodChats) {
+        $emptiedSays += '; at the last backup {0} user(s) and {1} chat(s), {2} and {3} at the last good one' -f $nowUsers, $nowChats, $goodUsers, $goodChats
+    }
     $lastGood = ([string]$emptied['lastGood'] -replace '\s+', ' ').Trim()
     # The record is a file any program of this user can write, and a backup can have been moved or
     # removed since: a restore command is given only for a file that is in the backup folder now (by
@@ -406,17 +430,35 @@ if ($bstate['emptied'] -is [hashtable]) {
             if ($lastGoodFull -eq [System.IO.Path]::GetFullPath($inBackupDir) -and (Test-Path -LiteralPath $inBackupDir -PathType Leaf)) { $lastGoodPath = $inBackupDir }
         } catch { Write-Verbose "the recorded last good backup is no usable path: $($_.Exception.Message)" }
     }
-    # The second way out, for an owner who emptied it on purpose: one backup run that takes the data
-    # as it is now for this install's own. The backup's own log names both ways as well.
-    $ifMeant = 'if you emptied it yourself, run once: & {0} -AIRoot {1} -AcceptEmpty' -f (ConvertTo-LaiPsQuoted (Join-Path $PSScriptRoot 'Backup-OpenWebUI.ps1')), (ConvertTo-LaiPsQuoted $AIRoot)
+    # The backup command. With its last switch it is the second way out, for an owner who emptied it
+    # on purpose: one run that takes the data as it is now for this install's own. The backup's own
+    # log names both ways as well.
+    $backupCmd = '& {0} -AIRoot {1}' -f (ConvertTo-LaiPsQuoted (Join-Path $PSScriptRoot 'Backup-OpenWebUI.ps1')), (ConvertTo-LaiPsQuoted $AIRoot)
+    $ifMeant = "if you emptied it yourself, run once: $backupCmd -AcceptEmpty"
+    # The mark goes when a backup counts the data again, not when a restore ends. Said here, or an
+    # owner who restored as told reads the same notice once more, and restores a second time or
+    # takes the other command for the way out.
+    $afterRestore = 'after a restore this notice stays until the next nightly backup has counted the data again (the same command without -AcceptEmpty does that at once)'
     if ($lastGoodPath) {
         $restoreCmd = '& {0} -AIRoot {1} -Archive {2}' -f (ConvertTo-LaiPsQuoted (Join-Path $PSScriptRoot 'Restore-OpenWebUI.ps1')), (ConvertTo-LaiPsQuoted $AIRoot), (ConvertTo-LaiPsQuoted $lastGoodPath)
-        $backupWhy += "$onDate Open WebUI had no chats; the last backup with chats is $lastGood, put back with: $restoreCmd (no older backup is deleted meanwhile); $ifMeant"
+        $backupWhy += "$emptiedSays; the last good backup is $lastGood, put back with: $restoreCmd (no older backup is deleted meanwhile); $ifMeant; $afterRestore"
     } elseif ($lastGood) {
-        $backupWhy += "$onDate Open WebUI had no chats; the backup on record as the last one with chats, $lastGood, is not in $backupDir (no older backup is deleted meanwhile); $ifMeant"
+        $backupWhy += "$emptiedSays; the backup on record as the last good one, $lastGood, is not in $backupDir (no older backup is deleted meanwhile); $ifMeant; $afterRestore"
     } else {
-        $backupWhy += "$onDate Open WebUI had no chats, and no earlier backup with chats is on record (no older backup is deleted meanwhile); $ifMeant"
+        $backupWhy += "$emptiedSays, and no earlier good backup is on record (no older backup is deleted meanwhile); $ifMeant; $afterRestore"
     }
+} elseif ($all.Count -gt 0 -and $all[0].Name -like '*-EMPTY.tar.gz') {
+    # The newest archive is an -EMPTY one and its record is gone (a backup-state.json that was
+    # damaged or deleted starts empty, or from its earlier copy). The old backups may be held back by
+    # nothing any more: a next nightly backup that finds no counts to compare with takes the data as
+    # it is for normal and prunes by age again. A reason of its own, so it lands in the detail: among
+    # the plain reasons above it showed alone as a bare 'Backups', and the next step then named a log
+    # that does not say the record is gone.
+    $orphanWay = "no nightly backup from before it is in $backupDir"
+    if ($daily.Count -gt 0) {
+        $orphanWay = 'if you did not empty it yourself, first put back the newest nightly backup from before it: & {0} -AIRoot {1} -Archive {2}' -f (ConvertTo-LaiPsQuoted (Join-Path $PSScriptRoot 'Restore-OpenWebUI.ps1')), (ConvertTo-LaiPsQuoted $AIRoot), (ConvertTo-LaiPsQuoted ($daily[0].FullName))
+    }
+    $backupWhy += "the newest backup, $($all[0].Name), was made when Open WebUI's data looked wiped, and the record of it is gone from backup-state.json: without it the next nightly backup can take the data as it is now for normal and delete old backups by age again; $orphanWay"
 }
 # The plain reasons from above (no nightly backup, the newest one damaged) come next. Alone they stay
 # the bare 'Backups' whose hint is backup.log. Next to another reason they are named too: Backups is
@@ -449,15 +491,16 @@ if ($backupWhy.Count -gt $backupBase.Count) {
 # The second copy (NAS, other drive): a mirror that stopped working is otherwise only a line in backup.log.
 $mirrorTarget = ''
 if ($config.ContainsKey('BackupMirror') -and $config['BackupMirror']) { $mirrorTarget = [string]$config['BackupMirror'] }
-if ($mirrorTarget -and $daily.Count -gt 0) {
+if ($mirrorTarget -and $nightly.Count -gt 0) {
     $okAt = $null
     if ([string]$bstate['mirrorTarget'] -eq $mirrorTarget) { $okAt = ConvertTo-WatchDate $bstate['mirrorOkAt'] }
     if ($okAt -or $bstate['mirrorError']) {
-        # The newest nightly archive must have been mirrored (within its own run).
-        $results['Backup mirror'] = [bool]($okAt -and $okAt -ge $daily[0].LastWriteTime.AddHours(-2))
+        # The newest nightly archive must have been mirrored (within its own run). While Open WebUI's
+        # data is marked as wiped that is the newest -EMPTY one ($nightly above): it is copied too.
+        $results['Backup mirror'] = [bool]($okAt -and $okAt -ge $nightly[0].LastWriteTime.AddHours(-2))
     } else {
         # No record yet (made by a version before this check, or a newly set mirror): look for the file.
-        $results['Backup mirror'] = Test-Path -LiteralPath (Join-Path $mirrorTarget $daily[0].Name)
+        $results['Backup mirror'] = Test-Path -LiteralPath (Join-Path $mirrorTarget $nightly[0].Name)
     }
     if (-not $results['Backup mirror']) {
         $why = 'newest backup not copied to ' + $mirrorTarget

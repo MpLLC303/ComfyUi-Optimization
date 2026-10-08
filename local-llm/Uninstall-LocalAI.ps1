@@ -309,14 +309,32 @@ if ($desktop) {
 }
 
 # The administrators-only copy the resume task runs (see Install-LocalAI.ps1, $ElevatedDir).
-if ($env:ProgramFiles) {
-    $elevated = Join-Path $env:ProgramFiles 'LocalAI'
-    $dlDir = Join-Path $env:ProgramFiles 'LocalAI-Downloads'
+# Windows is asked where Program Files is, as the update does for the folder it makes there: a
+# variable of this session could name another folder, and this run deletes what it names.
+$programFiles = [Environment]::GetFolderPath('ProgramFiles')
+if ($programFiles) {
+    $elevated = Join-Path $programFiles 'LocalAI'
+    $dlDir = Join-Path $programFiles 'LocalAI-Downloads'
     if (Test-Path -LiteralPath $dlDir) { Invoke-Step $dlDir { Remove-LaiTree -Path $dlDir; Write-LaiLog OK "Deleted $dlDir" } }
     # The folder an update unpacks into before it starts the installer (Get-LocalAI.ps1). The update
     # removes it itself; an Administrator window closed mid-run leaves it until the next update.
-    $updDir = Join-Path $env:ProgramFiles 'LocalAI-Update'
-    if (Test-Path -LiteralPath $updDir) { Invoke-Step $updDir { Remove-LaiTree -Path $updDir; Write-LaiLog OK "Deleted $updDir" } }
+    $updDir = Join-Path $programFiles 'LocalAI-Update'
+    if (Test-Path -LiteralPath $updDir) {
+        # An update that is still installing holds the file 'in-use' in that folder open (the update
+        # itself looks at it the same way before it takes the folder). Then the folder stays: the
+        # toolkit would be deleted from under the installer that is running from it.
+        $updLock = Join-Path $updDir 'in-use'
+        $updBusy = $false
+        if (-not $WhatIfPreference -and (Test-Path -LiteralPath $updLock -PathType Leaf)) {
+            try { [System.IO.File]::Delete($updLock) } catch { $updBusy = $true }
+        }
+        if ($updBusy) {
+            Write-LaiLog WARN "A Local AI update is still running, so $updDir stays: it is in use, and the update removes it when it ends. That update installs the toolkit again: let it finish, then run the uninstaller once more."
+            $kept += "$updDir (a Local AI update is still running; it removes the folder when it ends)"
+        } else {
+            Invoke-Step $updDir { Remove-LaiTree -Path $updDir; Write-LaiLog OK "Deleted $updDir" }
+        }
+    }
     if (Test-Path -LiteralPath $elevated) { Invoke-Step $elevated { Remove-LaiTree -Path $elevated; Write-LaiLog OK "Deleted $elevated" } }
 }
 if ($env:ProgramData) {

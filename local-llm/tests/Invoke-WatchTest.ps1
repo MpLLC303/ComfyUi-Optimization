@@ -277,34 +277,43 @@ services:
     Assert-That ($drReported -and @((Read-LaiState -Path $statePath)['notified']) -notcontains 'Deep research') "a reported check that is no longer part of the install is dropped, not carried as not checked (reported before: $drReported; now: $(@((Read-LaiState -Path $statePath)['notified']) -join ', '))"
     # The newest archive is an -EMPTY one (the nightly backup found Open WebUI without its users or
     # chats) and backup-state.json holds no record of it. The run above passed Backups on the fresh
-    # nightly archive; with the -EMPTY one next to it, newer, the name alone fails the check.
+    # nightly archive; with the -EMPTY one next to it, newer, the name alone fails the check. The
+    # reason stands in the log line (it was a bare 'Backups' once, which sent the owner to a log that
+    # does not say the record is gone), with the restore of the nightly backup from before it.
     $emOrphan = Join-Path $bdir ('open-webui-{0}-EMPTY.tar.gz' -f (Get-Date -Format 'yyyyMMdd-HHmmss'))
     Set-Content -LiteralPath $emOrphan -Value 'x'
     Invoke-Watch $w5 | Out-Null
-    Assert-That ((& $lastFail) -match 'Backups') "a newest archive named -EMPTY fails Backups also without its record in backup-state.json ($(& $lastFail))"
+    $orphanFail = [string](& $lastFail)
+    Assert-That ($orphanFail -match ('Backups \(the newest backup, ' + [regex]::Escape((Split-Path -Leaf $emOrphan)) + ', was made when Open WebUI''s data looked wiped, and the record of it is gone from backup-state\.json') -and
+        $orphanFail -match 'Restore-OpenWebUI\.ps1[^\n]* -Archive ''[^'']*open-webui-\d{8}-\d{6}\.tar\.gz''' -and $orphanFail -notmatch 'no nightly backup in the last 50 h') "a newest archive named -EMPTY fails Backups also without its record in backup-state.json, with the reason in the log line and the restore of the nightly backup from before it ($orphanFail)"
     Remove-Item -LiteralPath $emOrphan -Force
-    # (f) The nightly backup found Open WebUI without chats and recorded it ('emptied'). From a state
-    # with no failures the very first run tells: the date, the last backup with chats, the command that
-    # puts it back, that no older backup is deleted, and the command for an owner who emptied it on
-    # purpose. Once: the second run sends nothing.
+    # (f) The nightly backup found Open WebUI's data wiped and recorded it ('emptied'). From a state
+    # with no failures the very first run tells: the first night, the counts of the last backup and of
+    # the last good one, that backup, the command that puts it back, that no older backup is deleted,
+    # the command for an owner who emptied it on purpose, and that the notice stays after a restore
+    # until a backup has counted the data again. Once: the second run sends nothing.
+    # This record has chats left (3 of 40): the backup sets the mark under a tenth as well, and a
+    # notice that said 'no chats' then read like a false alarm.
     # LOCALAI_TEST_TOAST_SETTING is set for the first run. It used to make the watch act as if Windows
     # had notifications off (and record that for the health check); alone it changes nothing now.
     $emAt = (Get-Date).AddDays(-1)
     $emGood = 'open-webui-20260101-030000.tar.gz'
     # The restore command is only given for a file that is in the backup folder: this one is.
     Set-Content -LiteralPath (Join-Path $bdir $emGood) -Value 'x'
-    $emNotices = { @((Get-WatchLog) -split "`n" | Where-Object { $_ -match ' NOTIFY Local AI: problem detected: [^\n]*Open WebUI had no chats' }) }
-    Save-LaiState -State @{ emptied = @{ at = $emAt.ToString('s'); archive = 'open-webui-emptied.tar.gz'; lastGood = $emGood; users = 1; chats = 0; hadUsers = 1; hadChats = 12 } } -Path $bstatePath
+    # The words every notice for a recorded emptying begins with.
+    $emLead = 'Open WebUI''s data has looked wiped since the nightly backup of '
+    $emNotices = { @((Get-WatchLog) -split "`n" | Where-Object { $_ -match (' NOTIFY Local AI: problem detected: [^\n]*' + $emLead) }) }
+    Save-LaiState -State @{ emptied = @{ at = $emAt.ToString('s'); archive = 'open-webui-emptied.tar.gz'; lastGood = $emGood; users = 1; chats = 3; hadUsers = 1; hadChats = 40 } } -Path $bstatePath
     Save-LaiState -State @{ failed = @() } -Path $statePath
     $em0 = @(& $emNotices).Count
     $env:LOCALAI_TEST_TOAST_SETTING = 'DisabledForUser'
     try { Invoke-Watch $w5 | Out-Null } finally { $env:LOCALAI_TEST_TOAST_SETTING = '' }
     $em = @(& $emNotices)
     $emLine = ''; if ($em.Count) { $emLine = [string]$em[-1] }
-    $emSays = $emLine -match [regex]::Escape('on ' + $emAt.ToString('yyyy-MM-dd') + ' Open WebUI had no chats; the last backup with chats is ' + $emGood) -and
+    $emSays = $emLine -match [regex]::Escape($emLead + $emAt.ToString('yyyy-MM-dd') + '; at the last backup 1 user(s) and 3 chat(s), 1 and 40 at the last good one; the last good backup is ' + $emGood) -and
         $emLine -match ('Restore-OpenWebUI\.ps1[^\n]* -Archive ' + [regex]::Escape("'" + (Join-Path $bdir $emGood) + "'")) -and $emLine -match 'no older backup is deleted meanwhile' -and
-        $emLine -match 'if you emptied it yourself, run once: [^\n]*Backup-OpenWebUI\.ps1[^\n]* -AcceptEmpty'
-    Assert-That ($em.Count -eq $em0 + 1 -and $emSays) "an emptied Open WebUI is announced by the first run that sees it: the date, the last backup with chats, the restore command with that file, that no older backup is deleted, and the -AcceptEmpty command for an owner who emptied it ($($em.Count - $em0) notice(s): $emLine)"
+        $emLine -match 'if you emptied it yourself, run once: [^\n]*Backup-OpenWebUI\.ps1[^\n]* -AcceptEmpty; after a restore this notice stays until the next nightly backup has counted the data again \(the same command without -AcceptEmpty does that at once\)'
+    Assert-That ($em.Count -eq $em0 + 1 -and $emSays) "an emptied Open WebUI is announced by the first run that sees it: the first night, the counts of the last backup (3 chats, not 'no chats') and of the last good one, that backup, the restore command with that file, that no older backup is deleted, the -AcceptEmpty command for an owner who emptied it, and that the notice stays after a restore until a backup has counted the data ($($em.Count - $em0) notice(s): $emLine)"
     $ws5 = Read-LaiState -Path $statePath
     $emTold = [string]$ws5['emptiedTold']
     Assert-That ($emTold -and @($ws5['notified']) -contains 'Backups' -and -not $ws5.ContainsKey('toastSetting')) "it is recorded as told, and LOCALAI_TEST_TOAST_SETTING alone neither drops the toast nor records a notification switch (toastSetting '$([string]$ws5['toastSetting'])')"
@@ -316,7 +325,7 @@ services:
     Set-Content -LiteralPath $emGood2 -Value 'x'
     Save-LaiState -State @{ emptied = @{ at = (Get-Date).ToString('s'); lastGood = $emGood2; chats = 0; hadChats = 3 } } -Path $bstatePath
     Invoke-Watch ($w5 + @('-TestToastFail')) | Out-Null
-    $emTried = @((Get-WatchLog) -split "`n" | Where-Object { $_ -match 'NOTIFY \(toast failed\) Local AI: problem detected: [^\n]*Open WebUI had no chats' }).Count
+    $emTried = @((Get-WatchLog) -split "`n" | Where-Object { $_ -match ('NOTIFY \(toast failed\) Local AI: problem detected: [^\n]*' + $emLead) }).Count
     Assert-That ($emTried -eq 1 -and [string](Read-LaiState -Path $statePath)['emptiedTold'] -eq $emTold) "a new emptying is announced although Backups was reported already; that notification failed, so it is not recorded as told ($emTried tried)"
     # OS is set for this run as Windows sets it. The watch took that variable for 'this is Windows':
     # here it then tried a real toast (which fails on Linux), and on a PC any other value in the
@@ -326,20 +335,47 @@ services:
     try { Invoke-Watch $w5 | Out-Null } finally { $env:OS = $savedOS }
     $em = @(& $emNotices)
     Assert-That ($em.Count -eq $em0 + 2 -and [string]$em[-1] -match (' -Archive ' + [regex]::Escape("'" + $emGood2 + "'")) -and [string](Read-LaiState -Path $statePath)['emptiedTold'] -ne $emTold) "and the next run sends it, with the full path of a file in the backup folder ($([string]$em[-1]))"
+    # That record holds two of the four counts (no users). A number is printed only from a record
+    # that has all four: the file is one any program of the owner can write.
+    Assert-That ([string]$em[-1] -match ($emLead + '\d{4}-\d\d-\d\d; the last good backup is ') -and [string]$em[-1] -notmatch 'user\(s\)|chat\(s\)') "a record without all four counts is announced without numbers ($([string]$em[-1]))"
     $osNotice = [string]@((Get-WatchLog) -split "`n" | Where-Object { $_ -match ' NOTIFY' })[-1]
     Assert-That ($osNotice -match ' NOTIFY Local AI: problem detected: ' -and $osNotice -notmatch 'toast failed') "with OS set to Windows_NT alone it is still the plain notice of a run off Windows: the platform is not read from that variable ($osNotice)"
     # The record names a file that exists, but outside the backup folder (as one on another drive or a
     # share would be), and the nightly backups stopped three days ago. No restore command for a file
     # that is not in the backup folder, and the missing nightly backup is named next to the emptying:
     # Backups is reported already, so nothing else would say that no backup is being made.
+    # While the mark stands the nightly archives are the -EMPTY ones, so they count for this too: one
+    # of them is in the folder, as old as the rest.
     $emElsewhere = Join-Path $Work 'open-webui-20260103-030000.tar.gz'
     Set-Content -LiteralPath $emElsewhere -Value 'x'
+    Set-Content -LiteralPath (Join-Path $bdir 'open-webui-20260104-030000-EMPTY.tar.gz') -Value 'x'
     Get-ChildItem -LiteralPath $bdir -File | ForEach-Object { $_.LastWriteTime = (Get-Date).AddDays(-3) }
     Save-LaiState -State @{ emptied = @{ at = (Get-Date).AddHours(-2).ToString('s'); lastGood = $emElsewhere; chats = 0; hadChats = 3 } } -Path $bstatePath
     Invoke-Watch $w5 | Out-Null
-    $emFail = & $lastFail
-    Assert-That ($emFail -match ('Open WebUI had no chats; the backup on record as the last one with chats, ' + [regex]::Escape($emElsewhere) + ', is not in ' + [regex]::Escape($bdir) + ' ') -and $emFail -notmatch 'Restore-OpenWebUI|-Archive ') "a recorded backup outside the backup folder is named as not being there, with no restore command ($emFail)"
-    Assert-That ($emFail -match 'Backups \([^\n]*Open WebUI had no chats[^\n]*; no nightly backup in the last 50 h') "and nightly backups that stopped meanwhile are named next to the emptying ($emFail)"
+    $emFail = [string](& $lastFail)
+    Assert-That ($emFail -match ($emLead + '\d{4}-\d\d-\d\d; the backup on record as the last good one, ' + [regex]::Escape($emElsewhere) + ', is not in ' + [regex]::Escape($bdir) + ' ') -and $emFail -notmatch 'Restore-OpenWebUI|-Archive ') "a recorded backup outside the backup folder is named as not being there, with no restore command ($emFail)"
+    Assert-That ($emFail -match ('Backups \([^\n]*' + $emLead + '[^\n]*; no nightly backup in the last 50 h')) "and nightly backups that stopped meanwhile are named next to the emptying, an -EMPTY archive of three days ago being no fresh one either ($emFail)"
+    # The nightly task that still runs under the mark makes an -EMPTY archive each night. A fresh one
+    # is the nightly backup of that night: the emptying is still told, and the notice no longer adds
+    # that no nightly backup was made (it did after the second night, with the task at work).
+    $emFresh = Join-Path $bdir ('open-webui-{0}-EMPTY.tar.gz' -f (Get-Date -Format 'yyyyMMdd-HHmmss'))
+    Set-Content -LiteralPath $emFresh -Value 'x'
+    Invoke-Watch $w5 | Out-Null
+    $emFreshFail = [string](& $lastFail)
+    Assert-That ($emFreshFail -match ('Backups \([^\n]*' + $emLead) -and $emFreshFail -notmatch 'no nightly backup in the last 50 h') "a fresh -EMPTY archive under the mark counts as the nightly backup of that night: no 'no nightly backup in the last 50 h' ($emFreshFail)"
+    # The mirror row under the mark: what must be in the mirror is that fresh -EMPTY archive (the
+    # backup copies it too), not the newest archive with a nightly name, which is from before. With
+    # only those older ones in the mirror the row fails; with the -EMPTY one copied it passes.
+    $c5 = Read-LaiState -Path $cfgFile; $c5['BackupMirror'] = $mdir; Save-LaiState -State $c5 -Path $cfgFile
+    Get-ChildItem -LiteralPath $bdir -File | Where-Object { $_.Name -notlike '*-EMPTY.tar.gz' } | ForEach-Object { Copy-Item -LiteralPath $_.FullName -Destination $mdir }
+    Invoke-Watch $w5 | Out-Null
+    $emMirrorMissing = [string](& $lastFail)
+    Copy-Item -LiteralPath $emFresh -Destination $mdir
+    Invoke-Watch $w5 | Out-Null
+    $emMirrorThere = [string](& $lastFail)
+    $c5 = Read-LaiState -Path $cfgFile; $c5.Remove('BackupMirror'); Save-LaiState -State $c5 -Path $cfgFile
+    Get-ChildItem -LiteralPath $mdir -File | Remove-Item -Force
+    Assert-That ($emMirrorMissing -match 'Backup mirror \(newest backup not copied to ' -and $emMirrorThere -match 'Backups \(' -and $emMirrorThere -notmatch 'Backup mirror') "under the mark the mirror must hold the newest -EMPTY archive: with only the older nightly archives there the mirror row fails, with that archive copied it passes ($emMirrorMissing / $emMirrorThere)"
     Remove-Item -LiteralPath $emElsewhere -Force
     Remove-Item -LiteralPath $bstatePath -Force
     Get-ChildItem -LiteralPath $bdir -File | Remove-Item -Force
@@ -518,7 +554,7 @@ services:
     $bs8['emptied'] = @{ at = (Get-Date).ToString('s'); lastGood = $gone8; chats = 0; hadChats = 5 }
     Save-LaiState -State $bs8 -Path $bstatePath
     Invoke-Watch @('-NoHeal', '-MinFreeGB', '1000000') | Out-Null
-    $full8 = [string]@(& $notices8 'Local AI: problem detected: [^\n]*Open WebUI had no chats')[-1]
+    $full8 = [string]@(& $notices8 ('Local AI: problem detected: [^\n]*' + $emLead))[-1]
     if ($hadState8) { $bs8.Remove('emptied'); Save-LaiState -State $bs8 -Path $bstatePath } else { Remove-Item -LiteralPath $bstatePath -Force }
     Assert-That ($full8 -match 'Disk space \([^\n]*\. Free some disk space \(unused models\)\. Keep every backup in ' -and $full8 -notmatch 'old backups') "a disk without room next to an emptied Open WebUI: the next step frees space elsewhere and says to keep every backup ($full8)"
     Assert-That ($full8 -match ([regex]::Escape($gone8) + ', is not in ') -and $full8 -notmatch 'Restore-OpenWebUI|-Archive ') "and a recorded backup that is no longer in the backup folder gets no restore command ($full8)"

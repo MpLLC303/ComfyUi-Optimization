@@ -719,7 +719,17 @@ if ($onWindows) {
     Save-LaiState -Path (Join-Path $ihRoot 'backup-state.json') -State @{ emptied = @{ at = '2026-01-02T03:00:00'; archive = $ihEmpty; lastGood = $ihGood; users = 0; chats = 0; hadUsers = 3; hadChats = 40 } }
     $ihRes = Invoke-Child 'Test-LocalAI.ps1' @('-AIRoot', $ihRoot, '-NoContainers', '-Quick')
     $ihBackups = @($ihRes.Text -split "`n" | Where-Object { $_ -match ' Backups: ' }) -join ' '
-    Assert-That ($ihBackups -match 'FAIL Backups: ' -and $ihBackups -match 'looked wiped' -and $ihBackups -match '0 users and 0 chats, 3 and 40 at the last good backup' -and $ihBackups -match [regex]::Escape($ihGood) -and $ihBackups -match 'Restore-OpenWebUI\.ps1' -and $ihBackups -match '-AcceptEmpty' -and $ihBackups -notmatch 'EMPTY\.tar\.gz') "an Open WebUI the nightly backup found wiped fails the Backups row with the counts now and before, the last good backup and both ways out, and its -EMPTY archive is not named as a backup ($ihBackups)"
+    Assert-That ($ihBackups -match 'FAIL Backups: ' -and $ihBackups -match 'has looked wiped since the nightly backup of 2026-01-02T03:00:00; at the last backup 0 user\(s\) and 0 chat\(s\), 3 and 40 at the last good one' -and $ihBackups -match [regex]::Escape($ihGood) -and $ihBackups -match 'Restore-OpenWebUI\.ps1' -and $ihBackups -match '-AcceptEmpty' -and $ihBackups -notmatch 'EMPTY\.tar\.gz') "an Open WebUI the nightly backup found wiped fails the Backups row with the first night, the counts of the last backup and of the last good one, that backup and both ways out, and its -EMPTY archive is not named as a backup ($ihBackups)"
+    # A restore does not clear the mark, the next backup that counts the data does: the row says so,
+    # or an owner who restored as told reads 'run Restore-OpenWebUI.ps1' again.
+    Assert-That ($ihBackups -match 'After a restore this line stays until the next nightly backup has counted the data again; Backup-OpenWebUI\.ps1 run by hand does that at once') "and the row says that it stays after a restore until a backup has counted the data again ($ihBackups)"
+    # The same folder with the record gone (backup-state.json saved without it): the newest archive is
+    # still the -EMPTY one, so the row fails as the watch does, names that archive and gives the
+    # restore of the nightly backup from before it. It passed here, on the 30 h old nightly archive.
+    Save-LaiState -Path (Join-Path $ihRoot 'backup-state.json') -State @{ deepCheck = 'ok' }
+    $ihRes = Invoke-Child 'Test-LocalAI.ps1' @('-AIRoot', $ihRoot, '-NoContainers', '-Quick')
+    $ihOrphan = @($ihRes.Text -split "`n" | Where-Object { $_ -match ' Backups: ' }) -join ' '
+    Assert-That ($ihOrphan -match 'FAIL Backups: the newest backup open-webui-20260102-030000-EMPTY\.tar\.gz was made when Open WebUI''s data looked wiped, and the record of it is gone from backup-state\.json' -and $ihOrphan -match 'Restore-OpenWebUI\.ps1 -Archive ''[^'']*open-webui-20260101-030000\.tar\.gz''') "a newest -EMPTY archive whose record is gone fails the Backups row too, with the restore of the nightly backup from before it ($ihOrphan)"
 } else { Skip 'the Integrity watch line of the health check runs on Windows only' }
 
 Write-Host "`n=== diagnostics bundle: redaction ===" -ForegroundColor Cyan
@@ -1427,6 +1437,12 @@ foreach ($c in 'de-DE', 'tr-TR', 'ja-JP') {
 }
 [System.Globalization.CultureInfo]::CurrentCulture = $savedCulture
 Assert-That ($null -eq (ConvertTo-WatchDate 'not a date') -and $null -eq (ConvertTo-WatchDate '')) 'a damaged value reads as no date (no crash)'
+# The counts the watch's notice for an emptied Open WebUI prints come from backup-state.json, a file
+# any program of the owner can write: a whole number from 0 up is a count, anything else is none.
+. ([scriptblock]::Create($wAst.Find({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'ConvertTo-WatchCount' }, $true).Extent.Text))
+$wc0 = ConvertTo-WatchCount 0
+Assert-That ($null -ne $wc0 -and $wc0 -eq 0 -and (ConvertTo-WatchCount 40) -eq 40 -and (ConvertTo-WatchCount '3') -eq 3) 'a count from backup-state.json reads as that number, 0 included'
+Assert-That ($null -eq (ConvertTo-WatchCount $null) -and $null -eq (ConvertTo-WatchCount 'many') -and $null -eq (ConvertTo-WatchCount (-1)) -and $null -eq (ConvertTo-WatchCount 2.5) -and $null -eq (ConvertTo-WatchCount $true)) 'and a missing value, text, a negative number, a fraction or a switch reads as no count'
 
 Write-Host "`n=== integrity watch: files, settings, scheduled tasks and listeners against a baseline ===" -ForegroundColor Cyan
 # The watch compares the installed scripts, the Stack folder, the LocalAI-* tasks and the listeners
@@ -2209,7 +2225,10 @@ Assert-That ($instText -match "-InstallerSetBefore:\(\[bool\]\`$State\.stages\['
 $ustText = Get-Content -LiteralPath (Join-Path $src 'Uninstall-LocalAI.ps1') -Raw -Encoding UTF8
 Assert-That ($ustText -match 'Get-LaiEnvResetPlan' -and $ustText -match 'prevOllamaEnv') 'Uninstall-LocalAI.ps1 restores from the recorded values instead of only deleting'
 # An update whose Administrator window was closed mid-run leaves its folder under Program Files.
-Assert-That ($ustText -match "Join-Path \`$env:ProgramFiles 'LocalAI-Update'" -and $ustText -match 'Remove-LaiTree -Path \$updDir') 'Uninstall-LocalAI.ps1 also removes LocalAI-Update under Program Files, the folder an update unpacks into (text of the script)'
+Assert-That ($ustText -match "Join-Path \`$programFiles 'LocalAI-Update'" -and $ustText -match 'Remove-LaiTree -Path \$updDir') 'Uninstall-LocalAI.ps1 also removes LocalAI-Update under Program Files, the folder an update unpacks into (text of the script)'
+# The three folders it deletes there are named by what Windows says Program Files is, never by the
+# session's variable, and an update that still holds its 'in-use' file keeps its folder.
+Assert-That ($ustText -match "\`$programFiles = \[Environment\]::GetFolderPath\('ProgramFiles'\)" -and $ustText -notmatch "Join-Path \`$env:ProgramFiles 'LocalAI" -and $ustText -match "Join-Path \`$updDir 'in-use'" -and $ustText -match 'A Local AI update is still running') 'Uninstall-LocalAI.ps1 asks Windows where Program Files is for the folders it deletes there, and leaves LocalAI-Update alone while an update holds it (text of the script)'
 
 Write-Host "`n=== installer port choice: a port Docker holds for another project is not this stack's ===" -ForegroundColor Cyan
 $instAst4 = [System.Management.Automation.Language.Parser]::ParseFile((Join-Path $src 'Install-LocalAI.ps1'), [ref]$null, [ref]$null)

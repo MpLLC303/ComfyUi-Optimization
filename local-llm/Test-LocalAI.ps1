@@ -497,14 +497,23 @@ Add-Check 'Backups' {
     # The nightly backup found Open WebUI without its users or chats and recorded it (backup-state.json,
     # 'emptied': at, lastGood, users, chats, hadUsers, hadChats). It stands until the data is back or
     # the owner accepts it; the watch reports the same. 'at' is text under Windows PowerShell 5.1 and
-    # a date under PowerShell 7.
+    # a date under PowerShell 7. It is the first night the data looked wiped; the counts are those
+    # of the last backup. The mark goes when a backup counts the data again, not when a restore ends,
+    # so the line says that too: it stays for some hours after a restore that did its work.
     $wiped = (Read-LaiState -Path (Join-Path $AIRoot 'backup-state.json'))['emptied']
     if ($wiped -is [hashtable]) {
         $since = $wiped['at']; if ($since -is [datetime]) { $since = $since.ToString('s') }
         $good = ([string]$wiped['lastGood'] -replace '\s+', ' ').Trim()
         if ($good.Length -gt 300) { $good = $good.Substring(0, 300) + '...' }
         if (-not $good) { $good = 'none on record' }
-        return (Fail ("Open WebUI's data looked wiped at the nightly backup of {0}: {1} users and {2} chats, {3} and {4} at the last good backup ({5}). Nightly archives are kept as -EMPTY and no older backup is deleted until this is settled: run Restore-OpenWebUI.ps1 to get the data back (it takes that last good backup), or, if you emptied it yourself, Backup-OpenWebUI.ps1 -AcceptEmpty once" -f $since, $wiped['users'], $wiped['chats'], $wiped['hadUsers'], $wiped['hadChats'], $good))
+        return (Fail ("Open WebUI's data has looked wiped since the nightly backup of {0}; at the last backup {1} user(s) and {2} chat(s), {3} and {4} at the last good one ({5}). Nightly archives are kept as -EMPTY and no older backup is deleted until this is settled: run Restore-OpenWebUI.ps1 to get the data back (it takes that last good backup), or, if you emptied it yourself, Backup-OpenWebUI.ps1 -AcceptEmpty once. After a restore this line stays until the next nightly backup has counted the data again; Backup-OpenWebUI.ps1 run by hand does that at once" -f $since, $wiped['users'], $wiped['chats'], $wiped['hadUsers'], $wiped['hadChats'], $good))
+    }
+    # The same archive with its record gone (a backup-state.json that was damaged or deleted): the
+    # old backups may be held back by nothing any more, and the watch fails Backups for it as well.
+    if ($all.Count -gt 0 -and $all[0].Name -like '*-EMPTY.tar.gz') {
+        $way = "no nightly backup from before it is in $dir"
+        if ($daily) { $way = "if you did not empty it yourself, first put back the newest nightly backup from before it: Restore-OpenWebUI.ps1 -Archive '$($daily.FullName)'" }
+        return (Fail "the newest backup $($all[0].Name) was made when Open WebUI's data looked wiped, and the record of it is gone from backup-state.json: without it the next nightly backup can take the data as it is now for normal and delete old backups by age again; $way")
     }
     if (-not $newest) { return (Fail "no archive in $dir") }
     if (-not $daily) { return (Warn "no nightly archive yet (newest: $($newest.Name)); the nightly backup task has not run yet; if this stays, run Start menu > Local AI - Update toolkit to set it up again") }

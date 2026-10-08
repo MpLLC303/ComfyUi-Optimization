@@ -26,7 +26,7 @@ env:
 jobs:
   windows-ps51:
     runs-on: windows-latest
-    # 30, not 20: the bootstrap suite now starts about 40 child PowerShell runs on this job and the
+    # 30, not 20: the bootstrap suite now starts several dozen child PowerShell runs on this job and the
     # unit tests grew by about a minute, and no run has timed the two together yet. The bootstrap
     # suite prints its seconds part by part, so the first log shows what 20 would have left.
     timeout-minutes: 30

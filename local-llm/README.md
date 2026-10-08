@@ -414,7 +414,9 @@ the newest, and of the deep research archives made since only the newest two are
 watch tells you on its next run, and it and `Test-LocalAI.ps1` fail their Backups check until it is
 settled. There are two ways out: run `Restore-OpenWebUI.ps1` to get the data back, or, if you
 emptied it yourself, run `Backup-OpenWebUI.ps1 -AcceptEmpty` once. The mark also clears by itself
-when at least half the users and chats of the last good backup are back.
+when a nightly backup finds at least half the users and chats of the last good backup again. A
+restore does not clear it: both checks still fail until the next nightly backup has counted the
+data. To clear it at once after a restore, run `Backup-OpenWebUI.ps1` by hand.
 
 Keep a copy of `C:\AI\Secrets` (session key and admin login) in your password manager. It's
 deliberately not inside the backup archives.
