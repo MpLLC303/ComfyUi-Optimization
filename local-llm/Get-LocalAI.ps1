@@ -550,15 +550,23 @@
     #      the PC, and a removal with administrator rights would then be aimed by that program.
     #      The two files in the temp folder are removed by the window that put them there, with
     #      the user's own rights, once the step has said that it has read them
-    #      (Start-ElevatedWindow, Send-HandOverSignal). That step is itself handed over as text in
-    #      a file in the temp folder: the window with administrator rights is started with that
-    #      text's SHA-256 on its command line, reads the file once, and runs what it read only
-    #      when the two agree (Get-ElevatedLauncher).
+    #      (Start-ElevatedWindow, Send-HandOverSignal). It says so by a signal that window made,
+    #      which it finds by name. A name is something a program of the user can make stand for
+    #      another signal of Windows, so the step looks at what it opened before it touches it,
+    #      and sets it only when it belongs to the account that asked. That step is itself handed
+    #      over as text in a file in the temp folder: the window with administrator rights is
+    #      started with that text's SHA-256 on its command line, reads the file once, and runs
+    #      what it read only when the two agree (Get-ElevatedLauncher).
     # Out of scope: an attacker who is already administrator (or SYSTEM) on this PC. Such a program
     # can change Program Files, this check and Windows itself; nothing here is written against it.
     # Not covered either, and said so that it is not taken for granted:
     #   - Attacker B changing what is run before this point: the installed copy of this file, or the
     #     command that was pasted. The header of this file says the same about the review.
+    #   - Attacker B setting what this script reads from the environment (LOCALAI_REF,
+    #     LOCALAI_REVIEWED_COMMIT, LOCALAI_ROOT, LOCALAI_ARGS) for the windows the user opens later.
+    #     With the first two it can name a commit of its own as the reviewed one (GitHub answers
+    #     at this address for a fork's commits too): the question is then not asked, and the
+    #     prompt of Windows is all the user sees.
     #   - Attacker B swapping the downloaded file between the download and the one read of it. With
     #     the commit's list of files that is caught, as any other download that is not the commit.
     #     Without it (a first install GitHub's API did not answer for) nothing was shown that the
@@ -810,10 +818,10 @@
         # nothing and are not looked at: a letter outside ASCII in another folder of the repository
         # must not stop an install. Both readers of the archive go by this one rule
         # (Get-ArchiveFileList, Expand-ToolkitArchive), and Get-TreeManifest by the same.
-        # An error (the caller stops) for: a top folder with a name Windows may store elsewhere than
-        # written (it becomes a folder on this PC), a second top folder or a file beside it, and
-        # under local-llm any name Windows may store elsewhere than written (Test-PlainRepoPath: no
-        # '..', no drive, no stream).
+        # An error (the caller stops) for: a top folder whose name is more than letters, digits and
+        # . _ - or that Windows may store elsewhere than written, a second top folder or a file
+        # beside it, and under local-llm any name Windows may store elsewhere than written
+        # (Test-PlainRepoPath: no '..', no drive, no stream).
         param([string]$FullName, [string]$Top)
         # Compress-Archive of Windows PowerShell 5.1 writes '\' between the parts, GitHub '/'.
         $name = $FullName.Replace('\', '/')
@@ -822,7 +830,12 @@
         $parts = $name.Split('/')
         if (-not $Top) {
             $Top = $parts[0]
-            if (-not (Test-PlainRepoPath -Path $Top)) { throw "the archive's top folder has a name Windows may store elsewhere than written: $(ConvertTo-ReviewText -Text $FullName -Max 120)" }
+            # The top folder becomes a folder on this PC, in the path the installer is started from
+            # with administrator rights, and no comparison covers its name (the digest lists paths
+            # from local-llm down). GitHub makes it of the repository's name, a '-' and the commit
+            # or the ref: letters, digits and . _ - are all it ever holds. A quote, a bracket, a
+            # ';' or a space has no business in that path.
+            if ($Top -cnotmatch '^[A-Za-z0-9._-]+\z' -or -not (Test-PlainRepoPath -Path $Top)) { throw "the archive's top folder has a name that is more than letters, digits and . _ - (GitHub names it after the repository and the commit): $(ConvertTo-ReviewText -Text $FullName -Max 120)" }
         }
         if ($parts[0] -cne $Top -or ($parts.Count -eq 1 -and -not $isFolder)) { throw 'the archive does not hold one top folder with everything in it' }
         $other = [pscustomobject]@{ Top = $Top; Path = ''; Name = '' }
@@ -861,7 +874,7 @@
         # Invoke-ElevatedInstall. Every value in that line travels as base64 and is turned back by
         # the text itself, so no folder name, however it is spelled (a quote, a '$', a space), can
         # become part of the command.
-        param([System.Collections.IDictionary]$Definitions, [string]$Zip, [string]$ZipHash, [string]$Digest, [string]$Commit, [string]$Root, [string[]]$Extra, [string]$Signal)
+        param([System.Collections.IDictionary]$Definitions, [string]$Zip, [string]$ZipHash, [string]$Digest, [string]$Commit, [string]$Root, [string[]]$Extra, [string]$Signal, [string]$SignalOwner)
         $value = { param([string]$Text) '(& $plain ''' + [System.Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($Text)) + ''')' }
         $lines = New-Object System.Collections.Generic.List[string]
         $lines.Add('$ErrorActionPreference = ''Stop''')
@@ -869,7 +882,7 @@
         foreach ($name in @($Definitions.Keys)) { $lines.Add('function ' + $name + ' {' + [string]$Definitions[$name] + '}') }
         $lines.Add('$plain = { param([string]$Text) [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($Text)) }')
         $words = @($Extra | Where-Object { $_ } | ForEach-Object { & $value $_ }) -join ', '
-        $lines.Add('Invoke-ElevatedInstall -Zip ' + (& $value $Zip) + ' -ZipHash ' + (& $value $ZipHash) + ' -Digest ' + (& $value $Digest) + ' -Commit ' + (& $value $Commit) + ' -Root ' + (& $value $Root) + ' -Signal ' + (& $value $Signal) + ' -Extra @(' + $words + ')')
+        $lines.Add('Invoke-ElevatedInstall -Zip ' + (& $value $Zip) + ' -ZipHash ' + (& $value $ZipHash) + ' -Digest ' + (& $value $Digest) + ' -Commit ' + (& $value $Commit) + ' -Root ' + (& $value $Root) + ' -Signal ' + (& $value $Signal) + ' -SignalOwner ' + (& $value $SignalOwner) + ' -Extra @(' + $words + ')')
         return ($lines -join "`n")
     }
 
@@ -881,18 +894,23 @@
         # temp folder, where it can. A file that was changed or removed is refused: the command
         # says so and does no more than that. It removes nothing: the files in the temp folder are
         # left to the window that put them there, which is told that this one is done with them
-        # (-Signal: the name of that window's signal, see Send-HandOverSignal).
+        # (-Signal: the name of that window's signal; -SignalOwner: the account it must belong to,
+        # as its SID. The rule is Send-HandOverSignal's: what the name opens is set only when it
+        # belongs to that account, and closed untouched when not).
         # One line, without a double quote and without two spaces in a row: Start-Process hands its
         # arguments over joined by spaces, and powershell.exe puts the command together from the
         # pieces again. The path travels as base64 for the same reason.
-        param([string]$StageFile, [string]$Hash, [string]$Signal)
+        param([string]$StageFile, [string]$Hash, [string]$Signal, [string]$SignalOwner)
         $value = { param([string]$Text) "[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('" + [System.Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($Text)) + "'))" }
         $refuse = @(
             'Write-Host ''Stopped: the file that carries the step with administrator rights was changed or removed after this window was asked for (a program running under your Windows account can do that).'' -ForegroundColor Red'
             'Write-Host ''Nothing was installed or changed: your Local AI keeps working as it is.'' -ForegroundColor Yellow'
         )
-        # A name made here holds letters, digits and '-' only; any other is left out of the command.
-        if ($Signal -cmatch '^[A-Za-z0-9-]{1,80}\z') { $refuse += ('try{$e=[Threading.EventWaitHandle]::OpenExisting(''' + $Signal + ''');$null=$e.Set();$e.Close()}catch{$e=$null}') }
+        # A name made here holds letters, digits and '-' only, and a SID digits and '-' behind
+        # 'S-1-'. With any other name, or without a SID, the signal is left out of the command.
+        if ($Signal -cmatch '^[A-Za-z0-9-]{1,80}\z' -and $SignalOwner -cmatch '^S-1-[0-9-]{1,180}\z') {
+            $refuse += ('try{$e=[Threading.EventWaitHandle]::OpenExisting(''' + $Signal + ''',[Security.AccessControl.EventWaitHandleRights]''Modify,Synchronize,ReadPermissions'');if($e.GetAccessControl().GetOwner([Security.Principal.SecurityIdentifier]).Value -ceq ''' + $SignalOwner + '''){$null=$e.Set()};$e.Close()}catch{$e=$null}')
+        }
         $steps = @(
             ('$f=' + (& $value $StageFile))
             '$b=[byte[]]@()'
@@ -1032,10 +1050,11 @@
     function Get-ArchiveFileList {
         # The toolkit in the archive -Bytes (the download as it was read, once), without writing
         # anything: Files, a list of Path ('local-llm/...') and Id (Get-ToolkitFileId), which
-        # Compare-ToolkitTree and Get-ToolkitDigest take; Version, the text of local-llm/VERSION;
-        # and Top, the archive's top folder. The same entries Expand-ToolkitArchive writes, by the
-        # same rule (Get-ToolkitEntry), so the first comparison needs no file in the temp folder
-        # that a program of the user could rewrite between the unpacking and the reading.
+        # Compare-ToolkitTree and Get-ToolkitDigest take; Version, the text of local-llm/VERSION
+        # without the line break it ends in (and without a byte order mark, should an editor have
+        # left one); and Top, the archive's top folder. The same entries Expand-ToolkitArchive
+        # writes, by the same rule (Get-ToolkitEntry), so the first comparison needs no file in the
+        # temp folder that a program of the user could rewrite between the unpacking and the reading.
         # A file that is in the archive twice, also under two names that differ in capitals only
         # (Windows keeps one of them), and more than -MaxBytes of content are errors.
         param([byte[]]$Bytes, [long]$MaxBytes = 268435456)
@@ -1071,7 +1090,10 @@
                         $fileBytes = $content.ToArray()
                     } finally { $content.Dispose() }
                     $files.Add([pscustomobject]@{ Path = $item.Path; Id = (Get-ToolkitFileId -Path $item.Path -Bytes $fileBytes) })
-                    if ($item.Path -ceq 'local-llm/VERSION') { $version = [System.Text.Encoding]::UTF8.GetString($fileBytes) }
+                    # Trimmed here, where it is read: the file ends in a line break, and the text is
+                    # made printable before it is shown (ConvertTo-ReviewText), which would turn
+                    # that line break into a '?' behind the version.
+                    if ($item.Path -ceq 'local-llm/VERSION') { $version = [System.Text.Encoding]::UTF8.GetString($fileBytes).TrimStart([char]0xFEFF).Trim() }
                 }
             } finally { $archive.Dispose() }
         } finally { $stream.Dispose() }
@@ -1132,37 +1154,55 @@
     function New-HandOverSignal {
         # The signal the window with administrator rights sets when it needs the two files in the
         # temp folder no longer (Send-HandOverSignal): an event of Windows with the name -Name, made
-        # here and waited for by Start-ElevatedWindow. The account that runs this and Administrators
-        # may set it: the administrator rights may be those of another account (a standard user
-        # who types an administrator's password at the prompt of Windows). $null when it cannot be
-        # made; the files then stay until the next run.
-        param([string]$Name)
+        # here and waited for by Start-ElevatedWindow. It is made to belong to the account that runs
+        # this (-Owner, its SID as text): the other window sets a signal only when it finds that
+        # owner on it, and left to itself Windows hands what an administrator's window makes to
+        # the group Administrators on some systems. That account and Administrators may set it and
+        # read whom it belongs to: the administrator rights may be those of another account (a
+        # standard user who types an administrator's password at the prompt of Windows). $null when
+        # it cannot be made; the files then stay until the next run.
+        param([string]$Name, [string]$Owner)
         try {
+            $account = New-Object System.Security.Principal.SecurityIdentifier($Owner)
             $security = New-Object System.Security.AccessControl.EventWaitHandleSecurity
-            $rights = [System.Security.AccessControl.EventWaitHandleRights]'Modify, Synchronize'
-            foreach ($who in @([System.Security.Principal.WindowsIdentity]::GetCurrent().User, (New-Object System.Security.Principal.SecurityIdentifier('S-1-5-32-544')))) {
+            $security.SetOwner($account)
+            $rights = [System.Security.AccessControl.EventWaitHandleRights]'Modify, Synchronize, ReadPermissions'
+            foreach ($who in @($account, (New-Object System.Security.Principal.SecurityIdentifier('S-1-5-32-544')))) {
                 $security.AddAccessRule((New-Object System.Security.AccessControl.EventWaitHandleAccessRule($who, $rights, [System.Security.AccessControl.AccessControlType]::Allow)))
             }
             $madeNew = $false
             return (New-Object System.Threading.EventWaitHandle($false, [System.Threading.EventResetMode]::ManualReset, $Name, [ref]$madeNew, $security))
         } catch { $null = $_ }
-        # Without rules of its own (PowerShell 7 has no such constructor): the same account can still set it.
+        # Without an owner and rules of its own (PowerShell 7 has no such constructor): it is what
+        # Windows makes of it. Where that is not this account's, the other window leaves it alone,
+        # and the files stay until the next run.
         try { return (New-Object System.Threading.EventWaitHandle($false, [System.Threading.EventResetMode]::ManualReset, $Name)) } catch { return $null }
     }
 
     function Send-HandOverSignal {
         # Tells the window that asked for administrator rights that the two files it put in the
-        # temp folder are needed no longer: it sets that window's signal (New-HandOverSignal), by
-        # its name. That window then removes its files, with its own rights; nothing in the temp
-        # folder is removed with administrator rights. The signal carries no trust and nothing
-        # is read from it. All a program of the user can do with it is have that window remove its
-        # files too early, which ends this update with a refusal. No signal (no name, a name that
-        # is none, a window that is gone) is no error: the files then stay until the next run.
-        param([string]$Name)
-        if ($Name -cnotmatch '^[A-Za-z0-9-]{1,80}\z') { return }
+        # temp folder are needed no longer: it sets that window's signal (New-HandOverSignal). That
+        # window then removes its files, with its own rights; nothing in the temp folder is
+        # removed with administrator rights. The signal carries no trust and nothing is read from it.
+        # The signal is found by its name, and the name alone must not decide what is set: when
+        # the window that made the signal is gone (a program of the user can end it), the name is
+        # free, and such a program can make it stand for another signal of Windows, one that only
+        # administrators may set. So what the name opened is looked at before it is touched, and it
+        # is set only when it belongs to the account that asked (-Owner, that account's SID). The
+        # question is put to the signal that was opened, not to the name a second time, so nothing
+        # can change between the look and the setting. A signal of that account is one a program
+        # of that account can set without this step; any other is closed again as it was found.
+        # No signal (no name, no owner, a name that is none, a window that is gone, a signal that
+        # is somebody else's) is no error: the files then stay until the next run.
+        param([string]$Name, [string]$Owner)
+        if ($Name -cnotmatch '^[A-Za-z0-9-]{1,80}\z' -or $Owner -cnotmatch '^S-1-[0-9-]{1,180}\z') { return }
         try {
-            $handle = [System.Threading.EventWaitHandle]::OpenExisting($Name)
-            try { [void]$handle.Set() } finally { $handle.Dispose() }
+            $rights = [System.Security.AccessControl.EventWaitHandleRights]'Modify, Synchronize, ReadPermissions'
+            $handle = [System.Threading.EventWaitHandle]::OpenExisting($Name, $rights)
+            try {
+                $belongsTo = $handle.GetAccessControl().GetOwner([System.Security.Principal.SecurityIdentifier])
+                if ($null -ne $belongsTo -and ([string]$belongsTo.Value) -ceq $Owner) { [void]$handle.Set() }
+            } finally { $handle.Dispose() }
         } catch { $null = $_ }
     }
 
@@ -1187,9 +1227,11 @@
         #   7. Only then: COMMIT is written next to the installer, which records it, and the
         #      installer is started from that folder, by the full path of Windows PowerShell.
         # At the end, whatever happened, the folder is removed again. In the temp folder this step
-        # removes nothing: once it has its copy, and again at its end, it tells the window that put
-        # the files there (-Signal, see Send-HandOverSignal), and that window removes them.
-        param([string]$Zip, [string]$ZipHash, [string]$Digest, [string]$Commit, [string]$Root, [string[]]$Extra, [string]$Signal)
+        # removes nothing: it tells the window that put the files there, and that window removes
+        # them (-Signal and -SignalOwner: that window's signal and the account it must belong to,
+        # see Send-HandOverSignal). It tells it once: when it has its copy, or at its end when it
+        # never got that far.
+        param([string]$Zip, [string]$ZipHash, [string]$Digest, [string]$Commit, [string]$Root, [string[]]$Extra, [string]$Signal, [string]$SignalOwner)
         # Windows is asked where its folders are: a variable of this session could name others.
         $programFiles = [Environment]::GetFolderPath('ProgramFiles')
         $shell = [System.IO.Path]::Combine([Environment]::GetFolderPath('System'), 'WindowsPowerShell', 'v1.0', 'powershell.exe')
@@ -1198,6 +1240,7 @@
         $lock = $null
         $made = $false
         $started = $false
+        $told = $false
         try {
             Write-Host 'Checking the download once more, in a folder only administrators can change...' -ForegroundColor Cyan
             if ($ZipHash -cnotmatch '^[0-9a-f]{64}\z' -or $Digest -cnotmatch '^[0-9a-f]{64}\z' -or ($Commit -and $Commit -cnotmatch '^[0-9a-f]{40}\z')) { throw 'this step was not told what the download has to be' }
@@ -1228,8 +1271,10 @@
             $zipCopy = [System.IO.Path]::Combine($stage, 'download.zip')
             $copied = Copy-HandedOverArchive -From $Zip -To $zipCopy
             # From here on nothing more is read from the temp folder: the window that put the files
-            # there may remove them.
-            Send-HandOverSignal -Name $Signal
+            # there may remove them. It is told now and not again: once it has heard, it is done
+            # with its signal, and the name is then nobody's.
+            Send-HandOverSignal -Name $Signal -Owner $SignalOwner
+            $told = $true
             if ($copied -cne $ZipHash) { throw 'the archive in the temp folder is not the download that was compared: it was changed after the comparison' }
             $top = Expand-ToolkitArchive -Zip $zipCopy -Destination $stage
             $found = Get-ToolkitDigest -Files (Get-ToolkitFileList -Top $top)
@@ -1260,8 +1305,9 @@
                 }
                 if ($notRemoved) { Write-Host "Could not remove $stage ($(ConvertTo-ReviewText -Text $notRemoved -Max 200 -AllowUnicode)); the next update removes it." -ForegroundColor Yellow }
             }
-            # Also after a refusal that came before the copy: the files are needed no longer.
-            Send-HandOverSignal -Name $Signal
+            # After a refusal that came before the copy the files are needed no longer either, and
+            # the first window has not been told yet.
+            if (-not $told) { Send-HandOverSignal -Name $Signal -Owner $SignalOwner }
         }
     }
 
@@ -1276,13 +1322,18 @@
         # its prompt lands here) and Taken (the window has read both files: they can go).
         param([string]$Zip, [string]$StageFile, [string]$ZipHash, [string]$Digest, [string]$Commit, [string]$Root, [string[]]$Extra, [int]$WaitSeconds = 120)
         $signalName = 'LocalAI-Update-' + [guid]::NewGuid().ToString('N')
-        $signal = New-HandOverSignal -Name $signalName
+        # The account that asks, by its SID: the signal is made to belong to it, and the other
+        # window is told so in the step's text and on its command line. Without it the other
+        # window sets nothing, and the files stay until the next run.
+        $asker = ''
+        try { $asker = [string][System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value } catch { $asker = '' }
+        $signal = New-HandOverSignal -Name $signalName -Owner $asker
         try {
             $definitions = [ordered]@{}
             foreach ($name in (Get-ElevatedFunctionList)) { $definitions[$name] = [string](Get-Command -Name $name -CommandType Function).Definition }
-            $stageBytes = [System.Text.Encoding]::UTF8.GetBytes((Get-ElevatedStage -Definitions $definitions -Zip $Zip -ZipHash $ZipHash -Digest $Digest -Commit $Commit -Root $Root -Extra $Extra -Signal $signalName))
+            $stageBytes = [System.Text.Encoding]::UTF8.GetBytes((Get-ElevatedStage -Definitions $definitions -Zip $Zip -ZipHash $ZipHash -Digest $Digest -Commit $Commit -Root $Root -Extra $Extra -Signal $signalName -SignalOwner $asker))
             [System.IO.File]::WriteAllBytes($StageFile, $stageBytes)
-            $launcher = Get-ElevatedLauncher -StageFile $StageFile -Hash (Get-Sha256Hex -Bytes $stageBytes) -Signal $signalName
+            $launcher = Get-ElevatedLauncher -StageFile $StageFile -Hash (Get-Sha256Hex -Bytes $stageBytes) -Signal $signalName -SignalOwner $asker
             $shell = [System.IO.Path]::Combine([Environment]::GetFolderPath('System'), 'WindowsPowerShell', 'v1.0', 'powershell.exe')
             # -NoExit: the window stays open with the installer's messages, as the installer's own does.
             try { Start-Process -FilePath $shell -Verb RunAs -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-NoExit', '-Command', $launcher) -ErrorAction Stop }
