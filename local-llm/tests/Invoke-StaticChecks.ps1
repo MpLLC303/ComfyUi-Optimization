@@ -724,6 +724,10 @@ function Find-TestHookProblem($Hits, [string[]]$Pins = @()) {
 # read that went into a helper, into a name put together at run time or into text for another
 # PowerShell is still read, this rule no longer sees it, and its entry is the last trace of it.
 # Put such a read back where the rule sees it, or replace it, before the entry goes.
+# Two entries are younger than the rule. Each is a test parameter that took the place of reads
+# from the environment, and each has its reason in the comment above it. A parameter has to be
+# passed to the run it changes; a variable set once changes every later run. The word 'env' or
+# 'param' in an entry is written in small letters, as the sentence for a stale entry reads it.
 $testHookPins = @(
     'Backup-OpenWebUI.ps1 env LOCALAI_TEST_CHAT_POLL_SEC'
     'Enable-TailscaleAccess.ps1 env LOCALAI_TS_TIMEOUT'
@@ -731,20 +735,15 @@ $testHookPins = @(
     'Install-LocalAI.ps1 env LOCALAI_TEST_CATALOG'
     'Install-LocalAI.ps1 env LOCALAI_TEST_FAIL_STAGE'
     'Install-LocalAI.ps1 env LOCALAI_TEST_WEBUI_OLLAMA_URL'
-    'Restore-OpenWebUI.ps1 env LOCALAI_TEST_CATALOG'
-    'Restore-OpenWebUI.ps1 env LOCALAI_TEST_FAIL_OLLAMA_URL'
-    'Restore-OpenWebUI.ps1 env LOCALAI_TEST_FAIL_RESEARCH_SWAP'
-    'Restore-OpenWebUI.ps1 env LOCALAI_TEST_FAIL_SWAP'
-    'Restore-OpenWebUI.ps1 env LOCALAI_TEST_FAIL_SWAP_ONCE'
-    'Restore-OpenWebUI.ps1 env LOCALAI_TEST_KILL_IN_SWAP'
-    'Restore-OpenWebUI.ps1 env LOCALAI_TEST_WEBUI_WAIT_SEC'
+    # -TestFailOllamaUrl came in place of the variable LOCALAI_TEST_FAIL_OLLAMA_URL. It does one
+    # thing: the step that sets the Ollama connection after a restore counts as failed, and the
+    # message of that failure names the parameter. It is not said at the start of the run
+    # (IMPROVEMENTS.md has the row). Only tests/Invoke-UpdateWebUITest.ps1 passes it.
+    'Restore-OpenWebUI.ps1 param TestFailOllamaUrl'
     'Test-LocalAI.ps1 env LOCALAI_TEST_CATALOG'
-    'Update-Models.ps1 env LOCALAI_TEST_ALLOW_CPU'
-    'Update-Models.ps1 env LOCALAI_TEST_CATALOG'
-    'Update-Models.ps1 env LOCALAI_TEST_PULL_FROM'
-    'Update-Models.ps1 env LOCALAI_TEST_REGISTRY_URL'
-    'Update-Models.ps1 param TestGpuStaysBusy'
-    'Update-OpenWebUI.ps1 env LOCALAI_TEST_WEBUI_WAIT_SEC'
+    # -TestAllowCpu came in place of the variable LOCALAI_TEST_ALLOW_CPU. A run that gets it says
+    # so in a warning at its start. Only tests/Invoke-ModelUpdateTest.ps1 passes it.
+    'Update-Models.ps1 param TestAllowCpu'
     'Watch-LocalAI.ps1 param TestDockerTimeout'
     'Watch-LocalAI.ps1 param TestIntegrityEnd'
     'Watch-LocalAI.ps1 param TestToastFail'
