@@ -7,6 +7,7 @@ as a subprocess, exactly as in its container. Exit code = number of failed check
     python3 tests/test_render_guard.py
 """
 import base64
+import email.utils
 import hashlib
 import http.client
 import http.server
@@ -16,6 +17,7 @@ import re
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 
@@ -293,13 +295,79 @@ def silent_listener():
     return s, s.getsockname()[1]
 
 
-def run_guard(comfy_urls, upstream_port, extra=None):
+def closed_port():
+    """A port that refuses connections, as Ollama's does when Ollama is not running: bound, but
+    never listened on, so nothing else can take it meanwhile. Returns the socket (to close at
+    the end) and the port."""
+    s = socket.socket()
+    s.bind(('127.0.0.1', 0))
+    return s, s.getsockname()[1]
+
+
+def hang_up(listener, mode):
+    """A fake Ollama that takes connections and ends each without an answer. mode['read'] True:
+    once it has taken what was sent (nothing more has come for half a second), as an Ollama that
+    stops in the middle of a chat does. False: at once, so whoever is still sending finds the
+    connection broken. Goes on until mode['over'] is set (set it, then close the listener)."""
+    while not mode['over']:
+        try:
+            c, _ = listener.accept()
+        except OSError:
+            time.sleep(0.05)    # a connection that was gone before it was taken, or the listener is closed
+            continue
+        try:
+            if mode['read']:
+                c.settimeout(0.5)
+                while c.recv(65536):
+                    pass
+        except OSError:
+            pass    # nothing more came (the timeout), or the other side is gone
+        finally:
+            c.close()
+
+
+# Run in place of the guard (run_guard's clock_flag): the guard with a wall clock that is an hour
+# behind from the moment the file named last holds something. Only time.time() is changed, the
+# clock a time sync sets; time.monotonic() runs on as it does. The guard itself has no such switch.
+CLOCK_BACK = '''import os, runpy, sys, time
+guard, flag, wall = sys.argv[1], sys.argv[2], time.time
+time.time = lambda: wall() - (3600 if os.path.getsize(flag) else 0)
+sys.argv = [guard]
+runpy.run_path(guard, run_name='__main__')
+'''
+
+
+def copy_without_drain():
+    """A copy of the guard with one call taken out: the _drain() right after the 502 it gives
+    when a request cannot be sent on to Ollama. Returns (the path of the copy, how often that
+    call was found in the guard's code). The path is for run_guard's script, and the caller
+    removes the file. It is None unless the call was found exactly once: no copy is made then."""
+    with open(GUARD, encoding='utf-8') as f:
+        source = f.read()
+    cut, found = re.subn(r'(self\._send_json\(502, [^\n]*\n[ \t]+)self\._drain\(\)', r'\g<1>pass', source)
+    if found != 1:
+        return None, found
+    fd, path = tempfile.mkstemp(prefix='render-guard-', suffix='.py')
+    with os.fdopen(fd, 'w', encoding='utf-8') as f:
+        f.write(cut)
+    return path, found
+
+
+def run_guard(comfy_urls, upstream_port, extra=None, out=None, clock_flag=None, script=None):
+    """Start a guard; returns the process and its port. out: an open file that gets the guard's
+    log (see log_file); without one the log is dropped. clock_flag: the path of an empty file;
+    the guard's wall clock goes back an hour once something is written to it (CLOCK_BACK).
+    script: the path of a file to start in place of the guard's own (see copy_without_drain)."""
     port = free_port()
     env = dict(os.environ, UPSTREAM='http://127.0.0.1:%d' % upstream_port, COMFYUI_URLS=comfy_urls,
                LISTEN_PORT=str(port), PROBE_TIMEOUT='0.5', CACHE_SEC='0', HOLD_SEC='4',
                FREE_BACKOFF_SEC='30', WATCH_SEC='0.5', FREE_COMFYUI_MIN_MIB='1024')
     env.update(extra or {})
-    p = subprocess.Popen([sys.executable, '-u', GUARD], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    started = script or GUARD
+    cmd = [sys.executable, '-u', started]
+    if clock_flag:
+        cmd = [sys.executable, '-u', '-c', CLOCK_BACK, started, clock_flag]
+    p = subprocess.Popen(cmd, env=env, stdout=out or subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     for _ in range(50):
         try:
             socket.create_connection(('127.0.0.1', port), timeout=0.2).close()
@@ -471,6 +539,48 @@ def refusal(answer):
     except ValueError:
         return ''
     return str(obj.get('error') or '') if isinstance(obj, dict) else ''
+
+
+def wall_clock_behind(port):
+    """How many seconds a guard's wall clock is behind the one here, going by the Date line of
+    one of its answers (whole seconds). None: that answer had no date that can be read."""
+    c = http.client.HTTPConnection('127.0.0.1', port, timeout=30)
+    c.request('GET', '/render-guard/status')
+    r = c.getresponse()
+    r.read()
+    c.close()
+    try:
+        return time.time() - email.utils.parsedate_to_datetime(r.getheader('Date') or '').timestamp()
+    except (TypeError, ValueError):
+        return None     # an answer without a date that can be read
+
+
+def tells_too_much(answer, port):
+    """True when an answer of the guard holds what belongs in its log only: Ollama's address
+    (the host or the port) or the number of a socket error."""
+    text = answer.decode('utf-8', 'replace')
+    return '127.0.0.1' in text or str(port) in text or 'Errno' in text
+
+
+def log_file():
+    """A file for a guard's log, to hand to run_guard as out: the open file and its path. The
+    log is read back through the path (log_lines), never through this file."""
+    fd, path = tempfile.mkstemp(prefix='render-guard-', suffix='.log')
+    return os.fdopen(fd, 'wb'), path
+
+
+def log_lines(path):
+    """What a guard has written to its log so far: its lines, without the time each starts with."""
+    with open(path, encoding='utf-8', errors='replace') as f:
+        return [line.rstrip('\n').split(' ', 1)[-1] for line in f]
+
+
+def drop_log(out, path):
+    out.close()
+    try:
+        os.remove(path)
+    except OSError:
+        pass
 
 
 def chat_of(nbytes, model='m'):
@@ -766,8 +876,8 @@ def main():
 
         # An upload the guard cannot read to its end, from a client that is still there to read an
         # answer. The fault is the client's own: the guard gives no answer of its own (a 502 would
-        # say that Ollama is not reachable, and Ollama is) and ends the connection, and Ollama sees
-        # the upload cut short. Three ways: a chunk size that is not a number, nothing more sent in
+        # say that Ollama is not running or gave no answer, and neither is so) and ends the
+        # connection, and Ollama sees the upload cut short. Three ways: a chunk size that is not a number, nothing more sent in
         # the middle of a chunk, nothing more sent before the Content-Length is reached. In the
         # last two the client closes only its sending side, so an answer would still reach it.
         broken = (('a chunk size that is not a number', ['Transfer-Encoding: chunked'],
@@ -900,6 +1010,250 @@ def main():
     finally:
         guard.terminate()
         guard.wait(10)
+
+    # That wait is counted on the monotonic clock, not on the wall clock, which a time sync can set
+    # back in the middle of it. First by the look of the code:
+    with open(GUARD, encoding='utf-8') as f:
+        m = re.search(r'\n    def _drain\(self\):\n(.*?)\n    def ', f.read(), re.S)
+    drain_code = m.group(1) if m else ''
+    check('time.monotonic(' in drain_code and 'time.time(' not in drain_code,
+          '_drain counts its wait with time.monotonic(), and nowhere with the wall clock, time.time()')
+    # Then by what it does: the same client once more, at a guard whose wall clock goes back an
+    # hour while it waits. Counted on that clock, the wait would now last an hour longer.
+    fd, flag = tempfile.mkstemp(prefix='render-guard-', suffix='.clock')
+    os.close(fd)
+    guard, gport = run_guard(comfy, up_port, {'RENDER_GUARD_MODE': 'off', 'RENDER_GUARD_MAX_BODY_MIB': '1', 'DRAIN_SEC': str(drain)},
+                             clock_flag=flag)
+    try:
+        s = raw_open(gport, '/api/chat', ['Content-Type: application/json', 'Transfer-Encoding: chunked'],
+                     b'%x\r\n%s\r\n' % (len(over), over))
+        code = raw_status(s)
+        time.sleep(0.5)     # the guard is waiting by now, for an end it worked out before the clock moves
+        with open(flag, 'w') as f:
+            f.write('back')
+        took = held_open(s, drain + 8, drip=b'0')
+        s.close()
+        behind = wall_clock_behind(gport)
+        check(behind is not None and 3000 < behind < 4200,
+              "the guard's wall clock was set back an hour while it read on (%s s behind, by the Date line of its answers)" % (
+                  None if behind is None else int(behind)))
+        check(code == 413 and took is not None and took <= drain + 3,
+              'the wait ends after DRAIN_SEC (%d s) all the same (HTTP %d, %s after the clock went back; %d s at most '
+              'expected)' % (drain, code, how_long(took), drain + 3))
+    finally:
+        guard.terminate()
+        guard.wait(10)
+        os.remove(flag)
+
+    print('\n=== Ollama is not running: HTTP 502 in plain words, also for a client that is still sending ===', flush=True)
+    reset_ollama()
+    # The guard's Ollama address is a port that refuses connections. DRAIN_SEC=30 is the default:
+    # nothing here may come near it. RENDER_GUARD_MODE=off: the guard then asks Ollama nothing on
+    # its own, so every line about Ollama in its log is about one of these requests.
+    not_running = 'render-guard: Ollama is not running, so this chat cannot be answered. Start it (Start menu > Local AI - Start again), then send the message again.'
+    under = chat_of(cap // 2)
+    shut, shut_port = closed_port()
+    out, log_path = log_file()
+    guard, gport = run_guard(comfy, shut_port, {'RENDER_GUARD_MODE': 'off', 'RENDER_GUARD_MAX_BODY_MIB': '1', 'DRAIN_SEC': '30'}, out=out)
+    try:
+        # A model file is passed on as it arrives, so the guard finds Ollama gone before it has
+        # read any of the file: its client is still sending when the 502 is written, and gets to
+        # read it only if the guard reads on meanwhile. A chat has been read whole by then.
+        for what, route, body in (('an upload of 8 MiB', '/api/blobs/sha256:' + digest, blob),
+                                  ('a chat under the cap', '/api/chat', under)):
+            for chunked in (False, True):
+                how = '%s %s' % (what, 'sent chunked' if chunked else 'with a Content-Length')
+                t0 = time.time()
+                code, answer = send(gport, route, body, chunked=chunked)
+                took = time.time() - t0
+                err = refusal(answer)
+                check(code == 502 and err == not_running,
+                      '%s: HTTP 502 that says Ollama is not running and how to start it (HTTP %d: %s)' % (
+                          how, code, answer.decode('utf-8', 'replace')[:90]))
+                check(code == 502 and err.startswith('render-guard:') and not tells_too_much(answer, shut_port),
+                      "%s: the answer starts 'render-guard:' and holds neither Ollama's address nor an 'Errno'" % how)
+                check(code == 502 and took < 10,
+                      '%s: answered and over well before DRAIN_SEC (%.1f s; under 10 expected, DRAIN_SEC is 30)' % (how, took))
+        check(status(gport)['inflight'] == 0, 'a chat that got the 502 is not left counted as a chat in flight')
+
+        def unreachable():
+            return [l for l in log_lines(log_path) if 'Ollama at http://127.0.0.1:%d is not reachable' % shut_port in l]
+        wait_for(lambda: len(unreachable()) >= 4, 5)
+        lines = unreachable()
+        check(len(lines) == 4 and all('Errno' in l for l in lines),
+              "the guard's log has the address and the error, one line for each of the four (%d line(s): %s)" % (len(lines), lines[:1]))
+        check(not any('RENDER_GUARD_MAX_BODY_MIB' in l for l in log_lines(log_path)),
+              'a cap that is a whole number above 0 (1 here) is taken without a line in the log')
+
+        # The same chat from a client that stays on the line after the answer. The guard had read
+        # all of it before it found Ollama gone, so nothing is left to read: it ends the
+        # connection itself, and does not wait DRAIN_SEC for bytes that will not come.
+        for chunked in (False, True):
+            if chunked:
+                head, data = 'Transfer-Encoding: chunked', b'%x\r\n%s\r\n0\r\n\r\n' % (len(under), under)
+            else:
+                head, data = 'Content-Length: %d' % len(under), under
+            s = raw_open(gport, '/api/chat', ['Content-Type: application/json', head], data)
+            code = raw_status(s)
+            took = held_open(s, 10)
+            s.close()
+            check(code == 502 and took is not None and took < 5,
+                  'a chat %s from a client that stays: after the 502 the guard ends the connection itself (HTTP %d, %s)' % (
+                      'sent chunked' if chunked else 'with a Content-Length', code, how_long(took)))
+    finally:
+        guard.terminate()
+        guard.wait(10)
+        drop_log(out, log_path)
+        shut.close()
+
+    print('\n=== the same uploads at a copy of the guard that does not read on after that 502 ===', flush=True)
+    # What the upload checks above are worth. They are there for one call, the _drain() after the
+    # 502 in _proxy: with that call taken out they are to fail. They do only if the client of a
+    # guard without it cannot read the 502: such a guard closes a connection that has unread
+    # bytes in it, the client's sending fails on that, and it never gets as far as reading.
+    # Whether it goes that way is up to the kernel (how it ends such a connection, and how much
+    # of 8 MiB it takes before anyone reads them), so reading the code cannot settle it: only a
+    # run on the machine at hand does. This is that run, made every time: a copy of the guard
+    # with that one call taken out gets the same uploads. A client that reads the 502 from the
+    # copy as well means that the upload checks pass with the call and without it, and so say
+    # nothing about it.
+    # The two uploads further down, where Ollama ends the connection in the middle of one, lean
+    # on the same call. They are not sent to the copy: how much of an upload the guard has read
+    # by the time it finds that connection broken is not the same every time.
+    copy, found = copy_without_drain()
+    check(found == 1, 'the guard reads on after the 502 it gives when a request cannot be sent on to Ollama: one '
+                      '_drain() call right after that 502 in its code (%d found)' % found)
+    if copy:
+        shut, shut_port = closed_port()
+        out, log_path = log_file()
+        guard = None
+        try:
+            guard, gport = run_guard(comfy, shut_port, {'RENDER_GUARD_MODE': 'off', 'RENDER_GUARD_MAX_BODY_MIB': '1', 'DRAIN_SEC': '30'},
+                                     out=out, script=copy)
+            # In all else the copy is the guard. A chat has been read whole before the answer, so
+            # nothing is unread when the connection ends, and its client reads the 502.
+            code, answer = send(gport, '/api/chat', under)
+            check(code == 502 and refusal(answer) == not_running,
+                  'the copy answers as the guard does: a chat under the cap gets the 502 that says Ollama is not '
+                  'running (HTTP %d)' % code)
+            for chunked in (False, True):
+                code, answer = send(gport, '/api/blobs/sha256:' + digest, blob, chunked=chunked)
+                check(code == 0,
+                      'an upload of 8 MiB %s at the copy: its client cannot read the 502 (HTTP %d; 0: the connection '
+                      'broke first. A 502 here: the upload checks above do not show that the guard reads on)' % (
+                          'sent chunked' if chunked else 'with a Content-Length', code))
+
+            def at_502():
+                return [l for l in log_lines(log_path) if 'Ollama at http://127.0.0.1:%d is not reachable' % shut_port in l]
+            wait_for(lambda: len(at_502()) >= 3, 5)
+            check(len(at_502()) == 3,
+                  'the copy found Ollama gone all three times: both uploads came as far as the 502, and only their '
+                  'client did not get to read it (%d line(s) in its log)' % len(at_502()))
+        finally:
+            if guard is not None:
+                guard.terminate()
+                guard.wait(10)
+            drop_log(out, log_path)
+            shut.close()
+            os.remove(copy)
+
+    print('\n=== Ollama is there and gives no answer: HTTP 502 that does not call it not running ===', flush=True)
+    # The guard's Ollama address is a port that takes connections and, to begin with, does nothing
+    # with them. A small chat: one this fake Ollama has room for without reading it.
+    small = chat_of(2000)
+    sil, sil_port = silent_listener()
+    mode = {'read': True, 'over': False}
+    out, log_path = log_file()
+    guard, gport = run_guard(comfy, sil_port, {'RENDER_GUARD_MODE': 'off', 'RENDER_GUARD_MAX_BODY_MIB': '1', 'DRAIN_SEC': '30'}, out=out)
+    try:
+        def logged(what):
+            return [l for l in log_lines(log_path) if what in l and 'Ollama at http://127.0.0.1:%d:' % sil_port in l]
+
+        # Stop: the client hangs up while Ollama is still thinking. The guard then ends its own
+        # request to Ollama, and that comes out where an Ollama without an answer does. It is not
+        # Ollama failing, and the log must not call it that (every Stop would be a line there).
+        s = raw_open(gport, '/api/chat', ['Content-Type: application/json', 'Content-Length: %d' % len(small)], small)
+        waiting = wait_for(lambda: status(gport)['inflight'] == 1, 10)
+        s.close()
+        ended = wait_for(lambda: status(gport)['inflight'] == 0, 10)
+        check(waiting and ended, 'the client hangs up while Ollama says nothing: the guard gives that chat up '
+                                 '(seen in flight: %s, over: %s)' % (waiting, ended))
+        check(not logged('no answer from'), "that hang-up is not written to the log as Ollama giving no answer (%s)" % logged('no answer from'))
+
+        # Ollama takes the chat and then ends the connection without a word, as when it stops or
+        # is restarted in the middle of one.
+        threading.Thread(target=hang_up, args=(sil, mode), daemon=True).start()
+        t0 = time.time()
+        code, answer = send(gport, '/api/chat', small)
+        took = time.time() - t0
+        err = refusal(answer)
+        check(code == 502 and err.startswith('render-guard:') and 'CPU' in err and 'minutes' in err and took < 10,
+              'Ollama ends the connection without an answer: HTTP 502 that says a long answer on the CPU can take '
+              'minutes (HTTP %d after %.1f s: %s)' % (code, took, answer.decode('utf-8', 'replace')[:90]))
+        check(code == 502 and 'not running' not in err and not tells_too_much(answer, sil_port),
+              "that answer does not call Ollama not running, and holds neither its address nor an 'Errno'")
+        check(wait_for(lambda: len(logged('no answer from')) == 1, 5),
+              "the guard's log has the address and the error for it, in one line (%s)" % logged('no answer from'))
+
+        # Ollama ends the connection while a model file is still on its way to it. The guard had
+        # its connection, so this is not an Ollama that is not running either; and the client is
+        # still sending, so it reads the 502 only if the guard reads on meanwhile.
+        mode['read'] = False
+        for chunked in (False, True):
+            t0 = time.time()
+            code, answer = send(gport, '/api/blobs/sha256:' + digest, blob, chunked=chunked)
+            took = time.time() - t0
+            err = refusal(answer)
+            check(code == 502 and err.startswith('render-guard:') and 'not running' not in err
+                  and not tells_too_much(answer, sil_port) and took < 10,
+                  'Ollama ends the connection in the middle of an upload of 8 MiB %s: HTTP 502 the client can read, which does '
+                  'not call Ollama not running and holds no address (HTTP %d after %.1f s: %s)' % (
+                      'sent chunked' if chunked else 'with a Content-Length', code, took, answer.decode('utf-8', 'replace')[:90]))
+        check(wait_for(lambda: len(logged('could not be sent on to')) == 2, 5),
+              "the guard's log has the address and the error for both (%d line(s))" % len(logged('could not be sent on to')))
+    finally:
+        guard.terminate()
+        guard.wait(10)
+        drop_log(out, log_path)
+        mode['over'] = True
+        try:
+            sil.shutdown(socket.SHUT_RDWR)      # lets go of hang_up, which waits in accept()
+        except OSError:
+            pass
+        sil.close()
+
+    print('\n=== a mistyped RENDER_GUARD_MAX_BODY_MIB: the guard starts all the same, takes 256 MiB and says so ===', flush=True)
+    reset_ollama()
+    # The value comes from Stack/.env as it stands there. Read with a bare int(), one that is no
+    # number stopped the guard at its start, and 0 or less made it refuse every chat.
+    for bad in ('abc', '0', '-5'):
+        out, log_path = log_file()
+        guard = None
+        try:
+            try:
+                guard, gport = run_guard(comfy, up_port, {'RENDER_GUARD_MODE': 'off', 'RENDER_GUARD_MAX_BODY_MIB': bad}, out=out)
+            except RuntimeError:
+                pass    # it did not start: the check below says so
+            check(guard is not None, 'RENDER_GUARD_MAX_BODY_MIB=%s: the guard starts' % bad)
+            if guard is None:
+                continue
+            got = status(gport)['config'].get('max_body_bytes')
+            check(got == 256 * 1048576, 'RENDER_GUARD_MAX_BODY_MIB=%s: the status page shows a cap of 256 MiB (%s bytes)' % (bad, got))
+
+            def said():
+                return [l for l in log_lines(log_path) if 'RENDER_GUARD_MAX_BODY_MIB' in l]
+            wait_for(lambda: bool(said()), 5)
+            lines = said()
+            check(len(lines) == 1 and ("'%s'" % bad) in lines[0] and '256' in lines[0],
+                  'RENDER_GUARD_MAX_BODY_MIB=%s: one line in the log names the setting, the value and the 256 MiB used '
+                  'instead (%s)' % (bad, lines))
+            lines = chat(gport)
+            check(bool(lines) and lines[-1].get('done') is True, 'RENDER_GUARD_MAX_BODY_MIB=%s: a chat is answered' % bad)
+        finally:
+            if guard is not None:
+                guard.terminate()
+                guard.wait(10)
+            drop_log(out, log_path)
 
     print('\n=== ComfyUI that refuses /queue ===', flush=True)
     reset_ollama()
