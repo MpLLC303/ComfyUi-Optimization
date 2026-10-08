@@ -528,6 +528,33 @@ if ($onWindows) {
     Assert-That ($closed -match 'PASS') "the same port on 127.0.0.1 passes ($closed)"
 } else { Skip 'exposure check runs on Windows only' }
 
+Write-Host "`n=== Test-LocalAI: the Integrity watch line for an install baseline ===" -ForegroundColor Cyan
+# The health check's own sentences for a baseline an install recorded, run under Windows PowerShell
+# 5.1 against a baseline and a watch record written by hand: what an acceptance settled and an
+# install carried on is worded apart from what the install kept, with one advice and the command
+# to paste; the watch's reason for a comparison that did not run is shown only when its record
+# carries this baseline's own id.
+if ($onWindows) {
+    $ihRoot = Join-Path $Work 'integrity-health'
+    New-Item -ItemType Directory -Force -Path $ihRoot | Out-Null
+    ConvertTo-Json @{ WebUIPort = 39996; SearxngPort = 39995; OllamaUrl = 'http://127.0.0.1:1' } | Set-Content -LiteralPath (Join-Path $ihRoot 'localai-config.json')
+    $ihSettled = @{ Id = 'file+|Scripts\extra.ps1'; Text = '"Scripts\extra.ps1" is new'; Settled = $true }
+    $ihKept = @{ Id = 'file+|Stack\planted.yml'; Text = '"Stack\planted.yml" is new' }
+    $ihLine = { param([object[]]$Accepted, [hashtable]$Watch)
+        Save-LaiState -Path (Get-LaiIntegrityPath -AIRoot $ihRoot) -State @{ version = 1; id = 'ih-new'; reason = 'install'; recordedAt = '2026-01-02T10:00:00'; files = @{ 'Scripts\tool.ps1' = 'x' }; accepted = @($Accepted); acceptedCount = @($Accepted).Count }
+        Save-LaiState -Path (Join-Path $ihRoot 'watch-state.json') -State @{ integrity = $Watch }
+        $res = Invoke-Child 'Test-LocalAI.ps1' @('-AIRoot', $ihRoot, '-NoContainers', '-Quick')
+        return (@($res.Text -split "`n" | Where-Object { $_ -match 'Integrity watch' }) -join ' ')
+    }
+    $ihWhy = 'the comparison started at 09:00 did not finish'
+    $ihStale = & $ihLine @($ihSettled, $ihKept) @{ baseline = 'ih-old'; skippedWhy = $ihWhy }
+    $ihOwn = & $ihLine @($ihSettled) @{ baseline = 'ih-new'; skippedWhy = $ihWhy }
+    $ihPlain = & $ihLine @($ihKept) @{ baseline = 'ih-old' }
+    Assert-That ($ihStale -match 'WARN Integrity watch: .*on its next run\. That install or update carried on 1 thing\(s\) already accepted by hand \(-AcceptBaseline\), which still count as normal: "Scripts\\extra\.ps1" is new\. It also kept 1 thing\(s\) it did not install, which now count as normal: "Stack\\planted\.yml" is new\. That is 2 in all\. If that acceptance was not yours, or you did not add what was kept, do not repair this with Update toolkit' -and [regex]::Matches($ihStale, 'do not repair this with Update toolkit').Count -eq 1 -and $ihStale -notmatch 'first remove what was added|Start menu > Local AI - Update toolkit' -and [regex]::Matches($ihStale, 'this goes away with: ').Count -eq 1 -and $ihStale -match 'If both were you, this goes away with: .*-AcceptBaseline' -and $ihStale -notmatch 'the comparison is not running|did not finish') "a settled script and a kept Stack file: one advice, which names no shortcut, the number in all, and no reason from the record of another baseline ($ihStale)"
+    Assert-That ($ihOwn -match 'WARN Integrity watch: .*has not compared the PC with it yet: the comparison is not running \(the comparison started at 09:00 did not finish\)\. That install or update carried on 1 thing\(s\) already accepted by hand' -and $ihOwn -match 'If that acceptance was not yours, do not repair this with Update toolkit.*If it was, this goes away with: .*-AcceptBaseline' -and $ihOwn -notmatch 'on its next run|kept \d+ thing\(s\) it did not install') "the watch's record under this baseline's id: its reason is shown, and an all-settled list still ends in the command ($ihOwn)"
+    Assert-That ($ihPlain -match 'WARN Integrity watch: .*on its next run\. That install or update kept 1 thing\(s\) it did not install, which now count as normal: "Stack\\planted\.yml" is new\. If you did not add them, first remove what was added.*If you did, this goes away with: .*-AcceptBaseline' -and $ihPlain -notmatch 'carried on|in all') "only kept things: the line reads as before ($ihPlain)"
+} else { Skip 'the Integrity watch line of the health check runs on Windows only' }
+
 Write-Host "`n=== diagnostics bundle: redaction ===" -ForegroundColor Cyan
 $dRoot = Join-Path $Work 'diagroot'
 foreach ($d in 'Secrets', 'Stack', 'Logs') { New-Item -ItemType Directory -Force -Path (Join-Path $dRoot $d) | Out-Null }

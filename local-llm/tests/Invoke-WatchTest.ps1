@@ -588,6 +588,11 @@ services:
         $ig2 = Save-LaiIntegrityBaseline -AIRoot $aiRoot -Reason 'install' -SourceRoot $igSource
         $igKept = @($ig2['accepted'] | ForEach-Object { [string]$_['Text'] })
         Assert-That ($igKept.Count -eq 1 -and $igKept[0] -eq '"Stack\planted.yml" is new') "a baseline recorded by an install lists what it took in that the installer did not put there, and none of the installer's own files ($($igKept -join '; '))"
+        # The watch's record still belongs to the baseline before (the one recorded by hand) and
+        # holds its reason, 'the comparison started at ... did not finish'. That reason says nothing
+        # about the new baseline, so the health check must not show it.
+        $hc10 = & $igHealth
+        Assert-That ($hc10 -match 'WARN Integrity watch: [^\n]*on its next run' -and $hc10 -notmatch 'the comparison is not running|did not finish') "the stale-reason case: right after an install the health check does not show the reason the watch recorded under the baseline before ($hc10)"
         # The first run that sees the new baseline says what it kept, starts the comparison, and is
         # ended in the middle of it (Task Scheduler ends the task after ten minutes). The mark it
         # leaves has to sit in the record of the baseline it compares with, together with what was
@@ -608,6 +613,10 @@ services:
         $igEndLines = @(& $igLog | Where-Object { $_ -match 'INTEGRITY not compared: [^\n]*LOCALAI_TEST_INTEGRITY_END' })
         Assert-That (-not $igAfterEnd['checkedAt'] -and [string]$igAfterEnd['startedAt'] -eq [string]$igEnded['startedAt'] -and [string]$igAfterEnd['announced'] -eq [string]$ig2['id'] -and @(& $igNotices 'the update kept changes it did not make').Count -eq 1) "the two runs after it do not start that comparison again and do not announce again what the update kept ($(@(& $igNotices 'the update kept changes it did not make').Count) notice(s))"
         Assert-That ([string]$igAfterEnd['skippedWhy'] -match 'LOCALAI_TEST_INTEGRITY_END' -and [string]$igAfterEnd['skippedWhy'] -match 'remove that variable' -and $igEndLines.Count -eq 1) "what ended it is named, for the health check and the notice after hours, and once in watch.log over two runs: the variable, not an installer window ($($igEndLines.Count) line(s): $([string]$igAfterEnd['skippedWhy']))"
+        # Now the watch's record carries the new baseline's own id, and no comparison has finished
+        # under it: the health check gives the reason instead of 'on its next run'.
+        $hc10 = & $igHealth
+        Assert-That ($hc10 -match 'WARN Integrity watch: [^\n]*has not compared the PC with it yet: the comparison is not running \([^\n]*LOCALAI_TEST_INTEGRITY_END[^\n]*kept 1 thing\(s\) it did not install' -and $hc10 -notmatch 'on its next run') "a comparison that never finished under the new baseline: the health check says why ($hc10)"
         # Hours later the notice names the variable and gives no advice made for the setup lock: closing
         # an installer window or restarting the PC changes nothing for a variable that was set for good.
         $s10 = Read-LaiState -Path $statePath; $s10['integrity']['skippedSince'] = (Get-Date).AddHours(-7).ToString('s'); Save-LaiState -State $s10 -Path $statePath
@@ -668,6 +677,22 @@ services:
         $igThrice = Invoke-Watch @('-AcceptBaseline')
         $ig6 = Read-LaiIntegrityBaseline -AIRoot $aiRoot
         Assert-That ([string]$ig6['id'] -ne [string]$ig5['id'] -and @($ig6['accepted'] | Where-Object { $_ -is [hashtable] }).Count -eq 0 -and $igThrice -notmatch 'accepted: "') "the next acceptance does not list it again, although no notification went out ($(@($ig6['accepted'] | ForEach-Object { [string]$_['Text'] }) -join '; '))"
+        # An update keeps a planted file, the owner accepts it by hand, and another update follows
+        # before the watch's next run. That update carries on what the acceptance settled: the
+        # health check must not call it kept by the update, and must end in the command to paste.
+        Set-Content -LiteralPath (Join-Path $igStack 'planted3.yml') -Value 'x'
+        Save-LaiIntegrityBaseline -AIRoot $aiRoot -Reason 'install' -SourceRoot $igSource | Out-Null
+        Invoke-Watch @('-AcceptBaseline') | Out-Null
+        $ig7 = Save-LaiIntegrityBaseline -AIRoot $aiRoot -Reason 'install' -SourceRoot $igSource
+        $ig7Taken = @($ig7['accepted'] | Where-Object { $_ -is [hashtable] })
+        Assert-That ($ig7Taken.Count -eq 1 -and $ig7Taken[0]['Settled'] -and [string]$ig7Taken[0]['Id'] -eq 'file+|Stack\planted3.yml') 'setup: an update right after an acceptance carries on what that settled, marked as settled'
+        $hc10 = & $igHealth
+        Assert-That ($hc10 -match 'WARN Integrity watch: [^\n]*on its next run\. That install or update carried on 1 thing\(s\) already accepted by hand \(-AcceptBaseline\), which still count as normal: "Stack\\planted3\.yml" is new\. If that acceptance was not yours, first remove what was added[^\n]*If it was, this goes away with: [^\n]*-AcceptBaseline' -and $hc10 -notmatch 'kept \d+ thing\(s\) it did not install') "what an acceptance settled and an update carried on is not called kept by the update, and the line says what ends it ($hc10)"
+        # One more planted file and one more update: both kinds in one baseline.
+        Set-Content -LiteralPath (Join-Path $igStack 'planted4.yml') -Value 'x'
+        Save-LaiIntegrityBaseline -AIRoot $aiRoot -Reason 'install' -SourceRoot $igSource | Out-Null
+        $hc10 = & $igHealth
+        Assert-That ($hc10 -match 'carried on 1 thing\(s\) already accepted by hand \(-AcceptBaseline\), which still count as normal: "Stack\\planted3\.yml" is new\. It also kept 1 thing\(s\) it did not install, which now count as normal: "Stack\\planted4\.yml" is new\. That is 2 in all\. If that acceptance was not yours, or you did not add what was kept, first remove what was added[^\n]*If both were you, this goes away with: ' -and [regex]::Matches($hc10, 'first remove what was added').Count -eq 1 -and [regex]::Matches($hc10, 'this goes away with: ').Count -eq 1) "both kinds in one baseline: a sentence each, the number in all, the advice and the command once ($hc10)"
         # The baseline itself removed: that is a change, too.
         Remove-Item -LiteralPath (Get-LaiIntegrityPath -AIRoot $aiRoot) -Force
         & $igTwoLooks
