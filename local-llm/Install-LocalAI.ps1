@@ -670,6 +670,31 @@ function Get-ModelFolderContent {
     return 'empty'
 }
 
+function Test-OwnModelFolder {
+    # $true for a folder the installer chose itself: one of -Own (the model folder in its state, the
+    # value it wrote into OLLAMA_MODELS, Ollama's default folder; an empty entry counts for nothing).
+    # Only such a folder is opened and listed by this run, which has administrator rights. The
+    # folder Ollama uses now is read from Ollama's log, or from the user's OLLAMA_MODELS, and any
+    # program of this user can write both: a folder that only they name could be one this user
+    # cannot list, and whether it exists, whether it holds a manifest and how big it is would
+    # end up in the install log, which this user can read.
+    param([string]$Path, [string[]]$Own = @())
+    foreach ($folder in $Own) { if ($folder -and (Test-LaiSamePath $Path $folder)) { return $true } }
+    return $false
+}
+
+function Get-OllamaListedContent {
+    # Whether the running Ollama has models, from its own list and without looking at any folder:
+    # Content is 'models' (it lists some), 'empty' (it lists none) or 'unknown' (it did not answer),
+    # and Listed how many it lists (-1 without an answer). Asked in place of Get-ModelFolderContent
+    # for a folder in use that the installer did not choose itself (Test-OwnModelFolder).
+    param([string]$OllamaUrl)
+    try { $listed = @(Get-LaiOllamaModelNames -BaseUrl $OllamaUrl | Where-Object { $_ }).Count }
+    catch { return @{ Content = 'unknown'; Listed = -1 } }
+    if ($listed -gt 0) { return @{ Content = 'models'; Listed = $listed } }
+    return @{ Content = 'empty'; Listed = 0 }
+}
+
 function Get-OllamaModelsVarPlan {
     # OLLAMA_MODELS once Ollama's default folder is planned. No variable is written then, so the
     # ones that are there decide where Ollama keeps its models.
@@ -1301,22 +1326,32 @@ Invoke-Stage 'Preflight' {
     # models: every one downloaded again, the old copy left where it is, and no way back by passing
     # the old folder. Refused while the old folder still holds models, here, before the state or
     # anything else changes (the state is saved after a failure too). The folder in use: the one the
-    # running Ollama logged, else the variable, else the last plan, else Ollama's default.
-    $inUse = $defaultModels
-    if ($liveCfg -and $liveCfg['Models']) { $inUse = [string]$liveCfg['Models'] }
-    elseif ($envModels) { $inUse = $envModels }
+    # running Ollama logged, else the variable, else the last plan, else Ollama's default; and who
+    # says so, for a folder that only the log or the variable names.
+    $inUse = $defaultModels; $inUseSaidBy = ''
+    if ($liveCfg -and $liveCfg['Models']) { $inUse = [string]$liveCfg['Models']; $inUseSaidBy = "Ollama's start-up log" }
+    elseif ($envModels) { $inUse = $envModels; $inUseSaidBy = 'the OLLAMA_MODELS variable' }
     elseif ($State.flags['modelDir']) { $inUse = [string]$State.flags['modelDir'] }
     $otherModelDir = [bool]$ModelDir -and -not (Test-LaiSamePath $target $inUse)
-    # What that folder holds, as far as it can be looked at (an unplugged disk named by an old log
-    # line cannot): 'models', 'empty', 'absent' or 'unknown'.
-    $inUseContent = 'empty'
-    if ($otherModelDir) { $inUseContent = Get-ModelFolderContent -Path $inUse }
     # What the installer itself last wrote into OLLAMA_MODELS (the Ollama stage keeps it from now on):
     # an install from before this was kept wrote its plan there whenever that was not the default.
-    # Worked out before the refusal, which asks whose the variable is; kept in the state after it.
+    # Worked out before the folder in use is judged, which asks whether the installer chose it, and
+    # before the refusal, which asks whose the variable is; kept in the state after it.
     $ownModelsVar = ''
     if ($State.flags.ContainsKey('ollamaModelsEnv')) { $ownModelsVar = [string]$State.flags['ollamaModelsEnv'] }
     elseif ($State.flags['modelDir'] -and -not (Test-LaiSamePath ([string]$State.flags['modelDir']) $defaultModels)) { $ownModelsVar = [string]$State.flags['modelDir'] }
+    # What the folder in use holds: 'models', 'empty', 'absent' or 'unknown'. It is looked at only
+    # when the installer chose it itself: Ollama's default folder, the folder of the last plan, or
+    # the value the installer wrote into OLLAMA_MODELS (Test-OwnModelFolder says why). A folder that
+    # only Ollama's log or a variable of the user's names is never opened here: for it the running
+    # Ollama's own list of models decides (some: 'models', none: 'empty', no answer: 'unknown').
+    $inUseOwn = Test-OwnModelFolder -Path $inUse -Own @($defaultModels, [string]$State.flags['modelDir'], $ownModelsVar)
+    $inUseContent = 'empty'; $ollamaListed = -1
+    if ($otherModelDir -and $inUseOwn) { $inUseContent = Get-ModelFolderContent -Path $inUse }
+    elseif ($otherModelDir) {
+        $byList = Get-OllamaListedContent -OllamaUrl $OllamaUrl
+        $inUseContent = $byList['Content']; $ollamaListed = $byList['Listed']
+    }
     if ($inUseContent -eq 'models') {
         # What keeps them where they are: no -ModelDir when that plans the folder in use (the usual
         # case), else that folder by name (the Ollama app's own Model location is not the plan).
@@ -1339,12 +1374,21 @@ Invoke-Stage 'Preflight' {
                 $move = ("first remove the OLLAMA_MODELS variable from {0} (Start menu > '{1}'): it names {2} and is not the installer's own setting, so the installer leaves it, and while it is there Ollama keeps its models in that folder, not in {3}. Then " -f $stays['Where'], $stays['Editor'], $stays['Kept'], $target) + $move
             }
         }
-        throw ("-ModelDir {0} is not the folder Ollama keeps its models in now: they are in {1} (about {2}). Going on would download every model again into {0} and leave the old copy where it is. Nothing was changed. Either run the installer again {3} (the models stay in {1}), or {4}." -f $target, $inUse, (Get-FolderSizeText (Join-Path $inUse 'blobs')), $keep, $move)
+        # Where the models are: with their size for a folder the installer chose and has looked at.
+        # For any other folder what is known is what Ollama lists and who names the folder: it was
+        # not looked at, and no size is taken from it.
+        if ($inUseOwn) { $modelsAre = 'they are in {0} (about {1})' -f $inUse, (Get-FolderSizeText (Join-Path $inUse 'blobs')) }
+        else { $modelsAre = 'the running Ollama lists {0} model(s), and {1} names {2} as the folder they are in. The installer did not choose that folder itself, so it was not looked at and no size is given' -f $ollamaListed, $inUseSaidBy, $inUse }
+        throw ("-ModelDir {0} is not the folder Ollama keeps its models in now: {1}. Going on would download every model again into {0} and leave the old copy where it is. Nothing was changed. Either run the installer again {2} (the models stay in {3}), or {4}." -f $target, $modelsAre, $keep, $inUse, $move)
     }
     if ($inUseContent -eq 'unknown') {
         # Not refused: a disk that is gone for good must not keep the owner from another folder. But
         # said, and with time to stop: what follows is the very download this check is there for.
-        Write-LaiLog WARN ("The folder Ollama uses now, {0}, cannot be looked at (its drive is unplugged or offline, or the folder cannot be read), so the installer cannot tell whether models are in it. This run goes on with {1}: models in {0} are not used any more, and every model that is not in {1} yet is downloaded again. Not wanted? Close this window now, connect the drive, and run the installer again with -ModelDir {2}. Continuing in 20 seconds." -f $inUse, $target, (ConvertTo-PsLiteral $inUse))
+        # For a folder the installer did not choose, 'unknown' is an Ollama that did not answer: the
+        # folder was not looked at, and the warning says that, not that it cannot be looked at.
+        $notSeen = 'cannot be looked at (its drive is unplugged or offline, or the folder cannot be read)'; $toSee = 'connect the drive'
+        if (-not $inUseOwn) { $notSeen = "was not looked at ($inUseSaidBy names it, and the installer did not choose it itself), and Ollama, whose list of models would tell, did not answer"; $toSee = 'start Ollama' }
+        Write-LaiLog WARN ("The folder Ollama uses now, {0}, {3}, so the installer cannot tell whether models are in it. This run goes on with {1}: models in {0} are not used any more, and every model that is not in {1} yet is downloaded again. Not wanted? Close this window now, {4}, and run the installer again with -ModelDir {2}. Continuing in 20 seconds." -f $inUse, $target, (ConvertTo-PsLiteral $inUse), $notSeen, $toSee)
         Start-Sleep -Seconds 20
     }
     if ($ownModelsVar -and -not $State.flags.ContainsKey('ollamaModelsEnv')) { $State.flags['ollamaModelsEnv'] = $ownModelsVar }
@@ -1369,9 +1413,14 @@ Invoke-Stage 'Preflight' {
         if ($otherModelDir) {
             $inFolder = @($present | Select-Object -Unique)
             $inFolderText = 'none there yet'; if ($inFolder.Count) { $inFolderText = $inFolder -join ', ' }
-            # 'holds no models' only of a folder that was read.
+            # 'holds no models' only of a folder that was read; of one the installer did not choose,
+            # and so did not read, what the running Ollama's list said.
             $inUseText = 'which holds no models'
             if ($inUseContent -eq 'absent') { $inUseText = 'a folder that is not there' } elseif ($inUseContent -eq 'unknown') { $inUseText = 'which could not be looked at' }
+            if (-not $inUseOwn) {
+                $inUseText = 'which was not looked at; the running Ollama lists no models'
+                if ($inUseContent -eq 'unknown') { $inUseText = 'which was not looked at, and Ollama did not answer' }
+            }
             Write-LaiLog INFO "-ModelDir $target is not the folder Ollama uses now ($inUse, $inUseText): what is installed is read from $(Join-Path $target 'manifests'): $inFolderText"
         } elseif ($present.Count) { Write-LaiLog INFO "Ollama is not answering yet; found $($present.Count) installed model(s) in $target" }
     }

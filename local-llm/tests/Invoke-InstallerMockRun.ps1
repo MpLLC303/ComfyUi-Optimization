@@ -1169,6 +1169,15 @@ try {
     # The same refusal with apostrophes in both names, and with a folder in use that is not the plan
     # either (the Ollama app's own Model location names it, as in 7b): keeping it takes -ModelDir
     # with that folder. Both commands the message gives must be typed as it writes them.
+    # That folder is named by Ollama's log and by nothing the installer chose itself: not its
+    # state, not a value it wrote into OLLAMA_MODELS, and it is not Ollama's default. Any program
+    # of this user can write that log, and the installer, which has administrator rights, opened
+    # the folder it named, listed it, and put its size into the refusal. It is not looked at any
+    # more: the running Ollama's own list says that there are models, and the refusal says who
+    # names the folder and that it was not looked at, with no size.
+    $refusal7g = { param([string]$Log) @($Log -split "`n" | Where-Object { $_ -match '-ModelDir .* is not the folder Ollama keeps its models in now' }) -join ' ' }
+    $notLooked7g = { param([string]$Folder) "and Ollama's start-up log names $Folder as the folder they are in. The installer did not choose that folder itself, so it was not looked at and no size is given." }
+    $listed7g = { param([string]$Refusal) [regex]::Match($Refusal, 'the running Ollama lists ([1-9]\d*) model\(s\), ').Groups[1].Value }
     & $moveModels7g $plannedModels $aposModels
     Set-Content -LiteralPath $serverLog -Value $srvApos7g
     & (Join-Path $aiRoot 'Scripts/Install-LocalAI.ps1') -AIRoot $aiRoot -SkipTests -TrialModels none -ModelDir $aposTarget
@@ -1177,8 +1186,52 @@ try {
     & $moveModels7g $aposModels $plannedModels
     Remove-Item -LiteralPath $aposModels -Recurse -Force
     Set-Content -LiteralPath $serverLog -Value $srv7g
-    Assert-That ($c7gA2 -ne 0 -and $log7gA2 -notmatch '=+ Ollama =+' -and $log7gA2.Contains("they are in $aposModels (about 3 MB)") -and -not (Test-Path -LiteralPath $aposTarget)) "the folder in use named by the Ollama app's own setting, with an apostrophe in its name: refused in the same way (exit $c7gA2)"
+    $said7gA2 = & $refusal7g $log7gA2
+    Assert-That ($c7gA2 -ne 0 -and $log7gA2 -notmatch '=+ Ollama =+' -and (& $listed7g $said7gA2) -and $said7gA2.Contains((& $notLooked7g $aposModels)) -and -not (Test-Path -LiteralPath $aposTarget)) "the folder in use named by the Ollama app's own setting, with an apostrophe in its name: refused all the same, on the running Ollama's own list of models, and the message says that the folder Ollama's log names was not looked at (exit ${c7gA2}: $said7gA2)"
+    $sized7g = 'now: they are in |\(about |\d (MB|GB)\b'
+    Assert-That ($said7gA2 -and $said7gA2 -notmatch $sized7g) "and that refusal carries no size: none is taken from a folder the installer did not choose itself ($said7gA2)"
     Assert-That ($log7gA2.Contains("Either run the installer again with -ModelDir $(& $asTyped7g $aposModels) (the models stay in $aposModels)") -and $log7gA2.Contains("and run the installer again with -ModelDir $(& $asTyped7g $aposTarget).")) "and both commands write their folder as PowerShell reads one folder, the apostrophe doubled (to keep: -ModelDir $(& $asTyped7g $aposModels); after the move: -ModelDir $(& $asTyped7g $aposTarget))"
+    # What is in such a folder plays no part, because it is never opened: here the log names a
+    # folder that is there and empty. Looked at, it read 'holds no models' and the run went on into
+    # the download this check is there for. It is refused as above, with the same count of models
+    # and no size.
+    $emptyNamed = Join-Path $Work 'Log Named Empty'
+    New-Item -ItemType Directory -Force -Path $emptyNamed | Out-Null
+    Set-Content -LiteralPath $serverLog -Value ($srv7g -replace 'OLLAMA_MODELS:[^ \]]*', ('OLLAMA_MODELS:' + $emptyNamed.Replace('\', '\\')))
+    & (Join-Path $aiRoot 'Scripts/Install-LocalAI.ps1') -AIRoot $aiRoot -SkipTests -TrialModels none -ModelDir $aposTarget
+    $c7gA3 = $LASTEXITCODE
+    $log7gA3 = Get-NewestLog
+    Set-Content -LiteralPath $serverLog -Value $srv7g
+    $said7gA3 = & $refusal7g $log7gA3
+    $notRead7g = $sized7g + '|holds no models|a folder that is not there|cannot be looked at'
+    Assert-That ($c7gA3 -ne 0 -and $log7gA3 -notmatch '=+ Ollama =+' -and $said7gA3.Contains((& $notLooked7g $emptyNamed)) -and (& $listed7g $said7gA3) -and (& $listed7g $said7gA3) -eq (& $listed7g $said7gA2) -and $said7gA3 -notmatch $notRead7g -and
+        @(Get-ChildItem -LiteralPath $emptyNamed -Force).Count -eq 0 -and -not (Test-Path -LiteralPath $aposTarget)) "a folder that only Ollama's log names and that is empty: still refused in Preflight while the running Ollama lists models, with the same count and no size (exit ${c7gA3}: $said7gA3)"
+    # The two judges that refusal rests on, from the installer's own text. A folder is the
+    # installer's own when it is one of those it chose (spelling apart), and no other; and for a
+    # folder that is not, the running Ollama's list is all that is asked.
+    $ownFn7g = [regex]::Match($text, '(?s)function Test-OwnModelFolder \{.*?\r?\n\}').Value
+    $listFn7g = [regex]::Match($text, '(?s)function Get-OllamaListedContent \{.*?\r?\n\}').Value
+    $judges7g = @{ Own = @(); Models = @{}; None = @{}; Down = @{} }
+    if ($ownFn7g -and $listFn7g) {
+        $judges7g = & {
+            . ([scriptblock]::Create($ownFn7g)); . ([scriptblock]::Create($listFn7g))
+            $answer7g = 'models'
+            function Get-LaiOllamaModelNames { param($BaseUrl) $null = $BaseUrl; if ($answer7g -eq 'down') { throw 'no answer' }; if ($answer7g -eq 'none') { return @() }; return @('one:latest', 'two:latest') }
+            $r7g = @{ Own = @((Test-OwnModelFolder -Path 'D:\Models' -Own @('C:\Users\testuser\.ollama\models', '', 'd:/models/')), (Test-OwnModelFolder -Path 'E:\Other' -Own @('C:\Users\testuser\.ollama\models', 'D:\Models', '')), (Test-OwnModelFolder -Path 'E:\Other' -Own @('', '')), (Test-OwnModelFolder -Path 'E:\Other')) }
+            $r7g['Models'] = Get-OllamaListedContent -OllamaUrl 'http://stand-in'
+            $answer7g = 'none'; $r7g['None'] = Get-OllamaListedContent -OllamaUrl 'http://stand-in'
+            $answer7g = 'down'; $r7g['Down'] = Get-OllamaListedContent -OllamaUrl 'http://stand-in'
+            $r7g
+        }
+    }
+    Assert-That ($judges7g['Own'].Count -eq 4 -and $judges7g['Own'][0] -eq $true -and $judges7g['Own'][1] -eq $false -and $judges7g['Own'][2] -eq $false -and $judges7g['Own'][3] -eq $false) "a folder is the installer's own when it is one of the folders it chose (letter case, slashes and a closing separator apart), and not when it is another folder or when nothing was chosen ($($judges7g['Own'] -join ', '))"
+    Assert-That ([string]$judges7g['Models']['Content'] -eq 'models' -and [int]$judges7g['Models']['Listed'] -eq 2 -and [string]$judges7g['None']['Content'] -eq 'empty' -and [int]$judges7g['None']['Listed'] -eq 0 -and [string]$judges7g['Down']['Content'] -eq 'unknown' -and [int]$judges7g['Down']['Listed'] -eq -1) "for a folder that is not its own the installer goes by the running Ollama's list: models when it lists some, empty when it lists none, unknown when it does not answer ($($judges7g['Models']['Content']) / $($judges7g['None']['Content']) / $($judges7g['Down']['Content']))"
+    # And where the installer does look: the one listing of the folder in use and the one size
+    # taken from it are both behind 'the installer chose this folder itself'.
+    $looks7g = [regex]::Matches($text, 'Get-ModelFolderContent -Path \$inUse').Count
+    $sizes7g = [regex]::Matches($text, 'Get-FolderSizeText \(Join-Path \$inUse').Count
+    Assert-That ($looks7g -eq 1 -and $text.Contains('if ($otherModelDir -and $inUseOwn) { $inUseContent = Get-ModelFolderContent -Path $inUse }') -and $sizes7g -eq 1 -and $text.Contains('if ($inUseOwn) { $modelsAre = ''they are in {0} (about {1})'' -f $inUse, (Get-FolderSizeText (Join-Path $inUse ''blobs'')) }') -and
+        $text.Contains('$inUseOwn = Test-OwnModelFolder -Path $inUse -Own @($defaultModels, [string]$State.flags[''modelDir''], $ownModelsVar)')) "the installer lists the folder in use, and takes a size from it, in one place each, and only when that folder is Ollama's default, the folder of its last plan or the value it wrote into OLLAMA_MODELS ($looks7g listing(s), $sizes7g size(s))"
 
     # B: the models moved by hand, as the message says. The folder in use is empty now, so the run
     # goes on, and it reads what is installed from the new folder's manifests (the running Ollama
@@ -1260,8 +1313,11 @@ try {
     # not plugged in now. It no longer holds the value the installer wrote, so it is not the
     # installer's to remove, and the state forgets that value. And the folder Ollama uses cannot be
     # looked at: said in a warning before anything is planned (with the folder as it has to be
-    # typed), not passed off as a folder that holds no models.
-    & $setState7g @{ modelDir = $otherModels; ollamaModelsEnv = $otherModels } ''
+    # typed), not passed off as a folder that holds no models. The state plans that folder (a run
+    # without -ModelDir took the variable for its plan), so it is one the installer chose and may
+    # look at; named by the log and the variable alone it would not be looked at, and the running
+    # Ollama's list would decide, as in A.
+    & $setState7g @{ modelDir = $goneModels; ollamaModelsEnv = $otherModels } ''
     $global:MockUserEnv['OLLAMA_MODELS'] = $goneModels
     Set-Content -LiteralPath $serverLog -Value $srvGone7g
     $global:MockOllamaLog = @{ User = $srvGone7g; Session = $srvGone7g }
@@ -1280,7 +1336,7 @@ try {
     Remove-Item -LiteralPath Env:OLLAMA_MODELS -ErrorAction SilentlyContinue
     Set-Content -LiteralPath $serverLog -Value $srv7g
     Copy-Item -LiteralPath $stateAside7g -Destination $statePath -Force
-    foreach ($made7g in @((Join-Path $plannedModels 'manifests'), (Join-Path $plannedModels 'blobs'), $otherModels, $aposModels, $aposTarget)) {
+    foreach ($made7g in @((Join-Path $plannedModels 'manifests'), (Join-Path $plannedModels 'blobs'), $otherModels, $aposModels, $aposTarget, (Join-Path $Work 'Log Named Empty'))) {
         if (Test-Path -LiteralPath $made7g) { Remove-Item -LiteralPath $made7g -Recurse -Force }
     }
 }
