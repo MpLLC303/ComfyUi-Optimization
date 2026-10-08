@@ -120,10 +120,21 @@ jobs:
 
       # The pure and syntax-tree parts; the end-to-end block needs Windows and prints SKIP here
       # (declared above, like the two smaller Windows-only checks of this suite).
+      # One part needs the network: it asks GitHub itself for the list of files and for the archive
+      # of this run's commit (-ProbeCommit: the head commit of a pull request, else the commit that
+      # was pushed; -ProbeRepo: this repository), and holds the two against each other. That is the
+      # check every update rests on. GITHUB_TOKEN goes to GitHub's API only (its hourly limit
+      # without a token is small); the archive is asked for without it, as a PC asks.
+      # Started without -ProbeCommit that part prints 'SKIP GitHub itself ...'. That line is in no
+      # LAI_DECLARED_SKIPS on purpose: the part can run here, so a step that no longer passes
+      # -ProbeCommit fails instead of leaving the check out.
       - name: Bootstrap update review (Get-LocalAI.ps1)
         shell: pwsh
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          LAI_PROBE_COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
         run: |
-          & ./local-llm/tests/Invoke-AllTests.ps1 -Step ./local-llm/tests/Invoke-GetLocalAITest.ps1
+          & ./local-llm/tests/Invoke-AllTests.ps1 -Step ./local-llm/tests/Invoke-GetLocalAITest.ps1 -StepArgs '-ProbeCommit', $env:LAI_PROBE_COMMIT, '-ProbeRepo', $env:GITHUB_REPOSITORY
           exit $LASTEXITCODE
 
   integration:
