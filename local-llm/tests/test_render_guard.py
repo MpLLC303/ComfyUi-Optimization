@@ -337,18 +337,36 @@ runpy.run_path(guard, run_name='__main__')
 '''
 
 
-def run_guard(comfy_urls, upstream_port, extra=None, out=None, clock_flag=None):
+def copy_without_drain():
+    """A copy of the guard with one call taken out: the _drain() right after the 502 it gives
+    when a request cannot be sent on to Ollama. Returns (the path of the copy, how often that
+    call was found in the guard's code). The path is for run_guard's script, and the caller
+    removes the file. It is None unless the call was found exactly once: no copy is made then."""
+    with open(GUARD, encoding='utf-8') as f:
+        source = f.read()
+    cut, found = re.subn(r'(self\._send_json\(502, [^\n]*\n[ \t]+)self\._drain\(\)', r'\g<1>pass', source)
+    if found != 1:
+        return None, found
+    fd, path = tempfile.mkstemp(prefix='render-guard-', suffix='.py')
+    with os.fdopen(fd, 'w', encoding='utf-8') as f:
+        f.write(cut)
+    return path, found
+
+
+def run_guard(comfy_urls, upstream_port, extra=None, out=None, clock_flag=None, script=None):
     """Start a guard; returns the process and its port. out: an open file that gets the guard's
     log (see log_file); without one the log is dropped. clock_flag: the path of an empty file;
-    the guard's wall clock goes back an hour once something is written to it (CLOCK_BACK)."""
+    the guard's wall clock goes back an hour once something is written to it (CLOCK_BACK).
+    script: the path of a file to start in place of the guard's own (see copy_without_drain)."""
     port = free_port()
     env = dict(os.environ, UPSTREAM='http://127.0.0.1:%d' % upstream_port, COMFYUI_URLS=comfy_urls,
                LISTEN_PORT=str(port), PROBE_TIMEOUT='0.5', CACHE_SEC='0', HOLD_SEC='4',
                FREE_BACKOFF_SEC='30', WATCH_SEC='0.5', FREE_COMFYUI_MIN_MIB='1024')
     env.update(extra or {})
-    cmd = [sys.executable, '-u', GUARD]
+    started = script or GUARD
+    cmd = [sys.executable, '-u', started]
     if clock_flag:
-        cmd = [sys.executable, '-u', '-c', CLOCK_BACK, GUARD, clock_flag]
+        cmd = [sys.executable, '-u', '-c', CLOCK_BACK, started, clock_flag]
     p = subprocess.Popen(cmd, env=env, stdout=out or subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     for _ in range(50):
         try:
@@ -1087,6 +1105,57 @@ def main():
         guard.wait(10)
         drop_log(out, log_path)
         shut.close()
+
+    print('\n=== the same uploads at a copy of the guard that does not read on after that 502 ===', flush=True)
+    # What the upload checks above are worth. They are there for one call, the _drain() after the
+    # 502 in _proxy: with that call taken out they are to fail. They do only if the client of a
+    # guard without it cannot read the 502: such a guard closes a connection that has unread
+    # bytes in it, the client's sending fails on that, and it never gets as far as reading.
+    # Whether it goes that way is up to the kernel (how it ends such a connection, and how much
+    # of 8 MiB it takes before anyone reads them), so reading the code cannot settle it: only a
+    # run on the machine at hand does. This is that run, made every time: a copy of the guard
+    # with that one call taken out gets the same uploads. A client that reads the 502 from the
+    # copy as well means that the upload checks pass with the call and without it, and so say
+    # nothing about it.
+    # The two uploads further down, where Ollama ends the connection in the middle of one, lean
+    # on the same call. They are not sent to the copy: how much of an upload the guard has read
+    # by the time it finds that connection broken is not the same every time.
+    copy, found = copy_without_drain()
+    check(found == 1, 'the guard reads on after the 502 it gives when a request cannot be sent on to Ollama: one '
+                      '_drain() call right after that 502 in its code (%d found)' % found)
+    if copy:
+        shut, shut_port = closed_port()
+        out, log_path = log_file()
+        guard = None
+        try:
+            guard, gport = run_guard(comfy, shut_port, {'RENDER_GUARD_MODE': 'off', 'RENDER_GUARD_MAX_BODY_MIB': '1', 'DRAIN_SEC': '30'},
+                                     out=out, script=copy)
+            # In all else the copy is the guard. A chat has been read whole before the answer, so
+            # nothing is unread when the connection ends, and its client reads the 502.
+            code, answer = send(gport, '/api/chat', under)
+            check(code == 502 and refusal(answer) == not_running,
+                  'the copy answers as the guard does: a chat under the cap gets the 502 that says Ollama is not '
+                  'running (HTTP %d)' % code)
+            for chunked in (False, True):
+                code, answer = send(gport, '/api/blobs/sha256:' + digest, blob, chunked=chunked)
+                check(code == 0,
+                      'an upload of 8 MiB %s at the copy: its client cannot read the 502 (HTTP %d; 0: the connection '
+                      'broke first. A 502 here: the upload checks above do not show that the guard reads on)' % (
+                          'sent chunked' if chunked else 'with a Content-Length', code))
+
+            def at_502():
+                return [l for l in log_lines(log_path) if 'Ollama at http://127.0.0.1:%d is not reachable' % shut_port in l]
+            wait_for(lambda: len(at_502()) >= 3, 5)
+            check(len(at_502()) == 3,
+                  'the copy found Ollama gone all three times: both uploads came as far as the 502, and only their '
+                  'client did not get to read it (%d line(s) in its log)' % len(at_502()))
+        finally:
+            if guard is not None:
+                guard.terminate()
+                guard.wait(10)
+            drop_log(out, log_path)
+            shut.close()
+            os.remove(copy)
 
     print('\n=== Ollama is there and gives no answer: HTTP 502 that does not call it not running ===', flush=True)
     # The guard's Ollama address is a port that takes connections and, to begin with, does nothing
