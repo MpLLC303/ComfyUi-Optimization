@@ -781,61 +781,132 @@ Assert-That ($hcFns.Count -eq 5 -and $hcSilent.Count -eq 0 -and $hcAc['Said'] -c
 Assert-That ($hcAc['passes'] -eq 'PASS x' -and $hcAc['words, then a verdict'] -eq 'WARN w' -and $hcAc['throws'] -eq 'FAIL boom') "a verdict is kept as given, also after other output, and a health check that throws is still FAIL with the error ($($hcAc['passes']) | $($hcAc['words, then a verdict']) | $($hcAc['throws']))"
 $hcVerdicts = & $looseRows $hcAst
 Assert-That ($hcVerdicts.Rows -ge 25 -and $hcVerdicts.Loose.Count -eq 0) "every health check row ends in Pass, Fail, Warn or Skip, returns nothing else and gives no verdict it does not hand back, so none of them meets that SKIP or loses a FAIL ($($hcVerdicts.Rows) rows; not: $($hcVerdicts.Loose -join ', '))"
-# The judge of a preset's switches: one function at the top of the script that calls nothing (no
-# command, no method, no static member) and reads no variable but its argument and its own.
-$riskDefs = @($hcTop | Where-Object { $_.Name -eq 'Get-PresetToolRisk' })
-$riskCalls = @(); $riskOutside = @()
+# The judge of a preset's switches is the module's Get-LaiPresetToolRisk, the one the installer holds
+# every preset to. (The health check had a judge of its own, Get-PresetToolRisk, which knew past chats
+# and code and not the seven writing tools: a preset with those on passed.) It is one function that
+# calls nothing (no command, no method, no static member), reads no variable but its argument, its
+# own and the module's one list of the switches that are off in every preset, and writes to none
+# outside itself.
+$modAst = [System.Management.Automation.Language.Parser]::ParseFile((Join-Path (Join-Path $src 'lib') 'LocalAI.psm1'), [ref]$null, [ref]$null)
+$riskDefs = @($modAst.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Get-LaiPresetToolRisk' }, $true))
+$riskOld = @($hcAst.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Get-PresetToolRisk' }, $true))
+$riskCalls = @(); $riskOutside = @(); $riskWrites = @()
 if ($riskDefs.Count -eq 1) {
     $riskCalls = @($riskDefs[0].FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] -or $n -is [System.Management.Automation.Language.InvokeMemberExpressionAst] -or
                 ($n -is [System.Management.Automation.Language.MemberExpressionAst] -and $n.Static) }, $true))
-    $riskOwn = @('Meta', 'null', 'true', 'false') + @($riskDefs[0].FindAll({ param($n) $n -is [System.Management.Automation.Language.AssignmentStatementAst] -and $n.Left -is [System.Management.Automation.Language.VariableExpressionAst] }, $true) |
-        ForEach-Object { [string]$_.Left.VariablePath.UserPath })
+    $riskAssigned = @($riskDefs[0].FindAll({ param($n) $n -is [System.Management.Automation.Language.AssignmentStatementAst] -and $n.Left -is [System.Management.Automation.Language.VariableExpressionAst] }, $true) | ForEach-Object { [string]$_.Left.VariablePath.UserPath })
+    $riskLoop = @($riskDefs[0].FindAll({ param($n) $n -is [System.Management.Automation.Language.ForEachStatementAst] }, $true) | ForEach-Object { [string]$_.Variable.VariablePath.UserPath })
+    $riskOwn = @('Meta', 'null', 'true', 'false', 'script:LaiPresetToolsOff') + $riskAssigned + $riskLoop
     $riskOutside = @($riskDefs[0].FindAll({ param($n) $n -is [System.Management.Automation.Language.VariableExpressionAst] }, $true) | ForEach-Object { [string]$_.VariablePath.UserPath } | Where-Object { $riskOwn -notcontains $_ } | Select-Object -Unique)
+    $riskWrites = @(@($riskAssigned + $riskLoop) | Where-Object { $_ -match ':' })
 }
-Assert-That ($riskDefs.Count -eq 1 -and $riskCalls.Count -eq 0 -and $riskOutside.Count -eq 0) "Get-PresetToolRisk is one top-level function that only reads its argument ($($riskDefs.Count) definition(s); calls: $(@($riskCalls | ForEach-Object { [string]$_.Extent.Text }) -join ', '); other variables: $($riskOutside -join ', '))"
-$riskOf = { param([string]$Json)
-    . ([scriptblock]::Create($riskDefs[0].Extent.Text))
-    $meta = $null; if ($Json) { $meta = $Json | ConvertFrom-Json }
-    '[' + (@(Get-PresetToolRisk $meta) -join ' and ') + ']'
+Assert-That ($riskDefs.Count -eq 1 -and $riskCalls.Count -eq 0 -and $riskOutside.Count -eq 0 -and $riskWrites.Count -eq 0) "Get-LaiPresetToolRisk is one function of the module that only reads its argument and the shared list of switches ($($riskDefs.Count) definition(s); calls: $(@($riskCalls | ForEach-Object { [string]$_.Extent.Text }) -join ', '); other variables: $($riskOutside -join ', '); written outside itself: $($riskWrites -join ', '))"
+Assert-That ($riskOld.Count -eq 0) "and the health check has no judge of its own any more ($($riskOld.Count) definition(s) of Get-PresetToolRisk in Test-LocalAI.ps1)"
+$judgeThere = ($riskDefs.Count -eq 1 -and $null -ne (Get-Command Get-LaiPresetToolRisk -ErrorAction SilentlyContinue))
+# The judge's word on a preset's meta given as JSON, read the way Open WebUI's answer is; -AsTable
+# hands it the same meta as a table (how a form is held before it is sent).
+$riskOf = { param([string]$Json, [switch]$AsTable)
+    $rkMeta = $null; if ($Json) { $rkMeta = $Json | ConvertFrom-Json }
+    if ($AsTable) { $rkMeta = ConvertTo-LaiHashtable $rkMeta }
+    '[' + (@(Get-LaiPresetToolRisk $rkMeta) -join ' and ') + ']'
 }
-$chatsOn = @(); $nothingOff = @(); $switchesOff = ''; $codeOn = @(); $codeUnread = @(); $bothOn = ''
-if ($riskDefs.Count -eq 1) {
-    $chatsOn = @((& $riskOf '{"builtinTools":{"chats":true,"code_interpreter":false},"capabilities":{"code_interpreter":false}}'),
-        (& $riskOf '{"builtinTools":{"code_interpreter":false},"capabilities":{"code_interpreter":false}}'))
+# The seven writing tools switched off, for the cases that are about the other switches: without
+# them every case below would name them as on.
+$writingNames = @('notes', 'tasks', 'automations', 'calendar', 'notifications', 'channels', 'subagents')
+$sevenOff = @($writingNames | ForEach-Object { '"' + $_ + '":false' }) -join ','
+$allOn = '[read past chats and run code and use its ' + ($writingNames -join ', ') + ' tools]'
+$chatsOn = @(); $nothingOff = @(); $switchesOff = ''; $codeOn = @(); $codeUnread = @(); $bothOn = ''; $oldSeven = ''; $notBool = @(); $setCased = @(); $asTable = @()
+if ($judgeThere) {
+    $chatsOn = @((& $riskOf ('{"builtinTools":{"chats":true,"code_interpreter":false,' + $sevenOff + '},"capabilities":{"code_interpreter":false}}')),
+        (& $riskOf ('{"builtinTools":{"code_interpreter":false,' + $sevenOff + '},"capabilities":{"code_interpreter":false}}')))
     $nothingOff = @((& $riskOf '{"capabilities":{"vision":true}}'), (& $riskOf '{}'), (& $riskOf ''))
-    $switchesOff = & $riskOf '{"builtinTools":{"chats":false,"code_interpreter":false},"capabilities":{"code_interpreter":false}}'
-    $codeOn = @((& $riskOf '{"builtinTools":{"chats":false,"code_interpreter":true},"capabilities":{"code_interpreter":false}}'),
-        (& $riskOf '{"builtinTools":{"chats":false,"code_interpreter":false},"capabilities":{"code_interpreter":true}}'),
-        (& $riskOf '{"builtinTools":{"chats":false,"code_interpreter":true},"capabilities":{"code_interpreter":true}}'))
+    $switchesOff = & $riskOf ('{"builtinTools":{"chats":false,"code_interpreter":false,' + $sevenOff + '},"capabilities":{"code_interpreter":false}}')
+    $codeOn = @((& $riskOf ('{"builtinTools":{"chats":false,"code_interpreter":true,' + $sevenOff + '},"capabilities":{"code_interpreter":false}}')),
+        (& $riskOf ('{"builtinTools":{"chats":false,"code_interpreter":false,' + $sevenOff + '},"capabilities":{"code_interpreter":true}}')),
+        (& $riskOf ('{"builtinTools":{"chats":false,"code_interpreter":true,' + $sevenOff + '},"capabilities":{"code_interpreter":true}}')))
     # A code switch that is not there, or is null, was not read as off: both missing (with and without
     # capabilities), then each one missing and each one null beside the other set to false.
-    $codeUnread = @((& $riskOf '{"builtinTools":{"chats":false}}'),
-        (& $riskOf '{"builtinTools":{"chats":false},"capabilities":{"vision":true}}'),
-        (& $riskOf '{"builtinTools":{"chats":false},"capabilities":{"code_interpreter":false}}'),
-        (& $riskOf '{"builtinTools":{"chats":false,"code_interpreter":false},"capabilities":{"vision":true}}'),
-        (& $riskOf '{"builtinTools":{"chats":false,"code_interpreter":null},"capabilities":{"code_interpreter":false}}'),
-        (& $riskOf '{"builtinTools":{"chats":false,"code_interpreter":false},"capabilities":{"code_interpreter":null}}'))
-    $bothOn = & $riskOf '{"builtinTools":{"chats":true,"code_interpreter":true},"capabilities":{"code_interpreter":true}}'
+    $codeUnread = @((& $riskOf ('{"builtinTools":{"chats":false,' + $sevenOff + '}}')),
+        (& $riskOf ('{"builtinTools":{"chats":false,' + $sevenOff + '},"capabilities":{"vision":true}}')),
+        (& $riskOf ('{"builtinTools":{"chats":false,' + $sevenOff + '},"capabilities":{"code_interpreter":false}}')),
+        (& $riskOf ('{"builtinTools":{"chats":false,"code_interpreter":false,' + $sevenOff + '},"capabilities":{"vision":true}}')),
+        (& $riskOf ('{"builtinTools":{"chats":false,"code_interpreter":null,' + $sevenOff + '},"capabilities":{"code_interpreter":false}}')),
+        (& $riskOf ('{"builtinTools":{"chats":false,"code_interpreter":false,' + $sevenOff + '},"capabilities":{"code_interpreter":null}}')))
+    $bothOn = & $riskOf ('{"builtinTools":{"chats":true,"code_interpreter":true,' + $sevenOff + '},"capabilities":{"code_interpreter":true}}')
+    # The seven switches a preset has that was last written before the writing tools were switched off
+    # (backlog row 153): past chats and code are off in it, the seven are missing, which is on.
+    $oldSeven = & $riskOf '{"builtinTools":{"memory":true,"web_search":true,"knowledge":true,"chats":false,"time":true,"image_generation":false,"code_interpreter":false},"capabilities":{"code_interpreter":false}}'
+    # Off is the boolean false and nothing that only looks like it: 0, the text "false", an empty text.
+    $notBool = @((& $riskOf ('{"builtinTools":{"chats":0,"code_interpreter":false,' + $sevenOff + '},"capabilities":{"code_interpreter":false}}')),
+        (& $riskOf ('{"builtinTools":{"chats":"false","code_interpreter":false,' + $sevenOff + '},"capabilities":{"code_interpreter":false}}')),
+        (& $riskOf ('{"builtinTools":{"chats":"","code_interpreter":false,' + $sevenOff + '},"capabilities":{"code_interpreter":false}}')))
+    # A set under a look-alike name is not the set Open WebUI reads: every switch in it counts as on.
+    $setCased = @((& $riskOf ('{"BuiltinTools":{"chats":false,"code_interpreter":false,' + $sevenOff + '},"capabilities":{"code_interpreter":false}}')),
+        (& $riskOf ('{"builtinTools":{"chats":false,"code_interpreter":false,' + $sevenOff + '},"Capabilities":{"code_interpreter":false}}')))
+    # The same meta as a table gets the same word: all off, the old seven, and a look-alike key.
+    $asTable = @((& $riskOf ('{"builtinTools":{"chats":false,"code_interpreter":false,' + $sevenOff + '},"capabilities":{"code_interpreter":false}}') -AsTable),
+        (& $riskOf '{"builtinTools":{"chats":false,"code_interpreter":false},"capabilities":{"code_interpreter":false}}' -AsTable),
+        (& $riskOf ('{"builtinTools":{"Chats":false,"code_interpreter":false,' + $sevenOff + '},"capabilities":{"code_interpreter":false}}') -AsTable))
 }
 Assert-That ($chatsOn.Count -eq 2 -and @($chatsOn | Where-Object { $_ -ceq '[read past chats]' }).Count -eq 2) "past-chat search counts as on when the preset says so and when the chats key is missing, as Open WebUI treats it ($($chatsOn -join ' | '))"
-Assert-That ($nothingOff.Count -eq 3 -and @($nothingOff | Where-Object { $_ -ceq '[read past chats and run code]' }).Count -eq 3) "a preset without builtinTools, with an empty meta or with no meta at all has switched nothing off: past chats and code both count as on ($($nothingOff -join ' | '))"
-Assert-That ($switchesOff -ceq '[]') "a preset with all three switches set to false is clean (found: $switchesOff)"
+Assert-That ($nothingOff.Count -eq 3 -and @($nothingOff | Where-Object { $_ -ceq $allOn }).Count -eq 3) "a preset without builtinTools, with an empty meta or with no meta at all has switched nothing off: past chats, code and the seven writing tools all count as on ($($nothingOff -join ' | '))"
+Assert-That ($switchesOff -ceq '[]') "a preset with past chats, both code switches and the seven writing tools set to false is clean (found: $switchesOff)"
 Assert-That ($codeOn.Count -eq 3 -and @($codeOn | Where-Object { $_ -ceq '[run code]' }).Count -eq 3 -and $bothOn -ceq '[read past chats and run code]') "code execution counts as on with either of its two switches, is named once with both, and comes after past chats when both are back ($($codeOn -join ' | ') | $bothOn)"
 Assert-That ($codeUnread.Count -eq 6 -and @($codeUnread | Where-Object { $_ -ceq '[run code]' }).Count -eq 6) "a code switch that is missing or null counts as on like a missing chats key, so the row never prints 'code execution off' for a switch it did not read as off ($($codeUnread -join ' | '))"
+Assert-That ($oldSeven -ceq ('[use its ' + ($writingNames -join ', ') + ' tools]')) "a preset with the seven switches of an install from before the writing tools were switched off is not safe: past chats and code are off in it, and the writing tools, whose switches are missing, are named as on ($oldSeven)"
+Assert-That ($notBool.Count -eq 3 -and @($notBool | Where-Object { $_ -ceq '[read past chats]' }).Count -eq 3) "off is the boolean false only: a 0, the text 'false' and an empty text count as on ($($notBool -join ' | '))"
+Assert-That ($setCased.Count -eq 2 -and $setCased[0] -ceq $allOn -and $setCased[1] -ceq '[run code]') "a set of switches under a look-alike name (BuiltinTools, Capabilities) is not the one Open WebUI reads, so what it would switch off counts as on ($($setCased -join ' | '))"
+Assert-That ($asTable.Count -eq 3 -and $asTable[0] -ceq '[]' -and $asTable[1] -ceq ('[use its ' + ($writingNames -join ', ') + ' tools]') -and $asTable[2] -ceq '[read past chats]') "the same meta held as a table gets the same word as the object Open WebUI returns, a look-alike key included ($($asTable -join ' | '))"
+# Each switch by itself, in each of the four ways it can fail to be off: missing, null, true, and
+# false under a look-alike name ('Chats' for 'chats': PowerShell's own $tools.chats reads that as
+# off, Open WebUI does not read it at all). The nine switches under builtinTools and the code switch
+# under capabilities, every other switch off: the judge names exactly the one.
+$rkTools = @('chats', 'code_interpreter') + $writingNames
+$rkSwitch = { param([string]$Name, [string]$Shape)
+    if ($Shape -eq 'missing') { return '' }
+    if ($Shape -eq 'null') { return ('"' + $Name + '":null') }
+    if ($Shape -eq 'true') { return ('"' + $Name + '":true') }
+    if ($Shape -eq 'mis-cased') { return ('"' + $Name.Substring(0, 1).ToUpperInvariant() + $Name.Substring(1) + '":false') }
+    return ('"' + $Name + '":false')
+}
+$rkMetaWith = { param([string]$Set, [string]$Name, [string]$Shape)
+    $rkT = @($rkTools | ForEach-Object { if ($Set -eq 'builtinTools' -and $_ -eq $Name) { & $rkSwitch $_ $Shape } else { & $rkSwitch $_ 'false' } } | Where-Object { $_ })
+    $rkC = '"vision":true'
+    if ($Set -eq 'capabilities') { $rkOne = & $rkSwitch $Name $Shape; if ($rkOne) { $rkC += ',' + $rkOne } } else { $rkC += ',' + (& $rkSwitch 'code_interpreter' 'false') }
+    '{"builtinTools":{' + ($rkT -join ',') + '},"capabilities":{' + $rkC + '}}'
+}
+$rkBad = @{}
+foreach ($rkShape in 'missing', 'null', 'true', 'mis-cased') {
+    $rkBad[$rkShape] = @('the judge is not there')
+    if (-not $judgeThere) { continue }
+    $rkBad[$rkShape] = @()
+    foreach ($rkName in $rkTools) {
+        $rkWant = "[use its $rkName tools]"
+        if ($rkName -eq 'chats') { $rkWant = '[read past chats]' } elseif ($rkName -eq 'code_interpreter') { $rkWant = '[run code]' }
+        $rkGot = & $riskOf (& $rkMetaWith 'builtinTools' $rkName $rkShape)
+        if ($rkGot -cne $rkWant) { $rkBad[$rkShape] += "builtinTools.$rkName gave $rkGot" }
+    }
+    $rkGot = & $riskOf (& $rkMetaWith 'capabilities' 'code_interpreter' $rkShape)
+    if ($rkGot -cne '[run code]') { $rkBad[$rkShape] += "capabilities.code_interpreter gave $rkGot" }
+}
+Assert-That ($rkBad['missing'].Count -eq 0) "a switch that is missing counts as on, each of the ten by itself: past chats, the two code switches and the seven writing tools (not so: $($rkBad['missing'] -join '; '))"
+Assert-That ($rkBad['null'].Count -eq 0) "a switch that is null counts as on, each of the ten by itself (not so: $($rkBad['null'] -join '; '))"
+Assert-That ($rkBad['true'].Count -eq 0) "a switch that is true counts as on, each of the ten by itself (not so: $($rkBad['true'] -join '; '))"
+Assert-That ($rkBad['mis-cased'].Count -eq 0) "a switch that is false under a look-alike name ('Chats', 'Notes', 'Code_interpreter') counts as on: Open WebUI reads the exact name only (not so: $($rkBad['mis-cased'] -join '; '))"
 # The Preset row asks that judge before the image switch and before any warning (either would otherwise
 # be all the row says), and its sentence, taken from the row's source, is word for word the one below.
-$presetRow = $hcAst.Find({ param($n) $n -is [System.Management.Automation.Language.CommandAst] -and $n.GetCommandName() -eq 'Add-Check' -and $n.CommandElements.Count -eq 3 -and [string]$n.CommandElements[1].Extent.Text -like '"Preset $*' }, $true)
+$presetRow = $hcAst.Find({ param($n) $n -is [System.Management.Automation.Language.CommandAst] -and $n.GetCommandName() -eq 'Add-Check' -and $n.CommandElements.Count -eq 3 -and [string]$n.CommandElements[1].Extent.Text -ceq '"Preset $($m.Display)"' }, $true)
 $presetAt = @{}; $presetText = @(); $presetNot = @('the sentence is not in the row')
 if ($presetRow) {
-    foreach ($name in 'Get-PresetToolRisk', 'Test-LaiPresetVision', 'Warn') {
+    foreach ($name in 'Get-LaiPresetToolRisk', 'Test-LaiPresetVision', 'Warn') {
         $hit = $presetRow.CommandElements[2].Find({ param($n) $n -is [System.Management.Automation.Language.CommandAst] -and $n.GetCommandName() -eq $name }, $true)
         if ($hit) { $presetAt[$name] = $hit.Extent.StartOffset }
     }
     $presetSays = $presetRow.CommandElements[2].Find({ param($n) $n -is [System.Management.Automation.Language.ExpandableStringExpressionAst] -and $n.Value -like 'the assistant can *' }, $true)
     if ($presetSays) {
-        # $risks is the row's own variable for what Get-PresetToolRisk found.
+        # $risks is the row's own variable for what Get-LaiPresetToolRisk found.
         $sayIt = [scriptblock]::Create('param($risks) ' + $presetSays.Extent.Text)
-        $presetText = @([string](& $sayIt @('read past chats')), [string](& $sayIt @('read past chats', 'run code')))
+        $presetText = @([string](& $sayIt @('read past chats')), [string](& $sayIt @('read past chats', 'run code')), [string](& $sayIt @('use its notes, tasks tools')))
         # How the sentence leaves the row: as Fail's own words in a 'return (Fail ...)' that is all the
         # row's own 'if ($risks.Count)' does, $risks being what the judge said of this preset's meta,
         # ahead of the image switch and of every warning. A Warn there, or a lost 'return' (the row's
@@ -850,13 +921,80 @@ if ($presetRow) {
                 [string]$sayIf.Clauses[0].Item1.Extent.Text -cmatch '^\$risks\.Count( -gt 0)?$' -and $sayIf.Clauses[0].Item2.Statements.Count -eq 1)) { $presetNot += "that return is not all the row's own 'if (`$risks.Count)' does" }
         elseif (-not ($presetAt.Count -eq 3 -and $sayIf.Extent.StartOffset -lt $presetAt['Test-LaiPresetVision'] -and $sayIf.Extent.StartOffset -lt $presetAt['Warn'])) { $presetNot += 'it comes after the image switch or a warning' }
         $riskSet = @($presetBody.FindAll({ param($n) $n -is [System.Management.Automation.Language.AssignmentStatementAst] -and [string]$n.Left.Extent.Text -eq '$risks' }, $true))
-        if (-not ($riskSet.Count -eq 1 -and [string]$riskSet[0].Right.Extent.Text -cmatch '^@\(Get-PresetToolRisk \$p\.meta\)$' -and [object]::ReferenceEquals($riskSet[0].Parent, $presetBody.EndBlock))) { $presetNot += '$risks is not, once and for every preset, what Get-PresetToolRisk says of $p.meta' }
+        if (-not ($riskSet.Count -eq 1 -and [string]$riskSet[0].Right.Extent.Text -cmatch '^@\(Get-LaiPresetToolRisk \$p\.meta\)$' -and [object]::ReferenceEquals($riskSet[0].Parent, $presetBody.EndBlock))) { $presetNot += '$risks is not, once and for every preset, what Get-LaiPresetToolRisk says of $p.meta' }
     }
 }
-Assert-That ($presetAt.Count -eq 3 -and $presetAt['Get-PresetToolRisk'] -lt $presetAt['Test-LaiPresetVision'] -and $presetAt['Get-PresetToolRisk'] -lt $presetAt['Warn']) "the Preset row judges the past-chat and code switches before the image switch and before any warning (found: $(@($presetAt.Keys) -join ', '))"
-Assert-That ($presetNot.Count -eq 0) "the Preset row hands that sentence back as a failure: 'return (Fail ...)' is all its 'if (`$risks.Count)' does, on what Get-PresetToolRisk says of the preset's meta, ahead of the image switch and of every warning (not so: $($presetNot -join '; '))"
+Assert-That ($presetAt.Count -eq 3 -and $presetAt['Get-LaiPresetToolRisk'] -lt $presetAt['Test-LaiPresetVision'] -and $presetAt['Get-LaiPresetToolRisk'] -lt $presetAt['Warn']) "the Preset row asks the module's judge (past chats, code, the writing tools) before the image switch and before any warning (found: $(@($presetAt.Keys) -join ', '))"
+Assert-That ($presetNot.Count -eq 0) "the Preset row hands that sentence back as a failure: 'return (Fail ...)' is all its 'if (`$risks.Count)' does, on what Get-LaiPresetToolRisk says of the preset's meta, ahead of the image switch and of every warning (not so: $($presetNot -join '; '))"
 $presetFix = ' again; run Start menu > Local AI - Update toolkit to put the safety settings back'
-Assert-That ($presetText.Count -eq 2 -and $presetText[0] -ceq "the assistant can read past chats$presetFix" -and $presetText[1] -ceq "the assistant can read past chats and run code$presetFix" -and ([string]$hcAst.Extent.Text) -notmatch 'memory/web/knowledge tools on') "a preset that can read past chats fails with what it can do again and the one step that puts it back, and the row no longer says 'tools on' without having read them ($($presetText -join ' | '))"
+Assert-That ($presetText.Count -eq 3 -and $presetText[0] -ceq "the assistant can read past chats$presetFix" -and $presetText[1] -ceq "the assistant can read past chats and run code$presetFix" -and $presetText[2] -ceq "the assistant can use its notes, tasks tools$presetFix" -and ([string]$hcAst.Extent.Text) -notmatch 'memory/web/knowledge tools on') "a preset that can read past chats, run code or use a writing tool fails with what it can do again and the one step that puts it back, and the row no longer says 'tools on' without having read them ($($presetText -join ' | '))"
+# A preset of the toolkit that is in Open WebUI without being selected (Vision or Code skipped later,
+# a trial that was dropped) kept the switches it had: only the selected ones were judged. Each such
+# preset has a row of its own now, with the same judge on what Open WebUI holds under the entry's
+# preset id, and its failure names the one step that switches the tools off.
+$keptRow = $hcAst.Find({ param($n) $n -is [System.Management.Automation.Language.CommandAst] -and $n.GetCommandName() -eq 'Add-Check' -and $n.CommandElements.Count -eq 3 -and [string]$n.CommandElements[1].Extent.Text -ceq '"Preset $($m.Display) (not selected)"' }, $true)
+$keptNot = @('the row is not there'); $keptText = ''
+if ($keptRow) {
+    $keptNot = @()
+    $keptBody = $keptRow.CommandElements[2].ScriptBlock
+    $keptSays = $keptBody.Find({ param($n) $n -is [System.Management.Automation.Language.ExpandableStringExpressionAst] -and $n.Value -like 'the assistant can *' }, $true)
+    if (-not $keptSays) { $keptNot += 'its sentence is not in the row' }
+    else {
+        $keptText = [string](& ([scriptblock]::Create('param($risks) ' + $keptSays.Extent.Text)) @('read past chats', 'use its notes, tasks tools'))
+        $keptReturn = @($keptBody.FindAll({ param($n) $n -is [System.Management.Automation.Language.ReturnStatementAst] -and $n.Extent.StartOffset -le $keptSays.Extent.StartOffset -and $n.Extent.EndOffset -ge $keptSays.Extent.EndOffset }, $false))
+        $keptIf = $null; if ($keptReturn.Count -eq 1 -and $keptReturn[0].Parent) { $keptIf = $keptReturn[0].Parent.Parent }
+        if (-not ($keptReturn.Count -eq 1 -and [string]$keptReturn[0].Extent.Text -cmatch '^return \(Fail "the assistant can ' -and $keptIf -is [System.Management.Automation.Language.IfStatementAst] -and
+                [object]::ReferenceEquals($keptIf.Parent, $keptBody.EndBlock) -and $keptIf.Clauses.Count -eq 1 -and [string]$keptIf.Clauses[0].Item1.Extent.Text -cmatch '^\$risks\.Count( -gt 0)?$')) { $keptNot += "the sentence is not handed back with 'return (Fail ...)' by the row's own 'if (`$risks.Count)'" }
+    }
+    $keptSet = @($keptBody.FindAll({ param($n) $n -is [System.Management.Automation.Language.AssignmentStatementAst] -and [string]$n.Left.Extent.Text -eq '$risks' }, $true))
+    if (-not ($keptSet.Count -eq 1 -and [string]$keptSet[0].Right.Extent.Text -cmatch '^@\(Get-LaiPresetToolRisk \$kept\.meta\)$' -and [object]::ReferenceEquals($keptSet[0].Parent, $keptBody.EndBlock))) { $keptNot += '$risks is not what Get-LaiPresetToolRisk says of $kept.meta' }
+    # The loop the row is in: one turn for each entry that is not selected, $kept being what Open
+    # WebUI holds under that entry's preset id; no row for a preset that is not there.
+    $keptLoop = $keptRow.Parent
+    while ($keptLoop -and $keptLoop -isnot [System.Management.Automation.Language.ForEachStatementAst]) { $keptLoop = $keptLoop.Parent }
+    $keptLoopText = ''; $keptOver = ''
+    if ($keptLoop) { $keptLoopText = [string]$keptLoop.Body.Extent.Text; $keptOver = [string]$keptLoop.Condition.Extent.Text }
+    if ($keptOver -cne '@($unselected.Entries)') { $keptNot += "the row is not in a loop over @(`$unselected.Entries) (it is over '$keptOver')" }
+    if (-not $keptLoopText.Contains('$kept = Get-LaiWebUIModel -BaseUrl $webUrl -Token $token -Id $m.Preset')) { $keptNot += '$kept is not what Open WebUI holds under the preset id of the entry' }
+    if (-not $keptLoopText.Contains('if (-not $kept -and -not $keptUnread) { continue }')) { $keptNot += 'a preset that is not in Open WebUI is not passed over' }
+}
+# Where the entries come from: the catalog this run reads and, always, the toolkit's own catalog next
+# to the script, so that no -CatalogPath (and no variable) can take a preset out of the check.
+$unselSet = @($hcAst.FindAll({ param($n) $n -is [System.Management.Automation.Language.AssignmentStatementAst] -and [string]$n.Left.Extent.Text -eq '$unselected' }, $true))
+$unselFrom = ''; if ($unselSet.Count -eq 1) { $unselFrom = [string]$unselSet[0].Right.Extent.Text }
+if (-not ($unselFrom -cmatch '^Get-UnselectedPresetEntry -CatalogFiles @\(' -and $unselFrom.Contains('$CatalogPath') -and $unselFrom.Contains("(Join-Path (Join-Path `$PSScriptRoot 'config') 'models.psd1')") -and
+        $unselFrom.Contains('-SelectedPresets @($catalog.Models | ForEach-Object { [string]$_.Preset })'))) { $keptNot += "the entries are not those of Get-UnselectedPresetEntry for `$CatalogPath and config\models.psd1 under `$PSScriptRoot, less the selected presets ($unselFrom)" }
+Assert-That ($keptNot.Count -eq 0) "a toolkit preset that is in Open WebUI without being selected has a health check row of its own: the module's judge on what Open WebUI holds under its id, a failure handed back with 'return (Fail ...)', for the entries of the catalog in use and of the toolkit's own (not so: $($keptNot -join '; '))"
+Assert-That ($keptText -ceq 'the assistant can read past chats and use its notes, tasks tools in this preset, which is not selected but still in Open WebUI, where a chat can be started on it; run Start menu > Local AI - Update toolkit to switch that off') "and that failure says what the assistant can do there and names Update toolkit as the step that switches it off ($keptText)"
+# The entries themselves, from the health check's own function on real catalog files: the test
+# catalog with Local Main and Local Fast selected, then the toolkit's catalog.
+$unselDefs = @($hcTop | Where-Object { $_.Name -eq 'Get-UnselectedPresetEntry' })
+$unselOf = { param([string[]]$Files, [string[]]$Selected)
+    . ([scriptblock]::Create($unselDefs[0].Extent.Text))
+    Get-UnselectedPresetEntry -CatalogFiles $Files -SelectedPresets $Selected
+}
+$ukTest = Join-Path (Join-Path $src 'tests') 'models.test.psd1'
+$ukOwn = Join-Path (Join-Path $src 'config') 'models.psd1'
+$ukShort = Join-Path $Work 'short-catalog.psd1'
+$ukBroken = Join-Path $Work 'broken-catalog.psd1'
+Set-Content -LiteralPath $ukShort -Encoding UTF8 -Value "@{ DefaultPreset = 'local-main'; ContextCandidates = @(8192); Models = @(@{ Key = 'main'; Display = 'Only Main'; Preset = 'local-main' }) }"
+Set-Content -LiteralPath $ukBroken -Encoding UTF8 -Value '@{ Models = @( this is not a data file'
+$ukBoth = @(); $ukShortIds = @(); $ukTwice = @(); $ukGone = @(); $ukBrokenIds = @(); $ukBrokenUnread = @()
+if ($unselDefs.Count -eq 1) {
+    $ukBoth = @((& $unselOf @($ukTest, $ukOwn) @('local-main', 'local-fast')).Entries | ForEach-Object { [string]$_.Preset })
+    $ukShortIds = @((& $unselOf @($ukShort, $ukOwn) @('local-main')).Entries | ForEach-Object { [string]$_.Preset })
+    $ukTwice = @((& $unselOf @($ukOwn, $ukOwn) @()).Entries | ForEach-Object { [string]$_.Preset })
+    $ukGone = @((& $unselOf @((Join-Path $Work 'no-such-catalog.psd1'), '', $ukShort) @()).Entries | ForEach-Object { [string]$_.Preset })
+    $ukBrokenRun = & $unselOf @($ukBroken, $ukShort) @()
+    $ukBrokenIds = @($ukBrokenRun.Entries | ForEach-Object { [string]$_.Preset }); $ukBrokenUnread = @($ukBrokenRun.Unread)
+}
+$ukOwnIds = @((Import-PowerShellDataFile -Path $ukOwn).Models | ForEach-Object { [string]$_.Preset })
+Assert-That ($unselDefs.Count -eq 1 -and $ukBoth -ccontains 'trial-standin' -and $ukBoth -ccontains 'official-standin' -and $ukBoth -ccontains 'local-vision' -and $ukBoth -ccontains 'official-main' -and $ukBoth -cnotcontains 'local-main' -and $ukBoth -cnotcontains 'local-fast' -and
+    @($ukBoth | Select-Object -Unique).Count -eq $ukBoth.Count) "the presets that are not selected come from both catalogs, trials and official ones included, each once, and the selected ones are not among them ($($ukBoth -join ', '))"
+Assert-That ($ukShortIds.Count -eq ($ukOwnIds.Count - 1) -and $ukShortIds -ccontains 'local-vision' -and $ukShortIds -ccontains 'local-fast' -and $ukShortIds -cnotcontains 'local-main') "a catalog that lists one preset (as a -CatalogPath can name) takes none of the toolkit's own out of the check: all but the selected one are there ($($ukShortIds.Count) of $($ukOwnIds.Count): $($ukShortIds -join ', '))"
+Assert-That ($ukTwice.Count -eq $ukOwnIds.Count -and $ukOwnIds.Count -ge 7) "the same catalog given twice lists each preset once, and with nothing selected all of them ($($ukTwice.Count) of $($ukOwnIds.Count))"
+Assert-That ($ukGone.Count -eq 1 -and $ukGone[0] -ceq 'local-main') "a catalog file that is not there, or no file name at all, is passed over and the others are read ($($ukGone -join ', '))"
+Assert-That ($ukBrokenIds.Count -eq 1 -and $ukBrokenIds[0] -ceq 'local-main' -and $ukBrokenUnread.Count -eq 1 -and ([string]$ukBrokenUnread[0]).StartsWith("$ukBroken (")) "a catalog that cannot be read is named as unread, which the health check fails, and the others are still listed ($($ukBrokenIds -join ', '); unread: $($ukBrokenUnread -join ' | '))"
 
 Write-Host "`n=== Test-LocalAI: anything listening beyond localhost is reported ===" -ForegroundColor Cyan
 if ($onWindows) {
@@ -1541,6 +1679,56 @@ $resetFast = [pscustomobject]@{ id = 'local-fast'; name = 'Local Fast'; params =
 $mReset = Merge-LaiPresetForm -Managed $fastForm -Existing $resetFast
 Assert-That ($mReset.params['think'] -eq $false) 'a preset whose Think was set back to Default gets the catalog value again'
 Assert-That ($mReset.meta.builtinTools['image_generation'] -is [bool] -and $mReset.meta.builtinTools['image_generation'] -eq $false -and @($mReset.meta.builtinTools.Keys).Count -eq 16) 'and a preset that has no tool switches at all gets the whole set as a new preset does, the picture tool off'
+# One list of the switches that are off in every preset, shared by the form of a new preset, by the
+# judge and by the form that makes a preset safe again: the nine of the list are the nine a new form
+# switches off (its tenth false, the picture tool, is the owner's), and the judge calls a new form clean.
+$psMod = Get-Module LocalAI
+$offList = @(& $psMod { if (Test-Path -LiteralPath variable:script:LaiPresetToolsOff) { $script:LaiPresetToolsOff } })
+$protectThere = ($null -ne (Get-Command Protect-LaiPresetForm -ErrorAction SilentlyContinue) -and $null -ne (Get-Command Get-LaiPresetToolRisk -ErrorAction SilentlyContinue))
+$fastOff = @($fastForm.meta.builtinTools.Keys | Where-Object { $fastForm.meta.builtinTools[$_] -eq $false -and $_ -ne 'image_generation' } | Sort-Object)
+$fastClean = 'the judge is not there'; if ($protectThere) { $fastClean = @(Get-LaiPresetToolRisk $fastForm.meta) -join ' and ' }
+Assert-That ($offList.Count -eq 9 -and (@($offList | Sort-Object) -join ',') -ceq ($fastOff -join ',') -and @($fastForm.meta.builtinTools.Keys).Count -eq 16 -and $fastClean -eq '') "the module's one list of switches that are off in every preset holds the nine a new preset form switches off besides the picture tool, the form still writes 16 switches, and the judge finds nothing on in it (list: $($offList -join ', '); form: $($fastOff -join ', '); on: $fastClean)"
+# A toolkit preset that is in Open WebUI without being selected is made safe from what Open WebUI
+# holds, not from a new form: Protect-LaiPresetForm. Here one as an install from before the writing
+# tools were switched off left it, since hidden and switched off by the owner, with the owner's
+# picture tool, a collection and a tool attached, web search on for every chat, code execution
+# ticked, a switch of a newer Open WebUI, and past chats 'off' under a look-alike name (Chats).
+$pfJson = '{"id":"trial-x","name":"Trial X","base_model_id":"localai-trial-x:latest","is_active":false,"access_grants":[{"principal_type":"user","principal_id":"u1","permission":"read"}],' +
+    '"params":{"system":"keep me","temperature":0.4},' +
+    '"meta":{"hidden":true,"description":"d","defaultFeatureIds":["web_search"],"knowledge":[{"id":"kb1"}],"toolIds":["my_tool"],' +
+    '"capabilities":{"vision":true,"image_generation":true,"code_interpreter":true},' +
+    '"builtinTools":{"memory":true,"web_search":true,"knowledge":true,"Chats":false,"time":true,"image_generation":true,"code_interpreter":false,"a_tool_of_tomorrow":false}}}'
+$pfOld = $pfJson | ConvertFrom-Json
+$pf = $null; $pfOfficial = $null; $pfBare = $null; $pfThrew = ''; $pfWas = ''; $pfNow = ''
+if ($protectThere) {
+    $pfWas = @(Get-LaiPresetToolRisk $pfOld.meta) -join ' and '
+    $pf = Protect-LaiPresetForm -Existing $pfOld
+    $pfOfficial = Protect-LaiPresetForm -Existing $pfOld -Official
+    $pfBare = Protect-LaiPresetForm -Existing ([pscustomobject]@{ id = 'bare'; name = 'Bare' })
+    try { Protect-LaiPresetForm -Existing 'the text of an answer that could not be read' | Out-Null } catch { $pfThrew = $_.Exception.Message }
+}
+$pfTools = @{}; $pfCaps = @{}; $pfMeta = @{}; $pfParams = @{}; $pfSent = ''; $pfActive = 'no form'; $pfOfficialAuto = 'no form'
+if ($pfOfficial) { $pfOfficialAuto = @($pfOfficial['meta']['defaultFeatureIds']) -join ',' }
+if ($pf) {
+    $pfMeta = $pf['meta']; $pfTools = $pfMeta['builtinTools']; $pfCaps = $pfMeta['capabilities']; $pfParams = $pf['params']; $pfActive = [string]$pf['is_active']
+    # As it goes to Open WebUI: the names in the JSON are the ones that count there.
+    $pfSent = ConvertTo-Json -InputObject $pf -Depth 30 -Compress
+    $pfNow = @(Get-LaiPresetToolRisk ($pfSent | ConvertFrom-Json).meta) -join ' and '
+}
+$pfNotOff = @($offList | Where-Object { -not (@($pfTools.Keys) -ccontains $_ -and $pfTools[$_] -is [bool] -and $pfTools[$_] -eq $false) })
+Assert-That ($pfWas -ceq ('read past chats and run code and use its ' + (@('notes', 'tasks', 'automations', 'calendar', 'notifications', 'channels', 'subagents') -join ', ') + ' tools')) "setup: the judge finds that old preset open (past chats behind a look-alike name, code execution ticked, the seven writing switches missing): $pfWas"
+Assert-That ($pf -and $offList.Count -eq 9 -and $pfNotOff.Count -eq 0 -and @($pfCaps.Keys) -ccontains 'code_interpreter' -and $pfCaps['code_interpreter'] -is [bool] -and $pfCaps['code_interpreter'] -eq $false) "the safe form of a preset as Open WebUI returned it has the nine switches written out as false under their exact names (past chats, code, the seven writing tools) and code execution off as a capability too (not off: $($pfNotOff -join ', '); capability: '$($pfCaps['code_interpreter'])')"
+Assert-That ($pfSent -cmatch '"chats":false' -and $pfSent -cnotmatch '"Chats"' -and $pf -and $pfNow -eq '') "a switch under a look-alike name (Chats) is taken out and the exact one written, so the form that is sent switches off what Open WebUI reads, and the judge finds nothing on in it (still on: $pfNow)"
+Assert-That ($pf -and $pfMeta.ContainsKey('defaultFeatureIds') -and @($pfMeta['defaultFeatureIds']).Count -eq 0 -and $pfSent -cmatch '"defaultFeatureIds":\[\]' -and $pfOfficialAuto -ceq 'web_search') "nothing is on by default for every chat any more, unless the preset is an official one (-Official), which keeps its web search (plain: '$(@($pfMeta['defaultFeatureIds']) -join ',')'; official: '$pfOfficialAuto')"
+Assert-That ($pf -and $pf['is_active'] -is [bool] -and $pf['is_active'] -eq $false -and $pfMeta['hidden'] -eq $true -and $pfTools['image_generation'] -eq $true -and $pfCaps['image_generation'] -eq $true) "a preset the owner switched off and hid stays switched off and hidden, and the owner's picture tool stays on (is_active '$pfActive', hidden '$($pfMeta['hidden'])', image_generation '$($pfTools['image_generation'])' / '$($pfCaps['image_generation'])')"
+Assert-That ($pf -and [string]$pf['id'] -ceq 'trial-x' -and [string]$pf['name'] -ceq 'Trial X' -and [string]$pf['base_model_id'] -ceq 'localai-trial-x:latest' -and [string]$pfParams['system'] -ceq 'keep me' -and [double]$pfParams['temperature'] -eq 0.4 -and
+    @($pf['access_grants']).Count -eq 1 -and [string]@($pf['access_grants'])[0]['principal_id'] -ceq 'u1' -and @($pfMeta['knowledge']).Count -eq 1 -and [string]@($pfMeta['knowledge'])[0]['id'] -ceq 'kb1' -and (@($pfMeta['toolIds']) -join ',') -ceq 'my_tool' -and [string]$pfMeta['description'] -ceq 'd' -and
+    $pfTools['a_tool_of_tomorrow'] -is [bool] -and $pfTools['a_tool_of_tomorrow'] -eq $false -and $pfTools['memory'] -eq $true -and $pfTools['web_search'] -eq $true -and $pfCaps['vision'] -eq $true) 'everything else on it is kept: name, base model, system prompt and parameters, who may use it, the attached collection and tool, the description, a switch of a newer Open WebUI and every switch the toolkit leaves on'
+Assert-That (@($pfOld.meta.builtinTools.PSObject.Properties | ForEach-Object { $_.Name }) -ccontains 'Chats' -and @($pfOld.meta.builtinTools.PSObject.Properties | ForEach-Object { $_.Name }) -cnotcontains 'notes' -and (@($pfOld.meta.defaultFeatureIds) -join ',') -ceq 'web_search' -and $pfOld.meta.capabilities.code_interpreter -eq $true -and (ConvertTo-Json -InputObject $pfOld -Depth 30 -Compress) -ceq (ConvertTo-Json -InputObject ($pfJson | ConvertFrom-Json) -Depth 30 -Compress)) 'and what Open WebUI returned is not changed by it: the safe form is a copy'
+$pfBareOff = @(); $pfBareSent = ''
+if ($pfBare) { $pfBareSent = ConvertTo-Json -InputObject $pfBare -Depth 30 -Compress; $pfBareOff = @($offList | Where-Object { $pfBareSent -cmatch ('"' + $_ + '":false') }) }
+Assert-That ($pfBare -and $offList.Count -eq 9 -and $pfBareOff.Count -eq 9 -and $pfBareSent -cmatch '"capabilities":\{"code_interpreter":false\}' -and [string]$pfBare['name'] -ceq 'Bare') "a preset without any meta gets both sets made, with the nine switches and the code capability off ($pfBareSent)"
+Assert-That ($pfThrew -match 'did not return the preset as an object') "an answer that is no object (Open WebUI's text, where the JSON could not be read) is refused instead of being sent back as a form ($pfThrew)"
 $catData = Import-PowerShellDataFile -Path (Join-Path (Join-Path $src 'config') 'models.psd1')
 $promise = @($catData.Models | Where-Object { $_.Think -eq $false -and $_.Description -match '(?i)chat controls' -and $_.Description -notmatch '(?i)cannot' } | ForEach-Object { $_.Key })
 Assert-That ($promise.Count -eq 0) "no catalog entry with Think = `$false promises a Chat Controls switch that the preset overrides ($($promise -join ', '))"
@@ -1657,6 +1845,76 @@ if ($missingFn.Count -eq 0) {
     $v = Test-LaiWebUIVision -Token 't' -Model 'local-vision'
     Assert-That (-not $v.Passed -and @('red', 'green', 'blue') -contains $v.Expected) "an answer without the colour fails the check (expected $($v.Expected))"
 }
+# Invoke-LaiPresetSafety, which the installer runs over every catalog entry, against an Open WebUI
+# that is a table in memory (the module's Invoke-LaiApi is a stand-in until the import below). A
+# preset is held there as the JSON that was sent, so what is read back has the names as written.
+# Five entries: the old preset of the cases above (not selected), a new preset form (safe), an
+# official one (safe, web search on by default, which is its own), a preset that is not in Open
+# WebUI, and the first one listed a second time.
+$psThere = ($null -ne (Get-Command Invoke-LaiPresetSafety -ErrorAction SilentlyContinue))
+$psMod = Get-Module LocalAI
+& $psMod {
+    $script:PsStore = @{}; $script:PsPosts = New-Object System.Collections.ArrayList; $script:PsKeeps = $true; $script:PsRefuses = $false
+    function script:Invoke-LaiApi { param($Method, $Uri, $Body, $Token, $TimeoutSec) $null = $Token, $TimeoutSec
+        if ($Method -eq 'POST') { [void]$script:PsPosts.Add([string]$Uri) }
+        if ($Uri -like '*/api/v1/models/model?id=*') {
+            $psId = [uri]::UnescapeDataString(([string]$Uri -split 'id=', 2)[1])
+            if ($script:PsStore.ContainsKey($psId)) { return ($script:PsStore[$psId] | ConvertFrom-Json) }
+            return $null
+        }
+        if ($Method -eq 'POST' -and $Uri -like '*/api/v1/models/model/update') {
+            if ($script:PsRefuses) { throw 'HTTP 500 from the stand-in' }
+            if ($script:PsKeeps) { $script:PsStore[[string]$Body['id']] = (ConvertTo-Json -InputObject $Body -Depth 30 -Compress) }
+            return $null
+        }
+        throw "unexpected call $Method $Uri" }
+}
+$psCleanJson = ConvertTo-Json -InputObject $fastForm -Depth 30 -Compress
+$psOfficialJson = ConvertTo-Json -InputObject (New-LaiPresetForm -Entry @{ Preset = 'official-main'; Alias = 'localai-official-main'; Display = 'Official Main'; Description = 'd'; Vision = $true; Think = $null; Official = $true } -NativeTools $true -SystemPrompt 'sys') -Depth 30 -Compress
+$psEntries = @(@{ Key = 'trial-x'; Preset = 'trial-x'; Display = 'Trial X'; Trial = $true }, @{ Key = 'fast'; Preset = 'local-fast'; Display = 'Local Fast' }, @{ Key = 'official-main'; Preset = 'official-main'; Display = 'Official Main'; Official = $true },
+    @{ Key = 'trial-gone'; Preset = 'trial-gone'; Display = 'Trial Gone'; Trial = $true }, @{ Key = 'trial-x-again'; Preset = 'trial-x'; Display = 'Trial X again'; Trial = $true })
+$psSeed = { & $psMod { param($Old, $Clean, $Official) $script:PsStore = @{ 'trial-x' = $Old; 'local-fast' = $Clean; 'official-main' = $Official }; $script:PsPosts.Clear(); $script:PsKeeps = $true; $script:PsRefuses = $false } $pfJson $psCleanJson $psOfficialJson }
+$psRead = @(); $psReadPosts = @('not run'); $psReadKept = ''; $psDone = @(); $psDonePosts = @(); $psAfter = @{ Kept = ''; Official = ''; Ids = @() }; $psAgain = @(); $psAgainPosts = @('not run'); $psNotKept = ''; $psRefused = ''; $psRefusedKept = ''
+$psAuto = @(); $psAutoKept = ''; $psAutoJson = $psCleanJson.Replace('"defaultFeatureIds":[]', '"defaultFeatureIds":["web_search"]')
+if ($psThere) {
+    & $psSeed
+    $psRead = @(Invoke-LaiPresetSafety -Token 't' -Entries $psEntries -ReadOnly)
+    $psReadPosts = @(& $psMod { $script:PsPosts.ToArray() })
+    $psReadKept = [string](& $psMod { $script:PsStore['trial-x'] })
+    & $psSeed
+    $psDone = @(Invoke-LaiPresetSafety -Token 't' -Entries $psEntries)
+    $psDonePosts = @(& $psMod { $script:PsPosts.ToArray() })
+    $psAfter = & $psMod { @{ Kept = [string]$script:PsStore['trial-x']; Official = [string]$script:PsStore['official-main']; Ids = @($script:PsStore.Keys | Sort-Object) } }
+    & $psMod { $script:PsPosts.Clear() }
+    $psAgain = @(Invoke-LaiPresetSafety -Token 't' -Entries $psEntries)
+    $psAgainPosts = @(& $psMod { $script:PsPosts.ToArray() })
+    & $psSeed
+    & $psMod { $script:PsKeeps = $false }
+    try { Invoke-LaiPresetSafety -Token 't' -Entries $psEntries | Out-Null; $psNotKept = 'no error' } catch { $psNotKept = $_.Exception.Message }
+    & $psSeed
+    & $psMod { $script:PsRefuses = $true }
+    try { Invoke-LaiPresetSafety -Token 't' -Entries $psEntries | Out-Null; $psRefused = 'no error' } catch { $psRefused = $_.Exception.Message }
+    $psRefusedKept = [string](& $psMod { $script:PsStore['trial-x'] })
+    # A preset with every switch off whose only fault is web search on for every chat, on a preset
+    # that is not an official one: written for that alone.
+    & $psSeed
+    & $psMod { param($Auto) $script:PsStore['local-fast'] = $Auto } $psAutoJson
+    $psAuto = @(Invoke-LaiPresetSafety -Token 't' -Entries @($psEntries[1]))
+    $psAutoKept = [string](& $psMod { $script:PsStore['local-fast'] })
+}
+$psReadOn = ''; if ($psRead.Count -gt 0) { $psReadOn = @($psRead[0].On) -join ' and ' }
+Assert-That ($psRead.Count -eq 3 -and (@($psRead | ForEach-Object { [string]$_.Preset }) -join ',') -ceq 'trial-x,local-fast,official-main' -and $psReadOn -ceq ('read past chats and run code and use its notes, tasks, automations, calendar, notifications, channels, subagents tools and use web_search in every chat without being asked') -and
+    @($psRead[1].On).Count -eq 0 -and @($psRead[2].On).Count -eq 0) "every catalog preset that is in Open WebUI is judged, selected or not, each once, one that is not there is passed over, and an official preset's own web search is not held against it (found: $(@($psRead | ForEach-Object { [string]$_.Preset }) -join ', '); the old one: $psReadOn)"
+Assert-That ($psRead.Count -eq 3 -and @($psRead | Where-Object { $_.Written }).Count -eq 0 -and $psReadPosts.Count -eq 0 -and $psReadKept -ceq $pfJson) "with -ReadOnly nothing is written: no request that changes anything, the old preset as it was ($($psReadPosts -join ' | '))"
+$psKeptNow = 'not read'; if ($psAfter['Kept']) { $psKeptNow = @(Get-LaiPresetToolRisk ($psAfter['Kept'] | ConvertFrom-Json).meta) -join ' and ' }
+Assert-That ($psDone.Count -eq 3 -and $psDone[0].Written -eq $true -and @($psDone | Where-Object { $_.Written }).Count -eq 1 -and $psDonePosts.Count -eq 1 -and [string]$psDonePosts[0] -like '*/api/v1/models/model/update' -and $psKeptNow -eq '') "without it the one preset that was open is written with the safe form, by an update and nothing else, and reads back clean (requests: $($psDonePosts -join ' | '); still on: $psKeptNow)"
+Assert-That ($psAfter['Kept'] -cmatch '"chats":false' -and $psAfter['Kept'] -cnotmatch '"Chats"' -and $psAfter['Kept'] -cmatch '"hidden":true' -and $psAfter['Kept'] -cmatch '"is_active":false' -and $psAfter['Kept'] -cmatch '"defaultFeatureIds":\[\]' -and $psAfter['Kept'] -cmatch '"system":"keep me"') "what Open WebUI holds for it afterwards: past chats off under the exact name, still hidden and switched off, nothing on by default, its system prompt kept"
+Assert-That ((@($psAfter['Ids']) -join ',') -ceq 'local-fast,official-main,trial-x' -and $psAfter['Official'] -ceq $psOfficialJson) "no preset is created for a catalog entry that is not in Open WebUI, and a preset that was safe is not written at all (presets: $(@($psAfter['Ids']) -join ', '))"
+Assert-That ($psAgain.Count -eq 3 -and @($psAgain | Where-Object { @($_.On).Count -gt 0 -or $_.Written }).Count -eq 0 -and $psAgainPosts.Count -eq 0) "a second run finds every preset safe and writes nothing ($($psAgainPosts -join ' | '))"
+Assert-That ($psNotKept -match "^Open WebUI did not keep the safety settings of the preset 'Trial X': the assistant can still read past chats and run code and use its notes, .* tools and use web_search in every chat without being asked there\. Run the installer again") "an Open WebUI that takes the write and keeps the old switches is an error that names the preset and what is still on, what is on by default included, never 'done' ($psNotKept)"
+Assert-That ($psRefused -match "^The safety settings of the preset 'Trial X' could not be written to Open WebUI \(HTTP 500 from the stand-in\): the assistant can still read past chats" -and $psRefusedKept -ceq $pfJson) "a write that Open WebUI refuses is an error with its reason ($psRefused)"
+$psAutoOn = ''; if ($psAuto.Count -eq 1) { $psAutoOn = @($psAuto[0].On) -join ' and ' }
+Assert-That ($psAutoJson -cne $psCleanJson -and $psAuto.Count -eq 1 -and $psAuto[0].Written -eq $true -and $psAutoOn -ceq 'use web_search in every chat without being asked' -and $psAutoKept -cmatch '"defaultFeatureIds":\[\]' -and $psAutoKept -cmatch '"web_search":true') "a preset that is not an official one and has web search on for every chat is written for that alone: nothing is on by default afterwards, and web search stays there to be switched on in a chat ($psAutoOn)"
 Import-Module (Join-Path (Join-Path $src 'lib') 'LocalAI.psm1') -Force
 # A moved endpoint: Open WebUI answers any unknown path with its web page (status 200).
 $started = Start-TestListener

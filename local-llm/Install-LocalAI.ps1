@@ -2178,6 +2178,18 @@ Invoke-Stage 'Configure' {
     $State.flags['configureWarnings'] = @(Invoke-LaiWebUISetup -BaseUrl $WebUIUrl -Token $token -Models $Catalog.Models -ModelResults $State.tuning `
         -SystemPrompt $SystemPrompt -DefaultPreset $defaultToSet -DefaultIsOwners:$ownersDefault -Collections $KnowledgeCollections)
     if (-not $ownersDefault) { $State.flags['defaultModelSet'] = $defaultToSet }
+    # The setup above writes the presets that are selected. A preset of the toolkit that is not
+    # (Vision or Code skipped since, a trial that was dropped, official models left out) is still in
+    # Open WebUI, hidden at most, with the switches it had when it was last written: an install from
+    # before the writing tools were switched off left them on there, and a chat can still be started
+    # on it. So every catalog preset that exists is judged here, selected or not, and one that lets
+    # the assistant do more than the toolkit allows gets its switches set (none is created). A
+    # preset that cannot be made safe stops the stage, as an open sign-up does.
+    $presetSafety = @(Invoke-LaiPresetSafety -BaseUrl $WebUIUrl -Token $token -Entries @((Get-LaiCatalog -Path $CatalogPath -IncludeTrials).Models))
+    foreach ($ps in @($presetSafety | Where-Object { $_.Written })) {
+        Write-LaiLog OK "Preset '$($ps.Display)' made safe again: the assistant could $($ps.On -join ' and ') there, which is switched off now"
+    }
+    Write-LaiLog OK "Safety settings checked on $($presetSafety.Count) toolkit preset(s) in Open WebUI, selected or not: past-chat search, code execution and the writing tools are off in each"
     # Shown again: a trial or official preset this installer hid, one named on this run's command
     # line, or one that is newly selected now (it may still be hidden from an earlier install).
     foreach ($om in @($Catalog.Models | Where-Object { $_.Trial -or $_.Official })) {

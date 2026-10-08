@@ -3903,12 +3903,25 @@ function Set-LaiWebUIModelsConfig {
     return Invoke-LaiApi -Method POST -Uri "$BaseUrl/api/v1/configs/models" -Body $cfg -Token $Token
 }
 
+# The tool categories of Open WebUI (meta.builtinTools) that are off in every preset of the toolkit,
+# selected or not, and that every install or update switches off again: past chats, code, and the
+# seven that write, schedule, send or start something (why each is off: New-LaiPresetForm). One
+# list for the three that have to agree: the form of a new preset (New-LaiPresetForm), the judge of
+# a preset as Open WebUI holds it (Get-LaiPresetToolRisk) and the form that makes a preset safe
+# again (Protect-LaiPresetForm). image_generation is off in a new preset as well, but it is the
+# owner's to switch on, so it is not in this list.
+$script:LaiPresetToolsOff = @('chats', 'code_interpreter', 'notes', 'tasks', 'automations', 'calendar', 'notifications', 'channels', 'subagents')
+
 function New-LaiPresetForm {
     # Open WebUI workspace model ("preset") on top of a tuned Ollama alias.
     param([Parameter(Mandatory)][hashtable]$Entry, [Parameter(Mandatory)][bool]$NativeTools, [Parameter(Mandatory)][string]$SystemPrompt)
     $params = @{ system = $SystemPrompt }
     if ($NativeTools) { $params['function_calling'] = 'native' } else { $params['function_calling'] = 'legacy' }
     if ($Entry.Think -eq $false) { $params['think'] = $false }
+    # The 16 tool switches (the comment in $meta below says which is which, and why): seven written
+    # here, and the nine of the shared list, off.
+    $tools = @{ time = $true; user_input = $true; knowledge = $true; files = $true; web_search = $true; memory = $true; image_generation = $false }
+    foreach ($off in $script:LaiPresetToolsOff) { $tools[$off] = $false }
     $meta = @{
         description       = $Entry.Description
         profile_image_url = '/static/favicon.png'
@@ -3948,12 +3961,7 @@ function New-LaiPresetForm {
         # switches are about Open WebUI's built-in tools only: a tool attached to the preset is
         # called without asking as well (the installer attaches one, the skill notebook, which
         # saves a skill draft that stays off until the owner switches it on).
-        builtinTools      = @{
-            time = $true; user_input = $true; knowledge = $true; files = $true; web_search = $true; memory = $true
-            chats = $false; code_interpreter = $false; image_generation = $false
-            notes = $false; tasks = $false; automations = $false; calendar = $false
-            notifications = $false; channels = $false; subagents = $false
-        }
+        builtinTools      = $tools
         tags              = @(@{ name = 'local' })
     }
     # No 'hidden' here: a preset the owner hid stays hidden. The installer shows a trial or official
@@ -3973,6 +3981,134 @@ function New-LaiPresetForm {
         access_grants = @()
         is_active     = $true
     }
+}
+
+function Get-LaiPresetToolRisk {
+    # What a preset lets the assistant do that the toolkit switches off in every preset, from the
+    # preset's meta as Open WebUI returns it (an object, or the same as a table): 'read past chats',
+    # 'run code', and one entry that names the writing tools that are on ('use its notes, tasks
+    # tools'). Nothing = safe. Pure: it reads its argument and the shared list above and calls
+    # nothing (tests\Invoke-WindowsUnitTests.ps1 holds it to that).
+    # Open WebUI takes a missing tool category for ON, so a switch counts as off only when it is
+    # written out as the boolean false under its exact name, letter case included: Open WebUI reads
+    # 'chats' and never 'Chats', while PowerShell's own $tools.chats reads either and would call a
+    # preset safe that is not. A switch that is missing, null, true, a text or spelt another way
+    # counts as on, and so does every switch of a set (builtinTools, capabilities) that is not
+    # there under its exact name. Code execution has two switches and counts as on when either does.
+    param($Meta)
+    # For each of the two sets, the names in it that are written out as false.
+    $off = @{ builtinTools = @(); capabilities = @() }
+    $sets = @()
+    if ($Meta -is [System.Collections.IDictionary]) { foreach ($k in @($Meta.PSBase.Keys)) { $sets += , @([string]$k, $Meta[$k]) } }
+    elseif ($null -ne $Meta) { foreach ($p in $Meta.PSObject.Properties) { $sets += , @([string]$p.Name, $p.Value) } }
+    foreach ($set in $sets) {
+        $setName = $set[0]; $switches = $set[1]
+        if ($setName -cne 'builtinTools' -and $setName -cne 'capabilities') { continue }
+        $names = @()
+        if ($switches -is [System.Collections.IDictionary]) {
+            foreach ($k in @($switches.PSBase.Keys)) { if ($switches[$k] -is [bool] -and -not $switches[$k]) { $names += [string]$k } }
+        } elseif ($null -ne $switches) {
+            foreach ($p in $switches.PSObject.Properties) { if ($p.Value -is [bool] -and -not $p.Value) { $names += [string]$p.Name } }
+        }
+        $off[$setName] = $names
+    }
+    $risks = @()
+    if ($off['builtinTools'] -cnotcontains 'chats') { $risks += 'read past chats' }
+    if ($off['builtinTools'] -cnotcontains 'code_interpreter' -or $off['capabilities'] -cnotcontains 'code_interpreter') { $risks += 'run code' }
+    $writing = @()
+    foreach ($name in $script:LaiPresetToolsOff) {
+        if ($name -ceq 'chats' -or $name -ceq 'code_interpreter') { continue }
+        if ($off['builtinTools'] -cnotcontains $name) { $writing += $name }
+    }
+    if ($writing.Count -gt 0) { $risks += ('use its ' + ($writing -join ', ') + ' tools') }
+    return $risks
+}
+
+function Protect-LaiPresetForm {
+    # A preset as Open WebUI returned it, made safe: the form to send back. Past chats, both code
+    # switches and the seven writing tools are written out as false under their exact names, and
+    # no feature is on by default for every chat, unless the preset is one of the official releases
+    # (-Official: those search the web by default, the others only when asked). Everything else
+    # is kept as it was found: name, base model, system prompt and parameters, who may use the
+    # preset, whether it is active or hidden, the owner's picture tool, what is attached to it,
+    # and every other switch.
+    # Pure: a copy is changed and returned, the argument is not, and Open WebUI is not asked.
+    # A switch under a look-alike name ('Chats') is taken out before the exact one is written: a
+    # PowerShell table finds 'Chats' when it is asked for 'chats' and would keep that spelling,
+    # which Open WebUI does not read. The same goes for the two sets and for defaultFeatureIds.
+    param([Parameter(Mandatory)]$Existing, [switch]$Official)
+    $form = ConvertTo-LaiHashtable $Existing
+    if ($form -isnot [hashtable]) { throw 'Open WebUI did not return the preset as an object, so it cannot be changed' }
+    $meta = $form['meta']; $form.Remove('meta')
+    if ($meta -isnot [hashtable]) { $meta = @{} }
+    $form['meta'] = $meta
+    foreach ($set in 'builtinTools', 'capabilities') {
+        $switches = $meta[$set]; $meta.Remove($set)
+        if ($switches -isnot [hashtable]) { $switches = @{} }
+        $meta[$set] = $switches
+    }
+    foreach ($name in $script:LaiPresetToolsOff) { $meta['builtinTools'].Remove($name); $meta['builtinTools'][$name] = $false }
+    $meta['capabilities'].Remove('code_interpreter'); $meta['capabilities']['code_interpreter'] = $false
+    if (-not $Official) { $meta.Remove('defaultFeatureIds'); $meta['defaultFeatureIds'] = @() }
+    return $form
+}
+
+function Invoke-LaiPresetSafety {
+    # Holds the toolkit's presets safe, every one that is in Open WebUI, selected or not. A preset
+    # that is no longer selected (Vision or Code skipped later, a trial that was dropped, official
+    # models left out) is hidden at most and never deleted: old chats use it, and a new chat can
+    # be started on it. -Entries: catalog entries (Get-LaiCatalog -IncludeTrials has all of them).
+    # For each one whose preset is there: what it lets the assistant do (Get-LaiPresetToolRisk),
+    # and on a preset that is not an official one what is on by default for every chat. When there
+    # is anything, the safe form is written (Protect-LaiPresetForm), read back and judged again.
+    # A preset that is not in Open WebUI is passed over: nothing is created (Set-LaiWebUIModel
+    # would). A write that fails, or that Open WebUI does not keep, is an error: this never reports
+    # a preset as safe that is still open. -ReadOnly judges and writes nothing.
+    # Returns one object for each preset found: Key, Preset, Display, On (what the assistant could
+    # do there, in words; empty = it was safe already) and Written.
+    param(
+        [string]$BaseUrl = 'http://127.0.0.1:3000',
+        [Parameter(Mandatory)][string]$Token,
+        [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Entries,
+        [switch]$ReadOnly
+    )
+    $found = @(); $seen = @()
+    foreach ($m in $Entries) {
+        $id = [string]$m.Preset
+        if (-not $id -or $seen -ccontains $id) { continue }
+        $seen += $id
+        $existing = Get-LaiWebUIModel -BaseUrl $BaseUrl -Token $Token -Id $id
+        if (-not $existing) { continue }
+        $official = [bool]$m.Official
+        # What a preset as Open WebUI holds it leaves open: asked before the write and again after it.
+        $openIn = { param($Preset)
+            $open = @(Get-LaiPresetToolRisk $Preset.meta)
+            if (-not $official -and $Preset.meta) {
+                $auto = @($Preset.meta.defaultFeatureIds | Where-Object { $_ })
+                if ($auto.Count -gt 0) { $open += ('use ' + ($auto -join ', ') + ' in every chat without being asked') }
+            }
+            $open
+        }
+        $on = @(& $openIn $existing)
+        $written = $false
+        if (-not $ReadOnly -and $on.Count -gt 0) {
+            $byHand = "Run the installer again (Start menu > Local AI - Update toolkit). If this stays, switch that off by hand in Open WebUI: Workspace > Models > $($m.Display)"
+            try {
+                $form = Protect-LaiPresetForm -Existing $existing -Official:$official
+                # The update takes the preset by its id and refuses a form without parameters.
+                $form['id'] = $id
+                if ($null -eq $form['params']) { $form['params'] = @{} }
+                Invoke-LaiApi -Method POST -Uri "$BaseUrl/api/v1/models/model/update" -Body $form -Token $Token | Out-Null
+            } catch { throw "The safety settings of the preset '$($m.Display)' could not be written to Open WebUI ($(Get-LaiHttpErrorText $_)): the assistant can still $($on -join ' and ') there. $byHand" }
+            $after = Get-LaiWebUIModel -BaseUrl $BaseUrl -Token $Token -Id $id
+            if (-not $after) { throw "The preset '$($m.Display)' was not in Open WebUI any more when its safety settings were read back, so they were not checked. $byHand" }
+            $left = @(& $openIn $after)
+            if ($left.Count -gt 0) { throw "Open WebUI did not keep the safety settings of the preset '$($m.Display)': the assistant can still $($left -join ' and ') there. $byHand" }
+            $written = $true
+        }
+        $found += [pscustomobject]@{ Key = [string]$m.Key; Preset = $id; Display = [string]$m.Display; On = $on; Written = $written }
+    }
+    return $found
 }
 
 function Get-LaiRagWanted {

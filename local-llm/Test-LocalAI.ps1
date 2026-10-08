@@ -11,8 +11,9 @@
       GPU + driver, Ollama, models installed, presets measured on the running Ollama version (and
       the nightly re-check that keeps them so), models 100% on GPU at their tuned context, a direct SearXNG search (names failed engines),
       Docker, containers, Open WebUI login, presets (system prompt + native tool calling, past-chat
-      search and code execution still off, image upload matching what Ollama reports for the model),
-      no context size set in Open WebUI over
+      search, code execution and the writing tools still off, image upload matching what Ollama
+      reports for the model; the switches also on every toolkit preset that is still in Open WebUI
+      without being selected), no context size set in Open WebUI over
       the tuned aliases, signup off / memories on, RAG + web search settings, a chat per preset, an
       image read by each preset with images (Uncensored Vision), memory recall, document retrieval, web
       search, backups, the health watch (and what it found changed in the installed scripts, tasks
@@ -91,22 +92,30 @@ function Get-WebUIStopReason {
     if ($hold) { return @{ Lock = $false; Text = "kept stopped after a failed restore ($($hold['Reason'])). Recover first: $($hold['Recover'])" } }
     return $null
 }
-# What a preset lets the assistant do that the installer switches off, from the preset's meta as Open
-# WebUI returns it (pure: reads only its argument; unit-tested in tests\Invoke-WindowsUnitTests.ps1).
-# Open WebUI treats a missing tool category as on, so a switch counts as off only when it is false: a
-# missing one (a preset restored from an older backup, or written by hand) counts as on, and the row
-# never says 'off' for a switch it did not read as off. Code execution has two switches and counts as
-# on when either of them does.
-function Get-PresetToolRisk($Meta) {
-    $tools = $null; $caps = $null
-    if ($null -ne $Meta) { $tools = $Meta.builtinTools; $caps = $Meta.capabilities }
-    $chats = $null; $toolCode = $null; $capCode = $null
-    if ($null -ne $tools) { $chats = $tools.chats; $toolCode = $tools.code_interpreter }
-    if ($null -ne $caps) { $capCode = $caps.code_interpreter }
-    $risks = @()
-    if (-not ($chats -is [bool] -and -not $chats)) { $risks += 'read past chats' }
-    if (-not ($toolCode -is [bool] -and -not $toolCode -and $capCode -is [bool] -and -not $capCode)) { $risks += 'run code' }
-    return $risks
+# The catalog entries whose preset this install does not have selected, from every catalog file
+# given that is there, each preset once. Such a preset can still be in Open WebUI (Vision or Code
+# skipped later, a trial that was dropped: hidden at most, never deleted), and a chat can still be
+# started on it, so it is judged like the selected ones. A file that cannot be read is named in
+# Unread instead of ending the run. (Reads only the files it is given; unit-tested in
+# tests\Invoke-WindowsUnitTests.ps1.)
+function Get-UnselectedPresetEntry {
+    param([string[]]$CatalogFiles = @(), [string[]]$SelectedPresets = @())
+    $entries = @(); $seen = @(); $unread = @()
+    foreach ($file in $CatalogFiles) {
+        if (-not $file -or -not (Test-Path -LiteralPath $file)) { continue }
+        # Every entry of the file, trials and official models included. Read here with -ErrorAction
+        # Stop: Windows PowerShell 5.1 only prints the error for a file that is no data file and
+        # hands back nothing, which would read as a catalog without presets.
+        try { $all = @((Import-PowerShellDataFile -LiteralPath $file -ErrorAction Stop).Models) }
+        catch { $unread += "$file ($($_.Exception.Message))"; continue }
+        foreach ($entry in $all) {
+            $id = [string]$entry.Preset
+            if (-not $id -or $SelectedPresets -ccontains $id -or $seen -ccontains $id) { continue }
+            $seen += $id
+            $entries += $entry
+        }
+    }
+    return @{ Entries = $entries; Unread = $unread }
 }
 
 Write-LaiLog STEP 'Local AI acceptance test'
@@ -403,8 +412,10 @@ if ($script:token) {
             if (-not $p) { return (Fail 'not found') }
             if ($p.base_model_id -ne "$($m.Alias):latest") { return (Fail "base is $($p.base_model_id)") }
             if (-not $p.params.system) { return (Fail 'no system prompt') }
-            # Before the image switch: its warning would otherwise be all this row says.
-            $risks = @(Get-PresetToolRisk $p.meta)
+            # Before the image switch: its warning would otherwise be all this row says. The judge is
+            # the module's, the one the installer holds every preset to: past chats, code, and the
+            # writing tools, each off only when it is written out as off.
+            $risks = @(Get-LaiPresetToolRisk $p.meta)
             if ($risks.Count) { return (Fail "the assistant can $($risks -join ' and ') again; run Start menu > Local AI - Update toolkit to put the safety settings back") }
             # Image upload on the preset against what Ollama reports for the model (no model load).
             $presetVision = $false
@@ -418,7 +429,29 @@ if ($script:token) {
                 }
             }
             if ($p.params.function_calling -ne 'native') { return (Warn "function calling = $($p.params.function_calling) (model template has no tool support)") }
-            Pass "system prompt set, native tool calling, past-chat search and code execution off$(if ($presetVision) { ', images on' })"
+            Pass "system prompt set, native tool calling, past-chat search, code execution and the writing tools off$(if ($presetVision) { ', images on' })"
+        }
+    }
+    # The toolkit's presets that are in Open WebUI without being selected, each with a row of its
+    # own and the same judge: such a preset keeps the switches it had when it was last written, and
+    # a chat can be started on it. The entries come from the catalog this run reads and, always,
+    # from the toolkit's own catalog next to this script: a -CatalogPath (or the test variable
+    # above) that names a shorter list cannot take a preset out of this check. A preset that is not
+    # in Open WebUI gets no row; one that cannot be read gets a failed one.
+    $unselected = Get-UnselectedPresetEntry -CatalogFiles @($CatalogPath, (Join-Path (Join-Path $PSScriptRoot 'config') 'models.psd1')) -SelectedPresets @($catalog.Models | ForEach-Object { [string]$_.Preset })
+    foreach ($unreadCatalog in @($unselected.Unread)) {
+        Add-Check 'Presets that are not selected' { Fail "the catalog $unreadCatalog could not be read, so the presets it lists were not checked; run Start menu > Local AI - Update toolkit to put the toolkit's files back" }
+    }
+    foreach ($m in @($unselected.Entries)) {
+        # Asked before the row, which a preset that is not there does not get.
+        $kept = $null; $keptUnread = ''
+        try { $kept = Get-LaiWebUIModel -BaseUrl $webUrl -Token $token -Id $m.Preset } catch { $keptUnread = 'error: ' + (Get-LaiHttpErrorText $_) }
+        if (-not $kept -and -not $keptUnread) { continue }
+        Add-Check "Preset $($m.Display) (not selected)" {
+            if ($keptUnread) { return (Fail "Open WebUI did not hand this preset over ($keptUnread), so its safety settings were not checked; run the health check again, and if this stays, Start menu > Local AI - Update toolkit") }
+            $risks = @(Get-LaiPresetToolRisk $kept.meta)
+            if ($risks.Count) { return (Fail "the assistant can $($risks -join ' and ') in this preset, which is not selected but still in Open WebUI, where a chat can be started on it; run Start menu > Local AI - Update toolkit to switch that off") }
+            Pass 'still in Open WebUI, with past-chat search, code execution and the writing tools off'
         }
     }
     Add-Check 'Context decided by the tuned aliases' {

@@ -571,6 +571,45 @@ $mcfg = Invoke-LaiApi -Uri 'http://127.0.0.1:3000/api/v1/configs/models' -Token 
 $st4 = Get-Content -Encoding UTF8 -Raw (Join-Path $aiRoot 'install-state.json') | ConvertFrom-Json
 Assert-That (@($st4.flags.selectedModels) -notcontains 'official-ok' -and $op -and $op.meta.hidden -eq $true -and [string]$mcfg.DEFAULT_MODELS -eq 'local-main') "-OfficialModels none hides the official preset and new chats start on Local Main again (default '$($mcfg.DEFAULT_MODELS)')"
 
+Write-Host "`n=== PHASE 4a: a preset that is no longer selected is held safe too, and the health check says when it is not ===" -ForegroundColor Cyan
+# The trial was dropped in phase 4: its preset is still in Open WebUI, hidden, and a chat can still be
+# started on it. Here it is given the switches an install from before the writing tools were switched
+# off wrote: seven, none of them for notes, tasks, automations, calendar, notifications, channels or
+# sub-agents, and Open WebUI takes a missing switch for on. The installer wrote only the selected
+# presets and the health check judged only those, so this preset stayed open and no row said so.
+$owui = 'http://127.0.0.1:3000'
+$writing4a = 'use its notes, tasks, automations, calendar, notifications, channels, subagents tools'
+$trialOld = ConvertTo-LaiHashtable (Get-LaiWebUIModel -BaseUrl $owui -Token $tok4 -Id 'trial-standin')
+$trialOld['meta']['builtinTools'] = @{ memory = $true; web_search = $true; knowledge = $true; chats = $false; time = $true; image_generation = $false; code_interpreter = $false }
+if ($null -eq $trialOld['params']) { $trialOld['params'] = @{} }
+Invoke-LaiApi -Method POST -Uri "$owui/api/v1/models/model/update" -Body $trialOld -Token $tok4 | Out-Null
+$switchNames = { param($Preset) if ($Preset -and $Preset.meta -and $Preset.meta.builtinTools) { @($Preset.meta.builtinTools.PSObject.Properties | ForEach-Object { [string]$_.Name }) } }
+$tpOld = Get-LaiWebUIModel -BaseUrl $owui -Token $tok4 -Id 'trial-standin'
+$oldNames = @(& $switchNames $tpOld)
+Assert-That ($oldNames.Count -eq 7 -and $oldNames -cnotcontains 'notes' -and $oldNames -cnotcontains 'subagents' -and $tpOld.meta.hidden -eq $true) "setup: the trial preset, not selected and hidden, has the seven old switches and none for the writing tools ($($oldNames -join ', '))"
+# Asked without writing anything first (-ReadOnly): the catalog's presets that are in Open WebUI, the
+# open one named with what the assistant can do there, and the preset left as it was.
+$every4a = @((Get-LaiCatalog -Path $env:LOCALAI_TEST_CATALOG -IncludeTrials).Models)
+$asked4a = @(Invoke-LaiPresetSafety -BaseUrl $owui -Token $tok4 -Entries $every4a -ReadOnly)
+$askedTrial = @($asked4a | Where-Object { $_.Preset -eq 'trial-standin' })
+$askedOn = ''; if ($askedTrial.Count -eq 1) { $askedOn = @($askedTrial[0].On) -join ' and ' }
+Assert-That ($askedTrial.Count -eq 1 -and $askedOn -ceq $writing4a -and -not $askedTrial[0].Written -and @($asked4a | Where-Object { $_.Preset -like '*-missing' }).Count -eq 0 -and @(& $switchNames (Get-LaiWebUIModel -BaseUrl $owui -Token $tok4 -Id 'trial-standin')).Count -eq 7) "asked with -ReadOnly, the real Open WebUI's unselected trial preset is found open (the assistant can $askedOn), presets that were never set up are not listed, and nothing is written"
+# The health check itself, the copy in AI\Scripts, in a process of its own; only the row of this
+# preset is read (this simulated PC has no GPU and no containers of its own, so other rows fail).
+$healthRow = { param([string]$Check)
+    $prevPref = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
+    $hcLines = @(& pwsh -NoProfile -File (Join-Path $aiRoot 'Scripts/Test-LocalAI.ps1') -AIRoot $aiRoot -Quick -NoContainers 2>&1 | ForEach-Object { "$_" })
+    $ErrorActionPreference = $prevPref
+    $hcRow = @($hcLines | Where-Object { $_ -match (' (PASS|WARN|FAIL|SKIP) ' + [regex]::Escape($Check) + ': ') } | Select-Object -Last 1)
+    if ($hcRow.Count -eq 1) { return [string]$hcRow[0] }
+    return ('no such row; the health check ended with: ' + (@($hcLines | Select-Object -Last 3) -join ' / '))
+}
+$trialRow = 'Preset Trial: stand-in (not selected)'
+$rowOpen = & $healthRow $trialRow
+Assert-That ($rowOpen -match (' FAIL ' + [regex]::Escape("${trialRow}: the assistant can $writing4a in this preset")) -and $rowOpen -match 'run Start menu > Local AI - Update toolkit to switch that off') "the health check fails a toolkit preset that is in Open WebUI without being selected and has the writing tools on, and names Update toolkit as the step ($rowOpen)"
+# The next installer run is the first one of phase 4b, in which the trial is asked for again and
+# left out for the busy GPU: still not selected. What that run did to this preset is checked there.
+
 Write-Host "`n=== PHASE 4b: the official models come back while the GPU is busy ===" -ForegroundColor Cyan
 # Forget official-ok's GPU check, so this run has to wait for an idle GPU before checking it again.
 # The same for the trial, which this run asks for again: it is skipped for the busy GPU as well.
@@ -586,6 +625,18 @@ $st4b = Get-Content -Encoding UTF8 -Raw (Join-Path $aiRoot 'install-state.json')
 Assert-That ($c4b -eq 0 -and $log4b -match 'Official: stand-in is set up on the next run: the GPU was busy') "a busy GPU skips the official model for now and the install completes (exit $c4b)"
 Assert-That (-not $st4b.flags.officialFailed.PSObject.Properties['official-ok'] -and [string]$st4b.flags.officialFailed.'official-missing'.Source) 'a busy GPU is not recorded as the model failing (a missing tag is)'
 Assert-That ($log4b -match 'Trial: stand-in is set up on the next run: the GPU was busy' -and @($st4b.flags.selectedModels) -notcontains 'trial-ok' -and @($st4b.flags.trialChoice) -contains 'trial-ok') "a trial skipped for the busy GPU is left out of this run and stays the choice (selected: $(@($st4b.flags.selectedModels) -join ', '); trialChoice: $(@($st4b.flags.trialChoice) -join ', '))"
+# The preset of phase 4a, open and not selected in that run either: one installer run (what Update
+# toolkit runs) has switched the writing tools off on it and says so, the rest of the preset is as
+# it was, nothing was created, and the health check row that failed passes.
+$tpSafe = Get-LaiWebUIModel -BaseUrl $owui -Token $tok4 -Id 'trial-standin'
+$safeNames = @(& $switchNames $tpSafe)
+$notOff4a = @('chats', 'code_interpreter', 'notes', 'tasks', 'automations', 'calendar', 'notifications', 'channels', 'subagents' | Where-Object { -not ($safeNames -ccontains $_ -and $tpSafe.meta.builtinTools.$_ -is [bool] -and $tpSafe.meta.builtinTools.$_ -eq $false) })
+Assert-That ($c4b -eq 0 -and @($st4b.flags.selectedModels) -notcontains 'trial-ok' -and $log4b.Contains("Preset 'Trial: stand-in' made safe again: the assistant could $writing4a there, which is switched off now")) "the next installer run, with the trial still not selected, says in its log what it switched off on that preset (exit $c4b)"
+Assert-That ($notOff4a.Count -eq 0 -and @(Get-LaiPresetToolRisk $tpSafe.meta).Count -eq 0 -and $tpSafe.meta.capabilities.code_interpreter -eq $false) "past chats, code and the seven writing tools are written out as off on the unselected preset in the real Open WebUI (not off: $($notOff4a -join ', '); switches: $($safeNames -join ', '))"
+Assert-That ($tpSafe.meta.hidden -eq $true -and $tpSafe.meta.builtinTools.memory -eq $true -and $tpSafe.meta.builtinTools.time -eq $true -and [string]$tpSafe.name -eq [string]$tpOld.name -and [string]$tpSafe.params.system -eq [string]$tpOld.params.system -and [string]$tpSafe.base_model_id -eq [string]$tpOld.base_model_id) 'and the rest of it is as it was: still hidden, the switches the toolkit leaves on, its name, base model and system prompt'
+Assert-That (-not (Get-LaiWebUIModel -BaseUrl $owui -Token $tok4 -Id 'trial-missing') -and -not (Get-LaiWebUIModel -BaseUrl $owui -Token $tok4 -Id 'official-missing')) 'a catalog preset that was never set up is not created by it'
+$rowSafe = & $healthRow $trialRow
+Assert-That ($rowSafe -match (' PASS ' + [regex]::Escape("${trialRow}: "))) "and after that one run the same health check row passes ($rowSafe)"
 # No -TrialModels on this run: the trial comes from the recorded choice, not from what was set up.
 & (Join-Path $aiRoot 'Scripts/Install-LocalAI.ps1') -AIRoot $aiRoot -SkipTests -GpuWaitMinutes 10
 $st4c = Get-Content -Encoding UTF8 -Raw (Join-Path $aiRoot 'install-state.json') | ConvertFrom-Json
