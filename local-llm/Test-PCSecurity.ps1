@@ -28,9 +28,10 @@
     normal window only). It never changes a setting, starts or stops anything, or contacts the
     internet. Every check is wrapped: a query that fails becomes SKIP, never an error that stops the run.
 
-    Works in a normal window; some checks (TPM, Secure Boot on some PCs, drive encryption, SMBv1)
-    need an elevated one and say so. For the full check: right-click Start menu > Local AI - Security
-    check > More > Run as administrator.
+    No single window makes every check, and each check says which one it needs. Use
+    a normal window for the driver test (the hardware-access drivers any program can open) and
+    Run as administrator for TPM, drive encryption and SMBv1 (on some PCs also for Secure Boot):
+    right-click Start menu > Local AI - Security check > More > Run as administrator.
 
     The Markdown report leaves out your Windows user name, the computer name, e-mail addresses and
     anything that looks like a password or key (your profile folder becomes %USERPROFILE%).
@@ -920,8 +921,10 @@ function Add-ReportSection([string]$Title, [string[]]$Lines) { [void]$sections.A
 function Add-Check {
     param([string]$Name, [scriptblock]$Body)
     try {
-        $r = @(& $Body | Where-Object { $_ -is [hashtable] -and $_.ContainsKey('Status') }) | Select-Object -Last 1
-        if ($null -eq $r) { $r = @{ Status = 'PASS'; Detail = ''; Fix = '' } }
+        # The verdict is the last answer with one of the four results. A body that gives none (nothing
+        # at all, plain text, a result this script does not know) has checked nothing: never a PASS.
+        $r = @(& $Body | Where-Object { $_ -is [hashtable] -and @('PASS', 'WARN', 'FAIL', 'SKIP') -ccontains [string]$_['Status'] }) | Select-Object -Last 1
+        if ($null -eq $r) { $r = @{ Status = 'SKIP'; Detail = 'this check gave no answer'; Fix = '' } }
     } catch {
         # One failing query must not end the run: report it and go on.
         $r = @{ Status = 'SKIP'; Detail = "could not be read ($($_.Exception.Message))"; Fix = '' }
@@ -939,7 +942,7 @@ function Warn([string]$d, [string]$f) { @{ Status = 'WARN'; Detail = $d; Fix = $
 function Skip([string]$d) { @{ Status = 'SKIP'; Detail = $d; Fix = '' } }
 function Convert-Verdict($Verdict) {
     # A judge's answer (an object with Status, Detail, Fix) as the hashtable Add-Check keeps. Add-Check
-    # reads anything else as PASS, so a status that is none of the four ends here as not checked.
+    # takes anything else for no answer, so a status that is none of the four ends here as not checked.
     switch ([string]$Verdict.Status) {
         'PASS' { return (Pass ([string]$Verdict.Detail)) }
         'WARN' { return (Warn ([string]$Verdict.Detail) ([string]$Verdict.Fix)) }
@@ -950,7 +953,7 @@ function Convert-Verdict($Verdict) {
 }
 
 Write-LaiLog STEP 'PC security check (read-only: nothing on this PC is changed)'
-if ($onWindows -and -not $isElevated) { Write-LaiLog INFO "Not elevated: a few checks are skipped. For all of them: $needAdmin." }
+if ($onWindows -and -not $isElevated) { Write-LaiLog INFO 'Not elevated: this is a normal window for the driver test; use Run as administrator for TPM, drive encryption and SMBv1 (right-click Start menu > Local AI - Security check > More > Run as administrator).' }
 
 # ---- 1. antivirus -----------------------------------------------------------------------------------
 Add-Check 'Antivirus' {
@@ -1274,17 +1277,15 @@ Add-Check 'Docker Desktop version' {
 Add-Check 'Docker API not exposed without TLS' {
     if (-not $onWindows) { return (Skip $winOnly) }
     if (-not $env:APPDATA) { return (Skip 'no APPDATA folder') }
-    $found = $false
     foreach ($f in @('settings-store.json', 'settings.json')) {
         $settingsFile = Join-Path (Join-Path $env:APPDATA 'Docker') $f
         if (-not (Test-Path -LiteralPath $settingsFile)) { continue }
-        $found = $true
         $j = Get-Content -LiteralPath $settingsFile -Raw -Encoding UTF8 -ErrorAction Stop | ConvertFrom-Json
         $v = Get-PcsJsonFlag -Object $j -Name 'exposeDockerAPIOnTCP2375'
         if ($v -eq $true) { return (Fail 'Docker Desktop''s Expose daemon on tcp://localhost:2375 without TLS is ON: any program or web page trick on this PC can control Docker without a password' 'Docker Desktop > Settings > General > untick Expose daemon on tcp://localhost:2375 without TLS > Apply & restart') }
         return (Pass "off ($f)")
     }
-    if (-not $found) { return (Skip 'no Docker Desktop settings file for this account') }
+    Skip 'no Docker Desktop settings file for this account'
 }
 
 # ---- 12. ComfyUI ------------------------------------------------------------------------------------
