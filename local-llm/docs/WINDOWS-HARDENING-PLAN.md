@@ -1,8 +1,9 @@
 # Windows hardening with undo (security track item 5): plan only, nothing is built yet
 
-Status (2026-10-08, revised after its re-check): plan for two files that do not exist yet,
-`local-llm/Set-PCHardening.ps1` and `local-llm/tests/Invoke-PCHardeningTest.ps1` (IMPROVEMENTS
-row 86 (5)). It was written on the owner's PC, where nothing from the repository may be run, and
+Status (2026-10-08, revised after its re-check and after a second review): plan for two files
+that do not exist yet, `local-llm/Set-PCHardening.ps1` and
+`local-llm/tests/Invoke-PCHardeningTest.ps1` (IMPROVEMENTS row 86 (5)). It was written on the
+owner's PC, where nothing from the repository may be run, and
 without the web. So: **what this plan says about Windows, Defender and Microsoft's documentation
 is from memory and unchecked** (section 1 lists what to check, the rule ids first). What it says
 about this repository was read from the code at commit f6afc18; every line number is from that
@@ -37,11 +38,11 @@ on the owner's PC and never on a CI runner.
 | C5 | Microsoft's requirements for ASR name Pro, Enterprise and Education, not Home. Whether Home acts on the rules shows only on a Home PC: an event 1122 for a rule in audit | Note N1 |
 | C6 | Which rules need cloud-delivered protection (from memory: the prevalence rule and the ransomware rule) | Note N3 |
 | C7 | Tamper Protection covers none of the three settings, so the cmdlets work while it is on, for this script and for any other program with administrator rights | The script never asks for it to be switched off; N2 and the table's footer must not promise more than this |
-| C8 | CFA: mode numbers 0 to 4; the folders protected by default (Documents, Pictures, Videos, Music, Desktop, Favorites); an allowed program is named by its full path and stays allowed when an update replaces the file; Microsoft allows programs it trusts by itself | Section 5, "stay right after updates" |
-| C9 | Which Windows program really writes: for a Docker bind mount into a protected folder, and for ComfyUI (a venv's `Scripts\python.exe` may only start another python.exe). Event 1124 names it. Also: that powershell.exe saving or deleting a shortcut on the Desktop is stopped like any other script | The allowed-program list must name the program that writes. For Docker the answer settles which path the owner would hand to -AllowWritable, not whether the file is refused: every Docker file is R26 (section 5, rule 3). The Desktop answer decides what section 5 and the README say about `Start-ComfyUI.ps1 -CreateShortcut` and the uninstaller |
+| C8 | CFA: mode numbers 0 to 4; the folders protected by default (Documents, Pictures, Videos, Music, Desktop, Favorites); an allowed program is named by its full path and stays allowed when an update replaces the file; Microsoft allows programs it trusts by itself. And, with a change, so on the throwaway machine: a program whose path holds `[`, `]`, a space, a comma and round brackets (a copy of any .exe at `C:\Program Files\Tools [x], (y)\probe.exe`) is added with `Add-MpPreference -ControlledFolderAccessAllowedApplications`, reads back from `Get-MpPreference` as exactly that string, and is taken out again by `Remove-MpPreference` with the same string | Section 5, "stay right after updates", and the path rule there (rule 1), which takes those characters for ordinary ones from memory. No CI test can show it: the Defender part is never run there. If Defender changes such a path or reads it as a pattern, the character that failed joins the ones the path rule refuses (R24) before the build, and T54 asserts that instead. Otherwise such a row would end in R31 on every -Apply, or -Undo could never take the script's own entry out (R44) |
+| C9 | Whether Controlled folder access sees a write at all, and which Windows program it names, for three writers into a folder of Documents. (a) A container with that folder bind-mounted: Docker Desktop on its WSL 2 backend, the only one the toolkit installs (`--backend=wsl-2`, Install-LocalAI.ps1:1562). (b) A WSL distribution writing below `/mnt/c` (the installer sets WSL up without one, :1526, so one is installed for the check). (c) ComfyUI saving a picture (a venv's `Scripts\python.exe` may only start another python.exe). For each: does event 1124 come in audit and 1123 with a block when on, and which program does it name. From memory, unchecked: for (a) and (b) the writing is done by a Windows or WSL component, not by `Docker Desktop.exe` or `com.docker.backend.exe`, and Windows may trust that component by itself, so that nothing is audited and nothing is stopped. Also: that powershell.exe saving or deleting a shortcut on the Desktop is stopped like any other script. Needs a change and WSL 2: a throwaway machine that runs it (a virtual one needs nested virtualization) | The allowed-program list must name the program that writes, and the plan may not promise a protection that is not there. (a) has three answers and (b) two, and the plan says what the script does for each (section 5, "Docker and WSL"): a file of Docker Desktop is named, a Windows component is named, or nothing is audited. The answers are two values in one function, `Get-PchRoute`. Until C9 is answered they stand at "nothing is audited", which allows least and promises least: no Docker row, and a footer line that says so. The Desktop answer decides what section 5 and the README say about `Start-ComfyUI.ps1 -CreateShortcut` and the uninstaller |
 | C10 | LSA: `RunAsPPL` = 2 works from build 22621; what `RunAsPPLBoot` is and who writes it; the policy value `HKLM:\SOFTWARE\Policies\Microsoft\Windows\System\RunAsPPL`; System-log event 12 from Wininit; Shut down with Fast Startup is not a restart. Page: the link at Test-PCSecurity.ps1:1070 | Section 6 |
 | C11 | The policy keys under `HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender\Windows Defender Exploit Guard` (`ASR\Rules`, `Controlled Folder Access`) | Refusal R14 |
-| C12 | What `Get-MpPreference` shows in a normal window (the allowed-program list may read "N/A: Must be an administrator"), and whether that window can read the Defender event log | What the bare run can show without administrator rights |
+| C12 | What `Get-MpPreference` shows in a normal window (the allowed-program list may read "N/A: Must be an administrator"), and whether that window can read the Defender event log | What the bare run can show without administrator rights. And what the script itself may show there: the plan takes it that Windows hides the allowed-program list from a normal window, so the script's own copy of that list (`Cfa\Apps`) and the record are closed to a normal window too (section 7, rule 1). If Windows shows the list to everyone, that restriction can go |
 | C13 | Owner and permissions, each entry with its account, its raw rights number, allow or deny, and whether it is inherit-only: of `HKLM:\SOFTWARE` and a key below it that some installer made; of a key newly made there from an elevated window, with UAC on and with UAC off; of the root of the system drive, the Program Files folder, a program folder in it and its .exe. From memory a new key inherits an inherit-only entry for CREATOR OWNER (S-1-3-0) whose rights read 268435456 (generic all), and belongs to Administrators, but to the user account where UAC is off or the built-in Administrator account is used | Section 7, rule 1: the judge must pass what Windows really hands out and nothing wider, and T44's fixtures are copied from these answers. Reading needs no change: any PC. The new key: throwaway machine (W4 makes one on the Windows CI job too) |
 | C14 | From an elevated window of another account: how to tell which account is signed in at the screen (`Win32_ComputerSystem.UserName`, or the owner of explorer.exe in the console session), its profile folder (`ProfileImagePath` under `HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\<SID>`) and its hive `HKEY_USERS\<SID>` | Section 5: the programs are looked for in the everyday account's profile, not in the administrator's |
 
@@ -57,15 +58,27 @@ section 7 draws it. Restart: the LSA row reads "on".
 Then the allowed programs. By section 5 only a candidate can be offered, and only one candidate
 can be offered without `-AllowWritable`: Ollama in a folder only administrators can change. So
 the setup, which is from memory and is to be tried there: from an elevated window install Ollama
-with `OllamaSetup.exe /DIR=` and a folder under Program Files (the switch that
-tests/Invoke-StaticChecks.ps1:70 names), set `OLLAMA_MODELS` to a folder in Documents, and pull
-a small model. Expected: event 1124 names `ollama.exe`, and the next bare run offers that row
-and no other. If Windows trusts Ollama by itself (C8) no event comes and the row rightly stays
-at R25; write that down, and the offer is then shown by T53 alone. Beside it, three programs
-that must not be offered. A script run by powershell.exe that writes into Documents is listed as
-seen and is no candidate. ComfyUI's python.exe saving a picture there shows R26. So does Docker
-Desktop once a container with a folder of Documents mounted has written into it. Each of the
-last two is allowed only by `-AllowWritable` with its path, and then with N6.
+with `OllamaSetup.exe /DIR=` (the switch that tests/Invoke-StaticChecks.ps1:70 names) and a
+folder under Program Files whose name holds the characters of C8,
+`C:\Program Files\Tools [x], (y)\Ollama`. If Ollama's installer does not take that name, use a
+plain one and write that down: C8's own check then stands for the characters. Set
+`OLLAMA_MODELS` to a folder in Documents, and pull a small model. Expected: event 1124 names
+`ollama.exe`, and the next bare run offers that row and no other; -Apply allows it, the path
+reads back from Defender letter for letter, and -Undo takes it out again. If Windows trusts
+Ollama by itself (C8) no event comes and the row rightly stays at R25; write that down, and the
+offer is then shown by T53 alone. Beside it, what must not be offered. A script run by
+powershell.exe that writes into Documents is listed as seen and is no candidate. ComfyUI's
+python.exe saving a picture there shows R26; it is allowed only by `-AllowWritable` with its
+path, and then with N6. `-AllowWritable` with a path that no row shows with R26 gets a row with
+R28, and that run ends with exit code 2.
+
+Docker and WSL are C9's question, asked once more on this machine. A container with a folder of
+Documents mounted writes into it, and a WSL distribution writes into the same folder below
+`/mnt/c`. For each: does an event come, and which program does it name. The two answers are set
+in `Get-PchRoute` (section 5, "Docker and WSL") before the script goes to the owner's PC, and
+the run is repeated with them: with "a file of Docker Desktop" the Docker row shows R26 and is
+allowed only by `-AllowWritable`, with N6; with either other answer there is no Docker row; with
+"nothing is audited" the footer carries its third line.
 
 Set every `Since` in the store back past the audit time by hand (the one time a person edits
 the store), then `-Apply -Enforce`: 14 rules at block, 2 in audit, Controlled folder access on.
@@ -82,14 +95,15 @@ Then once more from another start: one rule at 0, one at 1, Controlled folder ac
 | `Set-PCHardening.ps1 -Enforce` | Shows what `-Apply -Enforce` would change. Changes nothing |
 | `Set-PCHardening.ps1 -Undo` | Puts back every value this script changed, exactly as it found it |
 | `-Only Asr,Cfa,Apps,Lsa` | With any of the above: only the named switches. `Cfa` is the mode and the allowed programs, `Apps` the allowed programs alone. `[string[]]`; each element is first split on commas and trimmed, as Install-LocalAI.ps1:253-255 does, because `powershell.exe -File` hands `Asr,Cfa` over as one string. The names are checked by the script, so that a wrong one gets R03 and not PowerShell's own error |
-| `-AllowWritable <full path>` | With -Apply: allow this one program although any program running as the owner can change it, start it with a script of its own or, for a file of Docker Desktop, have it write through a container. It must be a path the table shows with R26, which says what that costs. `[string[]]`, not split on commas (a path may hold one) |
+| `-AllowWritable <full path>` | With -Apply: allow this one program although any program running as the owner can change it, start it with a script of its own or, for a file of Docker Desktop, have it write through a container. The path is one the table shows with R26, which says what that costs and prints the switch ready to copy, in single quotes: without them PowerShell splits a path at a comma. `[string[]]`, not split on commas by the script (a path may hold one). A value names a row when it equals that row's path letter for letter, without regard to case, as the read-back compares; no pattern, no relative path. A value that names a row which is allowed already, or which is offered without the switch, changes nothing and is no fault. Every other value gets a row of its own with R28: nothing is allowed for it, and the run ends with exit code 2. Without -Apply the table shows what -Apply with the same values would do, R28 included. With -Undo: R02 |
 | `-AIRoot <folder>` | The install folder, as for the other scripts. Only read: its `localai-config.json` gives `ComfyUIPath`. Nothing is written under it |
 
 **The bare run is write-free.** It sets nothing, creates no registry key or value and writes no
 file, not even a log: `Write-LaiLog` writes to the window only (lib/LocalAI.psm1:23-31). It works
 in a normal window; a cell it cannot read there says "needs an administrator window" (note N5).
 
-**The table.** One row per rule (16), one for the CFA mode, one per allowed program, one for LSA:
+**The table.** One row per rule (16), one for the CFA mode, one per allowed program, one for LSA,
+and one for each `-AllowWritable` value that could not be used:
 
 ```
 Item                                    Now           Would become           Refused because
@@ -98,22 +112,53 @@ ASR  Credential stealing from lsass     block         -                      alr
 CFA  Controlled folder access           off           audit
 CFA  allow Ollama (<path>)              not allowed   allowed
 CFA  allow ComfyUI (<path>)             not allowed   -                      any program running as you can start it (R26)
-CFA  allow Docker Desktop (<path>)      not allowed   -                      any program running as you can start a container (R26)
+CFA  -AllowWritable <value>             -             -                      not a program this table shows with R26 (R28)
 LSA  LSA protection                     off           on after a restart
 These settings stop programs that run without administrator rights. A program that already has
 administrator rights can switch all of them off again, with or without Tamper Protection.
+Do not count on Controlled folder access to stop a program that writes through a Docker container or through WSL.
 ```
 
-The last two lines are the table's footer, printed on every run.
+The last three lines are the table's footer, printed on every run. The third is there while
+`Get-PchRoute` (section 5, "Docker and WSL") says "nothing is audited" for a container, for WSL
+or for both, and names exactly those; it stands as drawn until C9 is answered. The table as
+drawn is that state. A row `CFA  allow Docker Desktop (<path>)`, refused like the ComfyUI row
+with "any program running as you can start a container (R26)", is there only when
+`Get-PchRoute` says a file of Docker Desktop does the writing, and then the footer no longer
+names a Docker container. The `-AllowWritable` row is there only for a value that could not be
+used.
 
 After -Apply or -Undo the same table is printed with what was done, and appended to
 `<ProgramFiles>\LocalAI-Logs\pc-hardening.log`, with the everyday account's profile folder written
 as %USERPROFILE% (as Test-PCSecurity.ps1:909 does). Not under <AIRoot>: this run is elevated, the
 user account has full control there, and a planted link would send the write somewhere else
 (lib/LocalAI.psm1:306-309); the table also carries text that others choose (program paths from
-events, the ComfyUI path). The folder is made if missing and inherits the permissions of Program
-Files, like the download folder beside it (Install-LocalAI.ps1:608-610). The file is a record: the
-script never reads it back, and a record that cannot be written is note N7, not a refusal.
+events, the ComfyUI path). The folder is made if missing, and the record in it, each with an
+owner and permissions of its own and none inherited from Program Files: owner Administrators,
+full control for SYSTEM and Administrators, nobody else (from memory: `Directory.CreateDirectory`
+with a `DirectorySecurity`, and the `FileStream` constructor that takes a `FileSecurity`; W8
+proves it). That is closed to a normal window on purpose. The record names the programs this
+script allowed, and Windows keeps that list from a normal window (C12; section 7, rule 1), so
+the owner reads the record from an administrator window. Before every write the folder and the
+record, when they are there, are judged (reader name `LogAcl`, section 8): neither may be a
+junction or a symbolic link or lie below one (the refusal of Install-LocalAI.ps1:610), and both
+must pass `Get-PchAclFault -Private`. A link or a fault means no write, and note N7 says which.
+The file is a record: the script never reads it back, and a record that cannot be written is
+note N7, not a refusal.
+
+**`<ProgramFiles>` is the folder Windows names, never a variable.** It is
+`[Environment]::GetFolderPath('ProgramFiles')`, asked in one function, `Get-PchProgramFiles`,
+and handed to `Get-PchPlace` (section 8). Not `$env:ProgramFiles` and not `$env:ProgramW6432`,
+although Install-LocalAI.ps1:219 and :608 use the first. Any program running as the owner can
+set that variable for the user, and from memory a user variable reaches that user's
+administrator window as well. The elevated run would then write its record below a folder of
+that program's choosing, through a link planted there, and R04 and R06 would name that folder as
+the copy only administrators can change. The uninstaller and the update ask Windows for the same
+reason (Uninstall-LocalAI.ps1:311-314, Get-LocalAI.ps1:1265-1266). T69 holds it in the source.
+Two things follow. In a 32-bit window on 64-bit Windows the answer is the folder of the 32-bit
+programs, so R05 is checked before R04 and R06, the two that print the path. And when Windows
+names no folder at all the script does not guess: that is an error it did not expect, it says
+"Windows did not name its Program Files folder" and ends with exit code 1, on every run.
 
 One item that fails does not stop the others (as Add-Check, Test-PCSecurity.ps1:921-931).
 
@@ -127,12 +172,13 @@ two groups, and one pure function, `Get-PchExitCode`, holds them (section 8, T59
 | Group | Ids | Exit code |
 |---|---|---|
 | nothing to do, or not offered: the normal answers of a healthy run | R16, R18, R19, R21, R22, R25, R26, R40 | 0 |
-| asked for and not done | R10, R11, R12, R13, R14, R15, R17, R20, R23, R24, R27, R30, R31, R32, R33, R34, R41, R42, R43, R44 | 2 |
+| asked for and not done | R10, R11, R12, R13, R14, R15, R17, R20, R23, R24, R27, R28, R30, R31, R32, R33, R34, R35, R41, R42, R43, R44 | 2 |
 
 So a first -Apply on a healthy PC ends with 0 although no program is allowed yet (R25, R21, and
-R26 for what `-AllowWritable` did not name). And -Apply on a PC where Defender is not in charge
-ends with 2, for the two switches it could not switch on (R10): there `-Apply -Only Lsa` is the
-command that ends with 0. A note (N1 to N8) never changes the code.
+R26 for what `-AllowWritable` did not name). An `-AllowWritable` value that could not be used is
+R28 and 2: the owner asked for that program by name. And -Apply on a PC where Defender is not in
+charge ends with 2, for the two switches it could not switch on (R10): there `-Apply -Only Lsa`
+is the command that ends with 0. A note (N1 to N9) never changes the code.
 
 **Every refusal, as the owner reads it.** `<...>` is filled in. The sentences live in one
 function, `Get-PchRefusalText` (section 8).
@@ -142,23 +188,45 @@ Whole run refused (printed once, nothing is changed):
 | Id | When | Sentence |
 |---|---|---|
 | R01 | not Windows | "This script only works on Windows. Nothing was changed." |
-| R02 | -Undo with -Apply or -Enforce | "Choose one: -Apply or -Undo. Nothing was changed." |
+| R02 | -Undo with -Apply, -Enforce or -AllowWritable | "-Undo does not go together with <-Apply / -Enforce / -AllowWritable>: -Undo puts back, the other one changes. Run -Undo alone, or leave it out. Nothing was changed." It names the first of the three that was given |
 | R03 | -Only names something else | "-Only takes Asr, Cfa, Apps or Lsa. '<value>' is none of them. Nothing was changed." |
-| R04 | -Apply or -Undo, not administrator | "Changing these settings needs administrator rights. Open Terminal (Admin) from a right-click on Start and run <command> there. Nothing was changed." |
+| R04 | -Apply or -Undo, not administrator | "Changing these settings needs administrator rights. Nothing was changed. Open Terminal (Admin) from a right-click on Start and run this there:" and then `<command>`, on a line of its own. When the administrators-only copy is not there (`AdminCopyExists` is false), a sentence goes in before "Open Terminal", the one R06 has for that case: "The copy of this script that only administrators can change is not on this PC yet (<path>): run the installer or 'Update toolkit' once more, which puts it there." and the last sentence begins "Then open Terminal (Admin)". So no message hands the owner a command for a file that is not there without saying so |
 | R05 | 32-bit PowerShell on 64-bit Windows | "This is a 32-bit PowerShell window, where the stored values would land in the wrong place. Start Windows PowerShell from the Start menu and run the script again. Nothing was changed." |
-| R06 | -Apply or -Undo from a folder others can change: `Get-PchAclFault` finds a fault in the `ScriptAcl` rows of section 8 (question 6) | "This copy of the script is in a folder that programs without administrator rights can change (<folder>). Run the copy only administrators can change: <path>. Nothing was changed." When that file is not there, the second sentence is: "The copy only administrators can change is not on this PC yet (<path>): run the installer or 'Update toolkit' once more, which puts it there, then run that copy." |
+| R06 | -Apply or -Undo from a folder others can change: `Get-PchAclFault` finds a fault in the `ScriptAcl` rows of section 8 (question 6) | "This copy of the script is in a folder that programs without administrator rights can change (<folder>). Nothing was changed. Run the copy only administrators can change:" and then `<command>`, on a line of its own. When that file is not there, the last sentence is: "The copy only administrators can change is not on this PC yet (<path>): run the installer or 'Update toolkit' once more, which puts it there, then run this:" |
 | R07 | -Apply or -Undo on a test machine (`LAI_SANDBOX` = 1 or `GITHUB_ACTIONS` = true) | "This looks like a test machine: the environment variable <name> is set to <value>, and there the script only shows. If this is your own PC, take the variable out (in this window: Remove-Item Env:<name>; for good: Settings > System > About > Advanced system settings > Environment Variables) and run the script again. Nothing was changed." |
 | R08 | the store is not administrators-only (section 7, rule 1) | "The place where this script keeps the old values (<key>) can be changed without administrator rights (<its owner is <account> / <account> may write to it>), so an undo could not be trusted. Nothing was changed." Under -Undo it goes on: "To put the settings back by hand: <by hand>." |
 | R09 | the store cannot be made or read | "The place where this script keeps the old values (<key>) could not be made or read (<error>). Nothing was changed." |
 
-They are checked in this order: R01, R02, R03, R07, R04, R05, R06 by `Get-PchRunRefusal`; then R08
+They are checked in this order: R01, R02, R03, R07, R05, R04, R06 by `Get-PchRunRefusal` (R05
+before the two that print a path below `<ProgramFiles>`, see above); then R08
 and R09 by `Invoke-PchRun`, which reads the permissions of the store's keys on every run that
 finds them there, the bare run included (a table built on values that others can change would
 mislead); and R08 and R09 once more by `Invoke-PchPlan` at the start of an -Apply, after it has
 made the keys this run needs and before any step (section 7, rule 1). `<command>` in R04 and
-`<path>` in R06 are always the administrators-only copy,
-`<ProgramFiles>\LocalAI\Set-PCHardening.ps1`, with the switches the owner gave: no message names
-the Scripts folder for -Apply or -Undo.
+R06 is one line from one pure function, `Get-PchCommandLine` (section 8): the call operator,
+the administrators-only copy `<ProgramFiles>\LocalAI\Set-PCHardening.ps1`, and the switches the
+owner gave, as in
+`& 'C:\Program Files\LocalAI\Set-PCHardening.ps1' -Apply -Only Asr,Cfa -AllowWritable '<path>' -AIRoot '<folder>'`.
+`<path>` in both is that copy's plain path. No message names the Scripts folder for -Apply or
+-Undo.
+
+**A printed line that the owner is to run never carries a raw value.** R04 and R06 tell the
+owner to paste a line into an administrator window, and R26 hands over a switch for one. Parts
+of those lines are chosen by programs without administrator rights: a program path comes from
+the HKCU registration, from `basePath` or from `ComfyUIPath` (section 5), and
+`X';&\Users\Public\a.cmd;'` is a legal folder name. Printed raw between quotes, such a path ends
+the string early and the rest runs as a command of its own, elevated. So every value in such a
+line, the copy's own path, each `-AllowWritable` path and the `-AIRoot` folder, goes through
+`ConvertTo-LaiPsQuoted` (lib/LocalAI.psm1:72-79, written for "commands printed for the user to
+paste": a single-quoted literal in which `'` and the typographic quotes U+2018 to U+201B, which
+PowerShell also takes for a quote, are doubled), and the sentence around it adds no quotes of
+its own. `-Only` is printed from the four checked names, joined by commas (R03 comes first, so
+nothing else can stand there), and `-AIRoot` only when the owner gave it. `Get-PchRefusalText`
+stays a plain fill-in: `Get-PchCommandLine` and, for R26's switch, `Get-PchCfaPlan` hand it
+values that are quoted already. The by-hand lines carry nothing but rule ids from the catalog
+(below). T68 parses every such line. As a second fence the path rule (section 5, rule 1) keeps
+a path that holds a quote, or another character that steers a command line, off the allowed
+list altogether, whoever prints it.
 
 `<by hand>` in R08, R41 and R42 comes from one pure function, `Get-PchByHandText`. For
 Controlled folder access, the mode and the allowed programs alike, it is "Windows Security >
@@ -197,19 +265,21 @@ One item refused (the "Refused because" column):
 | R17 | a state outside the known ones, a value of the wrong type, or unreadable | "This is in a state this script does not know (<what it read>): left alone." |
 | R18 | -Enforce, audit-only rule | "Stays in audit mode: in block mode this rule would stop <what>." |
 | R19 | -Enforce before the audit time is over | "In audit mode since <date> (<n> of <N> days). -Enforce waits, so that you can first see what would be blocked." |
-| R20 | -Apply: the setting holds none of the values this script stored for it (section 7, rule 3) | "Changed since this script set it (it set <x>, now it is <y>): left alone. -Undo makes this script forget it." |
+| R20 | -Apply: the setting holds none of the values this script stored for it (section 7, rule 3). `<x>` is `Set`, or `Pending` where the entry has no `Set` yet | "Changed since this script set it (it set <x>, now it is <y>): left alone. -Undo makes this script forget it." |
 | R21 | CFA: a program is not installed | "<Program> was not found on this PC (looked among the programs of <account>), so nothing was allowed for it." |
 | R22 | LSA: `RunAsPPL` = 1 | "LSA protection is already on, with a firmware lock (RunAsPPL = 1). This script leaves it alone: taking that lock off needs a Microsoft firmware tool, and the script only makes changes it can undo." |
 | R23 | LSA: build below 22621 | "This Windows build (<build>) is older than Windows 11 22H2. The setting this script can undo only works from 22H2 on. Not changed." |
-| R24 | CFA: a found program's path is not one the script allows | "<Program> was found at <path>. This script only allows a program file (.exe) on a built-in drive, named by its full path. Not allowed." |
+| R24 | CFA: a found program's path is not one the script allows (section 5, rule 1). `<the character>` is the first one that rule refuses, written as itself when it is a printable ASCII character and as U+ and its number otherwise | "<Program> was found at <path>. This script only allows a program file (.exe) on a built-in drive, named by its full path<, and no path that holds <the character>>. Not allowed." |
 | R25 | CFA: no event names the program | "Controlled folder access has not stopped <Program> <since <date> / so far>, so nothing was allowed for it: every allowed program is a way around the protection." |
-| R26 | CFA: the program can be changed without administrator rights, is python.exe, or is a file of Docker Desktop (section 5, rule 3) | "Any program running as you can <change this file / start this python.exe with a script of its own / start a container that writes through this program> (<path>). Allowing it lets every such program change your protected folders. Not allowed. If you want it all the same, run this again with -AllowWritable '<path>'." |
+| R26 | CFA: the program can be changed without administrator rights, is python.exe, or is a file of Docker Desktop (section 5, rule 3). `<quoted path>` is the row's path from `ConvertTo-LaiPsQuoted`, quotes included; the sentence adds none and ends with it, with no full stop behind it | "Any program running as you can <change this file / start this python.exe with a script of its own / start a container that writes through this program> (<path>). Allowing it lets every such program change your protected folders. Not allowed. If you want it all the same, run this again with -AllowWritable <quoted path>" |
 | R27 | CFA programs: the account signed in at the screen cannot be told | "This script could not tell which account is signed in at the screen, so it does not know whose programs to look for. No program was allowed." |
+| R28 | CFA: `-AllowWritable` names a path this run cannot allow through it. No row has that path, or the row has a refusal other than R26, or `-Only` leaves the allowed programs out. One row per such value | "-AllowWritable names <value>, which is not a program this table shows with R26 (<this table shows it with <id> / it is not in this table / -Only leaves the allowed programs out of this run>). Nothing was allowed for it. This table shows with R26: <the R26 paths / no program>." |
 | R30 | the before-value did not read back from the store | "The old value could not be stored safely (wrote <x>, read <y>), so the setting was not changed." |
 | R31 | the setting did not read back as written | "Windows did not take this change: asked for <x>, it still reads <y>. A policy or Tamper Protection may hold the setting. It was put back to <the value it had>. Do not switch Tamper Protection off for this." |
 | R32 | as R31, and putting back failed | "Windows did not take this change, and putting the old value back failed too (<error>). It now reads <y>. The old value (<before>) is still stored: run the script with -Undo." |
 | R33 | the cmdlet or registry write threw, and the setting still reads what it held | "Windows refused this change (<error>). Nothing was changed for this item." |
 | R34 | -Apply: an earlier run could not put this setting back (R32) and it still reads that value (section 7, rule 3) | "Not finished last time: Windows did not take the change, and the old value (<before>) could not be put back. It still reads <y>. Nothing was written now; run the script with -Undo to put the old value back." |
+| R35 | a write was made or tried and the script could not finish after it. -Apply: the setting cannot be read back, or the store cannot be updated after a change that landed (section 7, rule 2). -Undo: the entry cannot be taken out after the setting was put back (rule 5) | "This script could not finish here: <the setting could not be read after the write / its store could not be updated> (<error>). It does not guess: nothing more was written, and the old value stays stored. Run the same command again; it finishes this item." |
 | R40 | -Undo, nothing stored | "This script has changed nothing here that it could undo." |
 | R41 | -Undo, a stored value is not one the script writes | "The stored old value for <item> is not one this script writes ('<value>'), so it is not used. The setting was left as it is; to change it by hand: <by hand>." |
 | R42 | -Undo, the setting no longer holds what this script set | "Changed since this script set it (it set <x>, before that it was <before>, now it is <y>): left alone and forgotten. To put the old value back by hand: <by hand>." |
@@ -226,8 +296,9 @@ Notes (printed, nothing refused):
 | N4 | LSA changed, by -Apply or by -Undo | "Restart the PC to finish (Start > Power > Restart; Shut down is not enough while Fast Startup is on)." |
 | N5 | bare run in a normal window | "Some cells need an administrator window to be read." |
 | N6 | a program allowed through -AllowWritable | "<path> is now allowed. Any program running as you can change files in your protected folders through it, <by changing this file / by starting it with a script of its own, every ComfyUI custom node included / by starting a container with one of those folders mounted>: against those programs Controlled folder access no longer protects." The reason is the one R26 gave for the row |
-| N7 | the record could not be written | "The record of this run could not be written (<error>). The changes shown above were made." |
+| N7 | the record could not be written, or was not written because `LogAcl` could not be read or found its folder or file to be a link or open to others | "The record of this run could not be written (<error / <path> is a link or lies below one / <path> can be opened by <account>; delete it from an administrator window and the next run makes it afresh>). The changes shown above were made." |
 | N8 | the window's account is not the one signed in at the screen | "Programs are looked for in the profile of <account>, the account signed in at the screen. This window runs as <other account>." |
+| N9 | `Cfa\Apps` can be opened by an account other than SYSTEM and Administrators, and nothing else is wrong with it: `Get-PchAclFault` finds a fault with `-Private` and none without (section 7, rule 1) | "The list of the programs this script allowed (<key>) can be read by <account>. The script made that key closed, as Windows keeps its own list from programs without administrator rights, and someone with administrator rights has opened it since. Nobody without those rights can change it, so the script goes on. To close it again, take <account> off that key's permissions in the Registry Editor." |
 
 ## 3. The gate: which switch may be switched on
 
@@ -346,7 +417,8 @@ object inside powershell.exe, used to read and write .lnk shortcuts, and no scri
 it. So none of the 14 rules is aimed at what they do; the audit time is the proof.
 
 **Read back.** After each call `Get-MpPreference` again: the id must be in the list with the
-action asked for, else R31. That proves the write landed and nothing more (section 3; a wrong id
+action asked for, else R31 (R35 when the list cannot be read at all: section 7, rule 2 (d)).
+That proves the write landed and nothing more (section 3; a wrong id
 reads back too, C1). The proof that Windows acts on a rule is an event that carries its id: 1122
 in audit, 1121 in block. The table shows per rule the number of such events since `Since` and the
 programs they name (`Get-PchAuditSummary`, C4).
@@ -380,7 +452,7 @@ rules further down decide. A program that is not installed gets R21.
 | Program | Found by | Files offered |
 |---|---|---|
 | Ollama | `Find-LaiOllamaDir -LocalAppData <the everyday account's>` (lib/LocalAI.psm1:1630), without -OrDefault | `ollama.exe` and `ollama app.exe` in that folder |
-| Docker Desktop | `Find-LaiDockerDesktopExe` (lib/LocalAI.psm1:1656), without -OrDefault | that file, and `resources\com.docker.backend.exe` beside it (the installer derives `resources\bin` the same way, Install-LocalAI.ps1:211). Both always with R26 (rule 3) |
+| Docker Desktop | `Find-LaiDockerDesktopExe -ProgramFiles <the folder Windows names>` (lib/LocalAI.psm1:1656; left to itself that parameter is the variable, :1660), without -OrDefault | that file, and `resources\com.docker.backend.exe` beside it (the installer derives `resources\bin` the same way, Install-LocalAI.ps1:211). The rows are planned only while `Get-PchRoute` says a file of Docker Desktop does the writing ("Docker and WSL", below). Neither file is ever offered without `-AllowWritable` (rule 3); while no event names it the row reads R25, because rule 2 comes first |
 | ComfyUI | the roots of `Find-PcsComfyRoot` (Test-PCSecurity.ps1:356), fed as at :1293, with the everyday account's AppData and profile folder and the config's `ComfyUIPath` | per root the first that exists of `<root>\.venv\Scripts\python.exe`, `<parent of root>\python_embeded\python.exe`, `<root>\venv\Scripts\python.exe` (from memory, C9; question 3) |
 
 `Find-PcsComfyRoot` lives in a script, not in the module, so `Set-PCHardening.ps1` cannot call it.
@@ -417,8 +489,18 @@ would have put it past Controlled folder access. So, per candidate and in this o
 
 1. **The path rule, at -Apply and at -Undo alike** (`Test-PchStoreValue`, kind AppPath): a full
    path that starts with a drive letter (no `\\server` path, no `\\?\` form), ends in `.exe` and
-   holds no `*` and no `?`. `[`, `]`, spaces and commas are ordinary characters. At discovery the
-   drive must also be a built-in one (`DriveType` Fixed). Else R24.
+   holds no `*` and no `?`. Nor may it hold a character that ends a quoted string or steers a
+   command line: `'` and `"` and their typographic forms U+2018 to U+201E, a backtick, `$`, `;`,
+   `&`, `|`, `<`, `>`, `{`, `}`, or a control character (below U+0020, and U+007F). Every
+   printed line is quoted (section 2), so this is the second fence, and it costs the owner
+   nothing real: Windows itself forbids several of them in a file name, and no program this
+   script looks for is installed in a folder named with the others. `[`, `]`, `(`, `)`, spaces and
+   commas are ordinary characters. Round brackets stay allowed although they can steer an
+   unquoted line: `Program Files (x86)` holds them, and inside the single quotes of a printed
+   line they steer nothing (T68 parses such a path). That Defender takes all six as ordinary
+   too, as written and not as a pattern, is from memory: C8 checks it before the build, and a
+   character that fails there joins the refused ones. At discovery the drive must also be a
+   built-in one (`DriveType` Fixed). Else R24, which names what is wrong.
 2. **No entry before it is needed.** A candidate is offered only when a Controlled folder access
    event (1124 in audit, 1123 when on) names exactly that path as the program, since `Cfa\Since`,
    or in the last 30 days when Controlled folder access was on already and has no entry. Else
@@ -433,20 +515,54 @@ would have put it past Controlled folder access. So, per candidate and in this o
      or put another in its place.
    - *Python*: a file named python.exe or pythonw.exe, wherever it lies. It runs any script it
      is handed.
-   - *Container*: every file of the Docker Desktop row, wherever it lies, under Program Files
+   - *Container* (there is a Docker row only while `Get-PchRoute` says `DockerFile`, see "Docker
+     and WSL"): every file of the Docker Desktop row, wherever it lies, under Program Files
      too. Docker writes wherever a container is told to, and any program running as the owner
      can start a container with a protected folder mounted (`docker run -v`; the installer puts
      the owner into `docker-users`, the group that may, Install-LocalAI.ps1:1571-1576). Rule 2
      offers a Docker file only after an event named it as the writer into a protected folder,
      and that is this very case: the entry would be the way around Controlled folder access
-     that this rule exists to stop. Which of Docker's files the event names is check C9; the
-     answer changes the path, not the verdict.
+     that this rule exists to stop. Which of Docker's two files the event names is part of
+     check C9; between those two the answer changes the path, not the verdict.
 
-   A row with R26 is not allowed unless `-AllowWritable` names exactly that path, and then with
-   N6, which gives the same reason. A candidate whose permissions cannot be read (`Acl` is
-   `$null`) is not R26 but R17, and `-AllowWritable` does not lift that. So of the three
-   programs only Ollama, installed in a folder only administrators can change, is ever allowed
-   without `-AllowWritable`. Docker Desktop and ComfyUI's python.exe never are (question 3).
+   A row with R26 is not allowed unless `-AllowWritable` names that path (letter for letter,
+   without regard to case: section 2), and then with N6, which gives the same reason. R26 is
+   the only refusal the switch lifts. A candidate whose permissions cannot be read (`Acl` is
+   `$null`) is not R26 but R17, and `-AllowWritable` does not lift that, nor R24 or R25: the
+   value then gets its own row with R28, as does a value that names no row at all. So of the
+   three programs only Ollama, installed in a folder only administrators can change, is ever
+   allowed without `-AllowWritable`. Docker Desktop and ComfyUI's python.exe never are
+   (question 3).
+
+**Docker and WSL: what C9 decides.** The toolkit runs Docker Desktop on WSL 2
+(Install-LocalAI.ps1:1509-1562), and from memory Windows 11 Home has no other backend. There a
+container's write into a mounted Windows folder, and a WSL program's write below `/mnt/c`, are
+carried out on the Windows side by some program, and which one is not known here. If it is a
+component that Windows trusts by itself, Controlled folder access neither audits nor stops the
+write, and any program running as the owner has a way around it that needs no entry on any
+list: `docker run -v` with a protected folder (the installer puts the owner into
+`docker-users`, Install-LocalAI.ps1:1571-1576), or `wsl.exe`. A Docker row that sat at R25
+would then read as reassurance ("has not stopped Docker Desktop so far") while the way around
+stood open. So the plan does not assume an answer. C9 gives one per route, and `Get-PchRoute`
+holds the two, spelled once:
+
+| `Get-PchRoute` | C9 found | What the script does |
+|---|---|---|
+| `Container` = `DockerFile` | an event names `Docker Desktop.exe` or `com.docker.backend.exe` | the Docker rows are planned as the table above and rule 3 say: R25 until an event names the file, then R26 with the container reason, allowed only through `-AllowWritable`, with N6 |
+| `Container` = `Component` | an event names another program, a Windows or WSL component | no Docker row is planned, whatever is installed. The component shows among the programs that were seen and are no candidates. It is never allowed by this script or on its advice: it writes for every container and every WSL program alike. The way out is to mount no protected folder into a container |
+| `Container` = `None` | no event comes, in audit or on: the write goes through | no Docker row is planned. The footer's third line names "a Docker container" |
+| `Wsl` = `Component` | an event names a program | no row, as for any program that is no candidate; the footer does not name WSL |
+| `Wsl` = `None` | no event comes | the footer's third line names "WSL" |
+
+The footer's third line (section 2) is "Do not count on Controlled folder access to stop a
+program that writes through <a Docker container / WSL / a Docker container or through WSL>." It
+is printed while at least one of the two is `None` and names exactly those. Until C9 is answered
+both stand at `None`: the script then allows nothing for Docker and promises nothing, which is
+right whichever answer comes. `Get-PchCfaPlan` and `Format-PchTable` take the answer as a
+parameter, so T53 and T58 assert all of these rows on both CI jobs whatever `Get-PchRoute` holds;
+answering C9 later changes two words in that function and the README, nothing else. With no
+Docker row, an `-AllowWritable` that names a file of Docker Desktop is R28 ("it is not in this
+table").
 
 Comfy Desktop's default folder is `%USERPROFILE%\Documents\ComfyUI` (Find-PcsComfyRoot, :377),
 inside a folder Controlled folder access protects, so ComfyUI saving a picture is the first thing
@@ -460,11 +576,14 @@ programs that were seen and are no candidates.
 in place, so the path and the entry hold (C8). A program that moved (installed again elsewhere, a
 Comfy Desktop update that moves its Python) is caught because every run, the bare one too, finds
 the programs afresh and compares them with the paths under `Cfa\Apps`: a stored path whose file
-is gone, or a found path that is not stored, is shown as drift. `-Apply` then takes out its own
+is gone, or a found path that is not stored, is shown as drift. The bare run shows that in an
+administrator window only: a normal one can read neither Defender's list nor `Cfa\Apps`
+(section 7, rule 1), and its cells say so (N5). `-Apply` then takes out its own
 stale entry, Defender's list first and the store value last, and always: an entry for a file that
 is gone can be filled by whoever may write to that folder. The new path is a new candidate and
 goes through the three rules again, `-AllowWritable` included. Nothing runs this by itself in v1; the
-README tells the owner to run the bare script when a program is blocked after an update.
+README tells the owner to run the bare script, from an administrator window, when a program is
+blocked after an update.
 
 **Must be true first.** Defender in charge by the :966 test with real-time protection on
 (section 3); an administrator window; no policy value (C11). Tamper Protection: as in section 4.
@@ -474,7 +593,11 @@ Build: none beyond the cmdlets being there.
 **What can stop working.** In audit: nothing; Windows writes event 1124. On: any program that
 Microsoft does not trust by itself is stopped from changing files in Documents, Pictures, Videos,
 Music, Desktop and Favorites, with a notification: ComfyUI saving pictures, game saves, scripts
-run by powershell.exe or python.exe, older tools, a container with one of those folders mounted.
+run by powershell.exe or python.exe, older tools. A container with one of those folders
+mounted, and a WSL program that writes into one, belong on this list only if C9 finds that
+Windows stops them (`Get-PchRoute` at `DockerFile` or `Component`). If it finds that the write
+goes through (`None`), nothing stops working there and nothing is protected there either: the
+footer and the README then say that instead.
 
 The toolkit keeps its data under <AIRoot>, which is not protected. But two of its scripts change
 the Desktop, and they do it from powershell.exe (that Windows stops this like any other script
@@ -499,7 +622,8 @@ program in Windows Security.
 
 **Read back.** `Get-MpPreference` again: `EnableControlledFolderAccess` holds the number asked
 for; `@(ControlledFolderAccessAllowedApplications)` holds the path (compared without regard to
-case). Else R31. Events: 1124 in audit, 1123 when on; both name the program and the file.
+case). Else R31, and R35 when the answer cannot be read at all (section 7, rule 2 (d)). Events:
+1124 in audit, 1123 when on; both name the program and the file.
 
 **Undo.** Mode: `Set-MpPreference -EnableControlledFolderAccess` with the stored before-value
 (`0` as `Disabled`, `2` as `AuditMode`). Programs: `Remove-MpPreference` for each path under
@@ -541,7 +665,8 @@ smart-card software, an older fingerprint reader's software, a VPN or password t
 into sign-in (question 4). Password and PIN keep working, so the owner can always sign in and
 undo. Tools that read the sign-in process's memory stop working; that is the purpose.
 
-**Read back.** Right after the write: the value is 2 and a DWORD, else R31. It is in force only
+**Read back.** Right after the write: the value is 2 and a DWORD, else R31, and R35 when it
+reads `unreadable` (section 7, rule 2 (d)). It is in force only
 after a restart, so the row compares two times: the entry's `Since` (section 7) and the last
 start of Windows (`Win32_OperatingSystem.LastBootUpTime`, `LastBoot` in the `Lsa` reader's
 answer). Last start before `Since`: "set, waits for a restart". Last start after it, and the
@@ -596,21 +721,47 @@ days from it, and the LSA row compares it with the last start of Windows (sectio
 
 1. **Administrators only: made so, then checked.** A key the script makes gets its own
    permissions and no inherited ones: owner Administrators, full control for SYSTEM and
-   Administrators, read for Users, handed on to its subkeys (`CreateSubKey` with a
-   `RegistrySecurity`; from memory, W4 proves it). That holds also where UAC is off or the
-   built-in Administrator account is used, where a new key would otherwise belong to the user
-   account (C13). Keys are made in one place only, the writer name `StoreMake`, and only under
-   -Apply. The check comes twice. First `Invoke-PchRun` judges every key that is there, from
+   Administrators, read for Users, each for that key alone and not handed on to a subkey
+   (`CreateSubKey` with a `RegistrySecurity`; from memory, W4 proves it). That holds also where
+   UAC is off or the built-in Administrator account is used, where a new key would otherwise
+   belong to the user account (C13). Every key is made by a call of its own that carries these
+   permissions, the keys above it first (`LocalAI`, `PCHardening`, `Asr` above an `Asr\<id>`,
+   `Cfa` above `Cfa\Apps`). None is left to `CreateSubKey` making a parent on the way: that
+   parent would get inherited permissions and the default owner, and on a PC with UAC off the
+   second check below would then answer R08 on every -Apply that needs it.
+
+   **`Cfa\Apps` is closed to everyone but SYSTEM and Administrators**: no entry for Users, not
+   even read. Its value names are the programs this script put past Controlled folder access,
+   and Windows keeps that list from a normal window (C12). Left readable, the key would tell
+   any program running as the owner which file to write through, on the first try and without
+   the blocked attempt and the event 1123 that would otherwise warn the owner. The other keys
+   stay readable, so the bare run still shows before-values and `Since` in a normal window. For
+   `Cfa\Apps` that window gets a `StoreAcl` row that says `Closed` and nothing more: it is not
+   judged from there, nothing is shown from it, and the cells that would need it say so (N5).
+   A `Closed` row in an administrator window, or for any other key, is a store that cannot be
+   read: R09. And a `Cfa\Apps` that someone has opened for reading is no reason to refuse an
+   undo: when the judge finds a fault there with `-Private` and none without, nobody without
+   administrator rights can change the key, so the run goes on and says so with note N9. A
+   fault that stands without `-Private` is R08 there as on every key. If C12 finds that Windows
+   shows the list to everyone, `Cfa\Apps` may be made like the other keys.
+
+   Keys are made in one place only, the writer name `StoreMake`, and only under -Apply. The
+   check comes twice. First `Invoke-PchRun` judges every key that is there, from
    `HKLM:\SOFTWARE\LocalAI` down (`PCHardening`, `Asr`, each `Asr\<id>`, `Cfa`, `Cfa\Apps`,
    `Lsa`), on every run, before anything is planned and before -Undo uses a stored value: a
    fault is R08, a `StoreAcl` reader that throws is R09. Then, under -Apply, `Invoke-PchPlan`
    begins with the store, before any step: `StoreMake` makes the keys this run's steps write,
    the `StoreAcl` rows are read again, the new keys among them, and every row is judged once
-   more. A fault is R08; a `StoreMake` or a second read that throws is R09. Either way the keys
-   made in this run are removed again, deepest first, no step is run and no record is written
-   (T64). If that removal fails, it is an error the script did not expect: the run ends with
-   exit code 1 and the error names the key. The pure judge is `Get-PchAclFault`. It also judges
-   files and folders (R06, and rule 3 of section 5):
+   more. A fault is R08; a `StoreMake` that could not make a key, or a second read that throws,
+   is R09. In all three cases the keys made in this run are removed again, deepest first, no
+   step is run and no record is written (T64). "Made in this run" is exact, also when
+   `StoreMake` got only part of the way: it never throws for a key it could not make, it stops
+   and answers with the keys it did make and with the error (section 8), so `Invoke-PchPlan`
+   always holds the list and is the one place that removes. A key that was there before the
+   call is never on that list, whatever it holds. If the removal fails, it is an error the
+   script did not expect: the run ends with exit code 1 and the error names the key that
+   stayed. The pure judge is `Get-PchAclFault`. It also judges files and folders (R06, the
+   record's folder, and rule 3 of section 5):
    - The owner must be SYSTEM (S-1-5-18), Administrators (S-1-5-32-544) or TrustedInstaller
      (S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464). The owner counts: an
      owner who is a plain account can rewrite the permissions without administrator rights.
@@ -623,6 +774,9 @@ days from it, and the LSA row compares it with the last start of Windows (sectio
      signs in with); `Get-PcsAclVerdict` accepts the same two (Test-PCSecurity.ps1:300). The
      rights are judged as the raw number (`[int]` of the entry's rights), never by flag names:
      generic rights have none.
+   - With `-Private` reading counts as well: every Allow entry that is not inherit-only must
+     name one of those accounts, whatever its rights. That is how `Cfa\Apps`, the record's
+     folder and the record are judged (their `StoreAcl` and `LogAcl` rows say `Private`).
    - The write bits, by what is judged (from memory, C13):
 
    | Kind | Judged | Write bits |
@@ -638,20 +792,40 @@ days from it, and the LSA row compares it with the last start of Windows (sectio
      -Enforce: `Pending` = 1 into the entry that is there. An item found in audit already is
      adopted with `Before`, `Since` and, last, `Set`, and that is all: no setting is written.
    - (b) Read the entry back. If it differs: take out what (a) wrote, R30, and the setting is not
-     written.
+     written. A `Store` call in (a) that throws, or a read-back here that throws, is R30 as well
+     (its `<y>` is the error): what (a) wrote is taken out as far as Windows lets the script,
+     and the setting is not written. What may stay is an entry rule 3 knows (row 3 or row 5).
    - (c) Write the setting.
-   - (d) Read the setting back, whether (c) threw or not. It holds the target: write `Set` = the
-     target, then delete `Pending`, and `Left` with it where an earlier run left one. It holds
-     what it held before (c): nothing landed, so take out what (a) wrote (the whole entry, its
-     key included, on a first -Apply; only `Pending` under -Enforce); the row says R33 if (c)
-     threw, else R31. It holds something else: write back what it held before (c) and read that
-     back. If that worked, take out what (a) wrote, R31. If not, the entry stays, `Left` = what
-     the setting reads now is added, and the row says R32.
+   - (d) Read the setting back, whether (c) threw or not. There are four answers, and no fifth:
+     - It holds the target: write `Set` = the target, then delete `Pending`, and `Left` with it
+       where an earlier run left one.
+     - It holds what it held before (c): nothing landed, so take out what (a) wrote (the whole
+       entry, its key included, on a first -Apply; only `Pending` under -Enforce); the row says
+       R33 if (c) threw, else R31.
+     - It holds something else: write back what it held before (c) and read that back. If it
+       then holds the old value, take out what (a) wrote, R31. If it holds another value still,
+       the entry stays, `Left` = that value is added, and the row says R32.
+     - It cannot be read: the reader threw (Defender's service restarting between two of the
+       sixteen rules is enough), or answered `unreadable` for an LSA value. That holds here and
+       for the read after a put-back alike. The script does not guess what the setting holds.
+       Nothing more is written, to the setting or to the store: no put-back in the dark, no
+       `Set`, and no `Left`, which may only be a number or `absent`. The entry stays as (a) left
+       it, with `Pending`, and the row says R35. The run goes on with the next item. On the
+       next -Apply rule 3 finishes the entry (row 2 if the write had landed, row 3 if not, R20
+       from the last row if the setting holds a third value), and -Undo puts `Before` back
+       (rule 5).
+
+     A `Store` call that throws after (c) never undoes the setting. Where the row has a
+     refusal by then (R31, R33) it keeps it. Where the change landed and only the store could
+     not be finished (`Set` not written, or `Pending` not deleted), the row says R35. Either
+     way what stays is an entry rule 3 knows, and the next -Apply finishes it.
    - (e) Taking out goes the other way round: the setting first, the store last. That holds for
      every -Undo step and for a stale allowed program (section 5). An allowed program is added
      store value first, then Defender's list, then read back; so a path under `Cfa\Apps` that is
      not in Defender's list is one the script was about to add. -Apply adds it if it is still a
-     candidate and takes the value out if not.
+     candidate and takes the value out if not. A list that cannot be read after the add is R35
+     as in (d): the store value stays, and the next -Apply finds the path either in Defender's
+     list, where it is this script's entry, or not, and then does as just said.
 3. **A second run never overwrites a before-value, and finishes what an earlier run left.**
    `Before` and `Since` are never written twice. What -Apply does with an entry that is there;
    the first row that fits decides:
@@ -685,7 +859,9 @@ days from it, and the LSA row compares it with the last start of Windows (sectio
    still reads what it read before the write, and R44 in every other case, for LSA protection
    always. A setting that cannot be read at all is never "anything else": nothing is written
    and the entry stays, with R43 for a rule, the mode or an allowed program (Defender gave the
-   reader no answer) and R17 for LSA protection.
+   reader no answer) and R17 for LSA protection. And an entry that cannot be taken out of the
+   store after its setting was put back stays; the row says R35, and the next -Undo forgets it
+   without a write, because the setting holds `Before` already.
 6. When the last entry is gone, -Undo removes `PCHardening`, and `HKLM:\SOFTWARE\LocalAI` only
    when that is empty too. A key without values and without a subkey is no entry: -Undo forgets
    it on the way.
@@ -697,13 +873,16 @@ days from it, and the LSA row compares it with the last start of Windows (sectio
 **Set-PCHardening.ps1** begins like Test-PCSecurity.ps1:1-58: `#Requires -Version 5.1`, help that
 names every parameter (static rule HELP), `$ErrorActionPreference = 'Stop'`, the import of
 lib/LocalAI.psm1 (`Write-LaiLog`, `Read-LaiState` as at :894, the two locators), the elevation
-test of :911-914. Then functions only, all named `*-Pch*`, then a body of a few lines: build the
-real reader and writer, call `Invoke-PchRun`, print, exit with its `ExitCode`; an error that
-reaches the body is printed and the script exits with 1. The test loads the functions from the
-source text, so the body holds nothing a test must reach. Windows PowerShell 5.1, ASCII only. Of
-the rules at tests/Invoke-StaticChecks.ps1:27-88 these bite here: HELP, DOCPARAM, LOCATOR, PS51,
-MATCHES, ENCODING. The static checks take every *.ps1 under local-llm (:23): no file list to
-register.
+test of :911-914. Then functions only, all named `*-Pch*`, then a body of a few lines: get the
+places (`Get-PchPlace -ProgramFiles (Get-PchProgramFiles)`), build the real reader and writer
+from them, call `Invoke-PchRun` with `Get-PchRoute`'s answer and with the `-AIRoot` the owner
+gave or '', print, exit with its `ExitCode`; an error that reaches the body is printed and the
+script exits with 1. The test loads the functions from the source text, so the body holds
+nothing a test must reach. Windows PowerShell 5.1, ASCII only. Of the rules at
+tests/Invoke-StaticChecks.ps1:27-88 these bite here: HELP, DOCPARAM, LOCATOR, PS51, MATCHES,
+ENCODING, and BOUND (whether the owner gave `-AIRoot` is read from `$PSBoundParameters` in the
+body itself, not inside a scriptblock). The static checks take every *.ps1 under local-llm
+(:23): no file list to register.
 
 Pure functions (no cmdlet that asks Windows, no reader, no writer inside):
 
@@ -711,31 +890,35 @@ Pure functions (no cmdlet that asks Windows, no reader, no writer inside):
 |---|---|---|
 | `Get-PchRefusalText` | `-Id`, `-Values` (hashtable for the `<...>` parts) | the sentence of section 2 |
 | `Get-PchCatalog` | none | the 16 rules: Id, Name, Short, AuditOnly, BlockStops, NeedsCloud |
-| `Get-PchRunRefusal` | `-Apply`, `-Undo`, `-Enforce` (bool), `-Only` (string[], split on commas here), `-Run` (the answer of the `Run` reader) | `$null`, or the first of R01 to R07 in the order of section 2: Id and the Values for its sentence |
+| `Get-PchRunRefusal` | `-Apply`, `-Undo`, `-Enforce` (bool), `-Only` (string[], split on commas here), `-AllowWritable` (string[]), `-AIRootGiven` (the `-AIRoot` the owner gave, or ''), `-Run` (the answer of the `Run` reader) | `$null`, or the first of R01 to R07 in the order of section 2 (R05 before R04): Id and the Values for its sentence. For R04 and R06 the Values hold `<command>` from `Get-PchCommandLine`, the copy's plain path, and whether that copy is there |
+| `Get-PchCommandLine` | `-AdminCopy`, `-Apply`, `-Undo`, `-Enforce` (bool), `-Only` (the checked names), `-AllowWritable` (string[]), `-AIRootGiven` | one line: `&`, the copy's path, then of `-Apply` or `-Undo`, `-Enforce`, `-Only a,b`, `-AllowWritable <value>,<value>` and `-AIRoot <folder>` those that were given, in that order. The path and every value come from `ConvertTo-LaiPsQuoted` of the module; the function writes no quote itself (section 2; T68) |
 | `Get-PchExitCode` | `-Apply`, `-Undo` (bool), `-RunRefusal` (the id of a whole-run refusal, or ''), `-Refusals` (string[]: the refusal ids of the result rows) | 0 or 2, by the groups of section 2. 2 with a whole-run refusal, whatever the switches. Else 0 when neither -Apply nor -Undo is given. Else 2 when at least one id is of the group "asked for and not done", and 0 otherwise. An id that is in neither group throws: a bug, so the script ends with 1. The one place that holds the two groups (T59) |
 | `Get-PchGate` | `-Defender` (`$null`, or an object with AntivirusEnabled, RealTimeProtectionEnabled, AMRunningMode, IsTamperProtected, Error), `-MapsReporting` (a number, or `$null` when it cannot be read: then no N3), `-Build` (int), `-EditionId` | an object: Asr, Cfa, Lsa (each '' or a refusal id), Notes (note ids), DefenderText |
 | `Get-PchAsrPlan` | `-Catalog`, `-Ids`, `-Actions`, `-PolicyIds`, `-Store` (id to its entry), `-Enforce`, `-Now`, `-AuditDays` | one row per rule: Id, Name, Now, Want, Clean (what rule 3 of section 7 takes out of the store first: nothing, a left-over `Pending` and `Left`, or the values of a cut-off entry), Step (None, Adopt, Set, Resume at (c), Finish in the store), Before, Refusal (R34 for the state R32 left) |
-| `Get-PchCfaPlan` | `-Mode`, `-Allowed` (string[]), `-Programs` (the rows of the `Programs` reader, or `$null` for R27), `-Seen` (the program paths that events name), `-AllowWritable`, `-Policy`, `-Store`, `-Enforce`, `-Now`, `-AuditDays` | a mode row with the fields of a rule's row, and one row per program: Step (None, AddApp, RemoveApp), Refusal, Reason (for R26 and N6: File, Python or Container, section 5, rule 3), Note |
+| `Get-PchCfaPlan` | `-Mode`, `-Allowed` (string[], or `$null` when the list cannot be read), `-Programs` (the rows of the `Programs` reader, or `$null` for R27), `-Seen` (the program paths that events name), `-AllowWritable`, `-Route` (the answer of `Get-PchRoute`), `-AppsLeftOut` (bool: `-Only` leaves the allowed programs out), `-Policy`, `-Store`, `-Enforce`, `-Now`, `-AuditDays` | a mode row with the fields of a rule's row, and one row per program: Step (None, AddApp, RemoveApp), Refusal, Reason (for R26 and N6: File, Python or Container, section 5, rule 3), Note, and for R26 the quoted path for its sentence. The Docker Desktop rows only with `Container` = `DockerFile` in `-Route`. And one row with R28 for every `-AllowWritable` value that could not be used (section 2), each with the reason for its sentence and the paths this plan shows with R26. With `-AppsLeftOut` it plans no program row, and every `-AllowWritable` value is R28 |
 | `Get-PchLsaPlan` | `-RunAsPPL`, `-RunAsPPLBoot` (each `absent`, a number or `unreadable`), `-Policy`, `-Build`, `-Store`, `-RunningProtected`, `-LastBoot`, `-Now` | one row: Now, Want, Clean, Step, Before, BeforeBoot, Refusal, Restart |
 | `Get-PchUndoPlan` | `-Store` (all of it), `-Now` (rule states, CFA mode, allowed programs, RunAsPPL, RunAsPPLBoot; a part that could not be read is `$null`, with the error text beside it) | steps: Item, Kind (AsrRemove, AsrSet, CfaMode, CfaAppRemove, LsaSet, LsaDelete, Forget), Value, Refusal (section 7, rule 5: R43 or R17 for a part that could not be read) |
 | `Test-PchStoreValue` | `-Kind` (AsrBefore, AsrSet, CfaBefore, CfaSet, LsaBefore, LsaBootBefore, LsaSet, Left, Time, RuleId, AppPath; a `Pending` is judged as the `Set` of its item), `-Value` | `$true` or `$false` |
-| `Get-PchAclFault` | `-Kind` (Key, File, Folder, Above), `-OwnerSid`, `-Rules` (Sid, Type, Rights, InheritOnly) | `$null` when only administrators can change it, else Why (Owner or Rule) and Sid (section 7, rule 1) |
+| `Get-PchAclFault` | `-Kind` (Key, File, Folder, Above), `-OwnerSid`, `-Rules` (Sid, Type, Rights, InheritOnly), `-Private` (bool) | `$null` when only administrators can change it and, with `-Private`, only they can open it; else Why (Owner or Rule) and Sid (section 7, rule 1) |
 | `Get-PchByHandText` | `-Item` (Asr, Cfa, Lsa, or All for R08), `-RuleId` ('' for the words "the rule's id"), `-Before` | the `<by hand>` text of section 2. For a rule it reads `Cmdlet`, `Names` and the action name from `Get-PchDefenderCall`, spells none of them itself and calls nothing (T39, T65) |
 | `Get-PchDefenderCall` | `-Name` (AsrSet, AsrRemove, CfaMode, CfaAppAdd, CfaAppRemove), `-Key`, `-Value` | Cmdlet, Parameters (the hashtable to splat) and Names (the parameter names in the order a printed line gives them: the id first). The one place where the cmdlet, parameter and action names are spelled; W6 checks them against the real cmdlets |
-| `Get-PchPlace` | none | StoreRoot, LsaKey, LogFile, AdminCopy: the real places, spelled once |
+| `Get-PchPlace` | `-ProgramFiles` (what `Get-PchProgramFiles` answered) | StoreRoot, LsaKey, LogFile, AdminCopy: the real places, spelled once. The last two lie below `-ProgramFiles` and are '' when that is '' (section 2) |
+| `Get-PchRoute` | none | Container (`DockerFile`, `Component` or `None`) and Wsl (`Component` or `None`): C9's two answers, spelled once (section 5, "Docker and WSL"). Both `None` until C9 is answered |
 | `Find-PchProgram` | `-OllamaDir`, `-DockerExe`, `-ComfyRoots`, `-Exists` (scriptblock) | rows: Name, Path |
 | `Find-PchComfyRoot` | as `Find-PcsComfyRoot`: `-AppData`, `-UserProfile`, `-Remembered` | folders |
 | `Get-PchAuditSummary` | `-Events` (rows: Id, RuleId, Program, File, Time), `-Since` | per rule id and for CFA: Count, Programs; and Seen, the program paths that CFA events name |
-| `Format-PchTable` | rows | the lines of section 2's table, the footer last |
+| `Format-PchTable` | rows, `-Route` | the lines of section 2's table, the footer last: two lines, and the third while `-Route` holds a `None`, naming exactly the routes that are `None` |
 
-The three functions that touch the PC, and only through what they are handed:
+The functions that touch the PC. The first two do so only through the reader and writer they
+are handed:
 
 | Function | Input | Output |
 |---|---|---|
-| `Invoke-PchPlan` | `-Steps`, `-Apply` (bool), `-Reader`, `-Writer` (scriptblocks) | Refusal (`$null`, or R08 or R09 with the values for its sentence) and one result row per step. The only function that calls `$Writer`. Under -Apply, when at least one step writes to the store, it begins with the store: `& $Writer StoreMake` with the subkeys those steps write, then `& $Reader StoreAcl` once more, every row judged by `Get-PchAclFault` (section 7, rule 1). On a fault (R08), or when either call throws (R09), it removes the keys `StoreMake` answered with, deepest first, runs no step, makes no `Log` call and returns the refusal with no rows. Else it follows section 7, rules 2 and 3, removes the store when no entry is left (rule 6), and ends with one `Log` call that carries the table (a throw there is N7) |
-| `Invoke-PchRun` | `-Apply`, `-Undo`, `-Enforce` (bool), `-Only`, `-AllowWritable`, `-Reader`, `-Writer`, `-Now`, `-AuditDays` | Rows, Notes, Refusal (the whole-run refusal, or `$null`), ExitCode (from `Get-PchExitCode`). Asks the `Run` reader and `Get-PchRunRefusal` first; then, in every mode, `StoreAcl`: a fault in a key that is there is R08, a reader that throws is R09, and either ends the run before anything is planned. Then the gate and the planners. Any other reader that throws is caught here, name by name, and the planners get `$null` and the error text for that part. What becomes of it: no Defender status is R12 (section 3); a store that cannot be read is R09; a setting, or the event log, that cannot be read is R17 for the items that need it under -Apply, and R43 or R17 under -Undo (section 7, rule 5); on the bare run in a normal window the cell says that it needs an administrator window (N5). Hands the `Programs` reader the folders of the account at the screen. Calls `Invoke-PchPlan` for -Apply and -Undo only, and a refusal that comes back from it is the run's own |
-| `Get-PchRealReader` | `-AIRoot`, `-StoreRoot`, `-LsaKey` | the reader for the real PC. The only place with `Get-MpComputerStatus`, `Get-MpPreference`, `Get-WinEvent`, `Get-Acl` and the registry reads |
-| `Get-PchRealStoreWriter` (`-Root`), `Get-PchRealLsaWriter` (`-Key`), `Get-PchRealDefenderWriter`, `Get-PchRealLogWriter` (`-File`) | as named; none takes `-AIRoot` | the four parts of the writer, and the only places with a command or method that changes anything. The store part answers the names `StoreMake` and `Store`; its `-Root` is the key that holds the entries (`PCHardening`), and the key above it (`LocalAI`; in W4 the scratch key) is made with it and goes with it when empty. The store and LSA parts take their key as a parameter so that W4 and W5 can run them on a scratch key. The Defender part always, and the other two when built for the real key of `Get-PchPlace`, begin with R07's test and throw on a test machine: the brake then holds whichever function calls them |
+| `Invoke-PchPlan` | `-Steps`, `-Apply` (bool), `-Reader`, `-Writer` (scriptblocks) | Refusal (`$null`, or R08 or R09 with the values for its sentence) and one result row per step. The only function that calls `$Writer`. Under -Apply, when at least one step writes to the store, it begins with the store: `& $Writer StoreMake` with the subkeys those steps write, then `& $Reader StoreAcl` once more, every row judged by `Get-PchAclFault` as `Invoke-PchRun` judges them (section 7, rule 1). On a fault (R08), or when `StoreMake` answers with an `Error` or the `StoreAcl` read throws (R09), it removes every key in `StoreMake`'s `Made`, in the reverse of the order made and so deepest first (`Store` with a `$null` value name), runs no step, makes no `Log` call and returns the refusal with no rows; with an `Error` it does not ask `StoreAcl` at all. A removal that throws is not caught: exit code 1. Nor is a `StoreMake` that throws: it is built not to, R07's brake aside, which throws before anything is made. Else it follows section 7, rules 2 and 3, removes the store when no entry is left (rule 6), and ends with the record: it asks `& $Reader LogAcl`, and makes one `Log` call that carries the table unless a row there is a link or has a fault (`Get-PchAclFault -Private`) or the read throws; then no `Log` call is made. Each of these, and a `Log` call that throws, is N7 |
+| `Invoke-PchRun` | `-Apply`, `-Undo`, `-Enforce` (bool), `-Only`, `-AllowWritable`, `-AIRootGiven`, `-Route`, `-Reader`, `-Writer`, `-Now`, `-AuditDays` | Rows, Notes, Refusal (the whole-run refusal, or `$null`), ExitCode (from `Get-PchExitCode`). Asks the `Run` reader and `Get-PchRunRefusal` first; on Windows a `Run` answer whose `AdminCopy` is '' (Windows named no Program Files folder) makes it throw before that. Then, in every mode, `StoreAcl`: a fault in a key that is there is R08, a reader that throws is R09, and either ends the run before anything is planned. A row that says `Private` is judged with `-Private`, and when that finds a fault, once more without: a fault both times is R08, a fault the first time only is note N9 and the run goes on. A row that says `Closed` is accepted for `Cfa\Apps` in a window that is not elevated, where it is not judged and the cells that need it read N5; any other `Closed` row is R09. Then the gate and the planners; the CFA planner is also called when `-Only` leaves the allowed programs out and `-AllowWritable` was given, for its R28 rows. Any other reader that throws is caught here, name by name, and the planners get `$null` and the error text for that part. What becomes of it: no Defender status is R12 (section 3); a store that cannot be read is R09; a setting, or the event log, that cannot be read is R17 for the items that need it under -Apply, and R43 or R17 under -Undo (section 7, rule 5); on the bare run in a normal window the cell says that it needs an administrator window (N5). Hands the `Programs` reader the folders of the account at the screen. Calls `Invoke-PchPlan` for -Apply and -Undo only, and a refusal that comes back from it is the run's own |
+| `Get-PchProgramFiles` | none | the folder Windows names, `[Environment]::GetFolderPath('ProgramFiles')`, or '' when it names none. The only place that asks, and it reads no environment variable (section 2; T69) |
+| `Get-PchRealReader` | `-AIRoot`, `-StoreRoot`, `-LsaKey`, `-ProgramFiles`, `-AdminCopy`, `-LogFile` | the reader for the real PC. The only place with `Get-MpComputerStatus`, `Get-MpPreference`, `Get-WinEvent`, `Get-Acl` and the registry reads. `-ProgramFiles` goes to `Find-LaiDockerDesktopExe`; the other two are what `Run` and `LogAcl` answer about |
+| `Get-PchRealStoreWriter` (`-Root`), `Get-PchRealLsaWriter` (`-Key`), `Get-PchRealDefenderWriter`, `Get-PchRealLogWriter` (`-File`) | as named; none takes `-AIRoot` | the four parts of the writer, and the only places with a command or method that changes anything. The log part makes the record's folder and the record when they are missing, each with the owner and permissions of section 2 in the call that makes it, and appends; it judges nothing itself (`LogAcl` and `Invoke-PchPlan` do), and W8 runs it on a scratch folder. The store part answers the names `StoreMake` and `Store`; its `-Root` is the key that holds the entries (`PCHardening`), and the key above it (`LocalAI`; in W4 the scratch key) is the one `StoreMake` makes first and `Store` knows as `'..'`. The store and LSA parts take their key as a parameter, and the log part its file, so that W4, W5 and W8 can run them on a scratch key or folder. The Defender part always, and the other three when built for the real key or file of `Get-PchPlace`, begin with R07's test and throw on a test machine: the brake then holds whichever function calls them |
 | `Get-PchRealWriter` | `-StoreRoot`, `-LsaKey`, `-LogFile` | one scriptblock that hands each writer name to its part |
 
 **Names are taken literally.** A program path may hold `[`, `]`, spaces and commas (section 5,
@@ -749,24 +932,27 @@ every command that reads a file, a folder or a key carries `-LiteralPath`, never
 never a path by position. T66 holds both in the source; W4 and W7 try them on Windows.
 
 The reader answers `& $Reader <name>` (`Programs` and `PathAcl` take one argument); the writer
-takes `& $Writer <name> <key> <value>` and throws when Windows refuses:
+takes `& $Writer <name> <key> <value>` and throws when Windows refuses (`StoreMake` aside, which
+answers with what stopped it):
 
 | Reader name | Answer | Writer name | Key, value |
 |---|---|---|---|
-| `Run` | OnWindows, Elevated, Is64BitOs, Is64BitProcess, SandboxVar and SandboxValue (the variable R07 found, or ''), ScriptAcl (rows as `StoreAcl`: the script's folder, the script, `lib`, the module, the folders above), AdminCopy, AdminCopyExists, WindowUser, DeskUser (`$null`, or Name, Sid, Profile, AppData, LocalAppData) | `StoreMake` | (none), the subkeys this run's steps write (`Asr\<id>`, `Cfa`, `Cfa\Apps`, `Lsa`). It makes each one that is missing, and `HKLM:\SOFTWARE\LocalAI`, `PCHardening` and `Asr` above them, with the permissions of section 7, rule 1, and answers with the keys it made, in the order made. It is the one writer name that answers with anything, and the only place where a key is made |
-| `Defender` | the status object or `$null` | `Store` | `@(<subkey>, <value name>)`, as in `@('Asr\<id>', 'Before')` or `@('Cfa\Apps', '<full path>')`, so a value name may hold backslashes; a value. `$null` removes the value, and with a `$null` value name the whole subkey: its values, and the key itself unless it still holds a subkey (`Cfa` with `Cfa\Apps` in it). The subkey `''` is `PCHardening` itself; removing it also removes `HKLM:\SOFTWARE\LocalAI` when that is then empty. `Store` never makes a key: on a subkey that is not there it throws |
+| `Run` | OnWindows, Elevated, Is64BitOs, Is64BitProcess, SandboxVar and SandboxValue (the variable R07 found, or ''), ScriptAcl (rows as `StoreAcl`: the script's folder, the script, `lib`, the module, the folders above), AdminCopy (the path the reader was built with: `Get-PchPlace`, so below the folder Windows names), AdminCopyExists, WindowUser, DeskUser (`$null`, or Name, Sid, Profile, AppData, LocalAppData) | `StoreMake` | (none), the subkeys this run's steps write (`Asr\<id>`, `Cfa`, `Cfa\Apps`, `Lsa`). In the order given it makes each one that is missing and, before it, every key above it that is missing: `HKLM:\SOFTWARE\LocalAI`, `PCHardening`, `Asr` above an `Asr\<id>`, `Cfa` above `Cfa\Apps`. Every key is made by a call of its own that carries the permissions of section 7, rule 1 (`Cfa\Apps`: without Users), never as a parent that `CreateSubKey` makes on the way. It checks no name beforehand and stops at the first key Windows does not let it make. It does not throw for that: in every case it answers with `Made`, the keys it made in this call in the order made, each by the subkey name `Store` takes (`'..'` for the key above `PCHardening`, `''` for `PCHardening`), and `Error`, '' or the text of what stopped it. Every key it made is on that list, the key above included, so that none can stay behind unnamed. It is the one writer name that answers with anything, and the only place where a key is made |
+| `Defender` | the status object or `$null` | `Store` | `@(<subkey>, <value name>)`, as in `@('Asr\<id>', 'Before')` or `@('Cfa\Apps', '<full path>')`, so a value name may hold backslashes; a value. `$null` removes the value, and with a `$null` value name the whole subkey: its values, and the key itself unless it still holds a subkey (`Cfa` with `Cfa\Apps` in it). The subkey `''` is `PCHardening` itself. The subkey `'..'` is the key above it, `HKLM:\SOFTWARE\LocalAI`: it holds no value of the script, takes a `$null` value name only, and is then removed when it is empty and left, without an error, when it is not. So rule 6 of section 7 is two calls, `''` and then `'..'`, and so is the removal of what `StoreMake` made. `Store` never makes a key: on a subkey that is not there it throws |
 | `Os` | Build, EditionId | `AsrSet` | rule id, action number |
 | `Asr` | Ids, Actions, PolicyIds, MapsReporting | `AsrRemove` | rule id |
 | `Cfa` | Mode, Allowed, Policy | `CfaMode` | (none), mode number |
 | `Lsa` | RunAsPPL, RunAsPPLBoot, Policy, RunningProtected, LastBoot | `CfaAppAdd`, `CfaAppRemove` | path |
-| `Store` | the store as nested hashtables (a key without values is an empty one), or `$null` when `PCHardening` is not there | `LsaSet` | value name, number |
-| `StoreAcl` | one row per key that is there, from `HKLM:\SOFTWARE\LocalAI` down: Path, Kind, OwnerSid, Rules (Sid, Type, Rights, InheritOnly); no row when nothing is there | `LsaDelete` | value name |
+| `Store` | the store as nested hashtables (a key without values is an empty one), or `$null` when `PCHardening` is not there. Where `Cfa\Apps` is there and this window may not open it, `Cfa` holds `Apps` = `$null` and `AppsClosed` = `$true` | `LsaSet` | value name, number |
+| `StoreAcl` | one row per key that is there, from `HKLM:\SOFTWARE\LocalAI` down: Path, Kind, Private (`$true` for `Cfa\Apps`), OwnerSid, Rules (Sid, Type, Rights, InheritOnly); no row when nothing is there. A key that is there and that this window is refused when it opens it gets a row with Path, Kind, Private and `Closed` = `$true` and no more; any other error throws | `LsaDelete` | value name |
 | `PathAcl` (argument: a full path) | rows as `StoreAcl`, each read with -LiteralPath: the file (Kind File), the folder it is in (Folder), every folder above it to the root of the drive (Above). It throws when the path is not there or one of them cannot be read | `Log` | (none), the lines |
+| `LogAcl` | rows as `StoreAcl` for what is there of the record's folder (Kind Folder) and the record (Kind File), both `Private`, each with `Link`: `$true` when `Get-LaiReparsePath` (lib/LocalAI.psm1:306) answers anything for it, so also when it lies below a link. No row for what is not there: the log part then makes it, below the folder Windows names, where only an administrator can put anything | | |
 | `Programs` (argument: the `DeskUser` folders) | rows: Name, Path, DriveFixed, Acl (the `PathAcl` rows for Path, or `$null` and the error beside it when `PathAcl` threw) | | |
 | `Events` | rows of the last 90 days: Id, RuleId, Program, File, Time | | |
 
 **Invoke-PCHardeningTest.ps1** begins with the sandbox guard of Invoke-WindowsUnitTests.ps1:30,
-has `Assert-That` and `Skip` as :34-38, loads the functions as :2276-2277 does (parse
+has `Assert-That` and `Skip` as :34-38, imports lib/LocalAI.psm1 (`Get-PchCommandLine` and
+`Get-PchCfaPlan` call its `ConvertTo-LaiPsQuoted`), loads the functions as :2276-2277 does (parse
 `Set-PCHardening.ps1`, dot-source every function named `*-Pch*`), ends with the exit code = failed
 assertions and the banner `PC HARDENING TEST PASSED`.
 
@@ -777,26 +963,31 @@ loaded, the functions are never run. Every test of a change runs against a fake 
 over it, and a journal of every writer call in order. Its variants: "sticky" (one setting takes
 the write and still reads back the old value, as under a policy), "warped" (one setting reads
 back a third value), "throwing" (one named writer call throws and changes nothing), "deaf" (the
-`Asr` and `Cfa` readers throw, as when Defender's service gives no answer), "boot"
+`Asr` and `Cfa` readers throw, as when Defender's service gives no answer), "blind" (one named
+setting reader, `Asr`, `Cfa` or `Lsa`, answers until a named writer call was made and from
+then on throws, `Lsa` answering `unreadable` instead: a setting that cannot be read back
+after its write, while the store and the other readers go on answering), "boot"
 (`RunAsPPLBoot` turns 2 once `RunAsPPL` is written, as Windows is said to do) and "passive"
 (Defender answers Passive Mode, and every write reads back). Its `StoreMake` makes the missing
-keys in the hashtable and answers with them, as the real one does, and its `Store` throws on a
-subkey that is not there. A run that was cut off is made by replaying the first n journal
-entries of a whole run onto a fresh fake PC.
+keys in the hashtable and answers with `Made` and an empty `Error`, as the real one does; in
+the variant "half-made" it makes the first two keys, stops, and answers with those two and an
+`Error`. Its `Store` throws on a subkey that is not there. A run that was cut off is made by
+replaying the first n journal entries of a whole run onto a fresh fake PC.
 
-What the fake PC cannot show is whether the real writer and reader fit Windows. Three things
+What the fake PC cannot show is whether the real writer and reader fit Windows. Four things
 close that without touching Defender or LSA, on the Windows job only. The store part and the LSA
 part of the writer run for real, against scratch keys under
 `HKLM:\SOFTWARE\LocalAI-Test-<random>`, which the test removes again however it ends (W4, W5;
 the store's root there is `LocalAI-Test-<random>\PCHardening`): the store is neither a
-Defender nor an LSA setting, and a scratch key is not the LSA key. The Defender part is never
+Defender nor an LSA setting, and a scratch key is not the LSA key. The log part runs for real
+on a scratch folder in the test's work folder (W8). The Defender part is never
 run; the names it would use are checked against the real cmdlets, read-only (W6). And the judge
-runs over real permissions (W4, W7). T39 to T42 hold all this in the source itself, and R07's
+runs over real permissions (W4, W7, W8). T39 to T42 hold all this in the source itself, and R07's
 brake sits in the writer parts too, so it holds even if a later test built them for the real
 keys. Still no test runs -Apply or -Undo against a real Defender: that is the acceptance run of
 section 1.
 
-Assertions, by the name each prints. All but W1 to W7 run on both CI jobs.
+Assertions, by the name each prints. All but W1 to W8 run on both CI jobs.
 
 | # | Assertion |
 |---|---|
@@ -806,7 +997,7 @@ Assertions, by the name each prints. All but W1 to W7 run on both CI jobs.
 | T04 | gate: real-time protection off gives R11 for ASR and CFA |
 | T05 | gate: build 22000 refuses LSA only (R23); a Home edition adds note N1 and refuses nothing |
 | T06 | passive mode: on a fake PC where every write reads back, -Apply ends with no ASR or CFA writer call (the gate decides, not the read-back) |
-| T07 | run: -Apply not elevated, in a 32-bit window, from a folder others can change, on a test machine, and together with -Undo each get their own refusal through `Invoke-PchRun`, each with exit code 2, and none calls the writer. R06 with the administrators-only copy missing uses its other sentence and names the installer; R07 names the variable and its value |
+| T07 | run: -Apply not elevated, in a 32-bit window, from a folder others can change, on a test machine, and together with -Undo each get their own refusal through `Invoke-PchRun`, each with exit code 2, and none calls the writer. R04 and R06 with the administrators-only copy missing (`AdminCopyExists` false) each carry the sentence that says the copy is not on this PC yet and names the installer, and with the copy there neither carries it; R07 names the variable and its value. A window that is 32-bit and not elevated gets R05, not R04. -Undo with -AllowWritable is R02 and names that switch. A `Run` answer on Windows with an empty `AdminCopy` makes `Invoke-PchRun` throw, with no writer call |
 | T08 | run: -Only with an unknown name is R03; `'Asr,Cfa'` handed over as one string is the two names; -Only Lsa plans no ASR and no CFA row; `-Undo -Only Apps` takes out this script's allowed programs and leaves the mode, the rules, LSA and their entries |
 | T09 | catalog: 16 rules, 14 enforceable and 2 audit only, the ids equal to a second list kept in the test |
 | T10 | ASR: an absent rule and a rule at 0 both go to audit, with the before-values absent and 0 kept apart |
@@ -831,19 +1022,19 @@ Assertions, by the name each prints. All but W1 to W7 run on both CI jobs.
 | T29 | a second -Apply, and -Apply -Enforce after it, leave the first before-value in the store |
 | T30 | one rule per writer call: 16 rules give 16 `AsrSet` calls, none carries two ids |
 | T31 | undo of a value that was absent removes it (rule: `AsrRemove`; LSA: `LsaDelete`); undo of a value that was 0 writes 0 |
-| T32 | a tampered store value (Before = 3, an empty Before, a rule id not in the catalog, a path with `*` or `?`, a `\\server` path) is refused (R41) and the setting left |
+| T32 | a tampered store value (Before = 3, an empty Before, a rule id not in the catalog, a path with `*` or `?`, a path with `'` or `;`, a `\\server` path) is refused (R41) and the setting left |
 | T33 | undo removes only the allowed programs this script added |
-| T34 | -Apply then -Undo on the fake PC gives back the starting state exactly, and an empty store, for each of several starting states. Both runs end with exit code 0 from a starting state whose only refusals are of the first group of section 2 (a rule already at block, R16; LSA with the firmware lock, R22; programs at R21 or R25), and with 2 from one that also holds a rule in a state the script does not know (R17), where everything else is still done and undone |
+| T34 | -Apply then -Undo on the fake PC gives back the starting state exactly, and an empty store, for each of several starting states. Both runs end with exit code 0 from a starting state whose only refusals are of the first group of section 2 (a rule already at block, R16; LSA with the firmware lock, R22; programs at R21 or R25). From one that also holds a rule in a state the script does not know (action 7), -Apply ends with 2 (R17 for that rule) and the -Undo after it with 0: -Apply stored nothing for that rule, so its row under -Undo is R40, and `Get-PchUndoPlan` gives R17 only for a part it could not read. Everything else is still done and undone |
 | T35 | undo with nothing stored: R40 in every row, no writer call but the one `Log` call of T56, exit code 0 |
 | T36 | undo of a setting changed since: left alone, the entry forgotten (R42); for a rule the sentence carries the exact cmdlet line |
 | T37 | the bare run calls no writer, `Log` included: `Invoke-PchRun` with neither -Apply nor -Undo and a writer that throws returns its rows |
 | T38 | -Enforce without -Apply calls no writer |
-| T39 | Set-PCHardening.ps1, by its syntax tree: outside the four writer parts there is no command call named Set-, Add- or Remove-MpPreference, New-, Set-, Remove- or Clear-ItemProperty, New-Item, Set-Item, Remove-Item, Set-Acl, Add-Content, Set-Content, Out-File, reg or reg.exe; no method call named SetValue, DeleteValue, CreateSubKey, DeleteSubKey, DeleteSubKeyTree, SetAccessControl, AppendAllText, WriteAllText or WriteAllLines; no redirection into a file (`$null` is none); and the `Cmdlet` that `Get-PchDefenderCall` names is called in the Defender part only (through `&`, so no Mp cmdlet is a command call anywhere in the script). `Get-PchByHandText` may read it, to print the by-hand line, and calls nothing: it is the only other function that reads a `Cmdlet` member, and it holds no `&` or `.` invocation, no Invoke-Expression, no Invoke-Command and no call of a method named Invoke |
+| T39 | Set-PCHardening.ps1, by its syntax tree: outside the four writer parts there is no command call named Set-, Add- or Remove-MpPreference, New-, Set-, Remove- or Clear-ItemProperty, New-Item, Set-Item, Remove-Item, Set-Acl, Add-Content, Set-Content, Out-File, reg or reg.exe; no method call named SetValue, DeleteValue, CreateSubKey, DeleteSubKey, DeleteSubKeyTree, SetAccessControl, CreateDirectory, AppendAllText, WriteAllText or WriteAllLines; no `New-Object` and no `::new` of a FileStream or a StreamWriter; no redirection into a file (`$null` is none); and the `Cmdlet` that `Get-PchDefenderCall` names is called in the Defender part only (through `&`, so no Mp cmdlet is a command call anywhere in the script). `Get-PchByHandText` may read it, to print the by-hand line, and calls nothing: it is the only other function that reads a `Cmdlet` member, and it holds no `&` or `.` invocation, no Invoke-Expression, no Invoke-Command and no call of a method named Invoke |
 | T40 | Set-PCHardening.ps1: only `Invoke-PchPlan` invokes `$Writer` |
 | T41 | `Get-PchDefenderCall`: no call for a rule names `Set-MpPreference`, and each carries exactly one id |
-| T42 | this test file, by its syntax tree: no command call named `Get-PchRealWriter`, `Get-PchRealDefenderWriter` or one of the three Mp cmdlets (the same names as strings, as in T39's list, are data and fine); powershell.exe is started in one place only, and that call's text holds none of -Apply, -Undo, -Enforce. Files and keys the test makes for itself (T45's folder tree, the scratch keys of W4 and W5) are not what this guards |
+| T42 | this test file, by its syntax tree: no command call named `Get-PchRealWriter`, `Get-PchRealDefenderWriter` or one of the three Mp cmdlets (the same names as strings, as in T39's list, are data and fine); powershell.exe is started in one place only, and that call's text holds none of -Apply, -Undo, -Enforce. Files and keys the test makes for itself (T45's folder tree, the scratch keys of W4 and W5, the scratch folder of W8) are not what this guards |
 | T43 | every refusal and note id of section 2 has a sentence with no `<...>` left in it once its values are given, and every id the script uses is one of them |
-| T44 | Get-PchAclFault, on rows copied from C13's answers: the permissions a new key really gets under `HKLM:\SOFTWARE` pass, CREATOR OWNER's inherit-only 268435456 included; so do Users with read (131097), and the root of the system drive judged as Above. A fault: Users with generic write (1073741824) or with set value (2), a plain account with 268435456 that is not inherit-only, a plain account as owner |
+| T44 | Get-PchAclFault, on rows copied from C13's answers: the permissions a new key really gets under `HKLM:\SOFTWARE` pass, CREATOR OWNER's inherit-only 268435456 included; so do Users with read (131097), and the root of the system drive judged as Above. A fault: Users with generic write (1073741824) or with set value (2), a plain account with 268435456 that is not inherit-only, a plain account as owner. With `-Private` (as `Cfa\Apps` and the record are judged): SYSTEM and Administrators with full control pass, and so does an inherit-only entry for CREATOR OWNER; Users with read alone (131097) is a fault that names S-1-5-32-545, and so is read for any other plain account; the same rows without `-Private` pass |
 | T45 | Find-PchComfyRoot and Find-PcsComfyRoot (loaded from Test-PCSecurity.ps1) give the same folders for the same folder tree |
 | T46 | gate and security check agree: for a table of Defender answers (the modes of section 3, with stray spaces and capitals, each with the antivirus on and off and real-time protection on and off), wherever `Get-PchGate` offers ASR, `Get-PcsAvVerdict` (loaded from Test-PCSecurity.ps1, no other product) says PASS "Microsoft Defender on"; wherever its text says passive mode, not running or switched off the gate says R10; real-time protection off is R11; a mode it does not judge is R13 |
 | T47 | the writer throws on a first -Apply and the setting is unchanged: the entry made for the item is gone, the row says R33, the other items are still done and the run ends with exit code 2; the next -Apply plans the item afresh (no R20) and, with a writer that works, ends with 0 |
@@ -852,34 +1043,38 @@ Assertions, by the name each prints. All but W1 to W7 run on both CI jobs.
 | T50 | -Apply, then -Apply -Enforce after the audit time, then -Undo gives back the starting state exactly, and an empty store, for each starting state of T34 |
 | T51 | LSA on the boot PC: after -Apply `RunAsPPLBoot` reads 2; -Undo deletes it when `BeforeBoot` was absent, writes 0 when it was 0 and leaves 2 when it was 2. With `RunAsPPL` back at its before-value already, -Undo still puts `RunAsPPLBoot` back |
 | T52 | LSA row: last start before `Since` reads "set, waits for a restart"; after it with the event, "on"; after it without the event, the warning |
-| T53 | CFA programs: a candidate no event names gets R25; an Ollama file named by an event, with file and folders only administrators can change, is added and stored; with a folder a plain account may write, R26; the same with -AllowWritable naming it is added, with N6; -AllowWritable naming another path changes nothing; python.exe in a folder only administrators can change is R26 all the same. So is each file of the Docker Desktop row under Program Files, named by an event and with nothing a plain account may change: R26 with the container reason, and added, with N6 and that reason, only when -AllowWritable names exactly that file. A candidate whose `Acl` is `$null` (its permissions could not be read) gets R17, with or without -AllowWritable. No refusal makes a writer call. An -Apply whose program rows end in R21, R25 and R26 alone ends with exit code 0 |
-| T54 | path rule at -Apply and -Undo alike: a `\\server` path, a path without .exe, one with `*` or `?`, and one on a drive that is not built in get R24 and no store write; a path with `[`, `]`, a space and a comma is allowed, stored, and taken out again by -Undo |
+| T53 | CFA programs: a candidate no event names gets R25; an Ollama file named by an event, with file and folders only administrators can change, is added and stored; with a folder a plain account may write, R26; the same with -AllowWritable naming it is added, with N6, also when the value differs from the row's path in case only; python.exe in a folder only administrators can change is R26 all the same. -AllowWritable values that cannot be used each get a row of their own with R28, add nothing, and end the -Apply with exit code 2: a path that is in no row (the sentence says so and lists the paths this run shows with R26, or "no program"), the two halves of a path that PowerShell split at a comma, a row that is still at R25 or at R24 (the sentence names that id), and any value when -Only leaves the allowed programs out (`-Apply -Only Lsa -AllowWritable <path>`). A value that names a row which is allowed already, or the Ollama row that is offered without the switch, gets no R28 and the run ends with 0. On the bare run the same values show the same rows and the exit code is 0. With `Container` = `DockerFile` in `-Route`: each file of the Docker Desktop row under Program Files, named by an event and with nothing a plain account may change, is R26 with the container reason, and added, with N6 and that reason, only when -AllowWritable names that file; while no event names it the row is R25. With `Component` and with `None`: no Docker row is planned although Docker Desktop is installed and an event names its file, that file shows among the programs seen, and -AllowWritable naming it is R28 ("it is not in this table"). A candidate whose `Acl` is `$null` (its permissions could not be read) gets R17, with or without -AllowWritable. No refusal makes a writer call. An -Apply whose program rows end in R21, R25 and R26 alone ends with exit code 0 |
+| T54 | path rule at -Apply and -Undo alike: a `\\server` path, a path without .exe, one with `*` or `?`, and one on a drive that is not built in get R24 and no store write. So does a path that holds `'`, one with U+2019 (built with `[char]0x2019`: the test file is ASCII), and one each with `"`, a backtick, `$`, `;`, `&`, `{` and a control character: R24 whose sentence names the character (U+2019 as "U+2019"), no store write, and `-AllowWritable` naming such a path is R28, not an entry. A path with `[`, `]`, `(`, `)`, a space and a comma is allowed, stored, and taken out again by -Undo (C8 may move a character from this half to the other) |
 | T55 | everyday account: `Invoke-PchRun` hands the `Programs` reader the folders of the account at the screen, not those of the window's account, and prints N8 when the two differ; with no account at the screen the program rows get R27 and nothing is added |
-| T56 | record: -Apply and -Undo each end with one `Log` call, after every other writer call, with the profile folder as %USERPROFILE%; a `Log` call that throws adds N7 and changes neither the rows nor the exit code. A run that ends in a whole-run refusal makes no `Log` call (T60, T61, T64) |
+| T56 | record: -Apply and -Undo each end with one `Log` call, after every other writer call, with the profile folder as %USERPROFILE%; a `Log` call that throws adds N7 and changes neither the rows nor the exit code. Before that call `LogAcl` is asked. No row (nothing there yet) and rows without a fault lead to the `Log` call. A row with `Link`, a row where Users may read the folder, a row with a plain account as owner of the record, and a `LogAcl` read that throws each lead to no `Log` call at all and to N7, whose sentence names the path and the reason; rows and exit code are as without it. A run that ends in a whole-run refusal makes no `Log` call and asks no `LogAcl` (T60, T61, T64) |
 | T57 | Set-PCHardening.ps1: no writer part has an `-AIRoot` parameter |
-| T58 | the table ends with the footer of section 2, and N2's sentence names Microsoft Defender's real-time protection, not these settings |
-| T59 | exit code groups (`Get-PchExitCode`, section 2): each refusal id alone, under -Apply and again under -Undo, gives the code of its group: 0 for R16, R18, R19, R21, R22, R25, R26 and R40; 2 for R10 to R15, R17, R20, R23, R24, R27, R30 to R34 and R41 to R44; 2 for each whole-run id R01 to R09. The two item lists are kept in the test as a second copy (as T09 keeps the rule ids); together with R01 to R09 they hold every R id that `Get-PchRefusalText` knows exactly once, and no N id. With neither -Apply nor -Undo every item id gives 0 and every whole-run id still 2. One id of the second group among ids of the first gives 2; no id at all gives 0; an id that is in no group throws |
-| T60 | store not administrators-only, through `Invoke-PchRun`: with `StoreAcl` rows that hold a fault on the root `HKLM:\SOFTWARE\LocalAI`, with a fault on one `Asr\<id>` subkey and nowhere else, and with a plain account as owner of `PCHardening`, -Apply and -Undo each end in R08 with exit code 2 and not one writer call (no `StoreMake`, no `Log`). The sentence names the key at fault and the account. Under -Undo it carries the by-hand text: the two Windows Security pages and the rule line with the words "the rule's id", and no id, path or value that the fake store holds. The bare run over the same rows ends in R08 and 2 as well |
+| T58 | the table ends with the footer of section 2, and N2's sentence names Microsoft Defender's real-time protection, not these settings. `Format-PchTable` with `-Route` at `None` for both ends with the third footer line naming "a Docker container or through WSL"; with one `None` it names that route alone; with none at `None` the footer has two lines. `Get-PchRoute` answers with two of the values section 5 lists, and nothing else |
+| T59 | exit code groups (`Get-PchExitCode`, section 2): each refusal id alone, under -Apply and again under -Undo, gives the code of its group: 0 for R16, R18, R19, R21, R22, R25, R26 and R40; 2 for R10 to R15, R17, R20, R23, R24, R27, R28, R30 to R35 and R41 to R44; 2 for each whole-run id R01 to R09. The two item lists are kept in the test as a second copy (as T09 keeps the rule ids); together with R01 to R09 they hold every R id that `Get-PchRefusalText` knows exactly once, and no N id. With neither -Apply nor -Undo every item id gives 0 and every whole-run id still 2. One id of the second group among ids of the first gives 2; no id at all gives 0; an id that is in no group throws |
+| T60 | store not administrators-only, through `Invoke-PchRun`: with `StoreAcl` rows that hold a fault on the root `HKLM:\SOFTWARE\LocalAI`, with a fault on one `Asr\<id>` subkey and nowhere else, and with a plain account as owner of `PCHardening`, -Apply and -Undo each end in R08 with exit code 2 and not one writer call (no `StoreMake`, no `Log`). The sentence names the key at fault and the account. Under -Undo it carries the by-hand text: the two Windows Security pages and the rule line with the words "the rule's id", and no id, path or value that the fake store holds. The bare run over the same rows ends in R08 and 2 as well. `Cfa\Apps` with an entry that lets Users read (131097) and nothing else wrong is no refusal: in all three modes the run goes on, does what it would have done, and carries note N9, which names the key and the account; with set value (2) for Users on that key it is R08. The same read entry on `Cfa` is neither a fault nor a note. A `Closed` row for `Cfa\Apps` in a window that is not elevated is no refusal: the bare run goes on, calls no writer, and the "allowed" cells of the program rows read N5. The same row in an elevated window, and a `Closed` row for `Asr`, are R09 |
 | T61 | store unreadable: a `StoreAcl` reader that throws gives R09 with the error in its sentence, exit code 2 and no writer call, under -Apply, under -Undo and on the bare run |
 | T62 | -Undo on the sticky PC (a setting takes the write and still reads the value this script set): the row says R44, the entry stays whole (`Before`, `Set`, `Since`), the other items are put back, exit code 2. A second -Undo on that PC once it takes writes gives back the starting state and an empty store, exit code 0 |
 | T63 | -Undo while Microsoft Defender cannot be reached. On the deaf PC every rule row, the mode row and every allowed-program row says R43 with the error, no Defender writer call is made, every entry stays whole, the LSA step is still done and its entry goes, exit code 2. On the throwing PC (one `AsrRemove` call throws and changes nothing) that one row says R43 and its entry stays; the other steps are done. From both, -Undo again on a PC that answers gives back the starting state and an empty store. An LSA value that reads `unreadable` under -Undo gives R17 with the entry kept, never R42 |
-| T64 | the store step at the start of -Apply: `Invoke-PchPlan` calls `StoreMake` once, before every other writer call, with the subkeys this run's steps write, then asks the `StoreAcl` reader a second time and judges every row. When a key that `StoreMake` made comes back with a fault (the fake PC hands a new key to a plain account as owner), the run ends in R08; when `StoreMake` throws, or the second `StoreAcl` read does, in R09. In all three the keys made in this run are removed again and a key that was there before stays, no `Store` value and no setting is written, there is no `Log` call, and the exit code is 2. Without a fault the steps run, in T25's order after the `StoreMake` call. A run in which no step writes to the store, -Undo and the bare run never call `StoreMake` |
+| T64 | the store step at the start of -Apply: `Invoke-PchPlan` calls `StoreMake` once, before every other writer call, with the subkeys this run's steps write, then asks the `StoreAcl` reader a second time and judges every row. When a key that `StoreMake` made comes back with a fault (the fake PC hands a new key to a plain account as owner), the run ends in R08; when the second `StoreAcl` read throws, in R09; and on the half-made PC, where `StoreMake` makes the first two keys (on an empty store `'..'` and `''`; with `PCHardening` there before, `Asr` and one `Asr\<id>`), stops, and answers with those two and an `Error`, in R09 with that error in its sentence and without a second `StoreAcl` read. In all three the keys in `Made` are removed again, in the reverse of the order made, so that the fake store ends as it began (on the half-made PC that is the assertion that fails if `Invoke-PchPlan` only cleans up after a `StoreMake` that finished); a key that was there before stays, with its values, also when it is `PCHardening` itself and only keys below it were made. No `Store` value and no setting is written, there is no `Log` call, and the exit code is 2. A removal that throws leaves `Invoke-PchPlan` with an error (exit code 1), not with R09. Without a fault the steps run, in T25's order after the `StoreMake` call. A run in which no step writes to the store, -Undo and the bare run never call `StoreMake` |
 | T65 | by-hand line for a rule (`Get-PchByHandText`): with the before-value `absent` it is the `Cmdlet` and the parameter name of `Get-PchDefenderCall -Name AsrRemove` followed by the rule's id; with `0`, `2` or `5` the `Cmdlet`, the two parameter names in the order of `Names` and the action name of `-Name AsrSet`. The test builds each expected line from what `Get-PchDefenderCall` answers, and checks by the syntax tree that `Get-PchByHandText` holds none of those cmdlet, parameter or action names as a string of its own. For R08, and for R41 with an id that is not one of the 16, the line carries the words "the rule's id" where the id would stand |
 | T66 | names taken literally, Set-PCHardening.ps1 by its syntax tree: no command call anywhere, the writer parts included, is named Get-ItemProperty, Get-ItemPropertyValue, New-, Set-, Remove- or Clear-ItemProperty; and every command call named Get-Acl, Get-Item, Get-ChildItem, Get-Content, Test-Path or Resolve-Path carries `-LiteralPath` |
+| T67 | a setting that cannot be read back (section 7, rule 2 (d), the fourth answer). On the blind PC whose `Asr` reader throws from the first `AsrSet` call on, -Apply gives every rule that was to be set R35 with the error; each of their entries holds `Before`, `Since` and `Pending` and no `Left`; no rule gets a second `AsrSet` or an `AsrRemove` (no put-back in the dark) and no `Set`; the mode and LSA protection are still done; the `Log` call is made; exit code 2. The next -Apply on that PC with its readers answering again writes `Set`, deletes `Pending`, makes no Defender writer call for those rules (rule 3, row 2) and ends with 0; -Undo from the R35 state instead gives back the starting state and an empty store. Blind and throwing together (the `AsrSet` call throws and changes nothing, then the reader throws): R35 again, and the next -Apply goes on at (c) (row 3). Warped and blind after the put-back (the read after the put-back throws): R35, `Pending` and no `Left`. The same for `LsaSet` with the value answering `unreadable` afterwards, and for an allowed program whose list cannot be read after `CfaAppAdd` (the value under `Cfa\Apps` stays). A `Store` call that throws while `Set` is written, after a write that landed: R35, `Pending` stays, the setting is not undone, and the next -Apply finishes the entry. A `Store` call that throws in (a): R30, no setting write. Under -Undo, a `Store` call that throws while the entry is taken out: R35, exit code 2, and the next -Undo forgets the entry with no setting write |
+| T68 | printed lines that the owner is to run (`Get-PchCommandLine`, and R26's switch). Inputs: a copy at `C:\Program Files\LocalAI\Set-PCHardening.ps1`; -Apply -Enforce -Only Asr,Cfa; `-AllowWritable` with three values, `C:\A B\[x], (x86)\python.exe`, `C:\X';&\Users\Public\a.cmd;'\ollama.exe` and one that holds U+2019 followed by `;calc;` (built with `[char]`); an `-AIRoot` given as `D:\My AI's`. The line is handed to `[System.Management.Automation.Language.Parser]::ParseInput`: no parse error; one statement, one pipeline, one command, started with the call operator; its first element is a string constant whose value is the copy's path; the parameters are -Apply, -Enforce, -Only, -AllowWritable and -AIRoot and no other; the two `-Only` names, the three `-AllowWritable` values and the `-AIRoot` value, read from the string constants' `Value`, equal the inputs letter for letter. Without `-AIRoot` given the line holds no -AIRoot. The sentences of R04 and R06 from `Invoke-PchRun` end with exactly that line. For R26: the text behind "run this again with " in the sentence of a row whose path is `C:\A B\[x], (x86)\python.exe`, put behind `x `, parses as one command with the one parameter -AllowWritable and one string constant equal to the path. By the syntax tree, `Get-PchCommandLine` holds no string that contains a quote character: the quotes come from `ConvertTo-LaiPsQuoted` alone |
+| T69 | the folder Windows names. By the syntax tree, Set-PCHardening.ps1 holds no variable `$env:ProgramFiles`, `$env:ProgramW6432` or `${env:ProgramFiles(x86)}` and no string with `%ProgramFiles`, in its functions and in its body; `GetFolderPath` is called in `Get-PchProgramFiles` and nowhere else. `Get-PchPlace -ProgramFiles 'X:\pf'` answers `X:\pf\LocalAI\Set-PCHardening.ps1` and `X:\pf\LocalAI-Logs\pc-hardening.log`, and with '' two empty strings; StoreRoot and LsaKey are the same in both |
 | W1 | Windows only: the real reader answers every name without an error and in the shape the planners take |
 | W2 | Windows only: the bare run in a child powershell.exe ends with exit code 0 and a table of 16 rule rows, a CFA row and an LSA row |
 | W3 | Windows only: that run changed nothing: rule ids and actions, CFA mode and allowed programs, RunAsPPL, RunAsPPLBoot and the absence of the store key are the same before and after |
-| W4 | Windows only: the real store part (`StoreMake` and `Store`), `Store` reader and `StoreAcl` reader on a scratch key. `StoreMake` makes the subkeys it is given and answers with the keys it made; called again it makes none and answers with none. A value whose name is a full path that holds backslashes, `[`, `]`, a space and a comma (`C:\Program Files\a [b], c\x.exe`) is written, read back and removed under exactly that name, while a second value, named by the same path with `b` where the first has `[b]`, is there throughout and is never touched: a store part that took the name for a pattern would hit that one. `$null` removes a value, and a subkey; a subkey that still holds another loses its values and keeps its key; `Store` on a subkey that is not there throws and makes no key. A key the part made is owned by Administrators and passes `Get-PchAclFault`, and fails it once the test gives Users set value there; `HKLM:\SOFTWARE` itself, read only, passes with its CREATOR OWNER entry. Removing the subkey `''` takes the root key away and, because it is then empty, the scratch key above it that `StoreMake` made; with a second key left under the scratch key, the scratch key stays (section 7, rule 6) |
+| W4 | Windows only: the real store part (`StoreMake` and `Store`), `Store` reader and `StoreAcl` reader on a scratch key. `StoreMake` makes the subkeys it is given and answers with the keys it made in `Made` and an empty `Error`; called again it makes none and answers with none. Given `Cfa\Apps` alone where nothing is there yet, it makes the scratch key, `PCHardening`, `Cfa` and `Cfa\Apps`, answers with `'..'`, `''`, `Cfa` and `Cfa\Apps` in that order, and each of the four, the parent `Cfa` included, is owned by Administrators, carries no inherited entry and passes `Get-PchAclFault`: a `Cfa` that `CreateSubKey` made on the way would fail here. `Cfa\Apps` carries entries for SYSTEM and Administrators and for no one else, and passes the judge with `-Private`; `Cfa` and `Asr` carry read for Users and fail it with `-Private`. Once the test gives Users read on `Cfa\Apps`, its `StoreAcl` row fails the judge and names S-1-5-32-545. A key shut to the reader: the test adds an entry on a scratch `Cfa\Apps` that denies Administrators reading its values and subkeys (from memory an administrator is then refused when opening it for reading; the test, as owner, takes the entry off again afterwards, and its cleanup does so first however the test ends). The `StoreAcl` reader then gives that key a row with `Closed` and no rules and does not throw, and the `Store` reader gives `AppsClosed`. A `StoreMake` that cannot finish: given `Asr\<id>` and then a subkey whose name is 256 characters long (from memory Windows takes at most 255), it does not throw, `Error` holds the reason, and `Made` holds exactly the keys made before that one; after the test has removed them as `Invoke-PchPlan` does (`Store` with a `$null` value name, in the reverse of the order made), none of them is there any more, while a key that was there before the call is still there with its value. A value whose name is a full path that holds backslashes, `[`, `]`, a space and a comma (`C:\Program Files\a [b], c\x.exe`) is written, read back and removed under exactly that name, while a second value, named by the same path with `b` where the first has `[b]`, is there throughout and is never touched: a store part that took the name for a pattern would hit that one. `$null` removes a value, and a subkey; a subkey that still holds another loses its values and keeps its key; `Store` on a subkey that is not there throws and makes no key. A key the part made is owned by Administrators and passes `Get-PchAclFault`, and fails it once the test gives Users set value there; `HKLM:\SOFTWARE` itself, read only, passes with its CREATOR OWNER entry. Removing the subkey `''` takes the root key away and leaves the scratch key above it; removing `'..'` then takes the scratch key away, because it is empty. With a second key left under the scratch key, removing `'..'` leaves the scratch key and does not throw (section 7, rule 6) |
 | W5 | Windows only: the real LSA part and `Lsa` reader on a scratch key: absent, 0 and 2 each read back as written, the value is a DWORD, delete gives absent, and a value of another type reads `unreadable` |
 | W6 | Windows only, read-only: for every writer name, the cmdlet of `Get-PchDefenderCall` exists, has each parameter named, and each action name is one that parameter's type takes |
 | W7 | Windows only: the real `PathAcl` reader and `Get-PchAclFault`. For cmd.exe in System32 the reader gives a File row, a Folder row and one Above row for each folder up to the root of the drive, and the judge finds no fault in any of them. Then a fault the test sets itself: it makes `<work>\[x]\probe.exe` and, beside it, `<work>\x\probe.exe`, and gives Users (S-1-5-32-545) write on the folder `[x]` and on nothing else. `PathAcl` for the first file gives a Folder row whose path is that of `[x]`, and its fault names S-1-5-32-545; the Folder row for the second file holds no entry that lets that account write. A reader that took `[x]` for a pattern would have read `x`. Because the test sets the fault, the result does not hang on who may write to the runner's temp folder |
+| W8 | Windows only: the real log part and `LogAcl` reader on a scratch folder, `Get-PchRealLogWriter -File <work>\Logs [x]\pc-hardening.log` (not the real file, so the brake does not hold it). Before the first call `LogAcl` gives no row. The first `Log` call makes the folder and the record; a second one appends, and the record then holds the lines of both. Folder and record are each owned by Administrators and carry entries for SYSTEM and Administrators and for no one else, the folder none that is inherited, although the work folder above lets the runner's account in. `LogAcl` gives a Folder row and a File row, both `Private`, neither with `Link`, and both pass `Get-PchAclFault -Private`. Once the test gives Users read on the folder, its row fails the judge and names S-1-5-32-545. And with the folder replaced by a junction to another folder of the test, `LogAcl` says `Link` for it, and for a record below it |
 
-On Linux the block W1 to W7 prints one SKIP line, and that line has to be declared for the Linux
+On Linux the block W1 to W8 prints one SKIP line, and that line has to be declared for the Linux
 job (registrations, below). Its message, word for word: `the real reader and writer parts of
 Set-PCHardening.ps1 ask Windows itself (runs in Windows CI)`. The Windows job declares no skip,
-and nothing in the block may skip there: W4 and W5 need an elevated runner, which GitHub's Windows
-runners are (from memory), and W6 needs the Defender cmdlets. Where one is missing the assertion
-fails, so that it cannot go quiet.
+and nothing in the block may skip there: W4, W5 and W8 need an elevated runner, which GitHub's
+Windows runners are (from memory), and W6 needs the Defender cmdlets. Where one is missing the
+assertion fails, so that it cannot go quiet.
 
 **Registrations for the integrator** (none of these files belongs to the builder of the two):
 
@@ -887,11 +1082,11 @@ fails, so that it cannot go quiet.
 |---|---|
 | tests/Invoke-AllTests.ps1:243-256 | a row in `$suites`: Name `PCHardening`, the test file, no arguments, Pass `PC HARDENING TEST PASSED`. Not in `$stepOnlySuites` (:260-262): the suite needs no Docker engine and is safe in the full run. `Get-StepBanner` (:264) then finds its banner for -Step; check that `Get-SuitesForChange` (:274) picks the suite for a change to Set-PCHardening.ps1 |
 | .github/workflows/local-llm-windows.yml:100-121 | a step like the two there: `Invoke-AllTests.ps1 -Step .\local-llm\tests\Invoke-PCHardeningTest.ps1` under `shell: powershell` |
-| .github/workflows/local-llm-linux.yml:66 | the SKIP line of W1 to W7, word for word as given above, under `LAI_DECLARED_SKIPS`, and the count in the comment above it (:60, nineteen today) |
-| Install-LocalAI.ps1:213, :627-636 and tests/Invoke-InstallerMockRun.ps1 | `Set-PCHardening.ps1` in `$ToolkitItems`: that copies it to the Scripts folder. It does not put it where R04 and R06 point. The administrators-only copy `$ElevatedDir` (:219) is made only inside `Register-ResumeTask`, which runs before a reboot (:653) and in the -Resume repair (:942), so an install or update without a restart leaves it missing or old (Get-LocalAI.ps1:1496-1497 says the same). Needed, as a change to the installer: it makes or refreshes that copy on every run that has administrator rights, and sets the copy's owner to Administrators (S-1-5-32-544), which `Set-LaiPrivateAcl` (lib/LocalAI.psm1:338) does not do. And a mock-run assertion: after an install without a restart the copy holds `Set-PCHardening.ps1` and `lib` |
+| .github/workflows/local-llm-linux.yml:66 | the SKIP line of W1 to W8, word for word as given above, under `LAI_DECLARED_SKIPS`, and the count in the comment above it (:60, nineteen today) |
+| Install-LocalAI.ps1:213, :627-636 and tests/Invoke-InstallerMockRun.ps1 | `Set-PCHardening.ps1` in `$ToolkitItems`: that copies it to the Scripts folder. It does not put it where R04 and R06 point. The administrators-only copy `$ElevatedDir` (:219) is made only inside `Register-ResumeTask`, which runs before a reboot (:653) and in the -Resume repair (:942), so an install or update without a restart leaves it missing or old (Get-LocalAI.ps1:1496-1497 says the same). Needed, as a change to the installer: it makes or refreshes that copy on every run that has administrator rights, and sets the copy's owner to Administrators (S-1-5-32-544), which `Set-LaiPrivateAcl` (lib/LocalAI.psm1:338) does not do. The copy has to lie below the folder Windows names, where the script looks for it: :219 takes `$env:ProgramFiles` today and should ask Windows as the uninstaller does (Uninstall-LocalAI.ps1:314); the mock run sets that variable for its own folder (tests/Invoke-InstallerMockRun.ps1:39) and needs another way in then. Until that change the two agree on every PC where nothing has set the variable, and where they do not, R04 and R06 say that the copy is not there. And a mock-run assertion: after an install without a restart the copy holds `Set-PCHardening.ps1` and `lib` |
 | config/agent-rules.md and tests/Invoke-InstallerMockRun.ps1:265-273 | the rules for a local agent: `Set-PCHardening.ps1 -Apply` and `-Undo` under Never (line 28 already forbids changing Windows security settings) and in the mock run's list at :265. The bare run under "Fine without asking" and in the list at :268 only if the owner wants an agent to run it; :271-273 checks that every script named exists |
-| Uninstall-LocalAI.ps1:311-339 | it deletes the administrators-only copy (:338), the one that can undo. Before that, when the store key `HKLM:\SOFTWARE\LocalAI\PCHardening` is there, it starts that copy with `-Undo -Only Apps`: the allowed programs go even if the rest stays, because an entry for a program that is gone can be filled by another. Whatever that run answers, the uninstaller goes on with its own steps. Exit code 0 (R40, nothing stored for the programs, is 0 as well): nothing more is said. Exit code 2 or 1, or a copy that is missing or does not start: the lines the copy printed stay on the screen, and the uninstaller counts one problem, which says that programs this toolkit allowed through Controlled folder access may have stayed allowed and names the page where they are taken out by hand (Windows Security > Virus & threat protection > Manage ransomware protection). With a problem the uninstaller ends with 2 itself, as for any step that failed (:378-389). Under -WhatIf the copy is not started; the plan names the step. On a test machine (R07's test) it is not started either: the copy would only refuse there, and no test may run -Undo (T42). What happens to the copy, the store and `LocalAI-Logs` depends on question 5 |
-| README.md and tests/README.md | the script (DOCPARAM checks every switch named there; MDTABLE the tables) and the suite. The README gives -Apply and -Undo by the Program Files path only, repeats the footer of section 2, gives the three exit codes, lists the 16 rule ids (R08's by-hand line points there) and gives the by-hand undo of each switch. It says that Docker Desktop and ComfyUI's python.exe are allowed only through -AllowWritable and what that costs (R26, N6), and names the ways that need no allowed program first: move ComfyUI's output folder out of Documents, and mount no protected folder into a container. And it says what Controlled folder access stops in the toolkit itself: `Start-ComfyUI.ps1 -CreateShortcut` and the uninstaller's removal of that shortcut both change the Desktop from powershell.exe and are blocked, powershell.exe is never allowed, and the owner uses the Start-menu entry of the same name or makes the Desktop shortcut in Explorer, and deletes it by hand before uninstalling |
+| Uninstall-LocalAI.ps1:311-339 | it deletes the administrators-only copy (:338), the one that can undo. Before that, when the store key `HKLM:\SOFTWARE\LocalAI\PCHardening` is there, it starts that copy with `-Undo -Only Apps`: the allowed programs go even if the rest stays, because an entry for a program that is gone can be filled by another. Whatever that run answers, the uninstaller goes on with its own steps. Exit code 0 (R40, nothing stored for the programs, is 0 as well): nothing more is said. Exit code 2 or 1, or a copy that is missing or does not start: the lines the copy printed stay on the screen, and the uninstaller counts one problem, which says that programs this toolkit allowed through Controlled folder access may have stayed allowed and names the page where they are taken out by hand (Windows Security > Virus & threat protection > Manage ransomware protection). With a problem the uninstaller ends with 2 itself, as for any step that failed (:378-389). Under -WhatIf the copy is not started; the plan names the step. On a test machine (R07's test: `LAI_SANDBOX` = 1 or `GITHUB_ACTIONS` = true) it is not started either, because no test may run -Undo. But that is never silent. No test makes the store key (W4 works on a scratch key and no test runs -Apply), so the store key together with one of those variables is a real PC on which something else set the variable; any program running as the owner can, and until this script no production script reads it. There the uninstaller counts the same one problem as for exit code 2, its line also gives the variable's name and value and R07's way to take it out, and it ends with 2: the allowed programs are still on Defender's list and the owner is told. CI is not touched by this, since the key is never there. The step is decided by one small function that takes the facts and touches nothing (the store key is there, the variable R07 found or '', -WhatIf, the copy is there, the copy's exit code or `$null`) and answers whether to start the copy and the problem line or ''. The uninstall test needs these assertions on it: key there and `LAI_SANDBOX` = 1 gives no start and a problem line that names `LAI_SANDBOX`, its value, the way to take it out and the Windows Security page; key not there gives no start and no problem, whatever the variable; key there, no variable and exit code 0 gives no problem; exit code 2, exit code 1 and a missing copy each give the problem; under -WhatIf no start and no problem. And one on the script's text: the uninstaller ends with 2 when that problem was counted. What happens to the copy, the store and `LocalAI-Logs` depends on question 5 |
+| README.md and tests/README.md | the script (DOCPARAM checks every switch named there; MDTABLE the tables) and the suite. The README gives -Apply and -Undo by the Program Files path only, repeats the footer of section 2, gives the three exit codes, lists the 16 rule ids (R08's by-hand line points there) and gives the by-hand undo of each switch. It gives every command with a path in single quotes, and says that `-AllowWritable` wants its path quoted as R26 prints it and that a value the run could not use is R28 and exit code 2. It says that the record and the list of allowed programs are read from an administrator window. It says that ComfyUI's python.exe is allowed only through -AllowWritable and what that costs (R26, N6), and names the ways that need no allowed program first: move ComfyUI's output folder out of Documents, and mount no protected folder into a container. What it says about Docker Desktop and WSL follows `Get-PchRoute` (section 5, "Docker and WSL"): with `DockerFile`, that a file of Docker Desktop is allowed only through -AllowWritable; with `Component`, that a container cannot write into a protected folder and that nothing is to be allowed for it; with `None`, and until C9 is answered, the footer's third line in plain words, that Controlled folder access is not to be counted on against a program that writes through a Docker container or WSL, and that every program running as the owner can start one. And it says what Controlled folder access stops in the toolkit itself: `Start-ComfyUI.ps1 -CreateShortcut` and the uninstaller's removal of that shortcut both change the Desktop from powershell.exe and are blocked, powershell.exe is never allowed, and the owner uses the Start-menu entry of the same name or makes the Desktop shortcut in Explorer, and deletes it by hand before uninstalling |
 | Test-PCSecurity.ps1:1076, :1084, :1085 | the two next steps may name the script once it exists; :1084's advice to protect the Backups folder depends on question 2. The Controlled folder access row passes "on" from the setting alone (:1085), also while the :966 test fails and nothing acts on the setting: there it has to WARN ("set, but Microsoft Defender is not in charge") |
 | IMPROVEMENTS.md | row 86 (5) |
 
@@ -920,7 +1115,11 @@ The antivirus (section 1) comes first. Then, with what the plan assumes until an
    program running as you past Controlled folder access, custom nodes included (R26, N6).
    Assumed: neither by itself. The table shows the row with R26, and you allow it by naming its
    path with -AllowWritable. The ways that need no allowed program: move ComfyUI's output folder
-   out of Documents, and mount no protected folder into a container.
+   out of Documents, and mount no protected folder into a container. For Docker Desktop the
+   question may fall away: it is not known yet whether Controlled folder access sees a
+   container's write at all (C9). If it does not, there is nothing to allow, and the script and
+   the README say instead that this protection does not reach containers and WSL. Until that is
+   checked the script shows no Docker row and says so.
 4. **Sign-in plug-ins.** Do you sign in with anything but a password, a PIN or built-in Windows
    Hello: a smart card, a fingerprint reader with its own software, a VPN or password tool at the
    sign-in screen? LSA protection may stop it. Assumed: no.
