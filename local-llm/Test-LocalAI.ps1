@@ -80,6 +80,17 @@ function Pass([string]$d) { @{ Status = 'PASS'; Detail = $d } }
 function Fail([string]$d) { @{ Status = 'FAIL'; Detail = $d } }
 function Warn([string]$d) { @{ Status = 'WARN'; Detail = $d } }
 function Skip([string]$d) { @{ Status = 'SKIP'; Detail = $d } }
+# Why Open WebUI is stopped on purpose, or nothing when nothing says that it is. Lock = a backup,
+# restore or update holds the volume lock and has stopped it for a few minutes (a warning: that ends
+# by itself). Otherwise the hold a failed restore left (a failure, with its reason and the way out).
+# The lock is asked first, as the health watch does: a restore still running has written its hold
+# already, but has not failed.
+function Get-WebUIStopReason {
+    if (Test-LaiVolumeLockBusy) { return @{ Lock = $true; Text = 'a backup, restore or update is running and has stopped Open WebUI for a few minutes - run the health check again when it has finished' } }
+    $hold = Get-LaiWebUIHold -AIRoot $AIRoot
+    if ($hold) { return @{ Lock = $false; Text = "kept stopped after a failed restore ($($hold['Reason'])). Recover first: $($hold['Recover'])" } }
+    return $null
+}
 # What a preset lets the assistant do that the installer switches off, from the preset's meta as Open
 # WebUI returns it (pure: reads only its argument; unit-tested in tests\Invoke-WindowsUnitTests.ps1).
 # Open WebUI treats a missing tool category as on, so a switch counts as off only when it is false: a
@@ -112,7 +123,14 @@ $script:ollamaUp = $false
 $script:engineUp = $true
 $script:webUp = $false
 $script:searxUp = $true
+# Open WebUI stopped on purpose (a backup at work, or the hold of a failed restore) is said by the
+# first check that meets it; the next one skips.
+$script:webStopSaid = $false
 $startAgain = 'Start menu > Local AI > Start again'
+# Every docker call has a time limit. A Docker Desktop that stopped answering (it can after sleep) is
+# then one failed check with what to do, not a window that waits without a word.
+$dockerLimit = Get-LaiDockerTimeout
+$hungMsg = 'Docker Desktop is not responding. Restart it (whale icon > Restart), wait for Engine running, then run this again.'
 Add-Check 'Ollama running' {
     try { $v = Get-LaiOllamaVersion -BaseUrl $ollamaUrl } catch { return (Fail "not answering on $ollamaUrl - start Ollama from the Start menu, or $startAgain") }
     $script:ollamaUp = $true
@@ -221,17 +239,17 @@ if ($CpuCheck) {
     }
 }
 
-$dockerCmd = Get-Command docker -ErrorAction SilentlyContinue
+$dockerCmd = Get-Command docker -CommandType Application -ErrorAction SilentlyContinue
 if ($NoContainers) {
     Add-Check 'Docker + containers' { Skip 'not checked (-NoContainers)' }
 } else {
     Add-Check 'Docker engine' {
         if (-not $dockerCmd) { return (Fail 'docker CLI not found') }
-        $prev = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
-        $v = (& docker version --format '{{.Server.Version}}' 2>$null); $code = $LASTEXITCODE
-        $ErrorActionPreference = $prev
-        if ($code -ne 0) { $script:engineUp = $false; return (Fail "engine not running - $startAgain (starts Docker Desktop)") }
-        Pass "engine $v"
+        $r = Invoke-LaiTimedNative -File 'docker' -Arguments @('version', '--format', '{{.Server.Version}}') -TimeoutSec $dockerLimit
+        # No answer is not 'not running': Start again cannot help a Docker Desktop that is stuck.
+        if ($r.TimedOut) { $script:engineUp = $false; return (Fail $hungMsg) }
+        if ($r.ExitCode -ne 0) { $script:engineUp = $false; return (Fail "engine not running - $startAgain (starts Docker Desktop)") }
+        Pass "engine $(([string]$r.Out).Trim())"
     }
     $containers = @('open-webui', 'searxng')
     if ($researchPort -gt 0) { $containers += 'deep-research' }
@@ -240,11 +258,22 @@ if ($NoContainers) {
         Add-Check "Container $c" {
             if ($c -eq 'searxng') { $script:searxUp = $false }
             if (-not $script:engineUp) { return (Skip 'Docker engine down') }
-            $prev = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
-            $s = (& docker inspect -f '{{.State.Status}} {{if .State.Health}}{{.State.Health.Status}}{{end}} {{.HostConfig.RestartPolicy.Name}}' $c 2>$null); $code = $LASTEXITCODE
-            $ErrorActionPreference = $prev
-            if ($code -ne 0) { return (Fail "not found - re-run the installer: double-click $(Join-Path (Join-Path $AIRoot 'Scripts') 'Install-LocalAI.cmd') and click Yes") }
-            if ($s -notmatch '^running') { return (Fail "$s - $startAgain") }
+            $r = Invoke-LaiTimedNative -File 'docker' -Arguments @('inspect', '-f', '{{.State.Status}} {{if .State.Health}}{{.State.Health.Status}}{{end}} {{.HostConfig.RestartPolicy.Name}}', $c) -TimeoutSec $dockerLimit
+            # Docker stopped answering after its engine check: said once, and the rest is skipped.
+            if ($r.TimedOut) { $script:engineUp = $false; return (Fail $hungMsg) }
+            $s = ([string]$r.Out).Trim()
+            if ($r.ExitCode -ne 0 -or $s -notmatch '^running') {
+                # Open WebUI stopped on purpose is not a container to start again or to install again.
+                $stop = $null
+                if ($c -eq 'open-webui') { $stop = Get-WebUIStopReason }
+                if ($stop) {
+                    $script:webStopSaid = $true
+                    if ($stop.Lock) { return (Warn $stop.Text) }
+                    return (Fail $stop.Text)
+                }
+                if ($r.ExitCode -ne 0) { return (Fail "not found - re-run the installer: double-click $(Join-Path (Join-Path $AIRoot 'Scripts') 'Install-LocalAI.cmd') and click Yes") }
+                return (Fail "$s - $startAgain")
+            }
             if ($c -eq 'searxng') { $script:searxUp = $true }
             if ($s -match 'unhealthy') { return (Warn $s) }
             Pass $s
@@ -305,7 +334,17 @@ if ($researchPort -gt 0) {
 
 Add-Check 'Open WebUI reachable' {
     if (-not $script:engineUp) { return (Skip 'Docker engine down') }
-    try { Wait-LaiWebUI -BaseUrl $webUrl -TimeoutSec 30 } catch { return (Fail "no answer on http://localhost:$webPort - $startAgain; if it persists: docker logs --tail 50 open-webui") }
+    if ($script:webStopSaid) { return (Skip 'Open WebUI is stopped on purpose (see Container open-webui)') }
+    try { Wait-LaiWebUI -BaseUrl $webUrl -TimeoutSec 30 } catch {
+        # Asked only now: an Open WebUI that answers is fine, whoever holds the lock. Stopped on
+        # purpose, Start again is the wrong advice (it waits for the backup, or refuses on the hold).
+        $stop = Get-WebUIStopReason
+        if ($stop) {
+            if ($stop.Lock) { return (Warn $stop.Text) }
+            return (Fail $stop.Text)
+        }
+        return (Fail "no answer on http://localhost:$webPort - $startAgain; if it persists: docker logs --tail 50 open-webui")
+    }
     $script:webUp = $true
     Pass "http://localhost:$webPort"
 }

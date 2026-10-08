@@ -10,6 +10,8 @@
     loaded and its OLLAMA_* settings, the Ollama server log tail, Docker and container states, container
     log tails, the render guard status, Open WebUI health, the config/state/report files, the watch and
     backup logs, the newest install log, free disk space and (with -RunTests) Test-LocalAI -Quick.
+    A program that gives no answer within its time limit (a Docker Desktop that stopped answering
+    after sleep) is written down as such, and the bundle is made without its parts.
 
     Redaction, applied to every file before it is zipped:
       - the exact secret values this install uses (admin password, WEBUI_SECRET_KEY, SearXNG secret,
@@ -109,19 +111,46 @@ function Protect-Text([string]$Text) {
 function Save-Part([string]$Name, [string]$Text) {
     [System.IO.File]::WriteAllText((Join-Path $work $Name), (Protect-Text $Text), (New-Object System.Text.UTF8Encoding($false)))
 }
+# Every program run for the bundle has a time limit. After sleep Docker Desktop can stop answering
+# while its commands still start: without a limit this script would wait on the first docker call
+# without a word, and no bundle would be made. A program that gave no answer is not asked again
+# (ten more docker calls would each wait for the limit): every later capture of it gets the same line.
+$dockerLimit = Get-LaiDockerTimeout
+$hungMsg = 'Docker Desktop is not responding. Restart it (whale icon > Restart), wait for Engine running, then run this again.'
+$script:noAnswer = @{}
 function Invoke-Capture([string]$File, [string[]]$Arguments) {
-    if (-not (Get-Command $File -ErrorAction SilentlyContinue)) { return "($File not found)" }
-    $prev = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
-    # docker/ollama/nvidia-smi write UTF-8: decode it as such, or a non-ASCII user name in a path is
-    # mangled and slips past the redaction.
-    $prevEnc = $null
-    try { $prevEnc = [Console]::OutputEncoding; [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false) } catch { $prevEnc = $null }
-    try { $out = @(& $File @Arguments 2>&1 | ForEach-Object { "$_" }) }
-    finally {
-        $ErrorActionPreference = $prev
-        if ($prevEnc) { try { [Console]::OutputEncoding = $prevEnc } catch { Write-Verbose 'console encoding not restored' } }
+    if ($script:noAnswer.ContainsKey($File)) { return $script:noAnswer[$File] }
+    if (-not (Get-Command $File -CommandType Application -ErrorAction SilentlyContinue)) { return "($File not found)" }
+    # Invoke-LaiTimedNative reads the output as UTF-8, which is what docker/ollama/nvidia-smi write:
+    # read as anything else, a non-ASCII user name in a path is mangled and slips past the redaction.
+    try { $r = Invoke-LaiTimedNative -File $File -Arguments $Arguments -TimeoutSec $dockerLimit }
+    catch { return "($File could not be run: $($_.Exception.Message))" }
+    if ($r.TimedOut) {
+        $script:noAnswer[$File] = "($File did not answer within $dockerLimit s)"
+        return $script:noAnswer[$File]
     }
-    return ($out -join "`n")
+    return $r.Text
+}
+function Get-LogByTime([string]$Text) {
+    # A container's log, asked for with --timestamps, in the order it was written. 'docker logs' hands
+    # over what the container wrote to stdout and to stderr separately, and Invoke-Capture returns all
+    # of the first followed by all of the second: a request and the error it led to would be far
+    # apart, with nothing to tell that from. Every line starts with its time
+    # (2026-01-02T03:04:05.123456789Z ...): sorted by that, and by where it stood for the same time.
+    # A line without one (docker's own 'No such container') keeps its place behind the line before it.
+    $lines = @($Text -split "`r?`n")
+    $keys = New-Object string[] $lines.Count
+    $last = ''
+    for ($i = 0; $i -lt $lines.Count; $i++) {
+        $m = [regex]::Match($lines[$i], '^(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)(?:\.(\d{1,9}))?(?:Z|[+-]\d\d:\d\d)(?: |$)')
+        # The fraction padded to nine digits: compared as text, .5 must not come after .25.
+        if ($m.Success) { $last = $m.Groups[1].Value + '.' + $m.Groups[2].Value.PadRight(9, '0') }
+        $keys[$i] = $last + ' ' + $i.ToString('D6')
+    }
+    # Only the keys are sorted, and each one ends in the place of its line. (Sorting the lines along
+    # with them, [Array]::Sort($keys, $lines), sorts a copy of the lines and leaves these as they were.)
+    [Array]::Sort($keys, [System.StringComparer]::Ordinal)
+    return (@($keys | ForEach-Object { $lines[[int]$_.Substring($_.LastIndexOf(' ') + 1)] }) -join "`n")
 }
 function Get-Tail([string]$Path, [int]$Lines = 200) {
     if (-not (Test-Path -LiteralPath $Path)) { return "(missing: $Path)" }
@@ -176,7 +205,7 @@ Add-Summary "Docker engine: $(($dockerVer -split "`n")[0])"
 $states = Invoke-Capture 'docker' @('ps', '-a', '--filter', 'label=com.docker.compose.project=localai', '--format', '{{.Names}}: {{.Status}} ({{.Image}})')
 Add-Summary "Containers: $(($states -split "`n" | Where-Object { $_ }) -join '; ')"
 Save-Part 'docker.txt' (@("engine: $dockerVer", '', $states, '', (Invoke-Capture 'docker' @('volume', 'ls'))) -join "`n")
-foreach ($c in @('open-webui', 'searxng', 'render-guard', 'deep-research')) { Save-Part "logs-$c.txt" (Invoke-Capture 'docker' @('logs', '--tail', '200', $c)) }
+foreach ($c in @('open-webui', 'searxng', 'render-guard', 'deep-research')) { Save-Part "logs-$c.txt" (Get-LogByTime (Invoke-Capture 'docker' @('logs', '--timestamps', '--tail', '200', $c))) }
 $guard = Invoke-Capture 'docker' @('exec', 'render-guard', 'python3', '-c', "import urllib.request;print(urllib.request.urlopen('http://127.0.0.1:11434/render-guard/status',timeout=5).read().decode())")
 Save-Part 'render-guard-status.json' $guard
 $health = Invoke-Safely { (Invoke-LaiApi -Uri "http://127.0.0.1:$webPort/health" -TimeoutSec 10) | ConvertTo-Json -Compress }
@@ -225,6 +254,9 @@ Write-Host $summaryText
 Write-Host ''
 try { Set-Clipboard -Value $summaryText; $clip = ' (summary copied to the clipboard)' } catch { $clip = '' }
 Write-LaiLog OK "Diagnostics: $zip$clip. Secrets, tokens$(if (-not $KeepNames) { ', your user and computer names and e-mail addresses' }) are redacted; still, skim it before sharing."
+if ($script:noAnswer.ContainsKey('docker')) {
+    Write-LaiLog WARN "$hungMsg The bundle was made without the Docker parts (engine, containers, their logs, the render guard status)."
+}
 if ($script:unreadableSecrets.Count) {
     Write-LaiLog WARN "Could not read $($script:unreadableSecrets -join ', ') (run this as the account that installed Local AI): the admin password may not be redacted. Check the bundle before sharing it."
 }

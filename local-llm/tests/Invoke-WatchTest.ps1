@@ -32,6 +32,26 @@ function Invoke-Watch([string[]]$Arguments = @()) {
     return ($out -join "`n")
 }
 function Get-WatchLog { $f = Join-Path (Join-Path $aiRoot 'Logs') 'watch.log'; if (Test-Path -LiteralPath $f) { return (Get-Content -Raw -LiteralPath $f) } return '' }
+# One of the toolkit's scripts in a child process, as a Start-menu shortcut runs it: what it printed
+# (errors included), its exit code and how long it took.
+function Invoke-Script([string]$Name, [string[]]$Arguments = @()) {
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    $prev = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
+    $out = (& pwsh -NoProfile -File (Join-Path $src $Name) -AIRoot $aiRoot @Arguments 2>&1 | ForEach-Object { "$_" }) -join "`n"
+    $code = $LASTEXITCODE; $ErrorActionPreference = $prev
+    return [pscustomobject]@{ Code = $code; Text = $out; Sec = $sw.Elapsed.TotalSeconds }
+}
+# The last line of a script's output that matches a pattern ('' when none does).
+function Get-LastLine([string]$Text, [string]$Pattern) {
+    return [string]@($Text -split "`n" | Where-Object { $_ -match $Pattern } | Select-Object -Last 1)
+}
+# The row a health check printed for one check.
+function Get-CheckRow([string]$Text, [string]$Check) {
+    return (Get-LastLine $Text (' (PASS|WARN|FAIL|SKIP) ' + [regex]::Escape($Check) + ': '))
+}
+# What Start again, Gaming mode and the health check say about a Docker Desktop that does not
+# answer, word for word (as a pattern).
+$hungSaid = [regex]::Escape('Docker Desktop is not responding. Restart it (whale icon > Restart), wait for Engine running, then run this again.')
 
 if (Test-Path -LiteralPath $Work) { Remove-Item -LiteralPath $Work -Recurse -Force }
 $aiRoot = Join-Path $Work 'AI'
@@ -157,8 +177,135 @@ services:
         } else {
             Assert-That ($code -eq 0 -and $out -match 'Waiting for a backup' -and $waited -ge 4 -and (Get-State 'lai-stopstart-probe') -eq $step.Want) ("{0} waited {1:N0} s for the lock, then the container is {2} (exit {3})" -f $step.Script, $waited, (Get-State 'lai-stopstart-probe'), $code)
         }
+        if ($step.Script -eq 'Stop-LocalAI.ps1') {
+            # Gaming mode stops the containers first and unloads the models after that: a chat that was
+            # still being answered would load its model again right behind an unload.
+            $stoppedAt = $out.IndexOf('Containers stopped')
+            $unloadLine = [regex]::Match($out, '\] (No model loaded|Unloaded |Still loaded after two unloads)')
+            Assert-That ($stoppedAt -ge 0 -and $unloadLine.Success -and $unloadLine.Index -gt $stoppedAt) ("Stop-LocalAI stops the containers before it unloads the models ('Containers stopped' at {0}, the unload line '{1}' at {2})" -f $stoppedAt, $unloadLine.Value, $unloadLine.Index)
+        }
         if (-not $holder.HasExited) { $holder.WaitForExit(15000) | Out-Null }
     }
+
+    Write-Host "`n=== 4b. Open WebUI stopped on purpose in the health check; a model that will not unload in gaming mode ===" -ForegroundColor Cyan
+    # Port 3999 answers nothing and there is no open-webui container: for the health check Open WebUI
+    # is down. With the hold a failed restore leaves, that is a failure with the hold's reason and its
+    # way out, not 'not found - re-run the installer' and not 'no answer - Start again' (Start again
+    # refuses on a hold). The container row says it and the row for the page skips.
+    $cfg4 = Read-LaiState -Path $cfgPath; $cfg4['WebUIPort'] = 3999; Save-LaiState -State $cfg4 -Path $cfgPath
+    $holdFile = Join-Path $aiRoot 'open-webui-hold.json'
+    ConvertTo-Json @{ Reason = 'restore and its rollback failed (4b)'; Recover = 'run the recovery command of 4b' } | Set-Content -LiteralPath $holdFile
+    $holdSaid = 'kept stopped after a failed restore \(restore and its rollback failed \(4b\)\)\. Recover first: run the recovery command of 4b'
+    $busySaid = 'a backup, restore or update is running and has stopped Open WebUI for a few minutes'
+    try {
+        $hc4 = Invoke-Script 'Test-LocalAI.ps1' @('-Quick')
+        $rowC = Get-CheckRow $hc4.Text 'Container open-webui'; $rowP = Get-CheckRow $hc4.Text 'Open WebUI reachable'
+        Assert-That ($rowC -match (' FAIL Container open-webui: ' + $holdSaid) -and $rowP -match ' SKIP Open WebUI reachable: ') "with a hold the health check fails the Open WebUI container with the hold's reason and its Recover line, once: the row for the page skips ($rowC / $rowP)"
+        # Without the container rows the row for the page says it itself.
+        $hc4 = Invoke-Script 'Test-LocalAI.ps1' @('-Quick', '-NoContainers')
+        $rowP = Get-CheckRow $hc4.Text 'Open WebUI reachable'
+        Assert-That ($rowP -match (' FAIL Open WebUI reachable: ' + $holdSaid)) "with a hold 'Open WebUI reachable' fails with the hold's reason and its Recover line, not with Start again ($rowP)"
+        # A backup, restore or update at work holds the volume lock and has stopped Open WebUI for a
+        # few minutes: a warning, also with the hold file there (a restore writes it before it has
+        # failed), so the lock is asked first. The holder is ended below, long before its 600 s.
+        Set-Content -LiteralPath $holdScript -Value ("Import-Module '{0}' -Force; `$l = Enter-LaiVolumeLock; Start-Sleep -Seconds 600; Exit-LaiVolumeLock `$l" -f (Join-Path (Join-Path $src 'lib') 'LocalAI.psm1'))
+        $holder = Start-Process -FilePath 'pwsh' -ArgumentList @('-NoProfile', '-File', $holdScript) -PassThru
+        $deadline = (Get-Date).AddSeconds(30)
+        while (-not (Test-LaiVolumeLockBusy) -and (Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 300 }
+        Assert-That (Test-LaiVolumeLockBusy) 'setup: another process holds the volume lock (4b)'
+        $hc4 = Invoke-Script 'Test-LocalAI.ps1' @('-Quick')
+        $rowC = Get-CheckRow $hc4.Text 'Container open-webui'; $rowP = Get-CheckRow $hc4.Text 'Open WebUI reachable'
+        Assert-That ($rowC -match (' WARN Container open-webui: ' + $busySaid) -and $rowP -match ' SKIP Open WebUI reachable: ') "under the volume lock the health check warns that a backup, restore or update has stopped Open WebUI, and does not fail on the hold file a running restore has written ($rowC / $rowP)"
+        $hc4 = Invoke-Script 'Test-LocalAI.ps1' @('-Quick', '-NoContainers')
+        $rowP = Get-CheckRow $hc4.Text 'Open WebUI reachable'
+        Assert-That ($rowP -match (' WARN Open WebUI reachable: ' + $busySaid)) "and 'Open WebUI reachable' warns the same way when it is the row that meets it ($rowP)"
+    } finally {
+        if ($holder -and -not $holder.HasExited) { $holder.Kill() }
+        $deadline = (Get-Date).AddSeconds(30)
+        while ((Test-LaiVolumeLockBusy) -and (Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 300 }
+        Remove-Item -LiteralPath $holdFile -Force -ErrorAction SilentlyContinue
+    }
+    # Gaming mode with containers it cannot stop: docker compose rejects the compose file, and the
+    # container of 4. goes on running. The run used to end on that error with the watch left paused
+    # for 12 hours over containers that still ran, and no line said so. The pause is now taken back,
+    # and the last line before the error says that the watch stays on.
+    $composeFile = Join-Path $stack 'docker-compose.yml'
+    $composeText = Get-Content -Raw -LiteralPath $composeFile
+    Set-Content -LiteralPath $composeFile -Value 'services: not-a-mapping'
+    try {
+        $stopF = Invoke-Script 'Stop-LocalAI.ps1'
+        $pausedF = (Read-LaiState -Path $state3).ContainsKey('pausedUntil')
+        $failF = Get-LastLine $stopF.Text '\[FAIL\] '
+        Assert-That ($stopF.Code -ne 0 -and $failF -match 'Gaming mode did not finish, and the health watch stays on: docker compose stop failed: ' -and -not $pausedF -and (Get-State 'lai-stopstart-probe') -eq 'running') ("Gaming mode that cannot stop the containers ends as failed, says that the health watch stays on, and has taken its pause back (exit {0}, paused: {1}, the container is {2}: {3})" -f $stopF.Code, $pausedF, (Get-State 'lai-stopstart-probe'), $failF)
+    } finally {
+        Set-Content -LiteralPath $composeFile -Value $composeText -NoNewline
+        Invoke-Watch @('-Unpause') | Out-Null
+    }
+    # Gaming mode against an Ollama that keeps its model listed whatever it is told (a stand-in:
+    # /api/ps always names one model, an unload is answered and changes nothing). After the second
+    # unload the model is named in a warning, and no line says it was unloaded.
+    $fakePort = 11498
+    $fakeOllama = Join-Path $Work 'fake_ollama.py'
+    @"
+import json
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+class H(BaseHTTPRequestHandler):
+    def log_message(self, *a): pass
+    def _j(self, o):
+        d = json.dumps(o).encode(); self.send_response(200); self.send_header('Content-Type', 'application/json')
+        self.send_header('Content-Length', str(len(d))); self.end_headers(); self.wfile.write(d)
+    def do_GET(self):
+        if self.path == '/api/ps': self._j({'models': [{'name': 'stuck-model:latest'}]})
+        else: self._j({'version': 'fake'})
+    def do_POST(self):
+        self.rfile.read(int(self.headers.get('Content-Length') or 0)); self._j({})
+ThreadingHTTPServer(('127.0.0.1', $fakePort), H).serve_forever()
+"@ | Set-Content -LiteralPath $fakeOllama
+    $realOllama = [string]$cfg4['OllamaUrl']
+    $fake = Start-Process -FilePath 'python3' -ArgumentList $fakeOllama -PassThru
+    try {
+        $fakeUp = $false
+        for ($i = 0; $i -lt 50 -and -not $fakeUp -and -not $fake.HasExited; $i++) {
+            try { Invoke-LaiApi -Uri "http://127.0.0.1:$fakePort/api/ps" -TimeoutSec 2 | Out-Null; $fakeUp = $true } catch { Start-Sleep -Milliseconds 200 }
+        }
+        Assert-That $fakeUp "setup: the stand-in Ollama answers on port $fakePort"
+        $cfg4['OllamaUrl'] = "http://127.0.0.1:$fakePort"; Save-LaiState -State $cfg4 -Path $cfgPath
+        $stop4 = Invoke-Script 'Stop-LocalAI.ps1'
+        $stuckLine = Get-LastLine $stop4.Text 'Still loaded after two unloads'
+        Assert-That ($stop4.Code -eq 0 -and $stuckLine -match '\[WARN\] Still loaded after two unloads: stuck-model:latest\. ' -and $stop4.Text -notmatch '\] Unloaded ' -and $stop4.Text.IndexOf('Containers stopped') -ge 0 -and $stop4.Text.IndexOf('Containers stopped') -lt $stop4.Text.IndexOf('Still loaded after two unloads')) ("a model that is still listed after the second unload is named in a warning, after the containers were stopped, and is not reported as unloaded (exit {0}, {1:N0} s: {2})" -f $stop4.Code, $stop4.Sec, $stuckLine)
+    } finally {
+        if (-not $fake.HasExited) { $fake.Kill() }
+        # That run paused the watch, and the sections below need it running.
+        Invoke-Watch @('-Unpause') | Out-Null
+        $cfg4['OllamaUrl'] = $realOllama; $cfg4['WebUIPort'] = 3000; Save-LaiState -State $cfg4 -Path $cfgPath
+    }
+
+    Write-Host "`n=== 4c. the diagnostics keep a container's log in the order it was written ===" -ForegroundColor Cyan
+    # A stand-in under deep research's container name that writes to stdout and to stderr in turn, a
+    # second apart. 'docker logs' hands the two over separately, and the bundle held all of the first
+    # followed by all of the second: which request led to which error could not be read from it. The
+    # diagnostics now ask for the time of every line and put the lines back in that order.
+    $said4c = 'first-on-stdout second-on-stderr third-on-stdout fourth-on-stderr'
+    Invoke-DockerText @('rm', '-f', 'deep-research') | Out-Null
+    Invoke-DockerText @('run', '-d', '--name', 'deep-research', '--label', 'lai-test=1', 'alpine:3.20', 'sh', '-c',
+        'echo first-on-stdout; sleep 1; echo second-on-stderr >&2; sleep 1; echo third-on-stdout; sleep 1; echo fourth-on-stderr >&2') | Out-Null
+    try {
+        $deadline = (Get-Date).AddSeconds(60)
+        while ((Get-State 'deep-research') -ne 'exited' -and (Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 500 }
+        Assert-That ((Get-State 'deep-research') -eq 'exited') "setup: the stand-in has written its four lines and ended ($(Get-State 'deep-research'))"
+        $diagOut4 = Join-Path $Work 'diag-out-4c'
+        $diag4 = Invoke-Script 'Get-LocalAIDiagnostics.ps1' @('-OutDir', $diagOut4)
+        $zip4 = @(Get-ChildItem -LiteralPath $diagOut4 -Filter 'diagnostics-*.zip' -ErrorAction SilentlyContinue)
+        $logTxt = ''
+        if ($zip4.Count -eq 1) {
+            Expand-Archive -LiteralPath $zip4[0].FullName -DestinationPath (Join-Path $Work 'diag-x-4c') -Force
+            $logPart = Join-Path (Join-Path $Work 'diag-x-4c') 'logs-deep-research.txt'
+            if (Test-Path -LiteralPath $logPart) { $logTxt = Get-Content -Raw -LiteralPath $logPart }
+        }
+        # Each of the four lines with its time in front, in the order they come in the file.
+        $order4c = @([regex]::Matches($logTxt, '(?m)^\d{4}-\d\d-\d\dT[0-9:.]+Z (first-on-stdout|second-on-stderr|third-on-stdout|fourth-on-stderr)\s*$') | ForEach-Object { $_.Groups[1].Value }) -join ' '
+        Assert-That ($diag4.Code -eq 0 -and $order4c -eq $said4c) ("the bundle's container log has stdout and stderr in the order they were written, each line with its time (exit {0}, {1} zip(s): '{2}')" -f $diag4.Code, $zip4.Count, $order4c)
+    } finally { Invoke-DockerText @('rm', '-f', 'deep-research') | Out-Null }
 
     Write-Host "`n=== 5. long-term: reminders, clock skew, backup mirror, disk hysteresis ===" -ForegroundColor Cyan
     $cfgFile = Join-Path $aiRoot 'localai-config.json'
@@ -476,18 +623,72 @@ services:
         $bl = Join-Path (Join-Path $aiRoot 'Logs') 'backup.log'
         $blog = ''; if (Test-Path -LiteralPath $bl) { $blog = Get-Content -Raw -LiteralPath $bl }
         Assert-That ($bcode -eq 1 -and $backupSec -lt 120 -and $blog -match '\[FAIL\] Docker Desktop is not responding') ("the nightly backup writes a FAIL line to backup.log and exits 1 instead of hanging (exit {0}, {1:N0} s)" -f $bcode, $backupSec)
+        # The four scripts the owner starts by hand, against the same docker that never answers. They
+        # used to wait on it without a word. Each takes the 3 s limit from LOCALAI_DOCKER_TIMEOUT, as
+        # the backup above, and must end by itself and say what to do.
+        $start7 = Invoke-Script 'Start-LocalAI.ps1'
+        Assert-That ($start7.Code -ne 0 -and $start7.Sec -lt 120 -and $start7.Text -match ('\[FAIL\] Local AI did not start: ' + $hungSaid)) ("Start again ends with FAIL and the step for a Docker Desktop that does not answer, instead of hanging (exit {0}, {1:N0} s)" -f $start7.Code, $start7.Sec)
+        # Gaming mode asks Docker before it changes anything: no pause is written for a stack it
+        # could not stop (the watch would say nothing about this Docker for 12 hours).
+        $stop7 = Invoke-Script 'Stop-LocalAI.ps1'
+        $paused7 = (Read-LaiState -Path $statePath).ContainsKey('pausedUntil')
+        Invoke-Watch @('-Unpause') | Out-Null
+        Assert-That ($stop7.Code -ne 0 -and $stop7.Sec -lt 120 -and $stop7.Text -match ('\[FAIL\] [^\n]*' + $hungSaid) -and -not $paused7) ("Gaming mode ends as failed with that step, instead of hanging, and has not paused the health watch (exit {0}, {1:N0} s, paused: {2})" -f $stop7.Code, $stop7.Sec, $paused7)
+        $hc7 = Invoke-Script 'Test-LocalAI.ps1' @('-Quick')
+        $rowE = Get-CheckRow $hc7.Text 'Docker engine'; $rowC = Get-CheckRow $hc7.Text 'Container open-webui'
+        Assert-That ($hc7.Sec -lt 180 -and $rowE -match (' FAIL Docker engine: ' + $hungSaid) -and $rowC -match ' SKIP Container open-webui: ') ("the health check fails the Docker engine check with that step and skips the container checks, instead of hanging ({0:N0} s: {1} / {2})" -f $hc7.Sec, $rowE, $rowC)
+        $diagOut = Join-Path $Work 'diag-out'
+        $diag7 = Invoke-Script 'Get-LocalAIDiagnostics.ps1' @('-OutDir', $diagOut)
+        $zip7 = @(Get-ChildItem -LiteralPath $diagOut -Filter 'diagnostics-*.zip' -ErrorAction SilentlyContinue)
+        $dockerTxt = ''
+        if ($zip7.Count -eq 1) {
+            Expand-Archive -LiteralPath $zip7[0].FullName -DestinationPath (Join-Path $Work 'diag-x') -Force
+            $dockerPart = Join-Path (Join-Path $Work 'diag-x') 'docker.txt'
+            if (Test-Path -LiteralPath $dockerPart) { $dockerTxt = Get-Content -Raw -LiteralPath $dockerPart }
+        }
+        Assert-That ($diag7.Code -eq 0 -and $diag7.Sec -lt 120 -and $zip7.Count -eq 1 -and $dockerTxt -match [regex]::Escape('(docker did not answer within 3 s)')) ("the diagnostics still make their zip, with '(docker did not answer within 3 s)' where the Docker parts would be, instead of hanging (exit {0}, {1:N0} s, {2} zip(s))" -f $diag7.Code, $diag7.Sec, $zip7.Count)
     } finally { $env:PATH = $savedPATH; $env:LOCALAI_DOCKER_TIMEOUT = '' }
     $pids = @(Get-Content -LiteralPath $pidFile -ErrorAction SilentlyContinue | Where-Object { $_ -match '^\d+$' })
     # Still running = /proc entry that is not a zombie.
     $alive = @($pids | Where-Object { (Test-Path -LiteralPath "/proc/$_/stat") -and ((Get-Content -Raw -LiteralPath "/proc/$_/stat" -ErrorAction SilentlyContinue) -notmatch '^\d+ \(.*\) Z') })
-    Assert-That ($pids.Count -ge 2 -and $alive.Count -eq 0) "every docker call that hung was stopped ($($pids.Count) started, $($alive.Count) still running)"
+    Assert-That ($pids.Count -ge 6 -and $alive.Count -eq 0) "every docker call that hung was stopped, those of Start again, Gaming mode, the health check and the diagnostics among them ($($pids.Count) started, $($alive.Count) still running)"
+
+    Write-Host "`n=== 7b. Docker answers the first question and nothing after it: the command with work to do runs out of its time ===" -ForegroundColor Cyan
+    # A docker CLI that answers the engine probe and never anything else. With LOCALAI_DOCKER_TIMEOUT
+    # at 2, a quick call has 2 s, 'compose stop' ten times that and 'compose up' twenty times.
+    $halfDir = Join-Path $Work 'half-shim'
+    New-Item -ItemType Directory -Force -Path $halfDir | Out-Null
+    $halfPids = Join-Path $halfDir 'pids.txt'
+    Set-Content -LiteralPath (Join-Path $halfDir 'docker') -Value ("#!/bin/sh`nif [ `"`$1`" = version ]; then echo 27.0.0; exit 0; fi`necho `$`$ >> '{0}'`nexec sleep 617" -f $halfPids)
+    & chmod +x (Join-Path $halfDir 'docker')
+    $savedPATH = $env:PATH
+    $env:PATH = $halfDir + [System.IO.Path]::PathSeparator + $savedPATH
+    $env:LOCALAI_DOCKER_TIMEOUT = '2'
+    try {
+        # Gaming mode has paused the watch by the time 'compose stop' gets no answer: the pause is
+        # taken back, or the watch would say nothing about this Docker for 12 hours.
+        $stop7b = Invoke-Script 'Stop-LocalAI.ps1'
+        $paused7b = (Read-LaiState -Path $statePath).ContainsKey('pausedUntil')
+        Invoke-Watch @('-Unpause') | Out-Null
+        Assert-That ($stop7b.Code -ne 0 -and $stop7b.Sec -lt 120 -and $stop7b.Text -match ('\[FAIL\] Gaming mode did not finish, and the health watch stays on: ' + $hungSaid) -and -not $paused7b) ("Gaming mode whose 'compose stop' gets no answer ends as failed with the step for Docker Desktop, and has taken its pause of the health watch back (exit {0}, {1:N0} s, paused: {2})" -f $stop7b.Code, $stop7b.Sec, $paused7b)
+        # Start again: 'compose up' may be downloading images, so running out of its time is said as
+        # that, with the next step, and not as a Docker Desktop that does not answer.
+        $start7b = Invoke-Script 'Start-LocalAI.ps1' @('-TimeoutSec', '5')
+        $fail7b = Get-LastLine $start7b.Text '\[FAIL\] '
+        Assert-That ($start7b.Code -ne 0 -and $start7b.Sec -lt 150 -and $fail7b -match 'Local AI did not start: docker compose up did not finish within 40 s\. Restart Docker Desktop ' -and $start7b.Text -notmatch $hungSaid) ("Start again whose 'compose up' does not finish says so with its time limit and the next step, not that Docker Desktop is not responding (exit {0}, {1:N0} s: {2})" -f $start7b.Code, $start7b.Sec, $fail7b)
+    } finally { $env:PATH = $savedPATH; $env:LOCALAI_DOCKER_TIMEOUT = '' }
+    $pids7b = @(Get-Content -LiteralPath $halfPids -ErrorAction SilentlyContinue | Where-Object { $_ -match '^\d+$' })
+    $alive7b = @($pids7b | Where-Object { (Test-Path -LiteralPath "/proc/$_/stat") -and ((Get-Content -Raw -LiteralPath "/proc/$_/stat" -ErrorAction SilentlyContinue) -notmatch '^\d+ \(.*\) Z') })
+    Assert-That ($pids7b.Count -ge 2 -and $alive7b.Count -eq 0) "both commands that got no answer were stopped ($($pids7b.Count) started, $($alive7b.Count) still running)"
 
     Write-Host "`n=== 8. Open WebUI up, but unable to reach Ollama (the path chats take) ===" -ForegroundColor Cyan
     # A stand-in Open WebUI on the host network that answers /health on port 3998 and has python3
     # (SearXNG's image), so the watch probes Ollama from inside it as it would from the real one.
     $pyImage = Invoke-DockerText @('inspect', '-f', '{{.Config.Image}}', 'searxng')
     Invoke-DockerText @('rm', '-f', 'open-webui') | Out-Null
-    $srv = "import http.server as h;C=type('C',(h.BaseHTTPRequestHandler,),{'do_GET':lambda s:(s.send_response(200),s.end_headers(),s.wfile.write(b'{}'))});h.HTTPServer(('127.0.0.1',3998),C).serve_forever()"
+    # It answers {"status":true}, which is what Start again waits for from Open WebUI's /health. The
+    # two quotes are written as \x22 for Python: no literal double quote goes to a native program.
+    $srv = "import http.server as h;C=type('C',(h.BaseHTTPRequestHandler,),{'do_GET':lambda s:(s.send_response(200),s.end_headers(),s.wfile.write(b'{\x22status\x22:true}'))});h.HTTPServer(('127.0.0.1',3998),C).serve_forever()"
     # Labelled as a test container: if this suite is killed before 'finally', Reset-Sandbox removes it.
     Invoke-DockerText @('run', '-d', '--name', 'open-webui', '--label', 'lai-test=1', '--network', 'host', '--entrypoint', 'python3', $pyImage, '-c', $srv) | Out-Null
     $c7 = Read-LaiState -Path $cfgFile; $c7['WebUIPort'] = 3998; $c7['WebUIOllamaUrl'] = 'http://127.0.0.1:9'; Save-LaiState -State $c7 -Path $cfgFile
@@ -508,6 +709,38 @@ services:
     Invoke-Watch @('-NoHeal') | Out-Null
     $l7 = & $lastFail
     Assert-That ($l7 -notmatch 'Chats reach Ollama') "and passes once Ollama answers at that URL ($l7)"
+    # Start again against the same stand-in. It used to print OK as soon as /health answered. It now
+    # runs the watch's probe itself and ends as failed, naming the address and the next step, when a
+    # chat could not reach Ollama; the 'Open WebUI is up' line is not printed then.
+    $upSaid = '\[OK\s*\] Open WebUI is up on '
+    $c7['WebUIOllamaUrl'] = 'http://127.0.0.1:9'; Save-LaiState -State $c7 -Path $cfgFile
+    $start8 = Invoke-Script 'Start-LocalAI.ps1' @('-TimeoutSec', '60')
+    $fail8 = Get-LastLine $start8.Text '\[FAIL\] '
+    Assert-That ($start8.Code -ne 0 -and $fail8 -match 'Local AI did not start: Open WebUI answers, but it cannot reach Ollama at http://127\.0\.0\.1:9, so chats would fail\. Restart Docker Desktop ' -and $start8.Text -notmatch $upSaid) ("Start again with an Open WebUI that cannot reach Ollama ends as failed, naming the address and restarting Docker Desktop, and does not say Open WebUI is up (exit {0}: {1})" -f $start8.Code, $fail8)
+    $c7['WebUIOllamaUrl'] = 'http://127.0.0.1:11434'; Save-LaiState -State $c7 -Path $cfgFile
+    $start8 = Invoke-Script 'Start-LocalAI.ps1' @('-TimeoutSec', '60')
+    $fail8 = Get-LastLine $start8.Text '\[FAIL\] '
+    Assert-That ($start8.Code -eq 0 -and $start8.Text -match 'Chats reach Ollama \(Open WebUI gets an answer from http://127\.0\.0\.1:11434\)' -and $start8.Text -match $upSaid) ("and ends well, saying that chats reach Ollama, once Ollama answers at that address (exit {0}; {1})" -f $start8.Code, $fail8)
+    # The render guard is on the chat path unless Open WebUI was pointed past it. One that exists and
+    # does not run (created only, here) fails Start again while the guard is in use (no address of
+    # its own in the config), and is not looked at when Open WebUI talks to Ollama directly.
+    Invoke-DockerText @('rm', '-f', 'render-guard') | Out-Null
+    Invoke-DockerText @('create', '--name', 'render-guard', '--label', 'lai-test=1', 'alpine:3.20', 'sleep', '3600') | Out-Null
+    try {
+        Assert-That ((Get-State 'render-guard') -eq 'created') "setup: a render-guard container that exists and does not run ($(Get-State 'render-guard'))"
+        $c7.Remove('WebUIOllamaUrl'); Save-LaiState -State $c7 -Path $cfgFile
+        $start8 = Invoke-Script 'Start-LocalAI.ps1' @('-TimeoutSec', '60')
+        $fail8 = Get-LastLine $start8.Text '\[FAIL\] '
+        Assert-That ($start8.Code -ne 0 -and $fail8 -match 'Local AI did not start: Open WebUI answers, but the render guard, [^\n]* is not running \(Docker says: created\)[^\n]* Restart Docker Desktop ' -and $start8.Text -notmatch $upSaid) ("with the render guard in use and not running, Start again ends as failed and says so (exit {0}: {1})" -f $start8.Code, $fail8)
+        $c7['WebUIOllamaUrl'] = 'http://127.0.0.1:11434'; Save-LaiState -State $c7 -Path $cfgFile
+        $start8 = Invoke-Script 'Start-LocalAI.ps1' @('-TimeoutSec', '60')
+        $fail8 = Get-LastLine $start8.Text '\[FAIL\] '
+        Assert-That ($start8.Code -eq 0 -and $start8.Text -match $upSaid) ("with Open WebUI pointed past the render guard, the same container does not fail Start again (exit {0}; {1})" -f $start8.Code, $fail8)
+    } finally {
+        # 8b. below wants no render guard to judge and Ollama's own address for the chat path.
+        Invoke-DockerText @('rm', '-f', 'render-guard') | Out-Null
+        $c7['WebUIOllamaUrl'] = 'http://127.0.0.1:11434'; Save-LaiState -State $c7 -Path $cfgFile
+    }
 
     Write-Host "`n=== 8b. Docker stops while Open WebUI is reported: nothing 'recovered' until its check ran and passed ===" -ForegroundColor Cyan
     # A docker CLI that answers at once that the engine is not running. With it nothing behind Docker
