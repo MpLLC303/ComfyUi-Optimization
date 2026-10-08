@@ -60,19 +60,40 @@ try {
     Invoke-DockerText @('rm', '-f', 'open-webui') | Out-Null
     Invoke-DockerText @('create', '--name', 'open-webui', 'alpine:3.20', 'sleep', '3600') | Out-Null
     $holdScript = Join-Path $Work 'hold-lock.ps1'
-    Set-Content -LiteralPath $holdScript -Value ("Import-Module '{0}' -Force; `$l = Enter-LaiVolumeLock; Start-Sleep -Seconds 120; Exit-LaiVolumeLock `$l" -f (Join-Path (Join-Path $src 'lib') 'LocalAI.psm1'))
+    Set-Content -LiteralPath $holdScript -Value ("Import-Module '{0}' -Force; `$l = Enter-LaiVolumeLock; Start-Sleep -Seconds 180; Exit-LaiVolumeLock `$l" -f (Join-Path (Join-Path $src 'lib') 'LocalAI.psm1'))
     $holder = Start-Process -FilePath 'pwsh' -ArgumentList @('-NoProfile', '-File', $holdScript) -PassThru
     $deadline = (Get-Date).AddSeconds(30)
     while (-not (Test-LaiVolumeLockBusy) -and (Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 300 }
     Assert-That (Test-LaiVolumeLockBusy) 'setup: another process holds the volume lock'
     # A restore in progress has already written its hold: still maintenance, not a failure.
     ConvertTo-Json @{ Reason = 'a restore was interrupted (or is still running)'; Recover = 'x' } | Set-Content -LiteralPath (Join-Path $aiRoot 'open-webui-hold.json')
+    # Open WebUI was reported as not working before the backup or restore began. Left alone means not
+    # checked, and not checked is not 'working again': nothing is announced and it stays reported.
+    $state3 = Join-Path $aiRoot 'watch-state.json'
+    Save-LaiState -State @{ failed = @('Open WebUI'); notified = @('Open WebUI'); notifiedAt = (Get-Date).ToString('s') } -Path $state3
+    # A notice that counts Open WebUI among what works again (the names end at the first full stop).
+    $webuiBack = { @((Get-WatchLog) -split "`n" | Where-Object { $_ -match ' NOTIFY [^\n]*(recovered|Working again:) [^.\n]*Open WebUI' }).Count }
+    $back3 = & $webuiBack
     Invoke-Watch | Out-Null
     $lastLine = @((Get-WatchLog) -split "`n" | Where-Object { $_ -and $_ -notmatch ' NOTIFY ' })[-1]
     Remove-Item -LiteralPath (Join-Path $aiRoot 'open-webui-hold.json') -Force
     Assert-That ($lastLine -match 'left alone' -and $lastLine -notmatch 'failed restore') "a restore still running is not reported as failed ($lastLine)"
+    Assert-That ((& $webuiBack) -eq $back3 -and @((Read-LaiState -Path $state3)['notified']) -contains 'Open WebUI') "an Open WebUI that was reported and is now left alone for a backup or restore is not announced as recovered, and stays reported ($((& $webuiBack) - $back3) notice(s); reported: $(@((Read-LaiState -Path $state3)['notified']) -join ', '))"
     Assert-That ((Get-State 'open-webui') -eq 'created') 'Open WebUI is not started mid-backup/restore'
     Assert-That ((Get-WatchLog) -match 'left alone') 'watch.log says it was left alone on purpose'
+    # Two were reported. SearXNG answers again while Open WebUI is still left alone: that is not 'back
+    # to normal', which would be the last word although Open WebUI has not been looked at. The notice
+    # says what recovered and what was not checked. (A fresh backup and no disk limit, so that nothing
+    # else is expected to fail; the assertion holds either way.)
+    $fresh3 = Join-Path (Join-Path $aiRoot 'Backups') ('open-webui-{0}.tar.gz' -f (Get-Date -Format 'yyyyMMdd-HHmmss'))
+    Set-Content -LiteralPath $fresh3 -Value 'x'
+    Save-LaiState -State @{ failed = @('Open WebUI', 'SearXNG'); notified = @('Open WebUI', 'SearXNG'); notifiedAt = (Get-Date).ToString('s') } -Path $state3
+    $normal3 = { @((Get-WatchLog) -split "`n" | Where-Object { $_ -match ' NOTIFY Local AI: back to normal' }).Count }
+    $normalBefore = & $normal3
+    Invoke-Watch @('-MinFreeGB', '0') | Out-Null
+    $part3 = [string]@((Get-WatchLog) -split "`n" | Where-Object { $_ -match ' NOTIFY ' })[-1]
+    Remove-Item -LiteralPath $fresh3 -Force
+    Assert-That ((& $normal3) -eq $normalBefore -and $part3 -match 'NOTIFY Local AI: partly recovered: recovered SearXNG\.[^\n]* Not checked on this run: Open WebUI\.' -and @((Read-LaiState -Path $state3)['notified']) -contains 'Open WebUI') "one of two reported recovers while the other is left alone: 'partly recovered' naming what was not checked, no 'back to normal', and Open WebUI stays reported ($((& $normal3) - $normalBefore) 'back to normal'; $part3)"
 
     Write-Host "`n=== 3b. deep research paused by a backup: left alone under the lock, woken after ===" -ForegroundColor Cyan
     # A stand-in answering on its health URL, under deep research's container name: Python's http.server
@@ -160,7 +181,7 @@ services:
     $future = Join-Path $bdir ('open-webui-{0}.tar.gz' -f (Get-Date -Format 'yyyyMMdd-HHmmss'))
     Set-Content -LiteralPath $future -Value 'x'; (Get-Item -LiteralPath $future).LastWriteTime = (Get-Date).AddDays(365)
     Invoke-Watch @('-NoHeal') | Out-Null
-    Assert-That ((& $lastFail) -match 'Backups \(open-webui-\S+ is dated \S+, in the future .*: delete it\)') "a backup dated in the future fails the check and says to delete it ($(& $lastFail))"
+    Assert-That ((& $lastFail) -match 'Backups \(no nightly backup in the last 50 h; open-webui-\S+ is dated \S+, in the future .*: delete it\)') "a backup dated in the future fails the check and says to delete it, next to the plain reason that no other backup is there ($(& $lastFail))"
     # ...also next to a fresh one (clock fixed since): it would otherwise block pruning and restores for a year.
     Set-Content -LiteralPath (Join-Path $bdir ('open-webui-{0}.tar.gz' -f (Get-Date).AddHours(-1).ToString('yyyyMMdd-HHmmss'))) -Value 'x'
     Invoke-Watch @('-NoHeal') | Out-Null
@@ -196,21 +217,23 @@ services:
     Remove-Item -LiteralPath (Join-Path $aiRoot 'backup-state.json') -Force
     # A 'back to normal' toast that fails is retried on the next run.
     Save-LaiState -State @{ failed = @('Backups'); notified = @('Backups'); notifiedAt = (Get-Date).ToString('s') } -Path $statePath
-    $env:LOCALAI_TEST_TOAST_FAIL = '1'
-    try { Invoke-Watch @('-NoHeal') | Out-Null } finally { $env:LOCALAI_TEST_TOAST_FAIL = '' }
+    Invoke-Watch @('-NoHeal', '-TestToastFail') | Out-Null
     Assert-That (@((Read-LaiState -Path $statePath)['pendingRecovered']) -contains 'Backups') 'a recovery toast that failed is kept for the next run'
     Invoke-Watch @('-NoHeal') | Out-Null
     Assert-That ((Get-WatchLog) -match 'NOTIFY Local AI: [^\n]*(recovered Backups|Working again: Backups)' -and -not (Read-LaiState -Path $statePath).ContainsKey('pendingRecovered')) 'and is sent on the next run'
     # A 'problem detected' toast that fails is not marked as delivered: the next run tries again.
     Get-ChildItem -LiteralPath $bdir -File | Remove-Item -Force
     Save-LaiState -State @{ failed = @('Backups'); notified = @() } -Path $statePath
+    Invoke-Watch @('-NoHeal', '-TestToastFail') | Out-Null
+    Assert-That (@((Read-LaiState -Path $statePath)['notified']) -notcontains 'Backups') 'a problem toast that failed is not counted as delivered'
+    # The next run sends it, with the variable set that used to make every toast fail. No hook of the
+    # watch is read from the environment any more: a program running as the owner could leave such a
+    # variable set for good, and no notification would have gone out since.
+    $before = @((Get-WatchLog) -split "`n" | Where-Object { $_ -match 'NOTIFY Local AI: problem detected' }).Count
     $env:LOCALAI_TEST_TOAST_FAIL = '1'
     try { Invoke-Watch @('-NoHeal') | Out-Null } finally { $env:LOCALAI_TEST_TOAST_FAIL = '' }
-    Assert-That (@((Read-LaiState -Path $statePath)['notified']) -notcontains 'Backups') 'a problem toast that failed is not counted as delivered'
-    $before = @((Get-WatchLog) -split "`n" | Where-Object { $_ -match 'NOTIFY Local AI: problem detected' }).Count
-    Invoke-Watch @('-NoHeal') | Out-Null
     $after = @((Get-WatchLog) -split "`n" | Where-Object { $_ -match 'NOTIFY Local AI: problem detected' }).Count
-    Assert-That ($after -eq $before + 1 -and @((Read-LaiState -Path $statePath)['notified']) -contains 'Backups') 'and is sent on the next run'
+    Assert-That ($after -eq $before + 1 -and @((Read-LaiState -Path $statePath)['notified']) -contains 'Backups') 'and is sent on the next run, also with LOCALAI_TEST_TOAST_FAIL set: that variable alone makes no toast fail'
     # (d) Disk hysteresis: 'low' clears only with 2 GB to spare above the limit.
     # The free space sits near the middle of [limit, limit + 2) (at least 0.5 GB from either edge):
     # with limit = floor(free) - 1 it could be a few MB under limit + 2, and a file written or deleted
@@ -225,6 +248,91 @@ services:
     Invoke-Watch @('-NoHeal', '-MinFreeGB', "$limit") | Out-Null
     Assert-That ((& $lastFail) -match 'Disk space') 'but after a low-space failure it needs 2 GB more before it counts as fixed (no toast flapping)'
     $c5 = Read-LaiState -Path $cfgFile; $c5.Remove('BackupMirror'); Save-LaiState -State $c5 -Path $cfgFile
+    # (e) Deep research's own nightly archive keeps failing while the Open WebUI backup is fine: one
+    # bad night is a warning in the health check, no good one for 50 h fails Backups with the reason.
+    # Port 5062 answers nothing, so 'Deep research' fails next to it; only Backups is looked at.
+    $bstatePath = Join-Path $aiRoot 'backup-state.json'
+    $w5 = @('-NoHeal', '-MinFreeGB', '0')
+    Set-Content -LiteralPath (Join-Path $bdir ('open-webui-{0}.tar.gz' -f (Get-Date -Format 'yyyyMMdd-HHmmss'))) -Value 'x'
+    $c5 = Read-LaiState -Path $cfgFile; $c5['DeepResearchPort'] = 5062; Save-LaiState -State $c5 -Path $cfgFile
+    $researchError = "tar: short read`n   on the volume"
+    $researchSaid = [regex]::Escape('tar: short read on the volume (see ' + (Join-Path (Join-Path $aiRoot 'Logs') 'backup.log') + ')')
+    Save-LaiState -State @{ researchError = $researchError; researchErrorAt = (Get-Date).ToString('s') } -Path $bstatePath
+    Invoke-Watch $w5 | Out-Null
+    Assert-That ((& $lastFail) -match ('Backups \([^\n]*last good one: none on record[^\n]*' + $researchSaid)) "a deep research backup that fails with no good one on record fails Backups, with the recorded reason on one line and the path of backup.log ($(& $lastFail))"
+    Save-LaiState -State @{ researchError = $researchError; researchOkAt = (Get-Date).AddHours(-51).ToString('s') } -Path $bstatePath
+    Invoke-Watch $w5 | Out-Null
+    Assert-That ((& $lastFail) -match ('Backups \([^\n]*' + $researchSaid)) "and so does one whose last good backup is 51 h old ($(& $lastFail))"
+    Save-LaiState -State @{ researchError = $researchError; researchOkAt = (Get-Date).AddHours(-1).ToString('s') } -Path $bstatePath
+    Invoke-Watch $w5 | Out-Null
+    Assert-That ((& $lastFail) -notmatch 'Backups') "a failure an hour after a good backup does not fail the check ($(& $lastFail))"
+    $drReported = @((Read-LaiState -Path $statePath)['notified']) -contains 'Deep research'
+    $c5 = Read-LaiState -Path $cfgFile; $c5.Remove('DeepResearchPort'); Save-LaiState -State $c5 -Path $cfgFile
+    Save-LaiState -State @{ researchError = $researchError } -Path $bstatePath
+    Invoke-Watch $w5 | Out-Null
+    Assert-That ((& $lastFail) -notmatch 'Backups') "and an old record does not either once deep research is not installed ($(& $lastFail))"
+    # Deep research was reported (its port answered nothing on three runs) and is now removed. That is
+    # not 'not checked': kept as reported it would stand in every later notice as left unchecked, and
+    # none could say 'back to normal' again.
+    Assert-That ($drReported -and @((Read-LaiState -Path $statePath)['notified']) -notcontains 'Deep research') "a reported check that is no longer part of the install is dropped, not carried as not checked (reported before: $drReported; now: $(@((Read-LaiState -Path $statePath)['notified']) -join ', '))"
+    # (f) The nightly backup found Open WebUI without chats and recorded it ('emptied'). From a state
+    # with no failures the very first run tells: the date, the last backup with chats, the command that
+    # puts it back, and that nothing is deleted. Once: the second run sends nothing.
+    # LOCALAI_TEST_TOAST_SETTING is set for the first run. It used to make the watch act as if Windows
+    # had notifications off (and record that for the health check); alone it changes nothing now.
+    $emAt = (Get-Date).AddDays(-1)
+    $emGood = 'open-webui-20260101-030000.tar.gz'
+    # The restore command is only given for a file that is in the backup folder: this one is.
+    Set-Content -LiteralPath (Join-Path $bdir $emGood) -Value 'x'
+    $emNotices = { @((Get-WatchLog) -split "`n" | Where-Object { $_ -match ' NOTIFY Local AI: problem detected: [^\n]*Open WebUI had no chats' }) }
+    Save-LaiState -State @{ emptied = @{ at = $emAt.ToString('s'); archive = 'open-webui-emptied.tar.gz'; lastGood = $emGood; users = 1; chats = 0; hadUsers = 1; hadChats = 12 } } -Path $bstatePath
+    Save-LaiState -State @{ failed = @() } -Path $statePath
+    $em0 = @(& $emNotices).Count
+    $env:LOCALAI_TEST_TOAST_SETTING = 'DisabledForUser'
+    try { Invoke-Watch $w5 | Out-Null } finally { $env:LOCALAI_TEST_TOAST_SETTING = '' }
+    $em = @(& $emNotices)
+    $emLine = ''; if ($em.Count) { $emLine = [string]$em[-1] }
+    $emSays = $emLine -match [regex]::Escape('on ' + $emAt.ToString('yyyy-MM-dd') + ' Open WebUI had no chats; the last backup with chats is ' + $emGood) -and
+        $emLine -match ('Restore-OpenWebUI\.ps1[^\n]* -Archive ' + [regex]::Escape("'" + (Join-Path $bdir $emGood) + "'")) -and $emLine -match 'nothing is deleted meanwhile'
+    Assert-That ($em.Count -eq $em0 + 1 -and $emSays) "an emptied Open WebUI is announced by the first run that sees it: the date, the last backup with chats, the restore command with that file, and that nothing is deleted ($($em.Count - $em0) notice(s): $emLine)"
+    $ws5 = Read-LaiState -Path $statePath
+    $emTold = [string]$ws5['emptiedTold']
+    Assert-That ($emTold -and @($ws5['notified']) -contains 'Backups' -and -not $ws5.ContainsKey('toastSetting')) "it is recorded as told, and LOCALAI_TEST_TOAST_SETTING alone neither drops the toast nor records a notification switch (toastSetting '$([string]$ws5['toastSetting'])')"
+    Invoke-Watch $w5 | Out-Null
+    Assert-That (@(& $emNotices).Count -eq $em0 + 1) 'the second run does not announce it again'
+    # Emptied once more on a later night (this record names the last good backup by its full path),
+    # and the notification fails: not counted as told, so the next run tells.
+    $emGood2 = Join-Path $bdir 'open-webui-20260102-030000.tar.gz'
+    Set-Content -LiteralPath $emGood2 -Value 'x'
+    Save-LaiState -State @{ emptied = @{ at = (Get-Date).ToString('s'); lastGood = $emGood2; chats = 0; hadChats = 3 } } -Path $bstatePath
+    Invoke-Watch ($w5 + @('-TestToastFail')) | Out-Null
+    $emTried = @((Get-WatchLog) -split "`n" | Where-Object { $_ -match 'NOTIFY \(toast failed\) Local AI: problem detected: [^\n]*Open WebUI had no chats' }).Count
+    Assert-That ($emTried -eq 1 -and [string](Read-LaiState -Path $statePath)['emptiedTold'] -eq $emTold) "a new emptying is announced although Backups was reported already; that notification failed, so it is not recorded as told ($emTried tried)"
+    # OS is set for this run as Windows sets it. The watch took that variable for 'this is Windows':
+    # here it then tried a real toast (which fails on Linux), and on a PC any other value in the
+    # owner's own variables sent every notice to watch.log only. It asks .NET for the platform now.
+    $savedOS = $env:OS
+    $env:OS = 'Windows_NT'
+    try { Invoke-Watch $w5 | Out-Null } finally { $env:OS = $savedOS }
+    $em = @(& $emNotices)
+    Assert-That ($em.Count -eq $em0 + 2 -and [string]$em[-1] -match (' -Archive ' + [regex]::Escape("'" + $emGood2 + "'")) -and [string](Read-LaiState -Path $statePath)['emptiedTold'] -ne $emTold) "and the next run sends it, with the full path of a file in the backup folder ($([string]$em[-1]))"
+    $osNotice = [string]@((Get-WatchLog) -split "`n" | Where-Object { $_ -match ' NOTIFY' })[-1]
+    Assert-That ($osNotice -match ' NOTIFY Local AI: problem detected: ' -and $osNotice -notmatch 'toast failed') "with OS set to Windows_NT alone it is still the plain notice of a run off Windows: the platform is not read from that variable ($osNotice)"
+    # The record names a file that exists, but outside the backup folder (as one on another drive or a
+    # share would be), and the nightly backups stopped three days ago. No restore command for a file
+    # that is not in the backup folder, and the missing nightly backup is named next to the emptying:
+    # Backups is reported already, so nothing else would say that no backup is being made.
+    $emElsewhere = Join-Path $Work 'open-webui-20260103-030000.tar.gz'
+    Set-Content -LiteralPath $emElsewhere -Value 'x'
+    Get-ChildItem -LiteralPath $bdir -File | ForEach-Object { $_.LastWriteTime = (Get-Date).AddDays(-3) }
+    Save-LaiState -State @{ emptied = @{ at = (Get-Date).AddHours(-2).ToString('s'); lastGood = $emElsewhere; chats = 0; hadChats = 3 } } -Path $bstatePath
+    Invoke-Watch $w5 | Out-Null
+    $emFail = & $lastFail
+    Assert-That ($emFail -match ('Open WebUI had no chats; the backup on record as the last one with chats, ' + [regex]::Escape($emElsewhere) + ', is not in ' + [regex]::Escape($bdir) + ' ') -and $emFail -notmatch 'Restore-OpenWebUI|-Archive ') "a recorded backup outside the backup folder is named as not being there, with no restore command ($emFail)"
+    Assert-That ($emFail -match 'Backups \([^\n]*Open WebUI had no chats[^\n]*; no nightly backup in the last 50 h') "and nightly backups that stopped meanwhile are named next to the emptying ($emFail)"
+    Remove-Item -LiteralPath $emElsewhere -Force
+    Remove-Item -LiteralPath $bstatePath -Force
+    Get-ChildItem -LiteralPath $bdir -File | Remove-Item -Force
 
     Write-Host "`n=== 6. Ollama updated itself since the presets were tuned: one notice, then quiet ===" -ForegroundColor Cyan
     # The sandbox's real Ollama stands in for one the tray app replaced; the tuning says 0.0.1.
@@ -297,14 +405,23 @@ services:
     & chmod +x (Join-Path $hangDir 'docker')
     $savedPATH = $env:PATH
     $env:PATH = $hangDir + [System.IO.Path]::PathSeparator + $savedPATH
-    $env:LOCALAI_DOCKER_TIMEOUT = '3'
+    # The 3 s limit is a parameter for the watch, which reads no hook from the environment. The backup
+    # script still takes it from LOCALAI_DOCKER_TIMEOUT, set below for its run only.
+    $w7 = @('-NoHeal', '-TestDockerTimeout', '3')
     try {
         Save-LaiState -State @{ failed = @() } -Path $statePath
         $sw = [Diagnostics.Stopwatch]::StartNew()
-        Invoke-Watch @('-NoHeal') | Out-Null
+        Invoke-Watch $w7 | Out-Null
         $watchSec = $sw.Elapsed.TotalSeconds
         $hangLine = & $lastFail
-        Assert-That ($watchSec -lt 90 -and $hangLine -match 'FAIL .*Docker \(not responding' -and @((Read-LaiState -Path $statePath)['failed']) -contains 'Docker') ("the watch reports Docker as not responding, and logs and saves its state instead of hanging ({0:N0} s: {1})" -f $watchSec, $hangLine)
+        Assert-That ($watchSec -lt 90 -and $hangLine -match 'FAIL .*Docker \(not responding \(no answer within 3 s\)' -and @((Read-LaiState -Path $statePath)['failed']) -contains 'Docker') ("the watch reports Docker as not responding, and logs and saves its state instead of hanging ({0:N0} s: {1})" -f $watchSec, $hangLine)
+        # Seen on a second run it is announced, and the next step leads with restarting Docker
+        # Desktop: Start again gets no answer from a Docker that does not answer. Case matters here:
+        # the detail in the parentheses says 'restart Docker Desktop' too, in lower case.
+        Invoke-Watch $w7 | Out-Null
+        $hungNotice = [string]@((Get-WatchLog) -split "`n" | Where-Object { $_ -match ' NOTIFY Local AI: problem detected: ' })[-1]
+        Assert-That ($hungNotice -cmatch 'Docker \(not responding[^\n]*\. Restart Docker Desktop \(whale icon > Restart\)\. ' -and $hungNotice -cnotmatch '\. Use Start menu > Local AI - Start again\. ') "for a Docker Desktop that does not answer, the notice's next step starts with restarting it, not with Start again ($hungNotice)"
+        $env:LOCALAI_DOCKER_TIMEOUT = '3'
         $sw = [Diagnostics.Stopwatch]::StartNew()
         $prev = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
         & pwsh -NoProfile -File (Join-Path $src 'Backup-OpenWebUI.ps1') -AIRoot $aiRoot -EngineWaitSec 20 2>&1 | Out-Null
@@ -331,13 +448,71 @@ services:
     $up = $false
     for ($i = 0; $i -lt 30 -and -not $up; $i++) { try { Invoke-LaiApi -Uri 'http://127.0.0.1:3998/health' -TimeoutSec 2 | Out-Null; $up = $true } catch { Start-Sleep -Seconds 1 } }
     Assert-That $up "setup: the stand-in Open WebUI answers on port 3998 ($(Get-State 'open-webui'))"
-    Invoke-Watch @('-NoHeal') | Out-Null
+    # LOCALAI_DOCKER_TIMEOUT holds something that is no number for this run. The watch read it on every
+    # run and stopped on the cast, before any check, log line or notification: one variable among the
+    # owner's own, and no scheduled run did anything from then on. It does not read it any more.
+    $ranCount = { @((Get-WatchLog) -split "`n" | Where-Object { $_ -match ' (FAIL|OK)( |$)' -and $_ -notmatch ' NOTIFY' }).Count }
+    $ran0 = & $ranCount
+    $env:LOCALAI_DOCKER_TIMEOUT = 'x'
+    try { $out7 = Invoke-Watch @('-NoHeal') } finally { $env:LOCALAI_DOCKER_TIMEOUT = '' }
+    Assert-That ((& $ranCount) -eq $ran0 + 1) "with LOCALAI_DOCKER_TIMEOUT set to 'x' alone the run still does its checks and writes its line: that variable ends no run ($((& $ranCount) - $ran0) line(s); $(($out7 -split "`n")[0]))"
     $l7 = & $lastFail
     Assert-That ($l7 -match 'Chats reach Ollama \(Open WebUI cannot reach Ollama at http://127\.0\.0\.1:9 ') "Open WebUI answering but unable to reach Ollama is a failed check that names the URL ($l7)"
     $c7['WebUIOllamaUrl'] = 'http://127.0.0.1:11434'; Save-LaiState -State $c7 -Path $cfgFile
     Invoke-Watch @('-NoHeal') | Out-Null
     $l7 = & $lastFail
     Assert-That ($l7 -notmatch 'Chats reach Ollama') "and passes once Ollama answers at that URL ($l7)"
+
+    Write-Host "`n=== 8b. Docker stops while Open WebUI is reported: nothing 'recovered' until its check ran and passed ===" -ForegroundColor Cyan
+    # A docker CLI that answers at once that the engine is not running. With it nothing behind Docker
+    # is looked at, and a check that did not run is not a check that passed: the Open WebUI reported
+    # before must not be announced as recovered the moment Docker stops. The stand-in from 8. answers
+    # again as soon as Docker does; a fresh backup and no disk limit leave nothing else to fail.
+    $downDir = Join-Path $Work 'down-shim'
+    New-Item -ItemType Directory -Force -Path $downDir | Out-Null
+    Set-Content -LiteralPath (Join-Path $downDir 'docker') -Value "#!/bin/sh`nexit 1"
+    & chmod +x (Join-Path $downDir 'docker')
+    Set-Content -LiteralPath (Join-Path $bdir ('open-webui-{0}.tar.gz' -f (Get-Date -Format 'yyyyMMdd-HHmmss'))) -Value 'x'
+    $w8 = @('-NoHeal', '-MinFreeGB', '0')
+    $notices8 = { param($Rx) @((Get-WatchLog) -split "`n" | Where-Object { $_ -match (' NOTIFY [^\n]*' + $Rx) }) }
+    # Any notice that names something as working again ('partly recovered: recovered X', 'Working again: X').
+    $againRx = '(recovered|Working again:) '
+    Save-LaiState -State @{ failed = @('Open WebUI'); notified = @('Open WebUI'); notifiedAt = (Get-Date).ToString('s') } -Path $statePath
+    $again0 = @(& $notices8 $againRx).Count
+    $savedPATH = $env:PATH
+    $env:PATH = $downDir + [System.IO.Path]::PathSeparator + $savedPATH
+    try {
+        Invoke-Watch $w8 | Out-Null
+        $down1 = & $lastFail
+        Invoke-Watch $w8 | Out-Null
+    } finally { $env:PATH = $savedPATH }
+    $ws8 = Read-LaiState -Path $statePath
+    Assert-That ($down1 -match 'FAIL [^\n]*Docker \(engine not running' -and @(& $notices8 $againRx).Count -eq $again0) "Docker down for two runs: no notice calls anything recovered ($(@(& $notices8 $againRx).Count - $again0) such notice(s); first run: $down1)"
+    Assert-That (@($ws8['notified']) -contains 'Docker' -and @($ws8['notified']) -contains 'Open WebUI') "Docker is reported on the second run, and Open WebUI, which could not be checked, stays reported (reported: $(@($ws8['notified']) -join ', '))"
+    $downNotice = [string]@(& $notices8 'Local AI: problem detected: ')[-1]
+    Assert-That ($downNotice -cmatch 'Docker \(engine not running - start Docker Desktop\)[^\n]*\. Use Start menu > Local AI - Start again\. If that does not help, restart Docker Desktop \(whale icon > Restart\) and use Start again once more\.') "for a Docker engine that is not running the next step is still Start again first ($downNotice)"
+    $back0 = @(& $notices8 'Local AI: back to normal: ').Count
+    Invoke-Watch $w8 | Out-Null
+    $back = @(& $notices8 'Local AI: back to normal: ')
+    $backLine = ''; if ($back.Count) { $backLine = [string]$back[-1] }
+    $ws8 = Read-LaiState -Path $statePath
+    Assert-That ($back.Count -eq $back0 + 1 -and $backLine -match 'recovered [^\n]*Docker' -and $backLine -match 'recovered [^\n]*Open WebUI') "Docker back and everything healthy: exactly one 'back to normal', naming Docker and Open WebUI ($($back.Count - $back0) notice(s): $backLine / $(& $lastFail))"
+    Assert-That (@(@($ws8['notified']) | Where-Object { $_ }).Count -eq 0) "and nothing is left as reported ($(@($ws8['notified']) -join ', '))"
+    # Everything is healthy here, so a disk without room and an emptied Open WebUI are the only two
+    # problems and the next step is the one for the disk. It must not offer the old backups for
+    # deletion in the very notice that says one of them holds the chats. The recorded backup is not
+    # in the folder (pruned or moved since): the notice says so, with no restore command for it.
+    $gone8 = 'open-webui-20251231-030000.tar.gz'
+    $hadState8 = Test-Path -LiteralPath $bstatePath
+    $bs8 = Read-LaiState -Path $bstatePath
+    $bs8['emptied'] = @{ at = (Get-Date).ToString('s'); lastGood = $gone8; chats = 0; hadChats = 5 }
+    Save-LaiState -State $bs8 -Path $bstatePath
+    Invoke-Watch @('-NoHeal', '-MinFreeGB', '1000000') | Out-Null
+    $full8 = [string]@(& $notices8 'Local AI: problem detected: [^\n]*Open WebUI had no chats')[-1]
+    if ($hadState8) { $bs8.Remove('emptied'); Save-LaiState -State $bs8 -Path $bstatePath } else { Remove-Item -LiteralPath $bstatePath -Force }
+    Assert-That ($full8 -match 'Disk space \([^\n]*\. Free some disk space \(unused models\)\. Keep every backup in ' -and $full8 -notmatch 'old backups') "a disk without room next to an emptied Open WebUI: the next step frees space elsewhere and says to keep every backup ($full8)"
+    Assert-That ($full8 -match ([regex]::Escape($gone8) + ', is not in ') -and $full8 -notmatch 'Restore-OpenWebUI|-Archive ') "and a recorded backup that is no longer in the backup folder gets no restore command ($full8)"
+    Get-ChildItem -LiteralPath $bdir -File | Remove-Item -Force
 
     Write-Host "`n=== 9. a lasting problem is also a banner in Open WebUI; Windows' notification switch off ===" -ForegroundColor Cyan
     # The sandbox's real Open WebUI (port 3000). A banner the owner made must survive.
@@ -369,8 +544,7 @@ services:
         Assert-That ((& $bannerLines) -eq $n9) 'the same problems again: no new sign-in, no banner rewrite'
         # Windows has notifications off for PowerShell: recorded for the health check, not retried every run.
         Save-LaiState -State @{ failed = @('Backups'); notified = @(); banner = 'Backups' } -Path $statePath
-        $env:LOCALAI_TEST_TOAST_SETTING = 'DisabledForUser'
-        try { Invoke-Watch $w9 | Out-Null } finally { $env:LOCALAI_TEST_TOAST_SETTING = '' }
+        Invoke-Watch ($w9 + @('-TestToastSetting', 'DisabledForUser')) | Out-Null
         $ws9 = Read-LaiState -Path $statePath
         Assert-That ([string]$ws9['toastSetting'] -eq 'DisabledForUser' -and @($ws9['notified']) -contains 'Backups' -and (Get-WatchLog) -match 'toast not shown, notifications are off: DisabledForUser') 'a toast Windows drops (notifications off) is logged as such, counted as told (no retry every 15 minutes), and the switch is recorded'
         $hc = (& pwsh -NoProfile -File (Join-Path $src 'Test-LocalAI.ps1') -AIRoot $aiRoot -Quick 2>&1 | ForEach-Object { "$_" }) -join "`n"
@@ -442,8 +616,7 @@ services:
         # writing it): still the same difference, so the second look announces it. Here that
         # notification fails once, and is tried again.
         Set-Content -LiteralPath $igTool -Value 'rewritten before the second look'
-        $env:LOCALAI_TEST_TOAST_FAIL = '1'
-        try { Invoke-Watch $w9 | Out-Null } finally { $env:LOCALAI_TEST_TOAST_FAIL = '' }
+        Invoke-Watch ($w9 + @('-TestToastFail')) | Out-Null
         $igFailed = @((Get-WatchLog) -split "`n" | Where-Object { $_ -match 'NOTIFY \(toast failed\) Local AI: changed outside an update' })
         Assert-That ($igFailed.Count -eq 1 -and @((& $igView)['told'] | Where-Object { $_ }).Count -eq 0 -and @((& $igView)['pending'] | Where-Object { $_ }).Count -eq 1 -and @(& $igBanner).Count -eq 0) "seen again with other content: announced all the same; that notification failed, so it is not counted as told and kept for the next run ($($igFailed.Count) tried)"
         Set-Content -LiteralPath $igTool -Value 'and rewritten once more'
@@ -598,40 +771,41 @@ services:
         # leaves has to sit in the record of the baseline it compares with, together with what was
         # just announced: left in the record of the baseline before, the next run would drop it with
         # that record, announce the same things again and start the same comparison again.
-        # The hook that ends the run is an environment variable, which any program running as the
-        # owner could set for good: it works only with the id of the baseline being compared, and
-        # the mark names it as what ended the run.
+        # The hook that ends the run is a parameter of that one run (-TestIntegrityEnd), which the
+        # scheduled task never passes; the mark names it as what ended the run. It used to be an
+        # environment variable, which any program running as the owner could set for good.
         $igOldId = [string](& $igView)['baseline']
-        $env:LOCALAI_TEST_INTEGRITY_END = [string]$ig2['id']
-        try { Invoke-Watch $w9 | Out-Null } finally { $env:LOCALAI_TEST_INTEGRITY_END = '' }
+        Invoke-Watch ($w9 + @('-TestIntegrityEnd')) | Out-Null
         $igEnded = & $igView
         Assert-That ($igOldId -and $igOldId -ne [string]$ig2['id'] -and [string]$igEnded['baseline'] -eq [string]$ig2['id'] -and [string]$igEnded['startedAt'] -and [string]$igEnded['announced'] -eq [string]$ig2['id'] -and -not $igEnded['checkedAt']) "a run ended in the middle of the first comparison with a new baseline leaves its mark under that baseline, with what it had announced (baseline $([string]$igEnded['baseline']), started $([string]$igEnded['startedAt']))"
         Assert-That ([string]$igEnded['tried'] -eq [string]$ig2['id']) "and with the word that the watch has had its turn with that baseline's list (tried $([string]$igEnded['tried']))"
         Invoke-Watch $w9 | Out-Null
         Invoke-Watch $w9 | Out-Null
         $igAfterEnd = & $igView
-        $igEndLines = @(& $igLog | Where-Object { $_ -match 'INTEGRITY not compared: [^\n]*LOCALAI_TEST_INTEGRITY_END' })
+        $igEndLines = @(& $igLog | Where-Object { $_ -match 'INTEGRITY not compared: [^\n]*-TestIntegrityEnd' })
         Assert-That (-not $igAfterEnd['checkedAt'] -and [string]$igAfterEnd['startedAt'] -eq [string]$igEnded['startedAt'] -and [string]$igAfterEnd['announced'] -eq [string]$ig2['id'] -and @(& $igNotices 'the update kept changes it did not make').Count -eq 1) "the two runs after it do not start that comparison again and do not announce again what the update kept ($(@(& $igNotices 'the update kept changes it did not make').Count) notice(s))"
-        Assert-That ([string]$igAfterEnd['skippedWhy'] -match 'LOCALAI_TEST_INTEGRITY_END' -and [string]$igAfterEnd['skippedWhy'] -match 'remove that variable' -and $igEndLines.Count -eq 1) "what ended it is named, for the health check and the notice after hours, and once in watch.log over two runs: the variable, not an installer window ($($igEndLines.Count) line(s): $([string]$igAfterEnd['skippedWhy']))"
+        Assert-That ([string]$igAfterEnd['skippedWhy'] -match '-TestIntegrityEnd' -and [string]$igAfterEnd['skippedWhy'] -match 'the scheduled task never passes it' -and $igEndLines.Count -eq 1) "what ended it is named, for the health check and the notice after hours, and once in watch.log over two runs: the test parameter, not an installer window ($($igEndLines.Count) line(s): $([string]$igAfterEnd['skippedWhy']))"
         # Now the watch's record carries the new baseline's own id, and no comparison has finished
         # under it: the health check gives the reason instead of 'on its next run'.
         $hc10 = & $igHealth
-        Assert-That ($hc10 -match 'WARN Integrity watch: [^\n]*has not compared the PC with it yet: the comparison is not running \([^\n]*LOCALAI_TEST_INTEGRITY_END[^\n]*kept 1 thing\(s\) it did not install' -and $hc10 -notmatch 'on its next run') "a comparison that never finished under the new baseline: the health check says why ($hc10)"
-        # Hours later the notice names the variable and gives no advice made for the setup lock: closing
-        # an installer window or restarting the PC changes nothing for a variable that was set for good.
+        Assert-That ($hc10 -match 'WARN Integrity watch: [^\n]*has not compared the PC with it yet: the comparison is not running \([^\n]*-TestIntegrityEnd[^\n]*kept 1 thing\(s\) it did not install' -and $hc10 -notmatch 'on its next run') "a comparison that never finished under the new baseline: the health check says why ($hc10)"
+        # Hours later the notice names the parameter and gives no advice made for the setup lock: closing
+        # an installer window or restarting the PC changes nothing about what starts the watch with it.
         $s10 = Read-LaiState -Path $statePath; $s10['integrity']['skippedSince'] = (Get-Date).AddHours(-7).ToString('s'); Save-LaiState -State $s10 -Path $statePath
         Invoke-Watch $w9 | Out-Null
         $igHookNotices = @(& $igNotices 'changes are not being checked')
         $igHookNotice = ''; if ($igHookNotices.Count) { $igHookNotice = [string]$igHookNotices[-1] }
-        Assert-That ($igHookNotices.Count -eq $igUnchecked.Count + 1 -and $igHookNotice -match 'LOCALAI_TEST_INTEGRITY_END' -and $igHookNotice -notmatch 'installer window|restart the PC') "the notice for a comparison ended by the test hook names the variable and does not send the owner to an installer window or a restart ($igHookNotice)"
+        Assert-That ($igHookNotices.Count -eq $igUnchecked.Count + 1 -and $igHookNotice -match '-TestIntegrityEnd' -and $igHookNotice -notmatch 'installer window|restart the PC') "the notice for a comparison ended by the test hook names the parameter and does not send the owner to an installer window or a restart ($igHookNotice)"
         Assert-That ($igUnchecked[0] -match 'close an installer window that is still open or restart the PC') "while the setup lock is held the notice does carry that advice ($($igUnchecked -join ' | '))"
-        # An hour after it was started the comparison is tried again, and this time it finishes: also
-        # with the variable still set to the id of the baseline before, as one set for good would be
-        # after the next update. A value that is not the id of the baseline in use ends nothing.
+        # An hour after it was started the comparison is tried again, and this time it finishes. The
+        # variable that used to end it is set for this run, to the id of the baseline in use: what a
+        # program running as the owner could read from the baseline file and leave set for good, so
+        # that no comparison ran again. Alone it ends nothing any more.
         $s10 = Read-LaiState -Path $statePath; $s10['integrity']['startedAt'] = (Get-Date).AddMinutes(-61).ToString('s'); Save-LaiState -State $s10 -Path $statePath
-        $env:LOCALAI_TEST_INTEGRITY_END = $igOldId
+        $igInUse = [string](Read-LaiIntegrityBaseline -AIRoot $aiRoot)['id']
+        $env:LOCALAI_TEST_INTEGRITY_END = $igInUse
         try { Invoke-Watch $w9 | Out-Null } finally { $env:LOCALAI_TEST_INTEGRITY_END = '' }
-        Assert-That ([string](& $igView)['checkedAt'] -and -not (& $igView)['startedAt'] -and -not (& $igView)['skippedWhy']) 'an hour later it is started again, and finishes; the variable left at the id of the baseline before does not end it'
+        Assert-That ($igInUse -and $igInUse -eq [string](& $igView)['baseline'] -and [string](& $igView)['checkedAt'] -and -not (& $igView)['startedAt'] -and -not (& $igView)['skippedWhy']) "an hour later it is started again, and finishes, also with LOCALAI_TEST_INTEGRITY_END set to the id of the baseline in use: that variable alone ends no comparison (baseline $igInUse)"
         Invoke-Watch $w9 | Out-Null
         $igKeptNotice = @(& $igNotices 'the update kept changes it did not make')
         Assert-That ($igKeptNotice.Count -eq 1 -and $igKeptNotice[0] -match '"Stack\\planted\.yml" is new' -and $igKeptNotice[0] -match 'If you did not add them' -and @(& $igFound).Count -eq 0) "the watch says so once: an addition does not drop out of every report because an update ran ($($igKeptNotice -join ' | '))"
@@ -645,8 +819,7 @@ services:
         Invoke-Watch @('-AcceptBaseline') | Out-Null
         $ig3Id = [string](Read-LaiIntegrityBaseline -AIRoot $aiRoot)['id']
         $igAccBefore = @(& $igNotices 'integrity baseline accepted').Count
-        $env:LOCALAI_TEST_INTEGRITY_END = $ig3Id
-        try { Invoke-Watch $w9 | Out-Null } finally { $env:LOCALAI_TEST_INTEGRITY_END = '' }
+        Invoke-Watch ($w9 + @('-TestIntegrityEnd')) | Out-Null
         $igEndedHand = & $igView
         Invoke-Watch $w9 | Out-Null
         $igAccNow = @(& $igNotices 'integrity baseline accepted')
@@ -665,8 +838,7 @@ services:
         Assert-That (@($ig4['accepted']).Count -eq 1 -and $igTwice1 -match 'accepted: "Stack\\planted2\.yml" is new' -and $igTwice2 -match 'accepted: "Stack\\planted2\.yml" is new' -and $igTwiceKept.Count -eq 1 -and $igTwiceKept[0]['Settled']) "-AcceptBaseline run twice before the watch's next run: the second baseline still lists what the update had kept, marked as settled ($(@($ig5['accepted'] | ForEach-Object { [string]$_['Text'] }) -join '; '))"
         # The watch has its turn with that baseline: the list goes to watch.log and into a
         # notification. Here the notification fails, as on a PC where none ever goes out.
-        $env:LOCALAI_TEST_TOAST_FAIL = '1'
-        try { Invoke-Watch $w9 | Out-Null } finally { $env:LOCALAI_TEST_TOAST_FAIL = '' }
+        Invoke-Watch ($w9 + @('-TestToastFail')) | Out-Null
         $igTurn = & $igView
         $igTurnFailed = @((Get-WatchLog) -split "`n" | Where-Object { $_ -match 'NOTIFY \(toast failed\) Local AI: integrity baseline accepted' })
         $igTurnLog = @(& $igLog | Where-Object { $_ -match 'INTEGRITY the baseline[^\n]* took in 1: "Stack\\planted2\.yml" is new' })
