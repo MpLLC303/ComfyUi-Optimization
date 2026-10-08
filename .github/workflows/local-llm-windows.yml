@@ -38,6 +38,8 @@ jobs:
       # Windows PowerShell 5.1, through -Step as the suite steps below use it: a suite that exits 0
       # but printed a SKIP line fails the step with a line that names the skip, and passes once the
       # job declares that skip. A suite's own exit code and its arguments come through as they are.
+      # And a suite that ends with exit 0 without its PASSED line fails the step: -Step knows that
+      # line by the suite's file name, so the made-up suite here carries the name of a real one.
       # Each run's output is caught (6>&1: the runner prints with Write-Host), shown, and searched.
       - name: A skipped test fails the step (test runner -Step on Windows PowerShell 5.1)
         shell: powershell
@@ -66,10 +68,18 @@ jobs:
           $kept = $LASTEXITCODE
           $shown | ForEach-Object { Write-Host $_ }
           $whole = @($shown | Where-Object { $_ -eq 'said: [two words]' }).Count
+          Write-Host '--- 4. a made-up suite with the file name of a real one that ends with exit 0 without the PASSED line of that suite: exit 1, and one ASSERT FAIL line that names the file and the line'
+          $fakeEarly = Join-Path $spaced 'Invoke-WatchTest.ps1'
+          Set-Content -LiteralPath $fakeEarly -Value @("Write-Host 'stopped before its end'", 'exit 0')
+          $shown = @(& .\local-llm\tests\Invoke-AllTests.ps1 -Step $fakeEarly 6>&1 | ForEach-Object { "$_" })
+          $early = $LASTEXITCODE
+          $shown | ForEach-Object { Write-Host $_ }
+          $missed = @($shown | Where-Object { $_ -like '*ASSERT FAIL Invoke-WatchTest.ps1 *WATCH TEST PASSED*' }).Count
           Write-Host "--- undeclared skip: exit $undeclared (wanted 1), lines that name it: $named (wanted 1)"
           Write-Host "--- declared skip: exit $declared (wanted 0), ASSERT FAIL lines: $blamed (wanted 0)"
           Write-Host "--- suite that ends with exit 3: exit $kept (wanted 3), its argument whole: $whole (wanted 1)"
-          if ($undeclared -ne 1 -or $named -ne 1 -or $declared -ne 0 -or $blamed -ne 0 -or $kept -ne 3 -or $whole -ne 1) { exit 1 }
+          Write-Host "--- suite that ends with exit 0 without its PASSED line: exit $early (wanted 1), lines that name it: $missed (wanted 1)"
+          if ($undeclared -ne 1 -or $named -ne 1 -or $declared -ne 0 -or $blamed -ne 0 -or $kept -ne 3 -or $whole -ne 1 -or $early -ne 1 -or $missed -ne 1) { exit 1 }
           exit 0
 
       - name: Static checks (5.1 parser, ASCII, PSScriptAnalyzer 5.1 profile, 5.1 pitfall scan)
