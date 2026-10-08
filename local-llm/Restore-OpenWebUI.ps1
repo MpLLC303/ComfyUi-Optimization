@@ -17,6 +17,12 @@
          fails, the container is left stopped and the exact recovery command is printed.
     A machine-wide lock stops the scheduled backup from running at the same time.
 
+    A backup carries the settings of its day, so once Open WebUI is back this install's own are
+    applied again: its Ollama connection, sign-up off, and on the toolkit's presets no past-chat
+    search, no code execution and (uncensored ones) no web search without being asked. An archive
+    the nightly backup marked -EMPTY (made after the data was wiped) is never picked by itself;
+    naming one with -Archive asks first.
+
 .EXAMPLE
     .\Restore-OpenWebUI.ps1                                   # newest daily backup
 .EXAMPLE
@@ -217,6 +223,13 @@ if (-not $Archive) {
     $Archive = $newest.FullName
 }
 if (-not (Test-Path -LiteralPath $Archive)) { throw "Archive not found: $Archive" }
+# An archive the nightly backup set aside because the database had lost its users or chats (a wiped
+# volume). It is never picked above; named on purpose, it gets a question of its own first.
+$leaf = Split-Path -Leaf $Archive
+if ($leaf -like '*-EMPTY.tar.gz') {
+    Write-LaiLog WARN "$leaf was set aside by the nightly backup: Open WebUI's data was already wiped when it was made, so restoring it brings back an (almost) empty Open WebUI. Without -Archive the newest backup that still has the data is used."
+    if (-not $Force -and (Read-Host 'Type YES to restore this emptied backup all the same') -cne 'YES') { Write-LaiLog INFO 'Nothing changed.'; exit 1 }
+}
 if (-not $Force) {
     $info = Get-Item -LiteralPath $Archive
     Write-LaiLog WARN ("This replaces ALL current Open WebUI data (chats, memories, knowledge, settings) with {0} from {1}." -f $info.Name, $info.LastWriteTime.ToString('yyyy-MM-dd HH:mm'))
@@ -391,13 +404,18 @@ if ($script:restoreFailed) { exit 1 }
 Clear-Hold 'Earlier failed restore cleared: Open WebUI may run again'
 
 # 4. Wait for Open WebUI.
+# Why step 5 did not put this install's safety settings back; '' once it has.
+$notReapplied = 'Open WebUI was not running, so its settings could not be reached'
 if ($stoppedContainers.Count -gt 0) {
     $config = Read-LaiState -Path (Join-Path $AIRoot 'localai-config.json')
     $port = 3000
     if ($config.ContainsKey('WebUIPort')) { $port = [int]$config['WebUIPort'] }
     $up = $false
     try { Wait-LaiWebUI -BaseUrl "http://127.0.0.1:$port" -TimeoutSec 300; Write-LaiLog OK "Open WebUI is back on http://localhost:$port"; $up = $true }
-    catch { Write-LaiLog WARN "Data restored, but Open WebUI did not answer within 5 minutes: check 'docker logs --tail 100 $Container'." }
+    catch {
+        Write-LaiLog WARN "Data restored, but Open WebUI did not answer within 5 minutes: check 'docker logs --tail 100 $Container'."
+        $notReapplied = 'Open WebUI did not answer'
+    }
 
     # 5. The restored database carries the settings from when the backup was taken, including the
     # Ollama connection: a backup from before the render guard points straight at Ollama. Put the
@@ -413,10 +431,58 @@ if ($stoppedContainers.Count -gt 0) {
             if (Set-LaiWebUIOllamaUrl -BaseUrl "http://127.0.0.1:$port" -Token $token -OllamaUrl $expected) {
                 Write-LaiLog OK "Re-applied this install's Ollama connection ($expected) to the restored settings"
             }
+            # The same goes for what keeps your chats on this PC. A backup from before the toolkit
+            # turned them off brings back sign-up for anyone who reaches the page, presets whose model
+            # can search and read every past chat or run code, and uncensored presets that search the
+            # web without being asked. A try of its own: an error here is not a failed sign-in.
+            try {
+                $base = "http://127.0.0.1:$port"
+                Set-LaiWebUIAdminConfig -BaseUrl $base -Token $token -Changes @{ ENABLE_SIGNUP = $false } | Out-Null
+                if ((Invoke-LaiApi -Uri "$base/api/v1/auths/admin/config" -Token $token).ENABLE_SIGNUP -ne $false) { throw "Open WebUI did not keep 'sign-up off'" }
+                $catalogPath = Join-Path (Join-Path $PSScriptRoot 'config') 'models.psd1'
+                if ($env:LOCALAI_TEST_CATALOG) { $catalogPath = $env:LOCALAI_TEST_CATALOG }
+                $changed = @()
+                foreach ($m in (Get-LaiCatalog -Path $catalogPath -IncludeTrials).Models) {
+                    $existing = Get-LaiWebUIModel -BaseUrl $base -Token $token -Id $m.Preset
+                    # Not in the restored data (never set up, or deleted): nothing to make safe, and
+                    # Set-LaiWebUIModel would create it.
+                    if (-not $existing) { continue }
+                    # The whole preset as Open WebUI returned it, so everything else on it is kept.
+                    $form = ConvertTo-LaiHashtable $existing
+                    if ($form['meta'] -isnot [hashtable]) { $form['meta'] = @{} }
+                    $meta = $form['meta']
+                    # Open WebUI takes a missing switch as ON, so a missing set of them is made.
+                    foreach ($set in 'builtinTools', 'capabilities') { if ($meta[$set] -isnot [hashtable]) { $meta[$set] = @{} } }
+                    $was = @()
+                    if ($meta['builtinTools']['chats'] -ne $false) { $was += 'past-chat search' }
+                    if ($meta['builtinTools']['code_interpreter'] -ne $false -or $meta['capabilities']['code_interpreter'] -ne $false) { $was += 'code execution' }
+                    # The official presets search by default (the installer sets that); the others only when asked.
+                    $auto = @($meta['defaultFeatureIds'] | Where-Object { $_ })
+                    if (-not $m.Official -and $auto.Count -gt 0) { $was += 'on by default: ' + ($auto -join ', ') }
+                    if ($was.Count -eq 0) { continue }
+                    $meta['builtinTools']['chats'] = $false
+                    $meta['builtinTools']['code_interpreter'] = $false
+                    $meta['capabilities']['code_interpreter'] = $false
+                    if (-not $m.Official) { $meta['defaultFeatureIds'] = @() }
+                    $form['id'] = $m.Preset
+                    if ($null -eq $form['params']) { $form['params'] = @{} }
+                    Set-LaiWebUIModel -BaseUrl $base -Token $token -Model $form | Out-Null
+                    $changed += "$($m.Display) ($($was -join ', '))"
+                }
+                $what = 'the presets already had past-chat search and code execution off'
+                if ($changed.Count -gt 0) { $what = 'turned off on the restored presets: ' + ($changed -join '; ') }
+                Write-LaiLog OK "Re-applied this install's safety settings to the restored data: sign-up off; $what"
+                $notReapplied = ''
+            } catch { $notReapplied = $_.Exception.Message }
         } catch {
             Write-LaiLog WARN (("Could not sign in with {0}: the restored data has the admin password from when the backup was taken. " -f $credFile) +
                 'Run Set-OpenWebUIPassword.ps1 -PromptCurrent (type that old password), then re-run Install-LocalAI.ps1 to re-apply presets and the render guard.')
+            $notReapplied = 'the sign-in failed (set the password right first, as said above)'
         }
     }
+}
+if ($notReapplied) {
+    Write-LaiLog WARN ("The restored data has the settings from when the backup was taken, and this install's safety settings (sign-up off; past-chat search, code execution and unasked web search off on the presets) were not put back: $notReapplied. " +
+        'To put them back, run Start menu > Local AI - Update toolkit')
 }
 exit 0
