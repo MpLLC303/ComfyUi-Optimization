@@ -56,16 +56,22 @@ $ErrorActionPreference = 'Stop'
 [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
 Import-Module (Join-Path (Join-Path $PSScriptRoot 'lib') 'LocalAI.psm1') -Force
 
-# -CatalogPath and -WebUIWaitSec are handed on only when given: without them Test-LocalAI.ps1 and
-# Restore-OpenWebUI.ps1 keep their own defaults. The catalog is looked at before anything is
-# changed (the scripts that read it run after the update, or in the middle of a rollback) and kept
-# as a full path.
-$catalogArgs = @{}
+# -CatalogPath and -WebUIWaitSec go to the restore of a rollback only when given: without them
+# Restore-OpenWebUI.ps1 keeps its own defaults. A catalog that was given is looked at before
+# anything is changed (the scripts that read it run after the update, or in the middle of a
+# rollback) and kept as a full path.
+# The health check (Test-LocalAI.ps1) is always handed a catalog: the one given, else the toolkit's
+# own, which is the file it takes by itself. Left to pick one, it looks in the environment for a
+# test catalog first, so an update that named none still took a test hook from there: with that
+# variable naming a file that is not there, every update and every rollback ended on a health
+# check that could not start (a failed update, and no older image removed).
+$restoreArgs = @{}
+$healthArgs = @{ CatalogPath = (Join-Path (Join-Path $PSScriptRoot 'config') 'models.psd1') }
 if ($CatalogPath) {
     if (-not (Test-Path -LiteralPath $CatalogPath -PathType Leaf)) { throw "The models catalog given with -CatalogPath was not found: $CatalogPath. Nothing was changed." }
-    $catalogArgs['CatalogPath'] = (Resolve-Path -LiteralPath $CatalogPath).ProviderPath
+    $restoreArgs['CatalogPath'] = (Resolve-Path -LiteralPath $CatalogPath).ProviderPath
+    $healthArgs['CatalogPath'] = $restoreArgs['CatalogPath']
 }
-$restoreArgs = $catalogArgs.Clone()
 if ($PSBoundParameters.ContainsKey('WebUIWaitSec')) { $restoreArgs['WebUIWaitSec'] = $WebUIWaitSec }
 
 $stack = Join-Path $AIRoot 'Stack'
@@ -248,7 +254,7 @@ if ($Rollback) {
         throw "$why. To return to Open WebUI $cur and the data from just before this rollback: Update-OpenWebUI.ps1 -Version $cur -SkipBackup first, then Restore-OpenWebUI.ps1 -Archive $(ConvertTo-LaiPsQuoted $safetyNew.FullName)"
     }
     Write-UpdateLog OK "Rolled back to Open WebUI $((Invoke-LaiApi -Uri "http://127.0.0.1:$port/api/version").version)"
-    & (Join-Path $PSScriptRoot 'Test-LocalAI.ps1') -AIRoot $AIRoot -Quick @catalogArgs
+    & (Join-Path $PSScriptRoot 'Test-LocalAI.ps1') -AIRoot $AIRoot -Quick @healthArgs
     exit $LASTEXITCODE
 }
 
@@ -384,7 +390,7 @@ $running = (Invoke-LaiApi -Uri "http://127.0.0.1:$port/api/version").version
 Write-UpdateLog OK "Open WebUI $running is up on http://localhost:$port (was $current)"
 if ($pre -and $Version) { Write-UpdateLog INFO "If this version misbehaves: Update-OpenWebUI.ps1 -Rollback (back to $current with the data from $($pre.Name))" }
 
-& (Join-Path $PSScriptRoot 'Test-LocalAI.ps1') -AIRoot $AIRoot -Quick @catalogArgs
+& (Join-Path $PSScriptRoot 'Test-LocalAI.ps1') -AIRoot $AIRoot -Quick @healthArgs
 $testExit = $LASTEXITCODE
 if ($testExit -eq 0 -and $Version) {
     # Each Open WebUI image is several GB and Docker's disk image never shrinks by itself: keep the

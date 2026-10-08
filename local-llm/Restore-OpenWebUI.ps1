@@ -107,9 +107,16 @@ function Invoke-Docker {
 # folders in the staging tree, and this swap (the rollback to the safety backup, or the restore run
 # again) starts by clearing that tree. They go back to their place first, where the second run
 # finds them. Best effort (|| true): it only saves a download, and must never stop a restore.
-# The archive is unpacked next to the staging tree (.restore-partial) and renamed, so the staging
-# tree only ever holds a complete one: a models folder taken back from it is whole, never the
-# first part of one from an older archive (those still carry the models) whose unpacking was cut off.
+# The archive is unpacked next to the staging tree (.restore-partial), checked there and only then
+# renamed, so the staging tree only ever holds a complete tree that passed the check: a models
+# folder taken back from it is whole, never the first part of one from an older archive (those
+# still carry the models) whose unpacking was cut off, and never that of an archive the check
+# turned down (checked after the rename, such a tree was the staging tree when the sweep below
+# ran, and its models went into a volume that had none).
+# The 'rm' after the unpacking: a backup made while one of the two trees sat in the volume (a
+# sweep that could not run) carries it, and the second run cannot move a folder named
+# .restore-staging onto the staging tree itself: it failed after the old data was gone, and so did
+# the rollback, whose safety backup carried the folder as well.
 # $sweepScript is how the first run begins (the models back to their place, both trees gone). It is
 # also run by itself after an unpacking that failed or was cut off, so that what it left in the
 # volume does not stay there.
@@ -120,8 +127,9 @@ $sweepScript = 'set -e; ' +
     'mkdir -p /data/${m%/*} && mv /data/.restore-staging/$m /data/$m || true; fi; fi; done; ' +
     'rm -rf /data/.restore-staging /data/.restore-partial'
 $extractScript = $sweepScript + '; mkdir /data/.restore-partial; ' +
-    'tar xzf /restore.tar.gz -C /data/.restore-partial; mv /data/.restore-partial /data/.restore-staging; ' +
-    'test -f /data/.restore-staging/webui.db'
+    'tar xzf /restore.tar.gz -C /data/.restore-partial; ' +
+    'rm -rf /data/.restore-partial/.restore-staging /data/.restore-partial/.restore-partial; ' +
+    'test -f /data/.restore-partial/webui.db; mv /data/.restore-partial /data/.restore-staging'
 $moveScript = 'set -e; test -d /data/.restore-staging; ' +
     'for m in cache/embedding/models cache/whisper/models; do if [ -d /data/$m ]; then if [ ! -e /data/.restore-staging/$m ]; then ' +
     'mkdir -p /data/.restore-staging/${m%/*}; mv /data/$m /data/.restore-staging/$m; fi; fi; done; ' +
@@ -129,8 +137,29 @@ $moveScript = 'set -e; test -d /data/.restore-staging; ' +
     'cd /data/.restore-staging; find . -mindepth 1 -maxdepth 1 -exec mv {} /data/ \; ; ' +
     'cd /; rmdir /data/.restore-staging'
 # Both in one run, for deep research (one container, no hold): its branch below swaps the check
-# 'test -f /data/.restore-staging/webui.db' in this text for its own.
+# 'test -f /data/.restore-partial/webui.db' in this text for its own.
 $swapScript = $extractScript + '; ' + $moveScript
+
+# The two runs of Invoke-Swap have a name each (per volume), so that a run can be ended. Ending the
+# docker client (Ctrl+C, a closed window) does not end the container it started: the helper went on
+# unpacking, or moving data, with nothing waiting for it. After a stopped unpacking the volume was
+# swept and Open WebUI started while it ran, and it then left its staging tree next to the live
+# data, where every backup from then on carried it.
+$helperName = 'localai-restore-' + ($Volume -replace '[^A-Za-z0-9_.-]', '-')
+$helperRuns = @("${helperName}-unpack", "${helperName}-move")
+function Stop-SwapHelper {
+    # Ends a run of the helper that is still there. $true when Docker says none is running any
+    # more (asked, not read off 'rm': what that answers for a container that is already gone
+    # differs between Docker versions). Never throws: 'finally' calls it.
+    try {
+        Invoke-Docker -Arguments (@('rm', '-f') + $helperRuns) -AllowFail | Out-Null
+        $left = Invoke-Docker -Arguments @('ps', '-q', '--filter', "name=$helperName") -AllowFail
+        return [bool]($left.ExitCode -eq 0 -and -not $left.Text.Trim())
+    } catch {
+        Write-Verbose "the helper could not be looked for: $($_.Exception.Message)"
+        return $false
+    }
+}
 
 function Invoke-Swap {
     # extractOpen: the first run was started and the second was not, so what it unpacked may sit in
@@ -139,12 +168,16 @@ function Invoke-Swap {
     # is cleared once the second run is through: while it is set, the volume may be half replaced,
     # and 'finally' starts nothing on it.
     param([string]$ArchivePath)
+    # One helper on the volume at a time: a run an earlier restore left behind (its window was
+    # closed), or one whose docker client gave up while the container ran on, is ended first. It
+    # would hold its name, and it would write into the tree this swap builds.
+    Stop-SwapHelper | Out-Null
     $script:extractOpen = $true
-    Invoke-Docker -Arguments @('run', '--rm', '-v', "${Volume}:/data", '-v', "${ArchivePath}:/restore.tar.gz:ro", $img, 'sh', '-c', $extractScript) | Out-Null
+    Invoke-Docker -Arguments @('run', '--rm', '--name', $helperRuns[0], '-v', "${Volume}:/data", '-v', "${ArchivePath}:/restore.tar.gz:ro", $img, 'sh', '-c', $extractScript) | Out-Null
     $script:volumeTouched = $true
     $script:swapOpen = $true
     $script:extractOpen = $false
-    Invoke-Docker -Arguments @('run', '--rm', '-v', "${Volume}:/data", $img, 'sh', '-c', $moveScript) | Out-Null
+    Invoke-Docker -Arguments @('run', '--rm', '--name', $helperRuns[1], '-v', "${Volume}:/data", $img, 'sh', '-c', $moveScript) | Out-Null
     $script:swapOpen = $false
 }
 
@@ -163,6 +196,8 @@ $volumeTouched = $false
 $script:swapOpen = $false
 $script:extractOpen = $false
 $safety = $null
+# Set once the rollback to the safety backup begins: 'finally' then speaks of a stopped rollback.
+$rollbackStarted = $false
 $holdPath = Join-Path $AIRoot 'open-webui-hold.json'
 $script:holdArchive = ''
 $script:recoverCmd = ''
@@ -208,9 +243,9 @@ if ($DeepResearch) {
         Write-LaiLog WARN ("This replaces ALL current deep research data (accounts, research history, reports) with {0} from {1}." -f $source.Name, $source.LastWriteTime.ToString('yyyy-MM-dd HH:mm'))
         if ((Read-Host 'Type YES to restore') -cne 'YES') { Write-LaiLog INFO 'Nothing changed.'; exit 1 }
     }
-    $rSwap = $swapScript.Replace('test -f /data/.restore-staging/webui.db', 'test -d /data/.restore-staging/encrypted_databases')
+    $rSwap = $swapScript.Replace('test -f /data/.restore-partial/webui.db', 'test -d /data/.restore-partial/encrypted_databases')
     # Putting the earlier data back: whatever it held (it may have been a fresh, empty install).
-    $rBack = $swapScript.Replace('test -f /data/.restore-staging/webui.db', 'true')
+    $rBack = $swapScript.Replace('test -f /data/.restore-partial/webui.db', 'true')
     if ($rSwap -eq $swapScript -or $rBack -eq $swapScript) { throw 'Internal error: the swap script changed; nothing was done.' }
     $wasRunning = $false
     $policy = ''
@@ -351,6 +386,12 @@ try {
         throw "Container '$Container' does not keep its data in volume '$Volume'; refusing to restore into the wrong place."
     }
 
+    # A helper an earlier restore left running in the volume (its window was closed during the
+    # swap, or Docker did not stop it) is ended by its name before the volume is read or written.
+    # Found only in step 3, among the containers that use the volume, it would be writing while the
+    # safety backup is taken, then be waited on for 30 seconds and 'started again' at the end.
+    Stop-SwapHelper | Out-Null
+
     # 2. Safety backup (verified, never pruned or mirrored here).
     $volumeExists = (Invoke-Docker -Arguments @('volume', 'inspect', $Volume) -AllowFail).ExitCode -eq 0
     if (-not $volumeExists) {
@@ -391,7 +432,8 @@ try {
     # again and the installer from starting Open WebUI, says how to finish, and holds the original
     # policies the recovery puts back. Cleared on success, after a rollback that worked, and on a
     # failure before the old data was touched (that includes an archive that did not unpack). It
-    # stays when the swap's second run failed without a rollback or was stopped (Ctrl+C).
+    # stays when the swap's second run failed without a rollback, or when that run or the rollback
+    # after it was stopped (Ctrl+C).
     $priorHold = Test-Path -LiteralPath $holdPath
     if (-not $priorHold) {
         $script:recoverCmd = "& $(ConvertTo-LaiPsQuoted (Join-Path $PSScriptRoot 'Restore-OpenWebUI.ps1')) -AIRoot $(ConvertTo-LaiPsQuoted $AIRoot) -Archive $(ConvertTo-LaiPsQuoted (Get-Item -LiteralPath $Archive).FullName) -SkipSafetyBackup"
@@ -434,6 +476,14 @@ try {
         if ($safety) {
             Write-LaiLog WARN "Rolling back to the safety backup $($safety.Name)"
             $rolledBack = $false
+            # From here on the way out is the safety backup, not the archive whose swap has just
+            # failed. Set before the rollback starts, not only once it has failed: a rollback that
+            # is stopped (Ctrl+C) skips its 'catch', and 'finally' then records and prints this
+            # command. It used to be the one for the archive that had just failed, and the safety
+            # backup, which holds the newest data, was offered as a command nowhere.
+            $script:recoverCmd = "& $(ConvertTo-LaiPsQuoted (Join-Path $PSScriptRoot 'Restore-OpenWebUI.ps1')) -AIRoot $(ConvertTo-LaiPsQuoted $AIRoot) -Archive $(ConvertTo-LaiPsQuoted $safety.FullName) -SkipSafetyBackup"
+            $script:holdArchive = $safety.FullName
+            $rollbackStarted = $true
             try {
                 Invoke-Swap $safety.FullName
                 Write-LaiLog OK 'Rollback complete: the volume is as it was before the restore.'
@@ -441,8 +491,6 @@ try {
             }
             catch {
                 Write-LaiLog FAIL "Rollback failed too: $($_.Exception.Message)"
-                $script:recoverCmd = "& $(ConvertTo-LaiPsQuoted (Join-Path $PSScriptRoot 'Restore-OpenWebUI.ps1')) -AIRoot $(ConvertTo-LaiPsQuoted $AIRoot) -Archive $(ConvertTo-LaiPsQuoted $safety.FullName) -SkipSafetyBackup"
-                $script:holdArchive = $safety.FullName
                 Write-LaiLog FAIL "Open WebUI is left STOPPED (the health watch will not start it). Recover with: $script:recoverCmd"
                 # Hold the list first, clear it, then record: if writing the hold fails (full disk), the
                 # 'finally' below must still not start Open WebUI on the damaged volume.
@@ -474,6 +522,16 @@ try {
     }
     $script:restoreFailed = $true
 } finally {
+    # A run of the helper may still be going: Ctrl+C ends the docker client, not the container it
+    # started (see $helperName). Ended first, before anything is swept, started or recorded: what
+    # is said below about the volume is then true of a volume nothing writes to any more. A helper
+    # that could not be seen to stop changes nothing in what follows: it deletes none of the old
+    # data in its first run, and the hold below is recorded either way in its second.
+    if ($script:extractOpen -or $script:swapOpen) {
+        if (-not (Stop-SwapHelper)) {
+            Write-LaiLog WARN "Could not make sure that the restore's helper container ($($helperRuns -join ' or ')) has stopped: Docker did not answer, or did not remove it. It may still be working in volume '$Volume'. The next restore stops it before it changes anything."
+        }
+    }
     # The archive did not unpack, or its unpacking was stopped (Ctrl+C): what it had unpacked by
     # then sits in the volume. None of the old data was deleted for it, but it can be GBs, Open
     # WebUI would start next to it, and every backup from then on would carry it. Best effort,
@@ -504,11 +562,21 @@ try {
                 if (-not $script:holdArchive) { $script:holdArchive = [string]$holdNow['Archive'] }
             }
             if (-not $script:recoverCmd) { $script:recoverCmd = "& $(ConvertTo-LaiPsQuoted (Join-Path $PSScriptRoot 'Restore-OpenWebUI.ps1')) -AIRoot $(ConvertTo-LaiPsQuoted $AIRoot) -Archive $(ConvertTo-LaiPsQuoted $source.FullName) -SkipSafetyBackup" }
+            # What was stopped: the restore itself, or the rollback after its swap had failed (the way
+            # out is then the safety backup, which 'catch' set before the rollback began).
+            # A stopped rollback may not have come to replacing anything yet (it unpacks first), but
+            # the swap that failed before it has.
+            $holdWhy = 'a restore was stopped while it replaced the data'
+            $stoppedWhat = "The restore was stopped while it replaced the data in volume '$Volume', which may be half replaced."
+            if ($rollbackStarted) {
+                $holdWhy = 'the rollback of a failed restore was stopped before it was through'
+                $stoppedWhat = "The rollback to the safety backup was stopped before it was through, so the data in volume '$Volume' may still be half replaced."
+            }
             # The watch is named only once the hold is on record: without one it would start Open WebUI.
             $watchNote = ''
-            try { Set-Hold 'a restore was stopped while it replaced the data' $held; $watchNote = ' (the health watch will not start it)' }
+            try { Set-Hold $holdWhy $held; $watchNote = ' (the health watch will not start it)' }
             catch { Write-LaiLog FAIL "Could not record the hold ($($_.Exception.Message)): do NOT start Open WebUI until the restore succeeds." }
-            Write-LaiLog FAIL "The restore was stopped while it replaced the data in volume '$Volume', which may be half replaced. Open WebUI is left STOPPED${watchNote}. Recover with: $script:recoverCmd"
+            Write-LaiLog FAIL "$stoppedWhat Open WebUI is left STOPPED${watchNote}. Recover with: $script:recoverCmd"
         }
     } else {
         foreach ($c in $stoppedContainers) {
