@@ -29,8 +29,18 @@
     SearXNG, started with a settings.yml as old as an existing install's (older than the image),
     answers a JSON search as its unprivileged user on a read-only filesystem, and its log names no
     file it could not write and no missing privilege; deep research (-DeepResearch) answers and
-    reaches Ollama through the guard; after all of that no container was ended by its memory limit
-    or restarted. Last, the stack is taken down with its volumes and nothing of it may remain.
+    reaches Ollama through the guard; a chat made through Open WebUI's API survives a backup, the
+    loss of the container and its volume, and a restore (Backup-OpenWebUI.ps1 and Restore-OpenWebUI.ps1
+    run as a real install runs them, in a sandbox install folder, -Work; the stack is started again
+    on the restored volume and the same chat is read back by its id); after all of that no container
+    was ended by its memory limit or restarted. Last, the stack is taken down with its volumes and
+    nothing of it may remain.
+
+    The .env does not repeat the compose file's fallbacks: the ports are the ones passed to this
+    script (CI passes others than the defaults), the guard's size cap is 300 MiB and its ComfyUI
+    address another one, and the checks read each back from the running containers (published
+    ports, WEBUI_URL and SEARXNG_BASE_URL in the environment, the guard's status page), so a
+    variable the compose file misnames or hard-codes fails here and is not covered by a fallback.
 
     The containers have fixed names (open-webui, searxng, render-guard, deep-research), so this
     cannot share a Docker engine with the other suites or with a real install: it refuses to start
@@ -80,6 +90,32 @@ function Get-DockerJson([string[]]$DockerArgs) {
 }
 function Invoke-Compose([string[]]$ComposeArgs) {
     return (Invoke-DockerCli (@('compose', '--project-directory', $stack, '-f', $composeFile) + $ComposeArgs))
+}
+function Invoke-ToolkitScript([string]$Name, [string[]]$ScriptArgs) {
+    # One of the toolkit's own scripts in a child PowerShell, aimed at the sandbox install folder in
+    # $Work. All of its output is collected into a variable before the exit code is read, so the code
+    # is the script's and not that of a pipeline stage cut short.
+    $prev = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
+    try {
+        $o = @(& pwsh -NoProfile -File (Join-Path $src $Name) -AIRoot $Work @ScriptArgs 2>&1 | ForEach-Object { "$_" })
+        $c = $LASTEXITCODE
+    } finally { $ErrorActionPreference = $prev }
+    return [pscustomobject]@{ Code = $c; Text = ($o -join "`n") }
+}
+function Assert-ScriptExit([string]$What, $Result) {
+    # Exit 0 or, for the reader of the CI log, everything the script printed and the log it keeps
+    # (quoted, as the runner expects of a passing test's quotes of product output), then the test
+    # stops: nothing below a backup or restore that did not happen can be judged.
+    Assert-That ($Result.Code -eq 0) "$What exits 0 (exit $($Result.Code))"
+    if ($Result.Code -eq 0) { return }
+    Write-Host "  $What printed:" -ForegroundColor Yellow
+    foreach ($line in @($Result.Text -split "`n")) { Write-Host "    | $line" }
+    $log = Join-Path (Join-Path $Work 'Logs') 'backup.log'
+    if (Test-Path -LiteralPath $log) {
+        Write-Host "  $log says:" -ForegroundColor Yellow
+        foreach ($line in @(Get-Content -Encoding UTF8 -LiteralPath $log)) { Write-Host "    | $line" }
+    }
+    throw "$What failed (exit $($Result.Code)); what it printed and Logs/backup.log are above"
 }
 function Get-StackContainers {
     $ids = @((Invoke-DockerCli @('ps', '-a', '-q', '--filter', 'label=com.docker.compose.project=localai')).Out | Where-Object { $_ -match '^[0-9a-f]{12,64}$' })
@@ -187,6 +223,11 @@ $rwView = "import json,os;k=('/proc','/sys','/dev');m=[l.split() for l in open('
 # them), sent to the render guard the way Open WebUI sends its chats. The model does not exist, so
 # Ollama takes the whole request and then says so. Prints what was sent and the answer.
 $chatMB = 64
+# Settings written to .env that are NOT the compose file's own fallbacks (256 MiB; Comfy Desktop and
+# the portable build on 8000 and 8188), so a variable the compose file misnames or hard-codes shows
+# in the guard's status page below. Both are above what the chat sent below needs.
+$guardCapMiB = 300
+$comfyUrl = 'http://host.docker.internal:18188'
 $bigChat = "import json,http.client;n=$chatMB*1024*1024;b=json.dumps({'model':'stack-smoke-no-such-model','stream':False,'messages':[{'role':'user','content':'What is in this picture?','images':['A'*n]}]}).encode();c=http.client.HTTPConnection('render-guard',11434,timeout=300);c.request('POST','/api/chat',body=b,headers={'Content-Type':'application/json'});r=c.getresponse();print(json.dumps({'sent':len(b),'code':r.status,'body':r.read(300).decode('utf-8','replace')}))"
 # Run inside a container: the most memory it has held since it started, as its control group
 # recorded it (empty where the kernel does not keep that number).
@@ -245,6 +286,8 @@ try {
         WEBUI_ADMIN_PASSWORD = $adminPassword
         OLLAMA_BASE_URL      = 'http://render-guard:11434'
         RENDER_GUARD_MODE    = 'cpu'
+        RENDER_GUARD_MAX_BODY_MIB = [string]$guardCapMiB
+        COMFYUI_URLS         = $comfyUrl
     }
     $research = Get-LaiDeepResearchEnv -Enabled ([bool]$DeepResearch) -Port $ResearchPort
     foreach ($k in $research.Keys) { $values[$k] = $research[$k] }
@@ -382,6 +425,14 @@ try {
         $open = @($others | Where-Object { Test-TcpPort $_ $port })
         Assert-That ($open.Count -eq 0) "port $port does not answer on this machine's other addresses ($($others -join ', '); open on: $($open -join ', '))"
     }
+    # The ports above only prove the ports mapping. Open WebUI and SearXNG also build the address
+    # they call themselves from the same two .env values, in the environment the engine gave them
+    # (from the inspect output read above: the fallback would be 3000 and 8888).
+    $owuiEnv = @($owui.Config.Env | ForEach-Object { [string]$_ })
+    $sxContainer = @($containers | Where-Object { (Get-ServiceName $_) -eq 'searxng' }) | Select-Object -First 1
+    $sxEnv = @(); if ($sxContainer) { $sxEnv = @($sxContainer.Config.Env | ForEach-Object { [string]$_ }) }
+    Assert-That ($owuiEnv -ccontains "WEBUI_URL=http://localhost:$WebUIPort") "Open WebUI knows its own address from .env: WEBUI_URL=http://localhost:$WebUIPort (its WEBUI_URL: $(@($owuiEnv | Where-Object { $_ -like 'WEBUI_URL=*' }) -join ', '))"
+    Assert-That ($sxEnv -ccontains "SEARXNG_BASE_URL=http://localhost:$SearxngPort/") "SearXNG knows its own address from .env: SEARXNG_BASE_URL=http://localhost:$SearxngPort/ (its SEARXNG_BASE_URL: $(@($sxEnv | Where-Object { $_ -like 'SEARXNG_BASE_URL=*' }) -join ', '))"
 
     # ---- Open WebUI --------------------------------------------------------------------------------
     # Root in its container but, as shown above, without a single capability: it must still start,
@@ -404,10 +455,13 @@ try {
     $r = Invoke-InContainer 'render-guard' "import urllib.request;print(urllib.request.urlopen('http://127.0.0.1:11434/render-guard/status',timeout=10).read().decode())"
     $status = ConvertFrom-ExecJson $r
     Assert-That ($r.Code -eq 0 -and $status -and $status.config.mode -eq 'cpu' -and $status.config.upstream -eq 'http://host.docker.internal:11434') "the render guard answers its status page (mode $($status.config.mode), upstream $($status.config.upstream))"
-    # The guard takes one chat up to its size cap (RENDER_GUARD_MAX_BODY_MIB in .env; 256 MiB when it
-    # is not set, as here) and answers a larger one itself with HTTP 413. A cap too small for the
-    # chat sent below is said here, not by that chat coming back as 'render-guard:'.
-    Assert-That ($status -and [int64]$status.config.max_body_bytes -gt ($chatMB * 1MB)) "the guard's size cap for one chat ($([int]([int64]$status.config.max_body_bytes / 1MB)) MB) is above the $chatMB MB chat sent below"
+    # The guard takes one chat up to its size cap (RENDER_GUARD_MAX_BODY_MIB in .env: $guardCapMiB MiB
+    # here, 256 MiB when it is not set) and answers a larger one itself with HTTP 413. Both settings
+    # are compared exactly, so a variable the compose file misnames or hard-codes shows here. The
+    # cap is above the $chatMB MB chat sent below, so a wrong cap is said here and not by that chat
+    # coming back as 'render-guard:'.
+    Assert-That ($status -and [int64]$status.config.max_body_bytes -eq ($guardCapMiB * 1MB)) "the guard's size cap for one chat is the $guardCapMiB MiB that .env sets, not the 256 MiB it falls back to (status page: $($status.config.max_body_bytes) bytes, wanted $($guardCapMiB * 1MB))"
+    Assert-That ($status -and (@($status.config.comfyui_urls) -join ',') -eq $comfyUrl) "the guard looks for ComfyUI at exactly the address .env sets, not at the two it falls back to (status page: $(@($status.config.comfyui_urls) -join ', '); wanted $comfyUrl)"
     $r = Invoke-InContainer 'render-guard' "import urllib.request;print(urllib.request.urlopen('http://127.0.0.1:11434/api/version',timeout=10).read().decode())"
     $guardVer = ConvertFrom-ExecJson $r
     Assert-That ($r.Code -eq 0 -and $guardVer -and [string]$guardVer.version -eq $ollamaVersion) "the guard reaches Ollama on the host: /api/version through it is $ollamaVersion (exit $($r.Code), $(@($r.Out | Select-Object -Last 1) -join ''))"
@@ -490,6 +544,70 @@ try {
         $reach = Test-LaiResearchOllama -OllamaUrl 'http://render-guard:11434' -Container 'deep-research'
         Assert-That $reach.Ok "the deep research container reaches Ollama through the guard ($($reach.Message))"
     }
+
+    # ---- backup, wipe, restore: a chat survives the loss of its volume -----------------------------
+    # A restore of real data had never run on the real stack: the other suites restore into Open WebUI
+    # from pip or into an empty volume. The toolkit's own scripts run here, on this stack, in the
+    # sandbox install folder $Work (its Stack\.env names the image Backup's database check runs).
+    # This section is under no condition, and nothing in it prints a skip.
+    Write-Host "`n=== backup, wipe, restore ===" -ForegroundColor Cyan
+    $chatTitle = 'stack-smoke-' + [guid]::NewGuid().ToString('N').Substring(0, 12)
+    # The shape the web app sends: a title, the messages, and the history they hang in.
+    $chatBody = @{ chat = @{ title = $chatTitle; messages = @(); history = @{ messages = @{}; currentId = $null } } }
+    $chatId = ''; $chatErr = ''; $chatRead = $null
+    try {
+        $created = Invoke-LaiApi -Method POST -Uri "$webui/api/v1/chats/new" -Token $token -Body $chatBody -TimeoutSec 30
+        $chatId = [string]$created.id
+        $chatRead = Invoke-LaiApi -Uri "$webui/api/v1/chats/$chatId" -Token $token -TimeoutSec 30
+    } catch { $chatErr = $_.Exception.Message }
+    Assert-That ($chatId -and $chatRead -and [string]$chatRead.id -eq $chatId -and [string]$chatRead.title -eq $chatTitle) "a chat made through Open WebUI's API is read back by its id with its title (id '$chatId', title '$($chatRead.title)', wanted '$chatTitle'; $chatErr)"
+    if (-not $chatId -or -not $chatRead) { throw 'there is no chat to carry through the backup' }
+
+    $backupDir = Join-Path $Work 'Backups'
+    $backup = Invoke-ToolkitScript 'Backup-OpenWebUI.ps1' @()
+    Assert-ScriptExit 'Backup-OpenWebUI.ps1' $backup
+    $archives = @(Get-ChildItem -LiteralPath $backupDir -Filter 'open-webui-*.tar.gz' -ErrorAction SilentlyContinue | ForEach-Object { $_.FullName })
+    Assert-That ($archives.Count -eq 1) "the backup made exactly one open-webui archive in $backupDir ($(@($archives | ForEach-Object { Split-Path -Leaf $_ }) -join ', '))"
+    # The deep check opened the archived database with SQLite in a throwaway volume and counted what it holds.
+    $deep = [regex]::Match($backup.Text, 'database OK \((\d+) users, (\d+) chats\)')
+    $deepChats = 0; if ($deep.Success) { $deepChats = [int]$deep.Groups[2].Value }
+    $deepSays = (@($backup.Text -split "`n" | Where-Object { $_ -like '*Backup *' -or $_ -like '*Deep check*' } | ForEach-Object { $_.Trim() }) -join ' | ')
+    Assert-That ($deep.Success -and $deepChats -ge 1) "the archived database passes SQLite's check and holds at least the chat made above ($deepSays)"
+    if ($archives.Count -ne 1) { throw 'there is no single archive to restore' }
+    $archive = [string]$archives[0]
+    $archiveName = Split-Path -Leaf $archive
+
+    # Judged before the container is removed: removing it erases whether the memory limit or a
+    # restart ever touched it. The backup stopped it and started it again.
+    $r = Invoke-DockerCli @('inspect', '--format', '{{.State.Status}}|{{.State.OOMKilled}}|{{.RestartCount}}', 'open-webui')
+    $state = [string](@($r.Out) | Select-Object -Last 1)
+    Assert-That ($r.Code -eq 0 -and $state -eq 'running|false|0') "after the backup stopped and started it, open-webui is running, was not ended for exceeding its memory limit and never restarted (state|out of memory|restarts: $state)"
+
+    # The wipe: the container and the volume with everything in it.
+    $rm = Invoke-DockerCli @('rm', '-f', 'open-webui')
+    $rmVolume = Invoke-DockerCli @('volume', 'rm', 'open-webui')
+    $still = @((Invoke-DockerCli @('ps', '-a', '--format', '{{.Names}}')).Out | Where-Object { $_ -eq 'open-webui' }) +
+        @((Invoke-DockerCli @('volume', 'ls', '--format', '{{.Name}}')).Out | Where-Object { $_ -eq 'open-webui' })
+    Assert-That ($rm.Code -eq 0 -and $rmVolume.Code -eq 0 -and $still.Count -eq 0) "the open-webui container and volume are gone (rm exit $($rm.Code), volume rm exit $($rmVolume.Code), still there: $($still.Count))"
+
+    # Restore makes the volume again (with plain docker, not compose) and starts nothing, as there is
+    # no container to stop; the stack is started below.
+    $restore = Invoke-ToolkitScript 'Restore-OpenWebUI.ps1' @('-Archive', $archive, '-Force')
+    Assert-ScriptExit 'Restore-OpenWebUI.ps1' $restore
+    Assert-That ($restore.Text.Contains("now holds $archiveName")) "the restore says the open-webui volume now holds $archiveName"
+    $up2 = Invoke-Compose @('up', '-d', '--remove-orphans')
+    Assert-That ($up2.Code -eq 0) "docker compose up -d --remove-orphans starts Open WebUI again on the restored volume (exit $($up2.Code))"
+    if ($up2.Code -ne 0) { throw "compose up after the restore failed: $(@($up2.Out | Select-Object -Last 5) -join ' | ')" }
+    # The archive leaves out the models Open WebUI downloads for document search: this start fetches them again.
+    Wait-LaiWebUI -BaseUrl $webui -TimeoutSec 600
+    $tokenAfter = ''; $signErr = ''
+    try { $tokenAfter = Connect-LaiWebUI -BaseUrl $webui -Email $adminEmail -Password $adminPassword } catch { $signErr = $_.Exception.Message }
+    $verAfter = ''
+    try { $verAfter = [string](Invoke-LaiApi -Uri "$webui/api/version" -TimeoutSec 15).version } catch { $verAfter = $_.Exception.Message }
+    Assert-That ($verAfter -eq $webuiTag.TrimStart('v') -and [bool]$tokenAfter) "Open WebUI answers again with the pinned version and the admin signs in ($verAfter$signErr)"
+    $chatBack = $null; $backErr = ''
+    try { $chatBack = Invoke-LaiApi -Uri "$webui/api/v1/chats/$chatId" -Token $tokenAfter -TimeoutSec 30 } catch { $backErr = $_.Exception.Message }
+    Assert-That ($chatBack -and [string]$chatBack.id -eq $chatId -and [string]$chatBack.title -eq $chatTitle) "the chat is back after the restore: read by id '$chatId' with the title '$chatTitle' (got '$($chatBack.title)'; $backErr)"
 
     # ---- after all of the above: no limit ended a container --------------------------------------
     Write-Host "`n=== after the checks ===" -ForegroundColor Cyan

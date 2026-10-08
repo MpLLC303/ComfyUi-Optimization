@@ -285,7 +285,10 @@ function Get-SuitesForChange {
         if ($f -match '^(lib/|config/|stack/docker-compose\.yml$|stack/searxng/|stack/openwebui-tools/|tests/Reset-Sandbox\.ps1$|tests/models\.test\.psd1$)') { return $all }
         if ($f -match '\.md$') { continue }   # documentation: the static checks read it
         if ($f -eq 'tests/Invoke-AllTests.ps1') { $pick += 'Harness'; continue }
-        if ($f -like 'stack/render-guard/*' -or $f -eq 'tests/test_render_guard.py') { $pick += @('RenderGuard', 'Mock'); continue }
+        # The guard's own code also runs in front of a real Ollama in Integration, the only suite that does;
+        # its test file does not (that suite never reads it).
+        if ($f -like 'stack/render-guard/*') { $pick += @('RenderGuard', 'Mock', 'Integration'); continue }
+        if ($f -eq 'tests/test_render_guard.py') { $pick += @('RenderGuard', 'Mock'); continue }
         $leaf = Split-Path -Leaf $f
         $hit = @($Suites | Where-Object { (Split-Path -Leaf $_.File) -eq $leaf } | ForEach-Object { $_.Name })
         $hit += @($texts.Keys | Where-Object { $texts[$_] -match [regex]::Escape($leaf) })
@@ -420,6 +423,8 @@ if ($SelfTest) {
         @{ Files = @('Watch-LocalAI.ps1'); Has = @('Static', 'Unit', 'Watch', 'Mock'); Not = @('Integration', 'ModelUpdate'); Why = 'the watch: its suite, the unit smoke runs, the mock run (the installer registers it)' }
         @{ Files = @('Update-Models.ps1'); Has = @('ModelUpdate', 'Mock'); Why = 'a script the installer runs: its suite and the mock run' }
         @{ Files = @('Test-LocalAI.ps1'); Has = @('Acceptance'); Why = 'the checklist is the Acceptance suite' }
+        @{ Files = @('stack/render-guard/render_guard.py'); Want = 'Static,RenderGuard,Mock,Integration'; Why = 'the guard: its own test, the mock run and the one suite that runs it in front of a real Ollama' }
+        @{ Files = @('tests/test_render_guard.py'); Want = 'Static,RenderGuard,Mock'; Why = 'the guard test file: no real Ollama run reads it' }
         @{ Files = @('No-Such-Script.ps1'); Want = (@($suites | ForEach-Object { $_.Name }) -join ','); Why = 'a file no suite names: everything' }
     )
     foreach ($c in $cases) {
