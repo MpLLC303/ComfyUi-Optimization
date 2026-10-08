@@ -234,7 +234,11 @@ if ($backups.Count -gt 0) { Add-Summary ("Newest backup: {0} ({1:N0} h old), {2}
 if ($RunTests) {
     $prev = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
     $exe = 'powershell.exe'; if ($PSVersionTable.PSEdition -ne 'Desktop') { $exe = 'pwsh' }
-    $t = @(& $exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot 'Test-LocalAI.ps1') -AIRoot $AIRoot -Quick 2>&1 | ForEach-Object { "$_" })
+    # -LockWaitSec 30: with Open WebUI down while the volume lock is held, the health check waits
+    # for that lock, 600 s unless told otherwise. Its output is caught here, so this window would
+    # say nothing for those ten minutes. After 30 s the row fails with words that say the wait was
+    # too short to tell, and that the health check run by itself waits the full time.
+    $t = @(& $exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot 'Test-LocalAI.ps1') -AIRoot $AIRoot -Quick -LockWaitSec 30 2>&1 | ForEach-Object { "$_" })
     $ErrorActionPreference = $prev
     Save-Part 'test-localai.txt' ($t -join "`n")
     $verdict = $t | Where-Object { $_ -match 'V1 COMPLETE|checks failed' } | Select-Object -Last 1

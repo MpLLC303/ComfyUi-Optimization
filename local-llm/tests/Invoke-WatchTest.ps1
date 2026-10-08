@@ -196,7 +196,7 @@ services:
     $holdFile = Join-Path $aiRoot 'open-webui-hold.json'
     ConvertTo-Json @{ Reason = 'restore and its rollback failed (4b)'; Recover = 'run the recovery command of 4b' } | Set-Content -LiteralPath $holdFile
     $holdSaid = 'kept stopped after a failed restore \(restore and its rollback failed \(4b\)\)\. Recover first: run the recovery command of 4b'
-    $busySaid = 'a backup, restore or update is running and has stopped Open WebUI for a few minutes'
+    $busySaid = 'Open WebUI is down and the volume lock was still held after the 3 s this check was told to wait \(-LockWaitSec\)'
     try {
         $hc4 = Invoke-Script 'Test-LocalAI.ps1' @('-Quick')
         $rowC = Get-CheckRow $hc4.Text 'Container open-webui'; $rowP = Get-CheckRow $hc4.Text 'Open WebUI reachable'
@@ -206,19 +206,22 @@ services:
         $rowP = Get-CheckRow $hc4.Text 'Open WebUI reachable'
         Assert-That ($rowP -match (' FAIL Open WebUI reachable: ' + $holdSaid)) "with a hold 'Open WebUI reachable' fails with the hold's reason and its Recover line, not with Start again ($rowP)"
         # A backup, restore or update at work holds the volume lock and has stopped Open WebUI for a
-        # few minutes: a warning, also with the hold file there (a restore writes it before it has
-        # failed), so the lock is asked first. The holder is ended below, long before its 600 s.
+        # few minutes. The health check waits for a held lock (-LockWaitSec, 3 s here) and then
+        # fails with the lock's words, never a warning: a run with Open WebUI stopped must not end
+        # with 0 failures. Also with the hold file there (a restore writes it before it has
+        # failed): the lock is still asked before the hold file, so the words are the lock's, not
+        # the hold's. The holder is ended below, long before its 600 s.
         Set-Content -LiteralPath $holdScript -Value ("Import-Module '{0}' -Force; `$l = Enter-LaiVolumeLock; Start-Sleep -Seconds 600; Exit-LaiVolumeLock `$l" -f (Join-Path (Join-Path $src 'lib') 'LocalAI.psm1'))
         $holder = Start-Process -FilePath 'pwsh' -ArgumentList @('-NoProfile', '-File', $holdScript) -PassThru
         $deadline = (Get-Date).AddSeconds(30)
         while (-not (Test-LaiVolumeLockBusy) -and (Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 300 }
         Assert-That (Test-LaiVolumeLockBusy) 'setup: another process holds the volume lock (4b)'
-        $hc4 = Invoke-Script 'Test-LocalAI.ps1' @('-Quick')
+        $hc4 = Invoke-Script 'Test-LocalAI.ps1' @('-Quick', '-LockWaitSec', '3')
         $rowC = Get-CheckRow $hc4.Text 'Container open-webui'; $rowP = Get-CheckRow $hc4.Text 'Open WebUI reachable'
-        Assert-That ($rowC -match (' WARN Container open-webui: ' + $busySaid) -and $rowP -match ' SKIP Open WebUI reachable: ') "under the volume lock the health check warns that a backup, restore or update has stopped Open WebUI, and does not fail on the hold file a running restore has written ($rowC / $rowP)"
-        $hc4 = Invoke-Script 'Test-LocalAI.ps1' @('-Quick', '-NoContainers')
+        Assert-That ($rowC -match (' FAIL Container open-webui: ' + $busySaid) -and $rowP -match ' SKIP Open WebUI reachable: ') "under a held volume lock the health check waits the 3 s it was told to and then fails the Open WebUI container with the lock's words, also with the hold file a running restore has written, once: the row for the page skips ($rowC / $rowP)"
+        $hc4 = Invoke-Script 'Test-LocalAI.ps1' @('-Quick', '-NoContainers', '-LockWaitSec', '3')
         $rowP = Get-CheckRow $hc4.Text 'Open WebUI reachable'
-        Assert-That ($rowP -match (' WARN Open WebUI reachable: ' + $busySaid)) "and 'Open WebUI reachable' warns the same way when it is the row that meets it ($rowP)"
+        Assert-That ($rowP -match (' FAIL Open WebUI reachable: ' + $busySaid)) "and 'Open WebUI reachable' fails the same way, after the same wait, when it is the row that meets it ($rowP)"
     } finally {
         if ($holder -and -not $holder.HasExited) { $holder.Kill() }
         $deadline = (Get-Date).AddSeconds(30)

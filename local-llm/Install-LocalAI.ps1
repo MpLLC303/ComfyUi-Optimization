@@ -1374,7 +1374,7 @@ Invoke-Stage 'Preflight' {
     if ($otherModelDir -and $inUseOwn) {
         $inUseContent = Get-ModelFolderContent -Path $inUse
         $lookedAt = ($inUseContent -ne 'link')
-        $notLookedWhy = 'it is, or lies behind, a junction or symbolic link, which the installer does not follow with administrator rights'
+        $notLookedWhy = 'it is or lies behind a junction or symbolic link, or has one at or under its manifests folder, and the installer follows no link with administrator rights'
     }
     if ($otherModelDir -and -not $lookedAt) {
         $byList = Get-OllamaListedContent -OllamaUrl $OllamaUrl
