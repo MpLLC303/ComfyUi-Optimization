@@ -39,7 +39,10 @@ param(
     [string]$CatalogPath = '',
     # For the Linux integration harness, where Open WebUI is not a container.
     [switch]$NoContainers,
-    [switch]$CpuCheck
+    [switch]$CpuCheck,
+    # Seconds to wait, when Open WebUI is found down while a backup, restore or update holds the
+    # volume lock, for that work to finish before Open WebUI is judged (they stop it for minutes).
+    [int]$LockWaitSec = 600
 )
 $ErrorActionPreference = 'Stop'
 Import-Module (Join-Path (Join-Path $PSScriptRoot 'lib') 'LocalAI.psm1') -Force
@@ -81,16 +84,45 @@ function Pass([string]$d) { @{ Status = 'PASS'; Detail = $d } }
 function Fail([string]$d) { @{ Status = 'FAIL'; Detail = $d } }
 function Warn([string]$d) { @{ Status = 'WARN'; Detail = $d } }
 function Skip([string]$d) { @{ Status = 'SKIP'; Detail = $d } }
-# Why Open WebUI is stopped on purpose, or nothing when nothing says that it is. Lock = a backup,
-# restore or update holds the volume lock and has stopped it for a few minutes (a warning: that ends
-# by itself). Otherwise the hold a failed restore left (a failure, with its reason and the way out).
-# The lock is asked first, as the health watch does: a restore still running has written its hold
-# already, but has not failed.
+# Why Open WebUI is down, for the row that found it so: always the words of a failure (Text), never
+# of a warning. A backup, restore or update holds the volume lock while it works and stops Open WebUI
+# for a few minutes, so a held lock is waited for, -WaitSec seconds at most, and the row then looks
+# at Open WebUI once more (Waited). The wait is all a held lock is good for. Any program of this user
+# can hold that lock and stop the container, nothing says who holds it or since when, and while a
+# held lock made the row a warning, a run with Open WebUI stopped ended with '0 failures' for as
+# long as somebody held it. Text is, in this order: the lock, when it is still held at the end of
+# the wait; the hold a failed restore left, with its reason and the way out; else -Otherwise, what
+# the row itself saw. Known says that it is one of the first two. The lock is asked first, as the
+# health watch does: a restore still running has written its hold already, but has not failed.
+# -EnoughSec is what any backup, restore or update finishes within (the default of -LockWaitSec):
+# only a wait of at least that long says that the lock was held longer than any of them takes. A
+# shorter one (-LockWaitSec given) cannot tell work in progress from a lock that is stuck, says so,
+# and is a failure all the same.
 function Get-WebUIStopReason {
-    if (Test-LaiVolumeLockBusy) { return @{ Lock = $true; Text = 'a backup, restore or update is running and has stopped Open WebUI for a few minutes - run the health check again when it has finished' } }
+    param([int]$WaitSec = 0, [string]$Otherwise = '', [int]$EnoughSec = 600)
+    $waited = $false
+    $until = (Get-Date).AddSeconds([Math]::Max(0, $WaitSec))
+    while (Test-LaiVolumeLockBusy) {
+        if ((Get-Date) -ge $until) {
+            $held = "Open WebUI is down and the volume lock was still held after the $WaitSec s this check was told to wait (-LockWaitSec), too short a time to tell a backup, restore or update at work from a lock that is stuck. Run the health check again without -LockWaitSec: it then waits as long as any of them takes"
+            if ($WaitSec -ge $EnoughSec) { $held = "Open WebUI is still down, and the volume lock has been held longer than any backup, restore or update takes (this check waited $WaitSec s for it), so none of them explains it: what holds the lock is stuck, or is another program. Restart the PC, which ends whatever holds it, then run the health check again" }
+            return @{ Waited = $true; Known = $true; Text = $held }
+        }
+        if (-not $waited) { Write-LaiLog INFO "Open WebUI is down and the volume lock is held: a backup, restore or update may be at work, which stops it for a few minutes. Waiting up to $WaitSec s for the lock before judging" }
+        $waited = $true
+        Start-Sleep -Seconds 1
+    }
     $hold = Get-LaiWebUIHold -AIRoot $AIRoot
-    if ($hold) { return @{ Lock = $false; Text = "kept stopped after a failed restore ($($hold['Reason'])). Recover first: $($hold['Recover'])" } }
-    return $null
+    if ($hold) { return @{ Waited = $waited; Known = $true; Text = "kept stopped after a failed restore ($($hold['Reason'])). Recover first: $($hold['Recover'])" } }
+    return @{ Waited = $waited; Known = $false; Text = $Otherwise }
+}
+# $true when a run did not find Open WebUI answering and none of its rows is a failure. Each row
+# that meets a stopped Open WebUI fails today; this is asked before the count at the end, so that
+# no row of tomorrow (a warning, a skip) lets such a run end with '0 failures' again.
+function Test-WebUIDownUncounted {
+    param([bool]$WebUp, [object[]]$Rows = @())
+    if ($WebUp) { return $false }
+    return (@($Rows | Where-Object { $_.Status -eq 'FAIL' }).Count -eq 0)
 }
 # The catalog entries whose preset this install does not have selected, from every catalog file
 # given that is there, each preset once. Such a preset can still be in Open WebUI (Vision or Code
@@ -132,9 +164,15 @@ $script:ollamaUp = $false
 $script:engineUp = $true
 $script:webUp = $false
 $script:searxUp = $true
-# Open WebUI stopped on purpose (a backup at work, or the hold of a failed restore) is said by the
-# first check that meets it; the next one skips.
+# Open WebUI down for a reason that Get-WebUIStopReason knows (a volume lock that stays held, or the
+# hold of a failed restore) is failed by the first check that meets it; the next one skips.
 $script:webStopSaid = $false
+# How long Open WebUI gets to answer: 30 s, and $webBackSec once this run has waited for a backup,
+# restore or update to finish, which start it again as their last step (its page needs a while).
+$webBackSec = 120
+$script:webAnswerSec = 30
+# The wait for the volume lock (-LockWaitSec) has an end, also when a number below 0 was given.
+if ($LockWaitSec -lt 0) { $LockWaitSec = 0 }
 $startAgain = 'Start menu > Local AI > Start again'
 # Every docker call has a time limit. A Docker Desktop that stopped answering (it can after sleep) is
 # then one failed check with what to do, not a window that waits without a word.
@@ -263,29 +301,45 @@ if ($NoContainers) {
     $containers = @('open-webui', 'searxng')
     if ($researchPort -gt 0) { $containers += 'deep-research' }
     if (-not ($config.ContainsKey('WebUIOllamaUrl') -and $config['WebUIOllamaUrl'] -and $config['WebUIOllamaUrl'] -notlike '*render-guard*')) { $containers += 'render-guard' }
+    # One look at a container: Hung (docker gave no answer in its time), Down (not there, or not
+    # running), its status line, and the words for one that is down.
+    $containerLook = { param([string]$Name)
+        $r = Invoke-LaiTimedNative -File 'docker' -Arguments @('inspect', '-f', '{{.State.Status}} {{if .State.Health}}{{.State.Health.Status}}{{end}} {{.HostConfig.RestartPolicy.Name}}', $Name) -TimeoutSec $dockerLimit
+        $s = ([string]$r.Out).Trim()
+        $why = "$s - $startAgain"
+        if ($r.ExitCode -ne 0) { $why = "not found - re-run the installer: double-click $(Join-Path (Join-Path $AIRoot 'Scripts') 'Install-LocalAI.cmd') and click Yes" }
+        return @{ Hung = [bool]$r.TimedOut; Down = ($r.ExitCode -ne 0 -or $s -notmatch '^running'); Status = $s; Why = $why }
+    }
     foreach ($c in $containers) {
         Add-Check "Container $c" {
             if ($c -eq 'searxng') { $script:searxUp = $false }
             if (-not $script:engineUp) { return (Skip 'Docker engine down') }
-            $r = Invoke-LaiTimedNative -File 'docker' -Arguments @('inspect', '-f', '{{.State.Status}} {{if .State.Health}}{{.State.Health.Status}}{{end}} {{.HostConfig.RestartPolicy.Name}}', $c) -TimeoutSec $dockerLimit
+            $look = & $containerLook $c
             # Docker stopped answering after its engine check: said once, and the rest is skipped.
-            if ($r.TimedOut) { $script:engineUp = $false; return (Fail $hungMsg) }
-            $s = ([string]$r.Out).Trim()
-            if ($r.ExitCode -ne 0 -or $s -notmatch '^running') {
-                # Open WebUI stopped on purpose is not a container to start again or to install again.
-                $stop = $null
-                if ($c -eq 'open-webui') { $stop = Get-WebUIStopReason }
-                if ($stop) {
-                    $script:webStopSaid = $true
-                    if ($stop.Lock) { return (Warn $stop.Text) }
+            if ($look.Hung) { $script:engineUp = $false; return (Fail $hungMsg) }
+            if ($look.Down -and $c -eq 'open-webui') {
+                # Open WebUI down: a backup, restore or update at work gets the time to finish, and
+                # then one more look. Still down, it is a failure whatever the reason: a lock that
+                # is still held, the hold of a failed restore (neither is a container to start
+                # again or to install again), or what the look itself says.
+                $stop = Get-WebUIStopReason -WaitSec $LockWaitSec -Otherwise $look.Why
+                if ($stop.Waited) {
+                    $look = & $containerLook $c
+                    if ($look.Hung) { $script:engineUp = $false; return (Fail $hungMsg) }
+                    # The row's own words are those of the last look.
+                    if (-not $stop.Known) { $stop.Text = $look.Why }
+                    # Running again after that work: its page gets the time to come up.
+                    if (-not $look.Down) { $script:webAnswerSec = $webBackSec }
+                }
+                if ($look.Down) {
+                    if ($stop.Known) { $script:webStopSaid = $true }
                     return (Fail $stop.Text)
                 }
-                if ($r.ExitCode -ne 0) { return (Fail "not found - re-run the installer: double-click $(Join-Path (Join-Path $AIRoot 'Scripts') 'Install-LocalAI.cmd') and click Yes") }
-                return (Fail "$s - $startAgain")
             }
+            if ($look.Down) { return (Fail $look.Why) }
             if ($c -eq 'searxng') { $script:searxUp = $true }
-            if ($s -match 'unhealthy') { return (Warn $s) }
-            Pass $s
+            if ($look.Status -match 'unhealthy') { return (Warn $look.Status) }
+            Pass $look.Status
         }
     }
 }
@@ -343,16 +397,23 @@ if ($researchPort -gt 0) {
 
 Add-Check 'Open WebUI reachable' {
     if (-not $script:engineUp) { return (Skip 'Docker engine down') }
-    if ($script:webStopSaid) { return (Skip 'Open WebUI is stopped on purpose (see Container open-webui)') }
-    try { Wait-LaiWebUI -BaseUrl $webUrl -TimeoutSec 30 } catch {
-        # Asked only now: an Open WebUI that answers is fine, whoever holds the lock. Stopped on
-        # purpose, Start again is the wrong advice (it waits for the backup, or refuses on the hold).
-        $stop = Get-WebUIStopReason
-        if ($stop) {
-            if ($stop.Lock) { return (Warn $stop.Text) }
-            return (Fail $stop.Text)
+    if ($script:webStopSaid) { return (Skip 'Open WebUI is down (see Container open-webui)') }
+    $answers = $true
+    try { Wait-LaiWebUI -BaseUrl $webUrl -TimeoutSec $script:webAnswerSec } catch { $answers = $false }
+    if (-not $answers) {
+        # Asked only now: an Open WebUI that answers is fine, whoever holds the lock. No answer: a
+        # backup, restore or update at work gets the time to finish, and then one more look. Still
+        # no answer, it is a failure whatever the reason; with a lock that stays held or a hold,
+        # Start again is the wrong advice (it waits for the lock, or refuses on the hold).
+        $stop = Get-WebUIStopReason -WaitSec $LockWaitSec -Otherwise "no answer on http://localhost:$webPort - $startAgain; if it persists: docker logs --tail 50 open-webui"
+        if ($stop.Waited) {
+            # The lock was let go and no hold is left: Open WebUI was just started again and gets
+            # the time to come up. Else a short look is enough.
+            $againSec = 5; if (-not $stop.Known) { $againSec = $webBackSec }
+            $answers = $true
+            try { Wait-LaiWebUI -BaseUrl $webUrl -TimeoutSec $againSec } catch { $answers = $false }
         }
-        return (Fail "no answer on http://localhost:$webPort - $startAgain; if it persists: docker logs --tail 50 open-webui")
+        if (-not $answers) { return (Fail $stop.Text) }
     }
     $script:webUp = $true
     Pass "http://localhost:$webPort"
@@ -778,6 +839,10 @@ Add-Check 'Nothing exposed beyond localhost' {
     Fail "listening beyond loopback: $($bad -join ', ') - reachable from your network; run Start menu > Local AI - Update toolkit to restore the localhost-only settings (for 11434 also turn off 'Expose Ollama to the network' in the Ollama app's Settings, which overrides them)"
 }
 
+# Whatever the rows above said: a run in which Open WebUI did not answer never ends with '0 failures'.
+if (Test-WebUIDownUncounted -WebUp $script:webUp -Rows @($results)) {
+    Add-Check 'Open WebUI answers' { Fail "Open WebUI did not answer in this run, and no check above counted that as a failure - $startAgain, then run the health check again" }
+}
 $fails = @($results | Where-Object { $_.Status -eq 'FAIL' }).Count
 $warns = @($results | Where-Object { $_.Status -eq 'WARN' }).Count
 Write-Host ''
