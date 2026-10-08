@@ -1,11 +1,17 @@
-# Container hardening (security track item 1): applied to the compose file; digests not started
+# Container hardening (security track item 1): applied to the compose file and passed by the CI job `stack`; digests not started
 
 Status (2026-10-07): the per-service hardening below is in `local-llm/stack/docker-compose.yml`,
 with a static rule (COMPOSESEC) and checks in `tests/Invoke-StackSmokeTest.ps1` that fail when it
-is missing or breaks a service. It was written on a PC where the stack may not be started, so
-**the first run on real containers is the CI job `stack`**: until that job has passed on this
-change, nothing here is proven on running containers. The digest plan is not started. What is
-still open is listed under "Still to do".
+is missing or breaks a service. It was written on a PC where the stack may not be started; **the
+first run on real containers, the CI job `stack`, passed on commit 8340532**. Every hardening
+assertion against the real containers was OK: all capabilities dropped (deep research keeps the
+five its start script needs), no new privileges, the memory and process limits, SearXNG as user
+977 on a read-only root with a settings.yml dated 2020, a 64 MB chat through the render guard, and
+no container killed or restarted. Those are Linux containers on a CI machine, so what that job
+cannot see is still open, as is the digest plan (not started): see "Still to do". Since that run
+the render guard has changed (batch 3): it now refuses a chat above a size cap and passes every
+other request body on in pieces, see render-guard below. The `stack` job has not run with that
+guard yet.
 
 Evidence for the choices comes from the Open WebUI v0.11.4 source and Dockerfile, the SearXNG image
 `searxng/searxng:2026.10.2-19ffbcd30` (inspected, not started) and the compose file.
@@ -33,7 +39,9 @@ Every service: `cap_drop: [ALL]`, `security_opt: ["no-new-privileges:true"]`, a 
     the image, which is the state of every existing install after a SearXNG update (the installer
     writes the file once). A start script may then want to put its newer settings beside the old
     file, into a folder that is now read-only. It was not read from the image; the stack smoke
-    test starts SearXNG in exactly that state and decides it (see "What checks it").
+    test starts SearXNG in exactly that state and decides it (see "What checks it"). The CI job
+    `stack` did so on 8340532 and passed: SearXNG as user 977 on a read-only root with a
+    settings.yml dated 2020.
   - Runtime writes go only to /tmp (SQLite caches sxng_cache_*.db and faviconcache.db:
     searx/cache.py, favicons/cache.py).
   - `read_only` covers the image's own files, not a folder the image declares as a volume: Docker
@@ -45,17 +53,26 @@ Every service: `cap_drop: [ALL]`, `security_opt: ["no-new-privileges:true"]`, a 
 - **render-guard:** already had user `65534:65534`, `read_only`, `cap_drop: [ALL]` and
   `no-new-privileges`; now also `mem_limit: 2g`, `pids_limit: 512`.
   - One thread per request plus a watcher; it writes no files.
-  - The memory limit is for the requests. `render_guard.py` reads every request body whole into
-    memory before it passes it on (`_read_body`), and for /api/chat and /api/generate it also
-    decodes and parses it, and writes it out again when it changes the request: about three
-    copies at the peak, about five when it rewrites. A chat with pictures carries all of them
-    again at every turn. 2g holds a chat of several hundred MB. The handover's 512m did not
-    count the bodies.
-  - Known limit: a request the limit cannot hold ends the guard (Docker restarts it; the chats
-    running through it are cut off). That is any body near 2 GB on a path the guard does not
-    parse, for example a model file sent to Ollama's /api/blobs through the guard. Before the
-    limit such a request was bounded only by the Docker VM's memory. The cure is in the guard,
-    not in the limit: see "Still to do".
+  - The memory limit is for the requests. `render_guard.py` holds only chat and generate requests
+    (/api/chat and /api/generate) whole, because it may have to rewrite them: the bytes, the
+    decoded text, the parsed request and, when it rewrites, the new text and its bytes. A chat
+    with pictures carries all of them again at every turn. One such request may be at most
+    `RENDER_GUARD_MAX_BODY_MIB` MiB (256 unless Stack\.env sets another number; the compose file
+    passes it on). A larger one gets HTTP 413 from the guard, with a message that names the
+    setting, and Ollama is not contacted. At 256 MiB the five copies are 1280 MiB, and 1536 MiB
+    with a sixth, which a request needs when it holds a raw character beyond U+FFFF. Both fit
+    the 2g. Every other request body, for example a model file sent to Ollama's /api/blobs, is
+    passed on in pieces of 64 KiB as it arrives, so its size no longer matters to the guard. The
+    handover's 512m did not count the bodies.
+  - Known limits: a request the limit cannot hold still ends the guard (Docker restarts it; the
+    chats running through it are cut off), and two kinds of request can still do that. The cap
+    is per request, not a total: several chats near it at the same moment add up. And the cap
+    does not bound what a request costs to parse: one long text holding a character beyond
+    U+FFFF costs 9 to 12 times its size, and millions of empty lists or objects cost more than
+    20 times. No chat with pictures looks like that, but a program in one of the stack's
+    containers (the guard has no port on the host) can send one below the cap. Also: a setting
+    that is not a number stops the guard at its start, and 0 or less makes it refuse every chat.
+    See "Still to do".
   - It runs from the SearXNG image, so it would carry that image's volumes too, if the image
     declares any. The compose file mounts nothing over them for the guard: the smoke test checks
     instead that the guard's user (65534) can write nowhere outside /dev.
@@ -108,13 +125,20 @@ matches it with a regex.
     file it could not write and no missing privilege (the entrypoint's ownership warning is
     expected; what single search engines answer is not judged, they often refuse a test
     machine). A start script that tried to write beside the old settings.yml would fail here;
-  - the render guard reaches Ollama, then passes on a chat with 64 MB of pictures, sent from the
-    Open WebUI container, and Ollama's answer comes back; the guard is not ended for it and the
-    test prints the most memory it held. This shows a real request body under the limit; it does
-    not show where the limit is reached;
+  - the render guard reaches Ollama and its status page shows a size cap above the chat the test
+    sends; then it passes on a chat with 64 MB of pictures, sent from the Open WebUI container,
+    and Ollama's answer comes back; the guard is not ended for it and the test prints the most
+    memory it held. This shows a real request body under the limit; it does not show where the
+    limit is reached, and it does not show that a number set in .env reaches the guard (the test
+    sets none);
   - deep research reaches Ollama through the guard under its limits;
   - after all of that every container is still running, was never ended for exceeding its memory
     limit and never restarted.
+- **Render guard test** (`tests/test_render_guard.py`, CI job `gate`, no container): the guard's own
+  handling of request bodies. A chat or generate request above the cap gets HTTP 413 and one of
+  exactly the cap passes; an upload is passed on piece by piece, with a Content-Length and chunked;
+  a chat sent two bytes to the chunk does not make the guard hold more than the cap counts (its
+  peak memory is read from the kernel, so this part needs Linux).
 - The CI jobs `integration`, `installer` and `webui-update` start SearXNG from the same compose file,
   so their web-search checks also run against the hardened SearXNG. They mount the repository's own
   `stack/searxng` folder (the template `settings.yml`, dated by the checkout, so newer than the
@@ -134,13 +158,10 @@ matches it with a regex.
   backup's check image all assume `repo:tag`.
 
 ## Still to do
-- **Request bodies in the render guard** (`stack/render-guard/render_guard.py`): pass the body of
-  a path it does not rewrite straight through instead of reading it whole, or answer 413 above a
-  size. Until then a request too big for the guard's memory limit ends the guard.
-- **If the stack job fails on SearXNG's log** with a line about `settings.yml.new` or `Read-only
-  file system`: the image's start script does write beside an older settings.yml. Then decide with
-  that log whether the line is harmless (SearXNG still starts and answers) and may be allowed in
-  the test, or the folder must stay writable.
+- **What the render guard's size cap does not cover** (`stack/render-guard/render_guard.py`; the cap
+  itself and the pass-through for other bodies are in): several large chats at the same moment,
+  a request that is expensive to parse, and a setting that is 0, less, or not a number. They are
+  rows 100, 101 and 103 of `IMPROVEMENTS.md`.
 - **By hand on a real install** (the smoke test has no browser and no model): upload a document
   (embedding and reranking), run a web search from a chat, save the skill notebook tool (that path
   runs pip install), and run one deep research report, all with the hardening on.

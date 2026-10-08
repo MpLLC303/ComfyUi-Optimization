@@ -39,6 +39,12 @@ permissions:
 # The test scripts refuse to run on machines not marked as throwaway sandboxes.
 env:
   LAI_SANDBOX: '1'
+  # A test that was skipped fails its job (audit T9). The suite steps go through
+  # tests/Invoke-AllTests.ps1 -Step, which under CI fails a step for every skip line of the suite
+  # whose message is not in this variable, one message per line. Empty here: the sandbox jobs may
+  # skip nothing (a deep research image that was not pulled, a leftover volume). Only the gate job,
+  # which runs the Windows suites on Linux, has a list of its own.
+  LAI_DECLARED_SKIPS: ''
 
 jobs:
   # No sandbox services: none of these five suites touches Ollama, Open WebUI or the containers.
@@ -46,6 +52,37 @@ jobs:
     name: Static checks and unit tests
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    env:
+      # Every block this job skips, and may skip: each needs Windows, and the Windows job (which
+      # declares no skip at all) runs it. One line per skip, exactly the message the suite prints
+      # after SKIP. A new skip, or a reworded one, fails this job until it is added here: leaving a
+      # block out on Linux is then a decision, not an accident.
+      # Nineteen lines. The first eleven are from Invoke-WindowsUnitTests.ps1, the next three from
+      # Invoke-GetLocalAITest.ps1, and the last five from Invoke-WindowsUnitTests.ps1 again: three
+      # checks that Linux used to leave out without a word and now prints as SKIP (no
+      # New-NetFirewallRule, no COMPUTERNAME, no USERPROFILE), the readers of the PC security
+      # check, which ask Windows itself, and the health check's Integrity watch line for an install
+      # baseline, which is run under Windows PowerShell 5.1.
+      LAI_DECLARED_SKIPS: |
+        ACL test runs on Windows only
+        mutex ACL exists only on Windows PowerShell
+        .lnk creation needs WScript.Shell
+        real execution-policy change needs elevated Windows PowerShell (runs in Windows CI)
+        resume round trip runs on Windows only
+        exposure check runs on Windows only
+        task command-line round trip runs on Windows only
+        a watch-state.json held open by another handle (the read fails with a sharing violation) is a Windows case
+        real scheduled tasks, real listeners and the watch reading them run on Windows only
+        native argument check runs on Windows only
+        console code pages exist on Windows only
+        the long comparison through .NET's JSON reader (Windows PowerShell 5.1 only: the Windows job runs this)
+        where Windows keeps the all-users Start menu (the Windows job checks this)
+        the bootstrap end to end (it starts powershell.exe: the Windows job runs this part)
+        Windows Firewall block ranges need New-NetFirewallRule
+        computer name redaction needs COMPUTERNAME
+        profile path check needs USERPROFILE
+        device-open, firewall, Security Center, cloud-sync and session readers: Windows only (the judges above ran on canned input)
+        the Integrity watch line of the health check runs on Windows only
     steps:
       - uses: actions/checkout@v5
 
@@ -73,17 +110,20 @@ jobs:
       - name: Render guard behaviour (fake ComfyUI + fake Ollama)
         run: python3 local-llm/tests/test_render_guard.py
 
+      # The parts that run on any system; the Windows-only blocks print SKIP here, each one declared
+      # in LAI_DECLARED_SKIPS above.
       - name: Cross-platform unit tests
         shell: pwsh
         run: |
-          & ./local-llm/tests/Invoke-WindowsUnitTests.ps1
+          & ./local-llm/tests/Invoke-AllTests.ps1 -Step ./local-llm/tests/Invoke-WindowsUnitTests.ps1
           exit $LASTEXITCODE
 
-      # The pure and syntax-tree parts; the end-to-end block needs Windows and prints SKIP here.
+      # The pure and syntax-tree parts; the end-to-end block needs Windows and prints SKIP here
+      # (declared above, like the two smaller Windows-only checks of this suite).
       - name: Bootstrap update review (Get-LocalAI.ps1)
         shell: pwsh
         run: |
-          & ./local-llm/tests/Invoke-GetLocalAITest.ps1
+          & ./local-llm/tests/Invoke-AllTests.ps1 -Step ./local-llm/tests/Invoke-GetLocalAITest.ps1
           exit $LASTEXITCODE
 
   integration:
@@ -165,13 +205,13 @@ jobs:
       - name: Integration test (API layer against the real servers)
         shell: pwsh
         run: |
-          & ./local-llm/tests/Invoke-IntegrationTest.ps1
+          & ./local-llm/tests/Invoke-AllTests.ps1 -Step ./local-llm/tests/Invoke-IntegrationTest.ps1
           exit $LASTEXITCODE
 
       - name: Health watch test (heal, pause, volume lock)
         shell: pwsh
         run: |
-          & ./local-llm/tests/Invoke-WatchTest.ps1 -Work "$env:RUNNER_TEMP/watch-test"
+          & ./local-llm/tests/Invoke-AllTests.ps1 -Step ./local-llm/tests/Invoke-WatchTest.ps1 -StepArgs '-Work', "$env:RUNNER_TEMP/watch-test"
           exit $LASTEXITCODE
 
       - name: Nothing left behind (containers, volumes, helper processes, models, admin password)
@@ -267,7 +307,7 @@ jobs:
       - name: Installer mock run (reboot/resume, migration, trials, re-runs)
         shell: pwsh
         run: |
-          & ./local-llm/tests/Invoke-InstallerMockRun.ps1 -Work "$env:RUNNER_TEMP/mockroot"
+          & ./local-llm/tests/Invoke-AllTests.ps1 -Step ./local-llm/tests/Invoke-InstallerMockRun.ps1 -StepArgs '-Work', "$env:RUNNER_TEMP/mockroot"
           exit $LASTEXITCODE
 
       - name: Nothing left behind (containers, volumes, helper processes, models, admin password)
@@ -381,7 +421,7 @@ jobs:
         shell: pwsh
         run: |
           docker pull -q alpine:3.19
-          & ./local-llm/tests/Invoke-UpdateWebUITest.ps1
+          & ./local-llm/tests/Invoke-AllTests.ps1 -Step ./local-llm/tests/Invoke-UpdateWebUITest.ps1
           exit $LASTEXITCODE
 
       - name: Nothing left behind (containers, volumes, helper processes, models, admin password)
@@ -428,13 +468,13 @@ jobs:
       - name: Model update test (keep previous version, rollback)
         shell: pwsh
         run: |
-          & ./local-llm/tests/Invoke-ModelUpdateTest.ps1
+          & ./local-llm/tests/Invoke-AllTests.ps1 -Step ./local-llm/tests/Invoke-ModelUpdateTest.ps1
           exit $LASTEXITCODE
 
       - name: Uninstall test
         shell: pwsh
         run: |
-          & ./local-llm/tests/Invoke-UninstallTest.ps1 -Work "$env:RUNNER_TEMP/uninstall-test"
+          & ./local-llm/tests/Invoke-AllTests.ps1 -Step ./local-llm/tests/Invoke-UninstallTest.ps1 -StepArgs '-Work', "$env:RUNNER_TEMP/uninstall-test"
           exit $LASTEXITCODE
 
       - name: Nothing left behind (containers, volumes, helper processes, models)
@@ -487,7 +527,7 @@ jobs:
         shell: pwsh
         timeout-minutes: 25
         run: |
-          & ./local-llm/tests/Invoke-StackSmokeTest.ps1 -DeepResearch
+          & ./local-llm/tests/Invoke-AllTests.ps1 -Step ./local-llm/tests/Invoke-StackSmokeTest.ps1 -StepArgs '-DeepResearch'
           exit $LASTEXITCODE
 
       - name: Nothing left behind (containers, volumes, helper processes, models)

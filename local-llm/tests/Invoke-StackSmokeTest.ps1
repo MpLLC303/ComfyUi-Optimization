@@ -404,6 +404,10 @@ try {
     $r = Invoke-InContainer 'render-guard' "import urllib.request;print(urllib.request.urlopen('http://127.0.0.1:11434/render-guard/status',timeout=10).read().decode())"
     $status = ConvertFrom-ExecJson $r
     Assert-That ($r.Code -eq 0 -and $status -and $status.config.mode -eq 'cpu' -and $status.config.upstream -eq 'http://host.docker.internal:11434') "the render guard answers its status page (mode $($status.config.mode), upstream $($status.config.upstream))"
+    # The guard takes one chat up to its size cap (RENDER_GUARD_MAX_BODY_MIB in .env; 256 MiB when it
+    # is not set, as here) and answers a larger one itself with HTTP 413. A cap too small for the
+    # chat sent below is said here, not by that chat coming back as 'render-guard:'.
+    Assert-That ($status -and [int64]$status.config.max_body_bytes -gt ($chatMB * 1MB)) "the guard's size cap for one chat ($([int]([int64]$status.config.max_body_bytes / 1MB)) MB) is above the $chatMB MB chat sent below"
     $r = Invoke-InContainer 'render-guard' "import urllib.request;print(urllib.request.urlopen('http://127.0.0.1:11434/api/version',timeout=10).read().decode())"
     $guardVer = ConvertFrom-ExecJson $r
     Assert-That ($r.Code -eq 0 -and $guardVer -and [string]$guardVer.version -eq $ollamaVersion) "the guard reaches Ollama on the host: /api/version through it is $ollamaVersion (exit $($r.Code), $(@($r.Out | Select-Object -Last 1) -join ''))"

@@ -82,6 +82,8 @@ exit `$LASTEXITCODE
     $code = $LASTEXITCODE
     $ErrorActionPreference = $prev
     $out | Select-Object -Last 4 | ForEach-Object { Write-Host "    | $_" }
+    # The whole output for the asserts that read it; never emitted, so the function still returns one exit code.
+    $script:lastOut = @($out)
     return $code
 }
 
@@ -158,10 +160,15 @@ try {
     Assert-That (($t -contains 'LocalAI-Watch') -and ($t -contains 'LocalAI-Backup-OpenWebUI') -and ($t -contains 'LocalAI-Recheck-Models')) "scheduled tasks unregistered, the nightly model re-check too ($($t -join ', '))"
     Assert-That ((Test-Path (Join-Path $aiRoot 'Stack')) -and (Test-Path (Join-Path $aiRoot 'Secrets'))) 'files kept without -RemoveData'
     Assert-That (-not (Test-Path $menuDir)) 'Start-menu folder removed'
+    Assert-That (@($script:lastOut | Where-Object { $_ -match 'CLAUDE\.md' }).Count -eq 0) 'no CLAUDE.md in the install folder: no output line names one'
 
     Write-Host "`n=== 3. -RemoveData -RemoveModels ===" -ForegroundColor Cyan
     New-Stack
     'x' | Set-Content (Join-Path $aiRoot 'localai-config.json.bak')
+    # The rules file for an AI coding agent, which the owner may have edited: not on the deletion list.
+    $claudePath = Join-Path $aiRoot 'CLAUDE.md'
+    $claudeText = "# Rules for an AI agent`nThe owner added this line by hand.`n"
+    [IO.File]::WriteAllText($claudePath, $claudeText)
     $code = Invoke-Uninstall @('-Force', '-RemoveData', '-RemoveModels')
     Assert-That ($code -eq 0) "full removal exits 0 (got $code)"
     Assert-That (-not (Test-Volume 'open-webui')) 'data volume deleted'
@@ -170,6 +177,9 @@ try {
     Assert-That ($del -notcontains 'other/model:latest') 'unrelated model kept'
     Assert-That (-not (Test-Path (Join-Path $aiRoot 'Stack')) -and -not (Test-Path (Join-Path $aiRoot 'Secrets')) -and -not (Test-Path (Join-Path $aiRoot 'localai-config.json')) -and -not (Test-Path (Join-Path $aiRoot 'localai-config.json.bak'))) 'stack, secrets and config (with its .bak) deleted'
     Assert-That (@(Get-ChildItem (Join-Path $aiRoot 'Backups') -Filter '*-pre-uninstall.tar.gz').Count -eq 1) 'Backups folder kept with the final backup'
+    Assert-That ((Test-Path -LiteralPath $claudePath -PathType Leaf) -and ([IO.File]::ReadAllText($claudePath) -ceq $claudeText)) 'CLAUDE.md in the install folder is still there after -RemoveData, its content unchanged'
+    $claudeKept = @($script:lastOut | Where-Object { $_ -match 'kept: .*CLAUDE\.md' })
+    Assert-That ($claudeKept.Count -eq 1) "the closing message lists CLAUDE.md as kept, once ($($claudeKept.Count) line(s))"
 
     Write-Host "`n=== 3b. deep research data: in the final backup, deleted only once saved ===" -ForegroundColor Cyan
     $rv = 'localai-deep-research'

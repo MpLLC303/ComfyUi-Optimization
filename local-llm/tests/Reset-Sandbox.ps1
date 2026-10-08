@@ -182,6 +182,13 @@ if (Get-Command pgrep -ErrorAction SilentlyContinue) {
             Invoke-Repair "process $procId ($($cmd.Trim()))" { Stop-Process -Id ([int]$procId) -Force -ErrorAction Stop }
         }
     }
+} elseif ($env:GITHUB_ACTIONS -eq 'true') {
+    # Without pgrep nothing above has looked. Under CI that counts, also with -LeftoversOnly: the
+    # 'Nothing left behind' step must not pass without having looked for helper processes.
+    $script:found++; $script:unfixed++
+    Write-Host '  MISSING  pgrep: helper processes left by a suite were not looked for' -ForegroundColor Red
+} else {
+    Write-Host '  MISSING  pgrep: helper processes left by a suite were not looked for (not counted outside CI)' -ForegroundColor Yellow
 }
 
 # ---- Ollama test models --------------------------------------------------------------------------

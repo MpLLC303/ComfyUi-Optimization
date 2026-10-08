@@ -104,10 +104,18 @@ services:
     read_only: true
     cap_drop: [ALL]
     security_opt: ["no-new-privileges:true"]
-    # The memory limit is for the requests, not for the code: the guard holds every request it
-    # passes on whole in memory (a chat about three times over while it reads it), and a chat with
-    # pictures sends all of them again at every turn. A request too big for the limit ends the
-    # guard: Docker restarts it and the chats running through it are cut off.
+    # The memory limit is for the requests, not for the code. The guard holds only chat and
+    # generate requests whole (it may have to rewrite them), and a chat with pictures sends all
+    # of them again at every turn. While it reads and rewrites one it keeps it five to six times
+    # over, so one such request may be at most RENDER_GUARD_MAX_BODY_MIB MiB (256 unless .env
+    # says otherwise: 5 x 256 = 1280 MiB, 6 x 256 = 1536 MiB); a larger one gets HTTP 413 and is
+    # not passed on. Every other request body, a model file for one, passes through in 64 KiB
+    # pieces. What the cap does not cover: it is per request, so several chats near it at the
+    # same moment can still outgrow the limit; and it does not bound what a request costs to
+    # parse (one long text holding a character beyond U+FFFF: 9 to 12 times its size; millions
+    # of empty lists or objects: over 20 times), so a program in one of the stack's containers
+    # can still send one that ends the guard. Docker then restarts the guard, and the chats
+    # running through it are cut off.
     # One thread per request plus a watcher; it writes no files.
     mem_limit: 2g
     pids_limit: 512
@@ -121,6 +129,10 @@ services:
       COMFYUI_URLS: ${COMFYUI_URLS:-http://host.docker.internal:8188,http://host.docker.internal:8000}
       RENDER_GUARD_MODE: ${RENDER_GUARD_MODE:-cpu}
       FREE_COMFYUI_WHEN_IDLE: ${FREE_COMFYUI_WHEN_IDLE:-1}
+      # Largest chat or generate request the guard takes, in MiB (see the memory limit above). A
+      # whole number above 0: a value that is not a number stops the guard at its start, and 0 or
+      # less makes it refuse every chat.
+      RENDER_GUARD_MAX_BODY_MIB: ${RENDER_GUARD_MAX_BODY_MIB:-256}
     healthcheck:
       test: ["CMD", "python3", "-c", "import urllib.request;urllib.request.urlopen('http://127.0.0.1:11434/render-guard/status',timeout=5)"]
       interval: 60s
