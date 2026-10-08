@@ -1223,6 +1223,30 @@ $managedForm = New-LaiPresetForm -Entry $entry -NativeTools $true -SystemPrompt 
 $offForm = New-LaiPresetForm -Entry @{ Preset = 'official-main'; Alias = 'localai-official-main'; Display = 'Official Main'; Description = 'd'; Vision = $true; Think = $null; Official = $true } -NativeTools $true -SystemPrompt 'sys'
 Assert-That ($managedForm.meta.builtinTools['chats'] -eq $false -and $offForm.meta.builtinTools['chats'] -eq $false) 'no preset gets the past-chat tools'
 Assert-That (@($managedForm.meta['defaultFeatureIds']).Count -eq 0 -and @($offForm.meta['defaultFeatureIds']) -contains 'web_search') 'uncensored presets search only when asked; official ones by default'
+# The tools that write, schedule, send or start something are off in every preset, each with a
+# false that is written out: Open WebUI takes a missing switch for ON, so a category left out of
+# the form is one the model may use without asking. One case per category, on the three kinds of
+# form the installer makes (an Uncensored preset, an Official one, one without native tool calling).
+$legacyForm = New-LaiPresetForm -Entry $entry -NativeTools $false -SystemPrompt 'sys'
+$uTools = $managedForm.meta.builtinTools; $oTools = $offForm.meta.builtinTools; $lTools = $legacyForm.meta.builtinTools
+$toolsOff = @('notes', 'tasks', 'automations', 'calendar', 'notifications', 'channels', 'subagents')
+foreach ($offKey in $toolsOff) {
+    Assert-That ($uTools.ContainsKey($offKey) -and $uTools[$offKey] -is [bool] -and $uTools[$offKey] -eq $false -and
+        $oTools.ContainsKey($offKey) -and $oTools[$offKey] -is [bool] -and $oTools[$offKey] -eq $false -and
+        $lTools.ContainsKey($offKey) -and $lTools[$offKey] -is [bool] -and $lTools[$offKey] -eq $false) "the '$offKey' tools are switched off in every preset with a written-out false (Uncensored: $($uTools[$offKey]); Official: $($oTools[$offKey]); no native tool calling: $($lTools[$offKey]); nothing shown = the switch is missing, which Open WebUI takes for on)"
+}
+# All 16 categories of Open WebUI 0.11.4, so that none is left to a default: six on, ten off.
+$toolsOn = @('time', 'user_input', 'knowledge', 'files', 'web_search', 'memory')
+$toolsAll = @($toolsOn + $toolsOff + @('chats', 'code_interpreter', 'image_generation'))
+$toolsWrong = @()
+foreach ($pair in @(@{ Name = 'Uncensored'; Tools = $uTools }, @{ Name = 'Official'; Tools = $oTools }, @{ Name = 'no native tool calling'; Tools = $lTools })) {
+    foreach ($key in $toolsAll) {
+        $want = ($toolsOn -contains $key)
+        if (-not ($pair.Tools.ContainsKey($key) -and $pair.Tools[$key] -is [bool] -and $pair.Tools[$key] -eq $want)) { $toolsWrong += "$($pair.Name): $key" }
+    }
+    foreach ($key in @($pair.Tools.Keys)) { if ($toolsAll -notcontains $key) { $toolsWrong += "$($pair.Name): $key is not a category" } }
+}
+Assert-That ($toolsAll.Count -eq 16 -and $toolsWrong.Count -eq 0) "every preset form writes out all 16 tool switches: time, user_input, knowledge, files, web_search and memory on, the other ten off (wrong: $($toolsWrong -join '; '))"
 $mergedOld = Merge-LaiPresetForm -Managed $managedForm -Existing ([pscustomobject]@{ id = 'local-main'; meta = [pscustomobject]@{ defaultFeatureIds = @('web_search'); builtinTools = [pscustomobject]@{ chats = $true } }; params = [pscustomobject]@{} })
 Assert-That (@($mergedOld.meta['defaultFeatureIds']).Count -eq 0 -and $mergedOld.meta.builtinTools['chats'] -eq $false) 'an existing install loses auto-search on the uncensored presets and the past-chat tools on update'
 # The preset form never sets 'hidden': a preset the owner hid stays hidden on re-runs. The installer
@@ -1234,11 +1258,29 @@ foreach ($kind in 'Official', 'Trial') {
     Assert-That (-not $of.meta.ContainsKey('hidden') -and $om.meta['hidden'] -eq $true) "a $kind preset the owner hid stays hidden on a re-run"
 }
 Assert-That (-not $managedForm.meta.ContainsKey('hidden')) 'a measured preset form leaves hidden alone (the user may have hidden it)'
+# An install from before the writing tools were switched off, updated: each of those switches may
+# be on (ticked by hand), missing (what every such install has: Open WebUI takes that for on) or
+# null (which Open WebUI's editor shows as ticked). After the update each is a written-out false.
+foreach ($offKey in $toolsOff) {
+    $offAfter = @()
+    foreach ($before in @(@{ Name = 'on'; Tools = @{ $offKey = $true; chats = $false } }, @{ Name = 'missing'; Tools = @{ chats = $false } }, @{ Name = 'null'; Tools = @{ $offKey = $null; chats = $false } })) {
+        $mt = (Merge-LaiPresetForm -Managed $managedForm -Existing ([pscustomobject]@{ id = 'local-main'; name = 'Local Main'; meta = [pscustomobject]@{ builtinTools = [pscustomobject]$before.Tools }; params = [pscustomobject]@{} })).meta.builtinTools
+        if (-not ($mt.ContainsKey($offKey) -and $mt[$offKey] -is [bool] -and $mt[$offKey] -eq $false)) { $offAfter += "$($before.Name) -> '$($mt[$offKey])'" }
+    }
+    Assert-That ($offAfter.Count -eq 0) "an update switches the '$offKey' tools off on an existing preset, whether the switch was on, missing or null (not off after: $($offAfter -join '; '))"
+}
+# user_input (the model asks a question) and files (it reads the files of the chat) are on from the
+# start and then the owner's, like Think: switched off by hand they stay off; a preset that has no
+# such switch yet gets it written out, on (which is what missing meant).
+$mergedOwn = Merge-LaiPresetForm -Managed $managedForm -Existing ([pscustomobject]@{ id = 'local-main'; name = 'Local Main'; meta = [pscustomobject]@{ builtinTools = [pscustomobject]@{ user_input = $false; files = $false } }; params = [pscustomobject]@{} })
+$mergedNone = Merge-LaiPresetForm -Managed $managedForm -Existing ([pscustomobject]@{ id = 'local-main'; name = 'Local Main'; meta = [pscustomobject]@{ builtinTools = [pscustomobject]@{ chats = $true } }; params = [pscustomobject]@{} })
+Assert-That ($mergedOwn.meta.builtinTools['user_input'] -is [bool] -and $mergedOwn.meta.builtinTools['user_input'] -eq $false -and $mergedOwn.meta.builtinTools['files'] -is [bool] -and $mergedOwn.meta.builtinTools['files'] -eq $false) 'the two tool switches that only ask or read (user_input, files) stay off on a re-run when the owner switched them off'
+Assert-That ($mergedNone.meta.builtinTools['user_input'] -is [bool] -and $mergedNone.meta.builtinTools['user_input'] -eq $true -and $mergedNone.meta.builtinTools['files'] -is [bool] -and $mergedNone.meta.builtinTools['files'] -eq $true -and @($mergedNone.meta.builtinTools.Keys).Count -eq 16) "and a preset from before gets them written out, on, with every other switch (16 in all; $(@($mergedNone.meta.builtinTools.Keys).Count) here)"
 $existingPreset = [pscustomobject]@{ id = 'local-main'; name = 'Local Main'; base_model_id = 'localai-main:latest'; params = [pscustomobject]@{ temperature = 0.3 }
-    meta = [pscustomobject]@{ builtinTools = [pscustomobject]@{ calendar = $false; web_search = $false; code_interpreter = $true }
+    meta = [pscustomobject]@{ builtinTools = [pscustomobject]@{ a_tool_of_tomorrow = $false; web_search = $false; code_interpreter = $true }
         capabilities = [pscustomobject]@{ usage = $true; code_interpreter = $true }; myOwnKey = 'kept' } }
 $merged = Merge-LaiPresetForm -Managed $managedForm -Existing $existingPreset
-Assert-That ($merged.meta.builtinTools['calendar'] -eq $false -and $merged.meta.capabilities['usage'] -eq $true -and $merged.meta['myOwnKey'] -eq 'kept') 'a tool category the user turned off, an extra capability and an unknown key are kept'
+Assert-That ($merged.meta.builtinTools['a_tool_of_tomorrow'] -eq $false -and $merged.meta.capabilities['usage'] -eq $true -and $merged.meta['myOwnKey'] -eq 'kept') 'a tool category the installer does not know (one of a newer Open WebUI) that the user turned off, an extra capability and an unknown key are kept'
 Assert-That ($merged.meta.builtinTools['code_interpreter'] -eq $false -and $merged.meta.capabilities['code_interpreter'] -eq $false -and $merged.meta.builtinTools['web_search'] -eq $true) 'what the installer manages is still enforced (no code execution)'
 Assert-That ($merged.params['temperature'] -eq 0.3 -and $merged.params['system'] -eq 'sys') 'user parameters kept, system prompt refreshed'
 Assert-That ((Get-LaiWebUICompat -Version 'v0.11.4') -eq 'tested' -and (Get-LaiWebUICompat -Version 'v0.12.0') -eq 'newer' -and (Get-LaiWebUICompat -Version '0.11.4-dev') -eq 'tested' -and (Get-LaiWebUICompat -Version 'main') -eq 'unknown') 'Open WebUI versions are compared numerically'

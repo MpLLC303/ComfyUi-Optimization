@@ -569,6 +569,31 @@ failures.
   and no file write access: those capabilities are turned off in every preset. Shell access (Open
   Terminal in a Docker sandbox, scoped to `C:\AI\Workspace`) is V2 and should keep the guide's
   permission levels A-F.
+- **What the assistant may do without asking is the same short list in every preset.** Open WebUI
+  0.11.4 offers a model its built-in tools in 16 groups, and a preset has one switch for each. A
+  switch that is missing counts as on, so the installer writes all 16:
+  - **On:** telling the time and date; asking you a question; searching the web and opening a web
+    page; reading the knowledge collections attached to the preset or the chat; reading the files
+    of the chat; and memory. Memory is the one group that is on and changes something: the model
+    can save a memory, and it can also change and delete memories, all without asking. That is how
+    it learns you; what it holds is in Settings > Personalization > Memory.
+  - **Off:** searching and reading your past chats; running code; making pictures; writing and
+    changing notes; making and changing task lists; automations (creating, changing, switching on
+    or off and deleting things that run later by themselves); the calendar (reading, creating,
+    changing and deleting entries); sending notifications; reading channels; and handing work to
+    sub-agents.
+
+  Three things have no switch among the 16. A preset that has skills can always read one
+  (`view_skill`). The terminal tools have none either; the toolkit sets up no terminal for them to
+  reach. And a chat you open from inside a note can read and write notes whatever the notes switch
+  says. To switch a group on, tick it in the preset's list of built-in tools (Workspace > Models,
+  edit the preset). The next install or update switches it off again: only *asking you a question*,
+  *reading the files of the chat* and *making pictures* stay as you set them. `Test-LocalAI.ps1`
+  looks at past-chat search and code execution only, and so does the clean-up after restoring an
+  older backup: a preset from a backup made before this can have the note, task, automation,
+  calendar, notification, channel and sub-agent tools on again until you run Start menu > Local AI >
+  Update toolkit. The 16 names are those of Open WebUI 0.11.4, the version the installer sets up; a
+  group that a newer Open WebUI adds is on until the toolkit knows it.
 - **Web pages and documents can try to steer the assistant.** Text in a search result, a fetched page
   or an uploaded PDF reaches the model like your own words, and a page can hide instructions in it. So
   no preset can search or read your past chats (a planted instruction could otherwise have them sent

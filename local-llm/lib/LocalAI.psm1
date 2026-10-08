@@ -2400,7 +2400,12 @@ function Merge-LaiPresetForm {
     #   think            Open WebUI 0.11.4 re-applies a preset's think over the per-chat Chat Controls
     #                    switch, so the preset is the only place to turn Uncensored Fast's reasoning on.
     #   image_generation an image button the user wired to ComfyUI (not code execution, which stays off).
-    $createOnly = @{ params = @('think'); capabilities = @('image_generation'); builtinTools = @('image_generation') }
+    #   user_input, files the two tool categories that only ask you a question or read the files of
+    #                    the chat: on when the preset is made, and off for good once you switch them
+    #                    off. (Every other tool category but image_generation is put back to the
+    #                    installer's value: the ones that write, schedule, send or start something
+    #                    stay off.)
+    $createOnly = @{ params = @('think'); capabilities = @('image_generation'); builtinTools = @('image_generation', 'user_input', 'files') }
     $old = ConvertTo-LaiHashtable $Existing
     $params = @{}
     if ($old.ContainsKey('params') -and $old['params'] -is [hashtable]) { $params = $old['params'] }
@@ -2411,9 +2416,13 @@ function Merge-LaiPresetForm {
     $meta = @{}
     if ($old.ContainsKey('meta') -and $old['meta'] -is [hashtable]) { $meta = $old['meta'] }
     foreach ($k in $Managed['meta'].Keys) {
-        # capabilities / builtinTools: set the switches the installer manages, keep every other one.
-        # Replacing the whole set erased the user's own choices (Open WebUI treats a missing tool
-        # category as ON, so a calendar or notes tool the user had turned off came back on).
+        # capabilities / builtinTools: set the switches the installer manages, keep every other one
+        # (replacing the whole set erased what the user had chosen for the rest). Among the tools
+        # the installer now manages every category Open WebUI 0.11.4 has (New-LaiPresetForm lists
+        # them), because Open WebUI treats a missing tool category as ON: an install from before
+        # that, where the note, task, automation, calendar, notification, channel and subagent
+        # switches are missing, gets them here, off, and gets them off again when they were
+        # switched on. What is kept is a switch of a newer Open WebUI that the installer does not know.
         if ($Managed['meta'][$k] -is [hashtable] -and $meta.ContainsKey($k) -and $meta[$k] -is [hashtable]) {
             foreach ($leaf in $Managed['meta'][$k].Keys) {
                 if ($createOnly.ContainsKey($k) -and $createOnly[$k] -contains $leaf -and $meta[$k].ContainsKey($leaf) -and $null -ne $meta[$k][$leaf]) { continue }
@@ -3692,12 +3701,36 @@ function New-LaiPresetForm {
             image_generation = $false; code_interpreter = $false; terminal = $false
             citations = $true; status_updates = $true; memory = $true; builtin_tools = $true
         }
-        # chats off: with it the model can search and read every past chat, and a web page or document
-        # it reads could tell it to put what it finds into a URL it fetches (fetch_url reaches any
-        # public site, without asking). Re-runs keep it off.
+        # Every tool category Open WebUI has gets a switch that is written out, true or false: it
+        # takes a MISSING one for ON, so a category left out here is one the model may use without
+        # asking, in a turn that holds a web page's text too. The 16 names are those of Open WebUI
+        # v0.11.4, the version the toolkit pins (its model editor, BuiltinTools.svelte, and
+        # get_builtin_tools in backend/open_webui/utils/tools.py, as read from its source on
+        # 2026-10-08; the toolkit cannot check them against a running Open WebUI). A category a
+        # newer Open WebUI adds is not in this list and is on there until it is added here.
+        #   on   time, user_input (the model asks you a question), knowledge and files (it reads
+        #        attached collections and the files of the chat), web_search (search_web, fetch_url)
+        #        and memory, which reads AND writes: add_memory, update_memory,
+        #        replace_memory_content, delete_memory. Saving what you tell it is what it is for.
+        #   off  chats: with it the model can search and read every past chat, and a web page or
+        #        document it reads could tell it to put what it finds into a URL it fetches
+        #        (fetch_url reaches any public site, without asking).
+        #        code_interpreter (it runs code) and image_generation (yours to switch on).
+        #        notes, tasks, automations, calendar, notifications, subagents: each can write,
+        #        schedule, send or start something (write_note, create_tasks, create_automation,
+        #        create_calendar_event, notify, delegate_task ...). The owner decided on 2026-10-07
+        #        that none of that is on in any preset. channels: it only reads Open WebUI's
+        #        channels, which the toolkit has no use for.
+        # Re-runs put every 'off' back, all but image_generation, and leave that one, user_input
+        # and files as the owner set them (Merge-LaiPresetForm). Three things no switch here
+        # covers: view_skill (offered whenever the preset has skills), the terminal tools (the
+        # toolkit connects no terminal), and a chat opened from a note, which gets the note tools
+        # whatever 'notes' says.
         builtinTools      = @{
-            memory = $true; web_search = $true; knowledge = $true; chats = $false; time = $true
-            image_generation = $false; code_interpreter = $false
+            time = $true; user_input = $true; knowledge = $true; files = $true; web_search = $true; memory = $true
+            chats = $false; code_interpreter = $false; image_generation = $false
+            notes = $false; tasks = $false; automations = $false; calendar = $false
+            notifications = $false; channels = $false; subagents = $false
         }
         tags              = @(@{ name = 'local' })
     }
