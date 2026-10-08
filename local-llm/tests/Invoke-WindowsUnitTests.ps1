@@ -1502,6 +1502,62 @@ if ($onWindows) { $prev = $ErrorActionPreference; $ErrorActionPreference = 'Cont
 $igSwapMap = @{}
 Add-LaiIntegrityEntry -Map $igSwapMap -Item $igStale -Relative 'Stack\sub'
 Assert-That ($igWasFolder -and (Test-Path -LiteralPath (Join-Path $igSwap 'elsewhere.txt')) -and @($igSwapMap.Keys).Count -eq 1 -and [string]$igSwapMap['Stack\sub'] -eq 'link') "a folder that became a link after it was listed is not entered: recorded as a link, nothing behind it is named or hashed ($(@($igSwapMap.Keys | Sort-Object) -join ', '))"
+if ($onWindows) {
+    # The swap a walk by path cannot see: not the entry but the folder above it becomes a link, to a
+    # folder that holds entries of the same names, after that folder was listed. Asked again by its
+    # path, the entry is an ordinary file or folder (the path now leads into the other folder), and
+    # the walk hashed or listed what lies there. Done in a loop while the installer records its
+    # baseline as administrator, that put the names and SHA-256 of files the user may not read into
+    # a file the user can read. On Windows the walk asks the entry's handle where the entry really
+    # is and holds that against where the folder above really was when it was listed from its own
+    # handle (-ParentFinal): anywhere else is a link, and nothing is listed or hashed.
+    $igRaceRoot = Join-Path $Work 'integrity-race'; $igRacePar = Join-Path $igRaceRoot 'par'; $igRaceOut = Join-Path $Work 'integrity-race-outside'
+    foreach ($d in (Join-Path $igRacePar 'sub'), (Join-Path $igRaceOut 'sub')) { New-Item -ItemType Directory -Force -Path $d | Out-Null }
+    Set-Content -LiteralPath (Join-Path $igRacePar 'same.txt') -Value 'inside the install'
+    Set-Content -LiteralPath (Join-Path (Join-Path $igRacePar 'sub') 'inner.txt') -Value 'inside the install'
+    $igRaceOutFile = Join-Path $igRaceOut 'same.txt'; $igRaceOutInner = Join-Path (Join-Path $igRaceOut 'sub') 'inner.txt'
+    Set-Content -LiteralPath $igRaceOutFile -Value 'outside: for administrators only'
+    Set-Content -LiteralPath $igRaceOutInner -Value 'outside: for administrators only, one folder down'
+    $igRaceOutHashes = @($igRaceOutFile, $igRaceOutInner | ForEach-Object { [string](Get-FileHash -LiteralPath $_ -Algorithm SHA256).Hash })
+    # What the walk holds once it has listed 'par' from its handle: where par really is, and what
+    # the listing said about its two entries.
+    $igRaceErr = ''; $igRaceParFinal = ''; $igRaceOutFinal = ''
+    try { $igRaceParFinal = [string](Get-LaiIntegrityFinalPath -Path $igRacePar); $igRaceOutFinal = [string](Get-LaiIntegrityFinalPath -Path $igRaceOut) } catch { $igRaceErr = $_.Exception.Message }
+    $igStaleFile = Get-Item -LiteralPath (Join-Path $igRacePar 'same.txt') -Force
+    $igStaleDir = Get-Item -LiteralPath (Join-Path $igRacePar 'sub') -Force
+    Remove-Item -LiteralPath $igRacePar -Recurse -Force
+    $prev = $ErrorActionPreference; $ErrorActionPreference = 'Continue'; & cmd.exe /c mklink /J $igRacePar $igRaceOut 2>&1 | Out-Null; $ErrorActionPreference = $prev
+    # Asked again by their paths, as the walk by path did: both are there, neither is a link.
+    $igStaleFile.Refresh(); $igStaleDir.Refresh()
+    $igRacePlain = ($igStaleFile.Exists -and $igStaleDir.Exists -and -not ($igStaleFile.Attributes -band [IO.FileAttributes]::ReparsePoint) -and -not ($igStaleDir.Attributes -band [IO.FileAttributes]::ReparsePoint))
+    $igRaceReached = [string](Get-Content -Encoding UTF8 -LiteralPath $igStaleFile.FullName -Raw)
+    Assert-That (-not $igRaceErr -and $igRaceParFinal -like '\Device\*\integrity-race\par' -and $igRaceOutFinal -like '\Device\*\integrity-race-outside' -and $igRacePlain -and $igRaceReached -like 'outside:*') "setup: the folder above a listed file and a listed folder became a link to a folder with the same names; by their paths both still look ordinary, and the file's path now reads the other folder's file ($igRaceParFinal; $igRaceErr)"
+    $igRaceFileMap = @{}; $igRaceDirMap = @{}
+    try {
+        Add-LaiIntegrityEntry -Map $igRaceFileMap -Item $igStaleFile -Relative 'Stack\par\same.txt' -ParentFinal $igRaceParFinal
+        Add-LaiIntegrityEntry -Map $igRaceDirMap -Item $igStaleDir -Relative 'Stack\par\sub' -ParentFinal $igRaceParFinal
+    } catch { $igRaceErr = $_.Exception.Message }
+    $igRaceLeaked = @(@($igRaceFileMap.Values) + @($igRaceDirMap.Values) | Where-Object { $igRaceOutHashes -contains [string]$_ })
+    Assert-That (-not $igRaceErr -and @($igRaceFileMap.Keys).Count -eq 1 -and [string]$igRaceFileMap['Stack\par\same.txt'] -eq 'link' -and $igRaceLeaked.Count -eq 0) "a listed file whose folder became a link is not read: its handle is somewhere else than below where that folder really was, so it is a link, and the other folder's file is not hashed ($(@($igRaceFileMap.Keys | Sort-Object | ForEach-Object { '{0} = {1}' -f $_, $igRaceFileMap[$_] }) -join ', ')) $igRaceErr"
+    Assert-That (-not $igRaceErr -and @($igRaceDirMap.Keys).Count -eq 1 -and [string]$igRaceDirMap['Stack\par\sub'] -eq 'link' -and @($igRaceDirMap.Keys | Where-Object { $_ -like '*inner*' }).Count -eq 0 -and $igRaceLeaked.Count -eq 0) "a listed folder whose folder above became a link is not entered: a link, and nothing in the other folder is named or hashed ($(@($igRaceDirMap.Keys | Sort-Object | ForEach-Object { '{0} = {1}' -f $_, $igRaceDirMap[$_] }) -join ', ')) $igRaceErr"
+    # The same two entries held against the folder they really are in are read: a file by its
+    # SHA-256, a folder entry by entry. (This folder's path is written with the temp folder's short
+    # name on some machines; where it really is, is not, and only that is compared.)
+    $igTrueFileMap = @{}; $igTrueDirMap = @{}; $igTrueErr = ''
+    try {
+        Add-LaiIntegrityEntry -Map $igTrueFileMap -Item (Get-Item -LiteralPath $igRaceOutFile -Force) -Relative 'Stack\out\same.txt' -ParentFinal $igRaceOutFinal
+        Add-LaiIntegrityEntry -Map $igTrueDirMap -Item (Get-Item -LiteralPath (Join-Path $igRaceOut 'sub') -Force) -Relative 'Stack\out\sub' -ParentFinal $igRaceOutFinal
+    } catch { $igTrueErr = $_.Exception.Message }
+    Assert-That (-not $igTrueErr -and @($igTrueFileMap.Keys).Count -eq 1 -and [string]$igTrueFileMap['Stack\out\same.txt'] -eq $igRaceOutHashes[0] -and @($igTrueDirMap.Keys).Count -eq 1 -and [string]$igTrueDirMap['Stack\out\sub\inner.txt'] -eq $igRaceOutHashes[1]) "held against the folder they really are in, the same file and folder are read from their handles: the file's SHA-256, and the folder's one file ($(@($igTrueFileMap.Values) -join ', '); $(@($igTrueDirMap.Keys) -join ', ')) $igTrueErr"
+    # File names that are also words of the list the walk keeps a folder's entries in: all are read.
+    $igWords = Join-Path $Work 'integrity-words'
+    New-Item -ItemType Directory -Force -Path $igWords | Out-Null
+    foreach ($n in 'Count', 'Keys', 'Values', 'z.txt') { Set-Content -LiteralPath (Join-Path $igWords $n) -Value "the file $n" }
+    $igWordsMap = @{}
+    Add-LaiIntegrityEntry -Map $igWordsMap -Item (Get-Item -LiteralPath $igWords -Force) -Relative 'Stack\words'
+    $igWordsRead = @($igWordsMap.GetEnumerator() | Where-Object { ([string]$_.Value).Length -eq 64 } | ForEach-Object { [string]$_.Key } | Sort-Object)
+    Assert-That (($igWordsRead -join ', ') -eq 'Stack\words\Count, Stack\words\Keys, Stack\words\Values, Stack\words\z.txt' -and @($igWordsMap.Keys).Count -eq 4) "files called Count, Keys and Values hide nothing in their folder: each of them and the file next to them is hashed ($(@($igWordsMap.Keys | Sort-Object | ForEach-Object { '{0} = {1}' -f $_, $igWordsMap[$_] }) -join ', '))"
+}
 Assert-That ([string](Get-LaiIntegrityFiles -AIRoot $igRoot -MaxHashBytes 3)['Scripts\tool.ps1'] -like 'size *') 'a file above the size limit is recorded by its size instead of being hashed'
 
 # A folder filled beyond what the watch reads in one go (a container writing into Stack\searxng, an
