@@ -90,15 +90,44 @@ function Set-WebUIExtraOrigin([string]$Value) {
     # Open WebUI accepts API calls (and live chat streaming) only from the origins it is told about
     # (CORS_ALLOW_ORIGIN in the compose file): the phone's https://<pc>.<tailnet>.ts.net is added
     # here and removed with -Disable. Open WebUI is then recreated to pick it up (about 20 s).
+    # .env is rewritten every time; the container is only recreated when that is safe:
+    #   - under the volume lock, so never in the middle of a backup, restore or update (they stop
+    #     Open WebUI on purpose while they work on its data);
+    #   - not while a failed restore keeps it stopped (the hold);
+    #   - not when there is no open-webui container. The uninstaller calls this script: 'compose up'
+    #     would bring the removed containers back, with restart: always, and after -RemoveData on an
+    #     empty volume with no account, where the first visitor becomes the administrator.
+    # A saved list reaches Open WebUI only when its container is recreated ('compose up', which
+    # Start again runs). A container that is merely started again (Docker Desktop's restart: always,
+    # 'docker start') keeps the list it was created with, so the messages below name Start again.
     $envPath = Join-Path (Join-Path $AIRoot 'Stack') '.env'
     if (-not (Test-Path -LiteralPath $envPath)) { Write-LaiLog WARN "No $envPath; re-run the installer, then this script."; return }
-    $lines = @(Get-Content -LiteralPath $envPath -Encoding UTF8 | Where-Object { $_ -notlike 'WEBUI_EXTRA_ORIGINS=*' })
-    if ($Value) { $lines += "WEBUI_EXTRA_ORIGINS=$Value" }
-    [System.IO.File]::WriteAllLines($envPath, [string[]]$lines, (New-Object System.Text.UTF8Encoding($false)))
-    $stackDir = Join-Path $AIRoot 'Stack'
-    try { $r = Invoke-LaiTimedNative -File 'docker' -Arguments @('compose', '--project-directory', $stackDir, '-f', (Join-Path $stackDir 'docker-compose.yml'), 'up', '-d', 'open-webui') -TimeoutSec 300 }
-    catch { $r = [pscustomobject]@{ ExitCode = -1; Text = $_.Exception.Message } }
-    if ($r.ExitCode -ne 0) { Write-LaiLog WARN "Open WebUI could not be restarted with the new address list ($($r.Text)); Start menu > Local AI > Start again does it." }
+    if (Test-LaiVolumeLockBusy) { Write-LaiLog INFO 'Waiting for a backup/restore/update to finish first' }
+    $lock = Enter-LaiVolumeLock
+    try {
+        $lines = @(Get-Content -LiteralPath $envPath -Encoding UTF8 | Where-Object { $_ -notlike 'WEBUI_EXTRA_ORIGINS=*' })
+        if ($Value) { $lines += "WEBUI_EXTRA_ORIGINS=$Value" }
+        [System.IO.File]::WriteAllLines($envPath, [string[]]$lines, (New-Object System.Text.UTF8Encoding($false)))
+        $hold = Get-LaiWebUIHold -AIRoot $AIRoot
+        if ($hold) {
+            Write-LaiLog WARN "Open WebUI is kept stopped after a failed restore ($($hold['Reason'])), so it was not restarted. The new address list is saved; after the recovery, Start menu > Local AI > Start again applies it. Recover first: $($hold['Recover'])"
+            return
+        }
+        # By exit code: 0 only when the container exists (running or stopped). No container, Docker
+        # not running and Docker not answering all end here, with nothing started.
+        try { $there = Invoke-LaiTimedNative -File 'docker' -Arguments @('container', 'inspect', 'open-webui') -TimeoutSec (Get-LaiDockerTimeout) }
+        catch { $there = [pscustomobject]@{ ExitCode = -1 } }
+        if ($there.ExitCode -ne 0) {
+            # A warning while the phone's address still waits to be allowed; with -Disable the mapping is gone either way.
+            $level = 'INFO'; if ($Value) { $level = 'WARN' }
+            Write-LaiLog $level 'Open WebUI was not restarted: there is no open-webui container, or Docker is not running. The new address list is saved; Start menu > Local AI > Start again applies it (a container that is only started again keeps the old list).'
+            return
+        }
+        $stackDir = Join-Path $AIRoot 'Stack'
+        try { $r = Invoke-LaiTimedNative -File 'docker' -Arguments @('compose', '--project-directory', $stackDir, '-f', (Join-Path $stackDir 'docker-compose.yml'), 'up', '-d', 'open-webui') -TimeoutSec 300 }
+        catch { $r = [pscustomobject]@{ ExitCode = -1; Text = $_.Exception.Message } }
+        if ($r.ExitCode -ne 0) { Write-LaiLog WARN "Open WebUI could not be restarted with the new address list ($($r.Text)); Start menu > Local AI > Start again does it." }
+    } finally { Exit-LaiVolumeLock $lock }
 }
 
 if ($Disable) {
