@@ -20,8 +20,9 @@
     A backup carries the settings of its day, so once Open WebUI is back this install's own are
     applied again: its Ollama connection, sign-up off, and on the toolkit's presets no past-chat
     search, no code execution and (uncensored ones) no web search without being asked. An archive
-    the nightly backup marked -EMPTY (made after the data was wiped) is never picked by itself;
-    naming one with -Archive asks first.
+    the nightly backup marked -EMPTY (made after the data was wiped) is never picked by itself, and
+    until that mark is settled the pick is the last good backup, not the newest; naming an -EMPTY
+    one with -Archive asks first.
 
 .EXAMPLE
     .\Restore-OpenWebUI.ps1                                   # newest daily backup
@@ -217,10 +218,29 @@ if ($DeepResearch) {
 # Pick and confirm the archive before taking the lock, so an unanswered prompt never blocks the
 # nightly backup.
 if (-not $Archive) {
-    $newest = Get-ChildItem -LiteralPath $backupDir -Filter 'open-webui-*.tar.gz' -ErrorAction SilentlyContinue |
-        Where-Object { $_.Name -match '^open-webui-\d{8}-\d{6}\.tar\.gz$' -and $_.LastWriteTime -le (Get-Date).AddHours(1) } | Sort-Object LastWriteTime -Descending | Select-Object -First 1  # lai-ok: objects (never one dated in the future)
-    if (-not $newest) { throw "No daily backups found in $backupDir. Pass -Archive <file>." }
-    $Archive = $newest.FullName
+    $daily = @(Get-ChildItem -LiteralPath $backupDir -Filter 'open-webui-*.tar.gz' -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -match '^open-webui-\d{8}-\d{6}\.tar\.gz$' -and $_.LastWriteTime -le (Get-Date).AddHours(1) } | Sort-Object LastWriteTime -Descending)  # lai-ok: objects (never one dated in the future)
+    # While the nightly backup has the data marked as wiped (backup-state.json: emptied), a nightly
+    # name proves nothing: a night whose database check did not run keeps one although it holds the
+    # wiped data. So the last good archive is taken, or else the newest one made before the mark.
+    $mark = $null
+    try { $mark = (Read-LaiState -Path (Join-Path $AIRoot 'backup-state.json'))['emptied'] } catch { Write-Verbose 'backup state not read' }
+    if ($mark -is [hashtable]) {
+        $lastGood = ''; if ($mark['lastGood']) { $lastGood = Split-Path -Leaf ([string]$mark['lastGood']) }
+        # (PowerShell 7 reads the saved time back as a date, Windows PowerShell 5.1 as text.)
+        $at = $null; try { $at = [datetime]$mark['at'] } catch { Write-Verbose 'the mark has no usable date' }
+        $when = 'an earlier night'; if ($at) { $when = $at.ToString('yyyy-MM-dd HH:mm') }
+        $fromBefore = @($daily | Where-Object { $_.Name -eq $lastGood })
+        if ($fromBefore.Count -eq 0 -and $at) {
+            $stamp = $at.ToString('yyyyMMdd-HHmmss')
+            $fromBefore = @($daily | Where-Object { [string]::CompareOrdinal($_.Name.Substring(11, 15), $stamp) -lt 0 })
+        }
+        if ($fromBefore.Count -eq 0) { throw "The nightly backup marked Open WebUI's data as wiped on $when, and no nightly backup from before that is in $backupDir. Pass -Archive <file> (one from your backup mirror, if you have one)." }
+        Write-LaiLog INFO "The nightly backup marked Open WebUI's data as wiped on ${when}: taking $($fromBefore[0].Name), made before that."
+        $daily = $fromBefore
+    }
+    if ($daily.Count -eq 0) { throw "No daily backups found in $backupDir. Pass -Archive <file>." }
+    $Archive = $daily[0].FullName
 }
 if (-not (Test-Path -LiteralPath $Archive)) { throw "Archive not found: $Archive" }
 # An archive the nightly backup set aside because the database had lost its users or chats (a wiped
@@ -428,8 +448,15 @@ if ($stoppedContainers.Count -gt 0) {
             try { Resolve-LaiPendingPassword -AIRoot $AIRoot -BaseUrl "http://127.0.0.1:$port" | Out-Null } catch { Write-Verbose 'pending password check failed' }
             $cred = Get-Content -Encoding UTF8 -LiteralPath $credFile -Raw | ConvertFrom-Json
             $token = Connect-LaiWebUI -BaseUrl "http://127.0.0.1:$port" -Email $cred.email -Password $cred.password
-            if (Set-LaiWebUIOllamaUrl -BaseUrl "http://127.0.0.1:$port" -Token $token -OllamaUrl $expected) {
-                Write-LaiLog OK "Re-applied this install's Ollama connection ($expected) to the restored settings"
+            # A try of its own: an error here is not a failed sign-in, and must not keep the safety
+            # settings below from being put back.
+            try {
+                if ($env:LOCALAI_TEST_FAIL_OLLAMA_URL) { throw 'Test hook: the Ollama connection could not be set' }
+                if (Set-LaiWebUIOllamaUrl -BaseUrl "http://127.0.0.1:$port" -Token $token -OllamaUrl $expected) {
+                    Write-LaiLog OK "Re-applied this install's Ollama connection ($expected) to the restored settings"
+                }
+            } catch {
+                Write-LaiLog WARN "Could not re-apply this install's Ollama connection ($expected) to the restored settings: $($_.Exception.Message). If chats get no answer, run Start menu > Local AI - Update toolkit"
             }
             # The same goes for what keeps your chats on this PC. A backup from before the toolkit
             # turned them off brings back sign-up for anyone who reaches the page, presets whose model
@@ -442,11 +469,13 @@ if ($stoppedContainers.Count -gt 0) {
                 $catalogPath = Join-Path (Join-Path $PSScriptRoot 'config') 'models.psd1'
                 if ($env:LOCALAI_TEST_CATALOG) { $catalogPath = $env:LOCALAI_TEST_CATALOG }
                 $changed = @()
+                $found = 0
                 foreach ($m in (Get-LaiCatalog -Path $catalogPath -IncludeTrials).Models) {
                     $existing = Get-LaiWebUIModel -BaseUrl $base -Token $token -Id $m.Preset
                     # Not in the restored data (never set up, or deleted): nothing to make safe, and
                     # Set-LaiWebUIModel would create it.
                     if (-not $existing) { continue }
+                    $found++
                     # The whole preset as Open WebUI returned it, so everything else on it is kept.
                     $form = ConvertTo-LaiHashtable $existing
                     if ($form['meta'] -isnot [hashtable]) { $form['meta'] = @{} }
@@ -469,9 +498,12 @@ if ($stoppedContainers.Count -gt 0) {
                     Set-LaiWebUIModel -BaseUrl $base -Token $token -Model $form | Out-Null
                     $changed += "$($m.Display) ($($was -join ', '))"
                 }
-                $what = 'the presets already had past-chat search and code execution off'
+                # None of them there (a backup of another install, presets since retired): no preset was
+                # looked at, so nothing may say the presets are fine. The warning below gives the way.
+                if ($found -eq 0) { throw "sign-up is off again, but none of the toolkit's presets is in the restored data, so no preset was checked" }
+                $what = 'all had past-chat search and code execution off already'
                 if ($changed.Count -gt 0) { $what = 'turned off on the restored presets: ' + ($changed -join '; ') }
-                Write-LaiLog OK "Re-applied this install's safety settings to the restored data: sign-up off; $what"
+                Write-LaiLog OK "Re-applied this install's safety settings to the restored data: sign-up off; $found toolkit preset(s) checked, $what"
                 $notReapplied = ''
             } catch { $notReapplied = $_.Exception.Message }
         } catch {

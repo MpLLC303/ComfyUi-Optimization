@@ -402,16 +402,27 @@ exec 'REALDOCKER' "$@"
             Set-LaiWebUIAdminConfig -BaseUrl $sb -Token $tok -Changes @{ ENABLE_SIGNUP = $true } | Out-Null
             $pm = (& $getPreset).meta
             Assert-That ($pm.builtinTools.chats -eq $true -and $pm.builtinTools.code_interpreter -eq $true -and $pm.capabilities.code_interpreter -eq $true -and @($pm.defaultFeatureIds) -contains 'web_search' -and (& $getSignup) -eq $true) 'setup: as in an old backup, the preset has past-chat search, code execution and unasked web search on, and sign-up is on'
-            $r = & $runScript 'Restore-OpenWebUI.ps1' @('-Archive', $good.FullName, '-Force', '-SkipSafetyBackup')
+            # On this run the Ollama connection cannot be set (in real life: an error from Open WebUI
+            # after a good sign-in). That is no reason to leave the safety settings as they came.
+            $env:LOCALAI_TEST_FAIL_OLLAMA_URL = '1'
+            try { $r = & $runScript 'Restore-OpenWebUI.ps1' @('-Archive', $good.FullName, '-Force', '-SkipSafetyBackup') } finally { $env:LOCALAI_TEST_FAIL_OLLAMA_URL = '' }
             $after = & $getPreset
             $pm = $after.meta
             Assert-That ($r.Code -eq 0 -and $pm.builtinTools.chats -eq $false) "after a restore the preset's model can no longer search and read past chats (exit $($r.Code), chats '$($pm.builtinTools.chats)')"
             Assert-That ($pm.builtinTools.code_interpreter -eq $false -and $pm.capabilities.code_interpreter -eq $false) "code execution is off again on the preset (tool '$($pm.builtinTools.code_interpreter)', capability '$($pm.capabilities.code_interpreter)')"
             Assert-That (@($pm.defaultFeatureIds | Where-Object { $_ }).Count -eq 0) "an uncensored preset searches the web only when asked again (on by default: '$(@($pm.defaultFeatureIds) -join ',')')"
             Assert-That ((& $getSignup) -eq $false) 'sign-up is off again'
-            Assert-That ($r.Text -match "Re-applied this install's safety settings.*sign-up off.*Local Main \(past-chat search, code execution, on by default: web_search\)" -and $r.Text -notmatch 'were not put back') 'the restore says what it re-applied, preset by preset'
+            Assert-That ($r.Text -match "Re-applied this install's safety settings.*sign-up off; \d+ toolkit preset\(s\) checked.*Local Main \(past-chat search, code execution, on by default: web_search\)" -and $r.Text -notmatch 'were not put back') 'the restore says what it re-applied, preset by preset, and how many presets it checked'
+            Assert-That ($r.Text -match "Could not re-apply this install's Ollama connection .*Test hook" -and $r.Text -notmatch 'Could not sign in') 'an Ollama connection that could not be set is reported as that, not as a failed sign-in (and the safety settings above were still put back)'
             Assert-That ([string]$after.name -eq [string]$presetWas['name'] -and [string]$pm.description -eq [string]$presetWas['meta']['description'] -and [string]$after.params.system -eq [string]$presetWas['params']['system']) 'everything else on the preset is kept (name, description, system prompt)'
             Assert-That ([bool](Get-LaiWebUIModel -BaseUrl $sb -Token $tok -Id 'official-standin') -eq $otherWas) 'a catalog preset the restored data does not have is not created'
+            # None of the toolkit's presets in the restored data (here: a catalog of one preset this
+            # Open WebUI does not have). No preset was looked at, so nothing may say they are fine.
+            $goneCatalog = Join-Path $aiRoot 'gone-catalog.psd1'
+            Set-Content -LiteralPath $goneCatalog -Encoding UTF8 -Value "@{ DefaultPreset = 'lai-gone'; ContextCandidates = @(8192); Models = @(@{ Key = 'gone'; Display = 'Gone'; Preset = 'lai-gone' }) }"
+            $catalogWas = $env:LOCALAI_TEST_CATALOG; $env:LOCALAI_TEST_CATALOG = $goneCatalog
+            try { $r = & $runScript 'Restore-OpenWebUI.ps1' @('-Archive', $good.FullName, '-Force', '-SkipSafetyBackup') } finally { $env:LOCALAI_TEST_CATALOG = $catalogWas; Remove-Item -LiteralPath $goneCatalog -Force -ErrorAction SilentlyContinue }
+            Assert-That ($r.Code -eq 0 -and $r.Text -match "were not put back: sign-up is off again, but none of the toolkit's presets is in the restored data.*run Start menu > Local AI - Update toolkit" -and $r.Text -notmatch "Re-applied this install's safety settings") "restored data with none of the toolkit's presets: the restore says no preset was checked and how to set them up, not that all is well (exit $($r.Code))"
         } finally {
             # Never leave the shared sandbox Open WebUI with these on.
             try {
@@ -514,8 +525,11 @@ exec 'REALDOCKER' "$@"
     $wipeBk = Join-Path $wipeRoot 'Backups'
     $wipeMirror = Join-Path $Work 'wipe-mirror'
     $noRowsDir = Join-Path $Work 'norowsdb'
-    foreach ($d in $wipeBk, $wipeMirror, $noRowsDir) { New-Item -ItemType Directory -Force -Path $d | Out-Null }
+    $fewRowsDir = Join-Path $Work 'fewrowsdb'
+    foreach ($d in $wipeBk, $wipeMirror, $noRowsDir, $fewRowsDir) { New-Item -ItemType Directory -Force -Path $d | Out-Null }
     & python3 -c "import sqlite3;c=sqlite3.connect('$noRowsDir/webui.db');c.execute('create table user(id text)');c.execute('create table chat(id text, body text)');c.commit();c.close()"
+    # The wiped install used again: its one user and 4 chats (a tenth of the 40, so not 'under a tenth').
+    & python3 -c "import sqlite3;c=sqlite3.connect('$fewRowsDir/webui.db');c.execute('create table user(id text)');c.execute('create table chat(id text, body text)');c.execute('insert into user values(?)',('0',));c.executemany('insert into chat values(?,?)',[(str(i),'x') for i in range(4)]);c.commit();c.close()"
     $rowsSize = [string](Get-Item -LiteralPath (Join-Path $dbDir 'webui.db')).Length
     $wipeState = Join-Path $wipeRoot 'backup-state.json'
     # The volume doubles as deep research's on one night (its archive only asks for that folder).
@@ -523,6 +537,8 @@ exec 'REALDOCKER' "$@"
     $liveSize = { Invoke-DockerText @('run', '--rm', '-v', 'lai-wipe-test:/d', 'alpine:3.20', 'stat', '-c', '%s', '/d/webui.db') }
     $plant = { param([string]$Path, [int]$DaysOld) Set-Content -LiteralPath $Path -Value 'old'; (Get-Item -LiteralPath $Path).LastWriteTime = (Get-Date).AddDays(-$DaysOld) }
     $oldLeft = { param([string]$Dir, [string]$Kind) @(Get-ChildItem -LiteralPath $Dir -Filter "$Kind-2020010*-000000.tar.gz").Count }
+    $researchSince = { param([string]$Dir) @(Get-ChildItem -LiteralPath $Dir -Filter 'deep-research-*.tar.gz' | Where-Object { $_.Name -notlike 'deep-research-2020010*' }).Count }
+    $researchOk = 'Deep research backup .*deep-research-\d{8}-\d{6}\.tar\.gz \('
     # '' and $false for a value that is not there: a missing key is then a failed assertion, not an error.
     $leafOf = { param($Path) if ($Path) { Split-Path -Leaf ([string]$Path) } else { '' } }
     $isFile = { param($Path) [bool]$Path -and (Test-Path -LiteralPath ([string]$Path)) }
@@ -536,6 +552,7 @@ exec 'REALDOCKER' "$@"
     }
     $night = @('-VerifyImage', $verifyImage, '-RetentionDays', '1', '-Mirror', $wipeMirror)
     $noResearch = @('-ResearchVolume', 'lai-no-such-volume')
+    $withResearch = @('-ResearchVolume', 'lai-wipe-test', '-ResearchContainer', 'lai-no-such-container')
     try {
         Invoke-DockerText @('volume', 'rm', '-f', 'lai-wipe-test') | Out-Null
         Invoke-DockerText @('volume', 'create', 'lai-wipe-test') | Out-Null
@@ -561,22 +578,60 @@ exec 'REALDOCKER' "$@"
         Assert-That ($e1['at'] -and $e1.ContainsKey('users') -and [int]$e1['users'] -eq 0 -and [int]$e1['chats'] -eq 0 -and [int]$e1['hadUsers'] -eq 3 -and [int]$e1['hadChats'] -eq 40) "backup-state.json: emptied is set, with the counts now (0 users, 0 chats) and before (3 and 40) and when it was first seen ($($e1['at']))"
         Assert-That ((& $leafOf $e1['lastGood']) -eq $rowsName -and (& $isFile $e1['lastGood']) -and (& $leafOf $e1['archive']) -like '*-EMPTY.tar.gz' -and (& $isFile $e1['archive'])) "emptied names the last good archive and this night's -EMPTY one, by full path ($(& $leafOf $e1['archive']))"
 
+        # A tagged run meanwhile (the rollback point of an update is found by its name): it judges
+        # nothing and keeps its name. It cannot tell the data is wiped, so only the mark in
+        # backup-state.json keeps it from pruning.
+        $b = & $runWipe 'Backup-OpenWebUI.ps1' ($night + $noResearch + @('-Tag', 'x'))
+        $ws = Read-LaiState -Path $wipeState
+        $ex = $ws['emptied']; if ($ex -isnot [hashtable]) { $ex = @{} }
+        Assert-That ($b.Code -eq 0 -and @(Get-ChildItem -LiteralPath $wipeBk -Filter 'open-webui-*-x.tar.gz').Count -eq 1 -and @(Get-ChildItem -LiteralPath $wipeBk -Filter '*-x-EMPTY*').Count -eq 0 -and (& $leafOf $ex['archive']) -eq (& $leafOf $e1['archive']) -and [int]$ws['goodUsers'] -eq 3 -and [int]$ws['goodChats'] -eq 40 -and (& $leafOf $ws['goodArchive']) -eq $rowsName) "a tagged run while the data looks wiped keeps its name (never -EMPTY) and changes neither the mark nor the good counts (exit $($b.Code))"
+        Assert-That ($b.Text -match 'Old backups are not pruned' -and (& $oldLeft $wipeBk 'open-webui') -eq 4 -and (& $oldLeft $wipeMirror 'open-webui') -eq 4) "and it prunes nothing, here or in the mirror, and says why ($(& $oldLeft $wipeBk 'open-webui') and $(& $oldLeft $wipeMirror 'open-webui') of 4 old)"
+        # The run at sign-in: this night's backup was made, as an -EMPTY one, so there is nothing to
+        # catch up. (The archive with the rows is dated before the due time, so only that one counts.)
+        Get-ChildItem -LiteralPath $wipeBk -Filter $rowsName | ForEach-Object { $_.LastWriteTime = (Get-Date).AddHours(-3) }
+        $b = & $runWipe 'Backup-OpenWebUI.ps1' ($night + $noResearch + @('-DailyAt', (Get-Date).AddHours(-1).ToString('HH:mm', [Globalization.CultureInfo]::InvariantCulture)))
+        Assert-That ($b.Code -eq 0 -and $b.Text -match 'Nothing to do: the backup due at .*-EMPTY\.tar\.gz') "the sign-in run does nothing when the night's backup is there as an -EMPTY one (exit $($b.Code))"
+
         # The second night: deep research is archived too (the purge that emptied Open WebUI emptied it).
-        $b = & $runWipe 'Backup-OpenWebUI.ps1' ($night + @('-ResearchVolume', 'lai-wipe-test', '-ResearchContainer', 'lai-no-such-container'))
+        $b = & $runWipe 'Backup-OpenWebUI.ps1' ($night + $withResearch)
         $ws = Read-LaiState -Path $wipeState
         $e2 = $ws['emptied']; if ($e2 -isnot [hashtable]) { $e2 = @{} }
         $empties = @(Get-ChildItem -LiteralPath $wipeBk -Filter 'open-webui-*-EMPTY.tar.gz' | Sort-Object LastWriteTime | ForEach-Object { $_.Name })  # lai-ok: objects
         Assert-That ($b.Code -eq 0 -and (& $oldLeft $wipeBk 'open-webui') -eq 4 -and (Test-Path -LiteralPath (Join-Path $wipeBk $rowsName))) "two empty nights: nothing pruned in Backups, the four old archives and the one with the rows are all there (exit $($b.Code), $(& $oldLeft $wipeBk 'open-webui') of 4 old)"
-        Assert-That ((& $oldLeft $wipeMirror 'open-webui') -eq 4 -and (Test-Path -LiteralPath (Join-Path $wipeMirror $rowsName)) -and @(Get-ChildItem -LiteralPath $wipeMirror -Filter '*-EMPTY*').Count -eq 0) "two empty nights: nothing pruned in the mirror, and no -EMPTY archive copied there ($(& $oldLeft $wipeMirror 'open-webui') of 4 old)"
-        Assert-That ($b.Text -match 'Deep research backup .*deep-research-\d{8}-\d{6}\.tar\.gz \(' -and (& $oldLeft $wipeBk 'deep-research') -eq 4) "old deep research archives are not pruned either while the data looks wiped ($(& $oldLeft $wipeBk 'deep-research') of 4 old)"
+        $mirrorEmpties = @(Get-ChildItem -LiteralPath $wipeMirror -Filter 'open-webui-*-EMPTY.tar.gz' | ForEach-Object { $_.Name })
+        Assert-That ((& $oldLeft $wipeMirror 'open-webui') -eq 4 -and (Test-Path -LiteralPath (Join-Path $wipeMirror $rowsName)) -and $mirrorEmpties.Count -eq 2 -and $mirrorEmpties -contains (& $leafOf $e2['archive'])) "two empty nights: nothing pruned in the mirror, and each -EMPTY archive is copied there (what the data is now has a copy off this PC; $(& $oldLeft $wipeMirror 'open-webui') of 4 old, $($mirrorEmpties.Count) -EMPTY)"
+        Assert-That ($b.Text -match $researchOk -and (& $oldLeft $wipeBk 'deep-research') -eq 4) "old deep research archives are not pruned either while the data looks wiped ($(& $oldLeft $wipeBk 'deep-research') of 4 old)"
         Assert-That ($e2['at'] -and [string]$e2['at'] -eq [string]$e1['at'] -and (& $leafOf $e2['archive']) -ne (& $leafOf $e1['archive']) -and [int]$e2['hadChats'] -eq 40 -and [int]$ws['goodUsers'] -eq 3 -and [int]$ws['goodChats'] -eq 40 -and (& $leafOf $ws['goodArchive']) -eq $rowsName) "the second empty night keeps emptied (first seen $($e2['at']), the new archive) and the good counts: an empty database never becomes the normal one"
         Assert-That ($empties.Count -eq 2 -and $empties[0] -eq (Split-Path -Leaf $oldEmpty) -and $empties[1] -eq (& $leafOf $e2['archive']) -and $empties -notcontains (& $leafOf $e1['archive'])) "two -EMPTY archives are kept, the oldest and the newest ($($empties -join ', '))"
 
+        # The third night: the wiped install is used again. One user and 4 chats are over the bar that
+        # set the mark, but they are not the 3 and 40 being back.
+        & $putDb $fewRowsDir
+        $b = & $runWipe 'Backup-OpenWebUI.ps1' ($night + $withResearch)
+        $ws = Read-LaiState -Path $wipeState
+        $e3 = $ws['emptied']; if ($e3 -isnot [hashtable]) { $e3 = @{} }
+        Assert-That ($b.Code -eq 0 -and $b.Text -match 'looks wiped: 1 users and 4 chats now, 3 and 40 at the last good backup' -and $b.Text -notmatch 'data is back' -and $e3['at'] -and [string]$e3['at'] -eq [string]$e1['at'] -and [int]$e3['chats'] -eq 4 -and (& $leafOf $e3['archive']) -like '*-EMPTY.tar.gz' -and (& $isFile $e3['archive'])) "a wiped install that is used again (1 user, 4 chats) is not the data being back: an -EMPTY night again, the mark stays (exit $($b.Code))"
+        Assert-That ([int]$ws['goodUsers'] -eq 3 -and [int]$ws['goodChats'] -eq 40 -and (& $leafOf $ws['goodArchive']) -eq $rowsName -and (& $oldLeft $wipeBk 'open-webui') -eq 4 -and (& $oldLeft $wipeMirror 'open-webui') -eq 4) "and its counts do not become the good ones, nothing is pruned ($($ws['goodUsers']) users, $($ws['goodChats']) chats; $(& $oldLeft $wipeBk 'open-webui') and $(& $oldLeft $wipeMirror 'open-webui') of 4 old)"
+        $mirrorEmpties = @(Get-ChildItem -LiteralPath $wipeMirror -Filter 'open-webui-*-EMPTY.tar.gz' | ForEach-Object { $_.Name })
+        Assert-That ($mirrorEmpties.Count -eq 2 -and $mirrorEmpties -contains (& $leafOf $e1['archive']) -and $mirrorEmpties -contains (& $leafOf $e3['archive'])) "the mirror keeps two -EMPTY archives too, the oldest and the newest ($($mirrorEmpties -join ', '))"
+        $research3 = $b.Text -match $researchOk
+
+        # A night that cannot tell (no database check): its archive keeps a nightly name although it
+        # holds the wiped data, nothing is pruned, and -AcceptEmpty has no counts to accept.
+        $b = & $runWipe 'Backup-OpenWebUI.ps1' ($night + $withResearch + @('-SkipDeepVerify', '-AcceptEmpty'))
+        $ws = Read-LaiState -Path $wipeState
+        $blind = @(Get-ChildItem -LiteralPath $wipeBk -Filter 'open-webui-*.tar.gz' | Where-Object { $_.Name -match '^open-webui-\d{8}-\d{6}\.tar\.gz$' -and $_.Name -ne $rowsName -and $_.Name -notlike 'open-webui-2020010*' })
+        Assert-That ($b.Code -eq 0 -and $blind.Count -eq 1 -and $ws.ContainsKey('emptied') -and [int]$ws['goodChats'] -eq 40 -and $b.Text -match '-AcceptEmpty was not applied' -and $b.Text -match 'Old backups are not pruned' -and (& $oldLeft $wipeBk 'open-webui') -eq 4 -and (& $oldLeft $wipeMirror 'open-webui') -eq 4) "a night without the database check while the data looks wiped: nothing pruned, the mark stays, and -AcceptEmpty says it was not applied (exit $($b.Code))"
+        # Three nights of deep research archives since the mark: the newest two are kept, the old ones all stay.
+        Assert-That ($research3 -and $b.Text -match $researchOk -and (& $researchSince $wipeBk) -eq 2 -and (& $researchSince $wipeMirror) -eq 2 -and (& $oldLeft $wipeBk 'deep-research') -eq 4) "deep research archives made since the data looked wiped are capped at the newest two, here and in the mirror; none from before goes ($(& $researchSince $wipeBk) and $(& $researchSince $wipeMirror) since, $(& $oldLeft $wipeBk 'deep-research') of 4 old)"
+
         $r = & $runWipe 'Restore-OpenWebUI.ps1' @('-Force', '-SkipSafetyBackup')
         $live = & $liveSize
-        Assert-That ($r.Code -eq 0 -and $r.Text -match ('Restoring ' + [regex]::Escape($rowsName)) -and $live -eq $rowsSize) "a restore without -Archive takes the newest backup that has the rows, never an -EMPTY one (exit $($r.Code), webui.db $live bytes, with rows $rowsSize)"
+        Assert-That ($r.Code -eq 0 -and $r.Text -match ('Restoring ' + [regex]::Escape($rowsName)) -and $live -eq $rowsSize) "a restore without -Archive takes the last good backup, the one with the rows: never an -EMPTY one, and not the newer night that could not tell (exit $($r.Code), webui.db $live bytes, with rows $rowsSize)"
         Assert-That ($r.Text -match 'were not put back: Open WebUI was not running.*run Start menu > Local AI - Update toolkit') 'a restore that could not reach Open WebUI says the safety settings were not re-applied, and how to'
-        $emptyArchive = Join-Path $wipeBk 'none-EMPTY.tar.gz'; if ($e2['archive']) { $emptyArchive = [string]$e2['archive'] }
+        # (Out of the way: it would be one of the newest three when pruning is on again below.)
+        foreach ($dir in $wipeBk, $wipeMirror) { $blind | ForEach-Object { Remove-Item -LiteralPath (Join-Path $dir $_.Name) -Force -ErrorAction SilentlyContinue } }
+        $emptyArchive = Join-Path $wipeBk 'none-EMPTY.tar.gz'; if ($e3['archive']) { $emptyArchive = [string]$e3['archive'] }
         $r = & $runWipe 'Restore-OpenWebUI.ps1' @('-Archive', $emptyArchive, '-SkipSafetyBackup')
         Assert-That ($r.Code -ne 0 -and $r.Text -match 'was set aside by the nightly backup' -and $r.Text -notmatch 'Restoring open-webui-' -and (& $liveSize) -eq $rowsSize) "naming an -EMPTY archive warns and asks; with no answer nothing changes (exit $($r.Code))"
 

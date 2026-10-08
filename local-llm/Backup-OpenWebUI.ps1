@@ -21,7 +21,8 @@
 
     A nightly archive whose database can be read but has lost its users or chats (what Docker
     Desktop's 'Purge data' leaves) is kept as open-webui-<timestamp>-EMPTY.tar.gz, and no older
-    backup is deleted until the data is back or -AcceptEmpty says the smaller database is meant.
+    backup is deleted until the data is back (at least half the users and chats of the last good
+    backup) or -AcceptEmpty says the smaller database is meant.
 
     The models are not backed up (re-download them). Secrets live in <AIRoot>\Secrets: keep a copy of
     that folder in your password manager, not next to the backups.
@@ -144,6 +145,9 @@ $verifiedOk = $false
 # $emptyRun: this run found the database emptied (see the deep check). $keepOld: nothing old is deleted.
 $emptyRun = $false
 $keepOld = $false
+# $keepSince: the night the data was first seen emptied. $countsRead: this run counted users and chats.
+$keepSince = $null
+$countsRead = $false
 $exitCode = 0
 
 # Each probe has a time limit: a Docker Desktop that stopped answering (it can after sleep) would
@@ -242,15 +246,24 @@ function Save-ResearchArchive {
             } catch { $note = "; mirror copy failed ($($_.Exception.Message))" }
         }
         # Same rule as Open WebUI's: daily archives older than N days go, the newest three always stay,
-        # and a pre-uninstall one is never pruned. Nothing goes while Open WebUI's data looks wiped
-        # ($keepOld): what emptied it (Docker's 'Purge data') emptied deep research too.
-        if (-not $NoPrune -and -not $keepOld) {
+        # and a pre-uninstall one is never pruned. While Open WebUI's data looks wiped ($keepOld)
+        # nothing from before that night goes: what emptied it (Docker's 'Purge data') emptied deep
+        # research too. Of the archives made since, the newest two stay (as with -EMPTY ones): a mark
+        # nobody settles would otherwise add one full archive a night, here and in the mirror.
+        if (-not $NoPrune -and (-not $keepOld -or $keepSince)) {
+            $stamp = ''; if ($keepOld) { $stamp = $keepSince.ToString('yyyyMMdd-HHmmss') }
             foreach ($dir in @($backupDir) + @($(if ($Mirror -and -not $NoMirror -and (Test-Path -LiteralPath $Mirror)) { $Mirror }))) {
                 $daily = @(Get-ChildItem -LiteralPath $dir -Filter 'deep-research-*.tar.gz' -ErrorAction SilentlyContinue |
                     Where-Object { $_.Name -match '^deep-research-\d{8}-\d{6}\.tar\.gz$' } | Sort-Object LastWriteTime -Descending)  # lai-ok: objects
-                # Safety copies of a restore (-pre-restore) go by age alone, like Open WebUI's tagged ones.
-                $tagged = @(Get-ChildItem -LiteralPath $dir -Filter 'deep-research-*-pre-restore.tar.gz' -ErrorAction SilentlyContinue)
-                foreach ($old in @(@($daily | Select-Object -Skip 3) + $tagged | Where-Object { $_.LastWriteTime -lt (Get-Date).AddDays(-$RetentionDays) -and $_.Name -ne $rName })) {
+                if ($keepOld) {
+                    # 'Since' by the time in the name: a sync client can change a file's date.
+                    $go = @($daily | Where-Object { [string]::CompareOrdinal($_.Name.Substring(14, 15), $stamp) -gt 0 } | Select-Object -Skip 2)
+                } else {
+                    # Safety copies of a restore (-pre-restore) go by age alone, like Open WebUI's tagged ones.
+                    $tagged = @(Get-ChildItem -LiteralPath $dir -Filter 'deep-research-*-pre-restore.tar.gz' -ErrorAction SilentlyContinue)
+                    $go = @(@($daily | Select-Object -Skip 3) + $tagged | Where-Object { $_.LastWriteTime -lt (Get-Date).AddDays(-$RetentionDays) -and $_.Name -ne $rName })
+                }
+                foreach ($old in $go) {
                     try { Remove-Item -LiteralPath $old.FullName -Force -ErrorAction Stop; Write-BackupLog INFO "Pruned $($old.FullName)" }
                     catch { Write-BackupLog WARN "Could not prune $($old.FullName): $($_.Exception.Message)" }
                 }
@@ -402,10 +415,18 @@ try {
                 # compared. Nightly runs only: a tagged archive is found by its name (the rollback
                 # point of an update) and is never one of the newest three.
                 if (-not $Tag) {
+                    $countsRead = $true
                     $hadUsers = 0; if ($bstate['goodUsers']) { $hadUsers = [int]$bstate['goodUsers'] }
                     $hadChats = 0; if ($bstate['goodChats']) { $hadChats = [int]$bstate['goodChats'] }
                     # Users or chats gone to 0, or the chats under a tenth of a count worth judging (20+).
                     $looksEmptied = ($users -eq 0 -and $hadUsers -gt 0) -or ($chats -eq 0 -and $hadChats -gt 0) -or ($hadChats -ge 20 -and $chats * 10 -lt $hadChats)
+                    # Once marked, being over that bar is not the data being back: a wiped install that
+                    # is used again has its user and a few new chats, and taking those for the good
+                    # counts would let its archives push the real ones out after all. Back is at least
+                    # half of both (a restore of an older backup has a little less than the last good
+                    # night). The good* counts are still those of that night: nothing changed them.
+                    $wasMarked = $bstate['emptied'] -is [hashtable]
+                    if ($wasMarked -and ($users * 2 -lt $hadUsers -or $chats * 2 -lt $hadChats)) { $looksEmptied = $true }
                     if ($looksEmptied -and -not $AcceptEmpty) {
                         $emptyRun = $true
                         # Named like a -CORRUPT one, so it is never a daily backup (not one of the
@@ -417,14 +438,14 @@ try {
                         # 'at' is the first night it was seen. The good* counts stay as they are, or the
                         # second night would take the empty database for the normal one.
                         $since = Get-Date
-                        if ($bstate['emptied'] -is [hashtable] -and $bstate['emptied']['at']) { $since = $bstate['emptied']['at'] }
+                        if ($wasMarked -and $bstate['emptied']['at']) { $since = $bstate['emptied']['at'] }
                         # (PowerShell 7 reads the saved time back as a date, Windows PowerShell 5.1 as text.)
                         if ($since -is [datetime]) { $since = $since.ToString('s') }
                         # The health watch reads exactly these names.
                         $bstate['emptied'] = @{ at = $since; archive = $archive; lastGood = [string]$bstate['goodArchive']; users = $users; chats = $chats; hadUsers = $hadUsers; hadChats = $hadChats }
                     } else {
                         if ($looksEmptied) { Write-BackupLog INFO "-AcceptEmpty: $users users and $chats chats (it had $hadUsers and $hadChats) count as this install's data from now on." }
-                        elseif ($bstate.ContainsKey('emptied')) { Write-BackupLog INFO "Open WebUI's data is back ($users users, $chats chats): old backups are pruned as usual again." }
+                        elseif ($wasMarked) { Write-BackupLog INFO "Open WebUI's data is back ($users users, $chats chats): old backups are pruned as usual again." }
                         $bstate.Remove('emptied')
                         $bstate['goodUsers'] = $users; $bstate['goodChats'] = $chats; $bstate['goodArchive'] = $archive
                     }
@@ -441,6 +462,10 @@ try {
         } finally {
             Invoke-Docker -Arguments @('volume', 'rm', '-f', $scratch) -AllowFail | Out-Null
         }
+    }
+    # Said, or a run that could not count anything looks like one that settled it.
+    if ($AcceptEmpty -and -not $countsRead) {
+        Write-BackupLog WARN '-AcceptEmpty was not applied: it counts on a nightly run (one without a tag) whose database check ran, and this run has no counts. Run Backup-OpenWebUI.ps1 -AcceptEmpty again.'
     }
     # Verified: from here on the archive is good, and nothing below may delete it.
     $verifiedOk = $true
@@ -460,28 +485,33 @@ try {
     Write-BackupLog OK ("Backup {0} ({1:N1} MB){2}{3}" -f $archive, ($size / 1MB), $(if ($stopped) { '; container was paused for consistency' } else { '' }), $verified)
     if ($emptyRun) {
         Write-BackupLog WARN (("Open WebUI's data looks wiped: {0} users and {1} chats now, {2} and {3} at the last good backup ({4}). This archive is kept as {5}, and no older backup is deleted until this is settled. " -f $users, $chats, $hadUsers, $hadChats, $bstate['emptied']['lastGood'], $name) +
-            'To get the data back, run Restore-OpenWebUI.ps1 (it picks the newest backup that still has the data). If you emptied it yourself, run Backup-OpenWebUI.ps1 -AcceptEmpty once.')
-        # Two are enough, as with -CORRUPT: the oldest (made right after the data went) and the newest.
-        $emp = @(Get-ChildItem -LiteralPath $backupDir -Filter 'open-webui-*-EMPTY.tar.gz' | Where-Object { $_.Name -match '^open-webui-\d{8}-\d{6}-EMPTY\.tar\.gz$' } | Sort-Object LastWriteTime)  # lai-ok: objects
+            'To get the data back, run Restore-OpenWebUI.ps1 (it takes that last good backup). If you emptied it yourself, run Backup-OpenWebUI.ps1 -AcceptEmpty once.')
+    }
+    # Two -EMPTY archives are enough, as with -CORRUPT: the oldest (made right after the data went)
+    # and the newest. The same in the mirror.
+    $capEmpty = {
+        param([string]$Dir)
+        $emp = @(Get-ChildItem -LiteralPath $Dir -Filter 'open-webui-*-EMPTY.tar.gz' -ErrorAction SilentlyContinue | Where-Object { $_.Name -match '^open-webui-\d{8}-\d{6}-EMPTY\.tar\.gz$' } | Sort-Object LastWriteTime)  # lai-ok: objects
         if ($emp.Count -gt 2) {
             $emp[1..($emp.Count - 2)] | ForEach-Object { Remove-Item -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue }
         }
     }
+    if ($emptyRun) { & $capEmpty $backupDir }
     # While the data looks wiped nothing old is deleted, here or in the mirror: not by this run, and
     # not by a later one that cannot tell (a tagged run, one without the deep check). The mark in
     # backup-state.json stays until the counts are back or -AcceptEmpty.
     $keepOld = $emptyRun
-    if (-not $keepOld) {
-        try {
-            $marked = (Read-LaiState -Path $backupStatePath)['emptied']
-            if ($marked) {
-                $keepOld = $true
-                if (-not $NoPrune) { Write-BackupLog INFO "Old backups are not pruned: Open WebUI's data looked wiped on $($marked['at']) (see the warning of that night in this log)." }
-            }
-        } catch {
+    try {
+        $marked = (Read-LaiState -Path $backupStatePath)['emptied']
+        if ($marked) {
+            if (-not $keepOld -and -not $NoPrune) { Write-BackupLog INFO "Old backups are not pruned: Open WebUI's data looked wiped on $($marked['at']) (see the warning of that night in this log)." }
             $keepOld = $true
-            Write-BackupLog WARN "Old backups are not pruned on this run: backup-state.json could not be read ($($_.Exception.Message))."
+            # (PowerShell 7 reads the saved time back as a date, Windows PowerShell 5.1 as text.)
+            try { $keepSince = [datetime]$marked['at'] } catch { Write-Verbose 'the mark has no usable date' }
         }
+    } catch {
+        $keepOld = $true
+        Write-BackupLog WARN "Old backups are not pruned on this run: backup-state.json could not be read ($($_.Exception.Message))."
     }
 
     # Retention: daily (untagged) archives older than N days go, but the newest three daily ones always
@@ -508,8 +538,10 @@ try {
     }
     if (-not $NoPrune -and -not $keepOld) { & $prune $backupDir }
 
-    # An -EMPTY archive is not copied: the mirror keeps the last good ones.
-    if ($Mirror -and -not $NoMirror -and -not $emptyRun) {
+    # An -EMPTY archive is copied too: it is what the data is now, and without it nothing newer than
+    # the last good night is off this PC for as long as the mark stays. It is never a daily one, so
+    # the mirror's good archives keep their place.
+    if ($Mirror -and -not $NoMirror) {
         try {
             if (-not (Test-Path -LiteralPath $Mirror)) { New-Item -ItemType Directory -Force -Path $Mirror -ErrorAction Stop | Out-Null }
             # Copy under a temporary name, then rename: an interrupted copy never looks like a backup.
@@ -523,6 +555,7 @@ try {
                 Save-LaiState -State $bs -Path $backupStatePath
             } catch { Write-BackupLog WARN "Mirror copy done, but its state could not be recorded: $($_.Exception.Message)" }
             Get-ChildItem -LiteralPath $Mirror -Filter 'incomplete-open-webui-*' -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
+            if ($emptyRun) { & $capEmpty $Mirror }
             if (-not $NoPrune -and -not $keepOld) { & $prune $Mirror }
         } catch {
             # The local archive is complete and verified; an offline NAS must not fail the backup.
