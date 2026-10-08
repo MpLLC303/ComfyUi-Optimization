@@ -588,9 +588,18 @@ exec 'REALDOCKER' "$@"
         Assert-That ($b.Text -match 'Old backups are not pruned' -and (& $oldLeft $wipeBk 'open-webui') -eq 4 -and (& $oldLeft $wipeMirror 'open-webui') -eq 4) "and it prunes nothing, here or in the mirror, and says why ($(& $oldLeft $wipeBk 'open-webui') and $(& $oldLeft $wipeMirror 'open-webui') of 4 old)"
         # The run at sign-in: this night's backup was made, as an -EMPTY one, so there is nothing to
         # catch up. (The archive with the rows is dated before the due time, so only that one counts.)
-        Get-ChildItem -LiteralPath $wipeBk -Filter $rowsName | ForEach-Object { $_.LastWriteTime = (Get-Date).AddHours(-3) }
+        # Dated through a container, like the rollback archive in part 3: Docker wrote the archive,
+        # so on Linux it belongs to root and this test may not set its time itself (the attempt
+        # ended the suite here). The time is given in UTC, which is the clock of the container.
+        if ($rows.Count -eq 1) {
+            $rowsDated = (Get-Date).ToUniversalTime().AddHours(-3).ToString('yyyy-MM-dd HH:mm:ss', [Globalization.CultureInfo]::InvariantCulture)
+            Invoke-DockerText @('run', '--rm', '-v', "${wipeBk}:/b", 'alpine:3.20', 'touch', '-d', $rowsDated, "/b/$rowsName") | Out-Null
+        }
+        $rowsNow = @(Get-ChildItem -LiteralPath $wipeBk -Filter $rowsName)
+        $rowsHours = -1
+        if ($rowsNow.Count -eq 1) { $rowsHours = [math]::Round(((Get-Date).ToUniversalTime() - $rowsNow[0].LastWriteTimeUtc).TotalHours, 1) }
         $b = & $runWipe 'Backup-OpenWebUI.ps1' ($night + $noResearch + @('-DailyAt', (Get-Date).AddHours(-1).ToString('HH:mm', [Globalization.CultureInfo]::InvariantCulture)))
-        Assert-That ($b.Code -eq 0 -and $b.Text -match 'Nothing to do: the backup due at .*-EMPTY\.tar\.gz') "the sign-in run does nothing when the night's backup is there as an -EMPTY one (exit $($b.Code))"
+        Assert-That ($b.Code -eq 0 -and $rowsHours -gt 2 -and $b.Text -match 'Nothing to do: the backup due at .*-EMPTY\.tar\.gz') "the sign-in run does nothing when the night's backup is there as an -EMPTY one (exit $($b.Code); the archive with the rows is dated $rowsHours h back)"
 
         # The second night: deep research is archived too (the purge that emptied Open WebUI emptied it).
         $b = & $runWipe 'Backup-OpenWebUI.ps1' ($night + $withResearch)
