@@ -483,7 +483,8 @@ function Find-PcsOpenDriver {
         Control): CVE-2020-12446 https://nvd.nist.gov/vuln/detail/CVE-2020-12446
       MsIo64.sys / MsIo32.sys (Patriot Viper RGB and other lighting tools): CVE-2019-18845
         https://nvd.nist.gov/vuln/detail/CVE-2019-18845
-    Device is the name the driver's device answers to (\\.\<Device>). The advisories do not all
+    Device is the name the driver's device answers to (a program opens it as \\.\<Device>; the
+    probe asks Windows' own list of device names, see Test-PcsDeviceOpen). The advisories do not all
     spell it out, so these names are unofficial: where one is wrong the probe finds no such device,
     and the driver counts as not checked.
     #>
@@ -802,20 +803,51 @@ function Get-PcsAvProduct {
     }
 }
 
+function ConvertFrom-PcsOpenStatus {
+    <#
+    Pure (unit-tested). What the status of opening a driver's device says: 'opened', 'denied',
+    'absent' (no device of that name) or 'error 0x<status>'. Status is the NTSTATUS that NtOpenFile
+    handed back, as the 32-bit number it is (the ones that say "failed" are negative, and PowerShell
+    reads 0xC0000022 as that same negative number).
+    Read from the status itself, never from the Windows error code it is turned into for a program:
+    there 0xC0000022 (the device's own access check refused the caller) and 0xC00000BA (what was
+    opened is a folder) are both 5, "access denied". So only 0xC0000022 is 'denied'.
+    NTSTATUS values (ntstatus.h; [MS-ERREF] section 2.3.1): 0x00000000 STATUS_SUCCESS;
+      0xC0000022 STATUS_ACCESS_DENIED; 0xC0000034 STATUS_OBJECT_NAME_NOT_FOUND and 0xC000003A
+      STATUS_OBJECT_PATH_NOT_FOUND = no such device. Any other status is handed on as 'error 0x...'
+      and not interpreted: not checked.
+    #>
+    param([int]$Status)
+    if ($Status -eq 0) { return 'opened' }
+    if ($Status -eq 0xC0000022) { return 'denied' }
+    if ($Status -eq 0xC0000034 -or $Status -eq 0xC000003A) { return 'absent' }
+    return ('error 0x{0:X8}' -f $Status)
+}
+
 function Test-PcsDeviceOpen {
     <#
     Can this program open a driver's device? Answers 'opened', 'denied', 'absent' (no device of
-    that name) or 'error ...'. It opens \\.\<Device> asking for neither read nor write access and
+    that name) or 'error ...'. It opens the device asking for neither read nor write access and
     closes the handle at once, in one call: nothing is sent to the driver and nothing is changed.
-    Takes a bare device name only, so it cannot be pointed at a file or a folder. The answer means
-    something only in a window without administrator rights; the caller sees to that.
-    CreateFileW (fileapi.h), https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-createfilew :
-      dwDesiredAccess 0 = neither GENERIC_READ nor GENERIC_WRITE (the open still has to pass the
-      device's own access check); dwShareMode 3 = FILE_SHARE_READ | FILE_SHARE_WRITE;
-      dwCreationDisposition 3 = OPEN_EXISTING; a failed open returns INVALID_HANDLE_VALUE (-1).
-    System error codes (winerror.h), https://learn.microsoft.com/en-us/windows/win32/debug/system-error-codes--0-499- :
-      2 ERROR_FILE_NOT_FOUND and 3 ERROR_PATH_NOT_FOUND = no such device; 5 ERROR_ACCESS_DENIED.
-      Any other code is handed on as 'error <code>' and not interpreted: not checked.
+    Takes a bare device name only. The answer means something only in a window without
+    administrator rights; the caller sees to that.
+    The device is opened by its place in Windows' own list of device names, \GLOBAL??\<Device>,
+    where a driver puts its name and a program without administrator rights cannot put one. Not as
+    \\.\<Device>: that form is looked up among the names of this sign-in session first, and there
+    any program may add a name without administrator rights (DefineDosDevice, which is what 'subst'
+    uses). The driver's name pointed at a folder that way made this check read 'denied', and so
+    fine, while every program could still open the real device. \\.\GLOBALROOT\... is no way round
+    it: GLOBALROOT is itself looked up among the session's names first.
+    ("Local and Global MS-DOS Device Names",
+    https://learn.microsoft.com/en-us/windows-hardware/drivers/kernel/local-and-global-ms-dos-device-names )
+    NtOpenFile (winternl.h), https://learn.microsoft.com/en-us/windows/win32/api/winternl/nf-winternl-ntopenfile ,
+    called with what CreateFileW passes on for an open that asks for no access:
+      DesiredAccess 0x00100080 = SYNCHRONIZE | FILE_READ_ATTRIBUTES, neither read nor write (the open
+      still has to pass the device's own access check); ShareAccess 3 = FILE_SHARE_READ |
+      FILE_SHARE_WRITE; OpenOptions 0x60 = FILE_SYNCHRONOUS_IO_NONALERT | FILE_NON_DIRECTORY_FILE;
+      in the object attributes 0x40 = OBJ_CASE_INSENSITIVE and no root directory, so the name is the
+      whole path. NtOpenFile opens what exists and creates nothing.
+    What the status it hands back means: ConvertFrom-PcsOpenStatus.
     #>
     param([string]$Device)
     if ($env:OS -ne 'Windows_NT') { return 'error (not Windows)' }
@@ -823,28 +855,54 @@ function Test-PcsDeviceOpen {
     try {
         if (-not ('PcsDevice' -as [type])) {
             $members = @(
-                '[System.Runtime.InteropServices.DllImport("kernel32.dll", CharSet = System.Runtime.InteropServices.CharSet.Unicode, SetLastError = true)]'
-                'static extern System.IntPtr CreateFileW(string lpFileName, uint dwDesiredAccess, uint dwShareMode, System.IntPtr lpSecurityAttributes, uint dwCreationDisposition, uint dwFlagsAndAttributes, System.IntPtr hTemplateFile);'
+                '[System.Runtime.InteropServices.DllImport("ntdll.dll")]'
+                'static extern int NtOpenFile(out System.IntPtr FileHandle, uint DesiredAccess, ref OBJECT_ATTRIBUTES ObjectAttributes, out IO_STATUS_BLOCK IoStatusBlock, uint ShareAccess, uint OpenOptions);'
                 '[System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError = true)]'
                 'static extern bool CloseHandle(System.IntPtr hObject);'
-                '// 0 = opened, and closed again here; otherwise the error code of the failed open (-1: none given).'
-                'public static int TryOpen(string name) {'
-                '    System.IntPtr handle = CreateFileW(name, 0, 3, System.IntPtr.Zero, 3, 0, System.IntPtr.Zero);'
-                '    if (handle == new System.IntPtr(-1)) { int code = System.Runtime.InteropServices.Marshal.GetLastWin32Error(); return code == 0 ? -1 : code; }'
-                '    CloseHandle(handle);'
-                '    return 0;'
+                '[System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]'
+                'struct UNICODE_STRING { public ushort Length; public ushort MaximumLength; public System.IntPtr Buffer; }'
+                '[System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]'
+                'struct OBJECT_ATTRIBUTES { public uint Length; public System.IntPtr RootDirectory; public System.IntPtr ObjectName; public uint Attributes; public System.IntPtr SecurityDescriptor; public System.IntPtr SecurityQualityOfService; }'
+                '[System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]'
+                'struct IO_STATUS_BLOCK { public System.IntPtr Status; public System.IntPtr Information; }'
+                '// The NTSTATUS of the open. 0 = opened, and closed again here. The path is handed over as a'
+                '// counted string (its length in bytes, without the closing zero) in memory that is freed here.'
+                'public static int TryOpen(string path) {'
+                '    System.IntPtr text = System.IntPtr.Zero;'
+                '    System.IntPtr namePointer = System.IntPtr.Zero;'
+                '    try {'
+                '        text = System.Runtime.InteropServices.Marshal.StringToHGlobalUni(path);'
+                '        namePointer = System.Runtime.InteropServices.Marshal.AllocHGlobal(System.Runtime.InteropServices.Marshal.SizeOf(typeof(UNICODE_STRING)));'
+                '        UNICODE_STRING name;'
+                '        name.Length = (ushort)(path.Length * 2);'
+                '        name.MaximumLength = (ushort)(path.Length * 2 + 2);'
+                '        name.Buffer = text;'
+                '        System.Runtime.InteropServices.Marshal.StructureToPtr(name, namePointer, false);'
+                '        OBJECT_ATTRIBUTES attributes;'
+                '        attributes.Length = (uint)System.Runtime.InteropServices.Marshal.SizeOf(typeof(OBJECT_ATTRIBUTES));'
+                '        attributes.RootDirectory = System.IntPtr.Zero;'
+                '        attributes.ObjectName = namePointer;'
+                '        attributes.Attributes = 0x40;'
+                '        attributes.SecurityDescriptor = System.IntPtr.Zero;'
+                '        attributes.SecurityQualityOfService = System.IntPtr.Zero;'
+                '        System.IntPtr handle;'
+                '        IO_STATUS_BLOCK io;'
+                '        int status = NtOpenFile(out handle, 0x00100080, ref attributes, out io, 3, 0x60);'
+                '        if (status == 0) { CloseHandle(handle); }'
+                '        return status;'
+                '    } finally {'
+                '        System.Runtime.InteropServices.Marshal.FreeHGlobal(namePointer);'
+                '        System.Runtime.InteropServices.Marshal.FreeHGlobal(text);'
+                '    }'
                 '}'
             ) -join "`n"
             Add-Type -Namespace '' -Name 'PcsDevice' -MemberDefinition $members
         }
-        $code = [PcsDevice]::TryOpen('\\.\' + $Device)
+        $status = [PcsDevice]::TryOpen('\GLOBAL??\' + $Device)
     } catch {
         return "error ($($_.Exception.Message))"
     }
-    if ($code -eq 0) { return 'opened' }
-    if ($code -eq 5) { return 'denied' }
-    if ($code -eq 2 -or $code -eq 3) { return 'absent' }
-    return "error $code"
+    return (ConvertFrom-PcsOpenStatus -Status $status)
 }
 
 function Get-PcsFirewallRuleText {

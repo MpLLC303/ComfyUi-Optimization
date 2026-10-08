@@ -674,6 +674,235 @@ function New-LaiIntegrityBudget {
     return @{ MaxEntries = $MaxEntries; MaxBytes = $MaxBytes; MaxSeconds = $MaxSeconds; Entries = 0; Bytes = [long]0; Clock = [System.Diagnostics.Stopwatch]::StartNew(); Stopped = '' }
 }
 
+function Test-LaiIntegrityOnWindows {
+    # Whether the integrity walk runs on Windows, asked of .NET and not of the OS variable. A
+    # per-user variable of that name (HKCU\Environment, which needs no administrator rights)
+    # replaces the system's one in that user's processes, the elevated installer and its resume task
+    # included: read from the variable, the walk went by path again, which is the walk that can be
+    # raced (Add-LaiIntegrityEntry). Watch-LocalAI.ps1 asks the same way for its notifications.
+    return ([System.Environment]::OSVersion.Platform -eq [System.PlatformID]::Win32NT)
+}
+
+function Initialize-LaiIntegrityNative {
+    # Windows only. The Windows calls that let the integrity walk ask a handle instead of a path
+    # (Add-LaiIntegrityEntry says why), compiled once per process the way Enable-LaiKeepAwake does
+    # it. Returns whether they are there: $false off Windows or when they could not be compiled, and
+    # the walk then records 'unreadable' and reads nothing.
+    #   Open       CreateFileW, https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-createfilew :
+    #              0x80000000 GENERIC_READ; 7 = FILE_SHARE_READ | WRITE | DELETE, so nobody is kept
+    #              from writing, renaming or deleting meanwhile; 3 OPEN_EXISTING; 0x02300000 =
+    #              FILE_FLAG_BACKUP_SEMANTICS (a folder can be opened too) |
+    #              FILE_FLAG_OPEN_REPARSE_POINT (a link in the last place of the path is opened
+    #              itself, not what it points at) | SECURITY_SQOS_PRESENT with SECURITY_ANONYMOUS
+    #              (should a path lead to a named pipe after all, its server cannot act as this
+    #              account; .NET opens every file that way). The path goes in behind \\?\, so it is
+    #              taken as written whatever its length. error: 0, or the Windows error code.
+    #              Only the place a walk starts from is opened this way (the install folder).
+    #   OpenBelow  NtOpenFile (winternl.h), https://learn.microsoft.com/en-us/windows/win32/api/winternl/nf-winternl-ntopenfile ,
+    #              with the handle of an open folder as the root directory and one name as the whole
+    #              name: the entry of that name in the folder the handle holds. No path is looked up,
+    #              so what any path to that folder leads to by now decides nothing. 0x80100000 =
+    #              GENERIC_READ | SYNCHRONIZE; 7 as above; 0x00200020 = FILE_OPEN_REPARSE_POINT (a
+    #              link is opened itself) | FILE_SYNCHRONOUS_IO_NONALERT (a read waits for its data,
+    #              as CreateFileW arranges it); 0x40 = OBJ_CASE_INSENSITIVE. Without
+    #              FILE_OPEN_FOR_BACKUP_INTENT: NtOpenFile opens a folder without it, and with it an
+    #              administrator's backup privilege would stand in for the permissions of the entry.
+    #              NtOpenFile opens what exists and creates nothing. A name that is no single name of
+    #              a folder ('.', '..', one with a backslash, a slash or a colon, one longer than a
+    #              file system allows) is not handed over (error -1). error: 0; 2 when the folder has
+    #              no such entry (0xC0000034 STATUS_OBJECT_NAME_NOT_FOUND, 0xC000003A
+    #              STATUS_OBJECT_PATH_NOT_FOUND); else the NTSTATUS, a negative number.
+    #   FinalPath  GetFinalPathNameByHandleW, https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-getfinalpathnamebyhandlew :
+    #              2 = FILE_NAME_NORMALIZED | VOLUME_NAME_NT. Where what the handle holds really is,
+    #              in long names and with the volume as a device (\Device\HarddiskVolume3\AI\Stack).
+    #              $null when Windows does not say.
+    #   Describe   GetFileInformationByHandleEx, https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-getfileinformationbyhandleex :
+    #              9 FileAttributeTagInfo (the attributes) and 1 FileStandardInfo (the size:
+    #              EndOfFile, at byte 8), both of the handle. $null when Windows does not say.
+    #   List       the same call with 11 FileIdBothDirectoryRestartInfo for the first entries and
+    #              10 FileIdBothDirectoryInfo for the rest, until error 18 ERROR_NO_MORE_FILES
+    #              (FILE_ID_BOTH_DIR_INFO: NextEntryOffset at byte 0, FileAttributes at 56,
+    #              FileNameLength at 60, FileName at 104). The names in the folder the handle holds,
+    #              sorted by name (ordinal), each with whether it is a folder; no more than 'room' of
+    #              them, 'cut' when there were more. $null when the folder could not be listed.
+    if (-not (Test-LaiIntegrityOnWindows)) { return $false }
+    try {
+        if (-not ('LaiIntegrityNative' -as [type])) {
+            $members = @(
+                '[System.Runtime.InteropServices.DllImport("kernel32.dll", CharSet = System.Runtime.InteropServices.CharSet.Unicode, SetLastError = true)]'
+                'static extern Microsoft.Win32.SafeHandles.SafeFileHandle CreateFileW(string lpFileName, uint dwDesiredAccess, uint dwShareMode, System.IntPtr lpSecurityAttributes, uint dwCreationDisposition, uint dwFlagsAndAttributes, System.IntPtr hTemplateFile);'
+                '[System.Runtime.InteropServices.DllImport("ntdll.dll")]'
+                'static extern int NtOpenFile(out System.IntPtr FileHandle, uint DesiredAccess, ref OBJECT_ATTRIBUTES ObjectAttributes, System.IntPtr IoStatusBlock, uint ShareAccess, uint OpenOptions);'
+                '[System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]'
+                'struct UNICODE_STRING { public ushort Length; public ushort MaximumLength; public System.IntPtr Buffer; }'
+                '[System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]'
+                'struct OBJECT_ATTRIBUTES { public uint Length; public System.IntPtr RootDirectory; public System.IntPtr ObjectName; public uint Attributes; public System.IntPtr SecurityDescriptor; public System.IntPtr SecurityQualityOfService; }'
+                '[System.Runtime.InteropServices.DllImport("kernel32.dll", CharSet = System.Runtime.InteropServices.CharSet.Unicode, SetLastError = true)]'
+                'static extern uint GetFinalPathNameByHandleW(Microsoft.Win32.SafeHandles.SafeFileHandle hFile, System.Text.StringBuilder lpszFilePath, uint cchFilePath, uint dwFlags);'
+                '[System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError = true)]'
+                'static extern bool GetFileInformationByHandleEx(Microsoft.Win32.SafeHandles.SafeFileHandle hFile, int FileInformationClass, System.IntPtr lpFileInformation, uint dwBufferSize);'
+                'public static Microsoft.Win32.SafeHandles.SafeFileHandle Open(string path, out int error) {'
+                '    error = -1;'
+                '    // A device name (\\.\NUL) is no file or folder of the install.'
+                '    if (path.StartsWith(@"\\.\", System.StringComparison.Ordinal)) { return null; }'
+                '    string literal = path;'
+                '    if (!path.StartsWith(@"\\?\", System.StringComparison.Ordinal)) {'
+                '        literal = path.StartsWith(@"\\", System.StringComparison.Ordinal) ? @"\\?\UNC\" + path.Substring(2) : @"\\?\" + path;'
+                '    }'
+                '    Microsoft.Win32.SafeHandles.SafeFileHandle handle = CreateFileW(literal, 0x80000000, 7, System.IntPtr.Zero, 3, 0x02300000, System.IntPtr.Zero);'
+                '    if (!handle.IsInvalid) { error = 0; return handle; }'
+                '    int code = System.Runtime.InteropServices.Marshal.GetLastWin32Error();'
+                '    handle.Dispose();'
+                '    if (code != 0) { error = code; }'
+                '    return null;'
+                '}'
+                '// The name is handed over as a counted string (its length in bytes, without the closing'
+                '// zero) in memory that is freed here; the folder cannot be closed while the call runs.'
+                'public static Microsoft.Win32.SafeHandles.SafeFileHandle OpenBelow(Microsoft.Win32.SafeHandles.SafeFileHandle folder, string name, out int error) {'
+                '    error = -1;'
+                '    if (folder == null || string.IsNullOrEmpty(name) || name == "." || name == ".." || name.Length > 255) { return null; }'
+                '    if (name.IndexOf(@"\", System.StringComparison.Ordinal) >= 0 || name.IndexOf("/", System.StringComparison.Ordinal) >= 0 || name.IndexOf(":", System.StringComparison.Ordinal) >= 0) { return null; }'
+                '    System.IntPtr text = System.IntPtr.Zero;'
+                '    System.IntPtr namePointer = System.IntPtr.Zero;'
+                '    System.IntPtr io = System.IntPtr.Zero;'
+                '    bool held = false;'
+                '    try {'
+                '        // Room for the IO_STATUS_BLOCK the call fills in (a status and a count, a pointer wide each); not read here.'
+                '        io = System.Runtime.InteropServices.Marshal.AllocHGlobal(2 * System.IntPtr.Size);'
+                '        text = System.Runtime.InteropServices.Marshal.StringToHGlobalUni(name);'
+                '        namePointer = System.Runtime.InteropServices.Marshal.AllocHGlobal(System.Runtime.InteropServices.Marshal.SizeOf(typeof(UNICODE_STRING)));'
+                '        UNICODE_STRING counted;'
+                '        counted.Length = (ushort)(name.Length * 2);'
+                '        counted.MaximumLength = (ushort)(name.Length * 2 + 2);'
+                '        counted.Buffer = text;'
+                '        System.Runtime.InteropServices.Marshal.StructureToPtr(counted, namePointer, false);'
+                '        folder.DangerousAddRef(ref held);'
+                '        OBJECT_ATTRIBUTES attributes;'
+                '        attributes.Length = (uint)System.Runtime.InteropServices.Marshal.SizeOf(typeof(OBJECT_ATTRIBUTES));'
+                '        attributes.RootDirectory = folder.DangerousGetHandle();'
+                '        attributes.ObjectName = namePointer;'
+                '        attributes.Attributes = 0x40;'
+                '        attributes.SecurityDescriptor = System.IntPtr.Zero;'
+                '        attributes.SecurityQualityOfService = System.IntPtr.Zero;'
+                '        System.IntPtr opened;'
+                '        int status = NtOpenFile(out opened, 0x80100000, ref attributes, io, 7, 0x00200020);'
+                '        if (status == 0) { error = 0; return new Microsoft.Win32.SafeHandles.SafeFileHandle(opened, true); }'
+                '        if (status == unchecked((int)0xC0000034) || status == unchecked((int)0xC000003A)) { error = 2; } else { error = status; }'
+                '        return null;'
+                '    } finally {'
+                '        if (held) { folder.DangerousRelease(); }'
+                '        System.Runtime.InteropServices.Marshal.FreeHGlobal(namePointer);'
+                '        System.Runtime.InteropServices.Marshal.FreeHGlobal(text);'
+                '        System.Runtime.InteropServices.Marshal.FreeHGlobal(io);'
+                '    }'
+                '}'
+                'public static string FinalPath(Microsoft.Win32.SafeHandles.SafeFileHandle handle) {'
+                '    System.Text.StringBuilder text = new System.Text.StringBuilder(1024);'
+                '    uint length = GetFinalPathNameByHandleW(handle, text, (uint)text.Capacity, 2);'
+                '    // Too small: the answer is then the room it needs.'
+                '    if (length >= text.Capacity && length < 65536) {'
+                '        text = new System.Text.StringBuilder((int)length + 1);'
+                '        length = GetFinalPathNameByHandleW(handle, text, (uint)text.Capacity, 2);'
+                '    }'
+                '    if (length == 0 || length >= text.Capacity) { return null; }'
+                '    return text.ToString();'
+                '}'
+                'public static long[] Describe(Microsoft.Win32.SafeHandles.SafeFileHandle handle) {'
+                '    System.IntPtr buffer = System.Runtime.InteropServices.Marshal.AllocHGlobal(24);'
+                '    try {'
+                '        if (!GetFileInformationByHandleEx(handle, 9, buffer, 8)) { return null; }'
+                '        long attributes = (uint)System.Runtime.InteropServices.Marshal.ReadInt32(buffer, 0);'
+                '        if (!GetFileInformationByHandleEx(handle, 1, buffer, 24)) { return null; }'
+                '        return new long[] { attributes, System.Runtime.InteropServices.Marshal.ReadInt64(buffer, 8) };'
+                '    } finally { System.Runtime.InteropServices.Marshal.FreeHGlobal(buffer); }'
+                '}'
+                '// The entries of one filled buffer. True when there was no room for one of them.'
+                'static bool Take(System.IntPtr buffer, int size, int room, System.Collections.Generic.SortedDictionary<string, bool> found) {'
+                '    int at = 0;'
+                '    while (true) {'
+                '        if (at < 0 || at > size - 104) { throw new System.IO.InvalidDataException(); }'
+                '        int next = System.Runtime.InteropServices.Marshal.ReadInt32(buffer, at);'
+                '        int attributes = System.Runtime.InteropServices.Marshal.ReadInt32(buffer, at + 56);'
+                '        int bytes = System.Runtime.InteropServices.Marshal.ReadInt32(buffer, at + 60);'
+                '        if (bytes < 0 || bytes > size - 104 - at) { throw new System.IO.InvalidDataException(); }'
+                '        string name = System.Runtime.InteropServices.Marshal.PtrToStringUni(System.IntPtr.Add(buffer, at + 104), bytes / 2);'
+                '        if (name != "." && name != "..") {'
+                '            if (found.Count >= room) { return true; }'
+                '            found[name] = (attributes & 0x10) != 0;'
+                '        }'
+                '        if (next <= 0) { return false; }'
+                '        at += next;'
+                '    }'
+                '}'
+                'public static System.Collections.Generic.SortedDictionary<string, bool> List(Microsoft.Win32.SafeHandles.SafeFileHandle folder, int room, out bool cut) {'
+                '    cut = false;'
+                '    System.Collections.Generic.SortedDictionary<string, bool> found = new System.Collections.Generic.SortedDictionary<string, bool>(System.StringComparer.Ordinal);'
+                '    const int size = 65536;'
+                '    System.IntPtr buffer = System.Runtime.InteropServices.Marshal.AllocHGlobal(size);'
+                '    try {'
+                '        int kind = 11;'
+                '        while (true) {'
+                '            if (!GetFileInformationByHandleEx(folder, kind, buffer, size)) {'
+                '                int code = System.Runtime.InteropServices.Marshal.GetLastWin32Error();'
+                '                // 18: no more entries. 2 on the first call: a folder with none at all (the top of a drive).'
+                '                if (code == 18 || (code == 2 && kind == 11)) { return found; }'
+                '                return null;'
+                '            }'
+                '            kind = 10;'
+                '            if (Take(buffer, size, room, found)) { cut = true; return found; }'
+                '        }'
+                '    } finally { System.Runtime.InteropServices.Marshal.FreeHGlobal(buffer); }'
+                '}'
+            ) -join "`n"
+            Add-Type -Namespace '' -Name 'LaiIntegrityNative' -MemberDefinition $members
+        }
+        return $true
+    } catch { return $false }
+}
+
+function Open-LaiIntegrityHandle {
+    # Windows only (unit-tested there). Opens one file or folder for the integrity walk and says what
+    # the handle holds. State 'ok' comes with Handle (the caller disposes it), Final (where the entry
+    # really is, as Windows says of that handle: long names, the volume as a device, every link above
+    # it resolved), Folder and Size. Any other State comes without a handle: 'gone' (no such entry),
+    # 'link' or 'unreadable' (also off Windows and when the Windows calls are not there).
+    #   -Path    by its path, a link in its last place not followed. Only for the place a walk starts
+    #            from: a link further up is followed as in any path.
+    #   -Parent  the entry -Name of the folder that this open handle holds (OpenBelow). No path is
+    #            looked up, so it is that folder's own entry, whatever a path to the folder leads to
+    #            by now, and the answer says nothing about any other folder. The entry must also be
+    #            that name directly below -ParentFinal (where the folder was when its handle was
+    #            asked): the entries of a folder that was moved since are a 'link' as well.
+    # Final paths are compared, never paths as they are written: two spellings of one place differ
+    # (C:\Users\LONGNA~1 and C:\Users\LongName), and a path says nothing about where it leads.
+    # A link is never 'ok', so nothing is read through one.
+    param([string]$Path = '', $Parent = $null, [string]$ParentFinal = '', [string]$Name = '')
+    if (-not (Initialize-LaiIntegrityNative)) { return @{ State = 'unreadable' } }
+    $handle = $null; $keep = $false
+    try {
+        $openError = 0
+        if ($Parent) { $handle = [LaiIntegrityNative]::OpenBelow($Parent, $Name, [ref]$openError) }
+        else { $handle = [LaiIntegrityNative]::Open([System.IO.Path]::GetFullPath($Path), [ref]$openError) }
+        if ($null -eq $handle) {
+            # 2 ERROR_FILE_NOT_FOUND, 3 ERROR_PATH_NOT_FOUND.
+            if ($openError -eq 2 -or $openError -eq 3) { return @{ State = 'gone' } }
+            return @{ State = 'unreadable' }
+        }
+        $final = [string][LaiIntegrityNative]::FinalPath($handle)
+        $info = [LaiIntegrityNative]::Describe($handle)
+        if (-not $final -or $null -eq $info) { return @{ State = 'unreadable' } }
+        if ($Parent -and -not $final.Equals($ParentFinal.TrimEnd([char]'\') + '\' + $Name, [StringComparison]::OrdinalIgnoreCase)) { return @{ State = 'link' } }
+        # 0x400 FILE_ATTRIBUTE_REPARSE_POINT, 0x10 FILE_ATTRIBUTE_DIRECTORY.
+        if ([long]$info[0] -band 0x400) { return @{ State = 'link' } }
+        $keep = $true
+        return @{ State = 'ok'; Handle = $handle; Final = $final; Folder = [bool]([long]$info[0] -band 0x10); Size = [long]$info[1] }
+    } catch {
+        return @{ State = 'unreadable' }
+    } finally {
+        if ($handle -and -not $keep) { $handle.Dispose() }
+    }
+}
+
 function Add-LaiIntegrityEntry {
     # Adds one file, or everything under one folder, to $Map as 'Scripts\lib\LocalAI.psm1' = SHA-256.
     # A junction or symbolic link is recorded as 'link' and never followed: the installer records the
@@ -682,18 +911,97 @@ function Add-LaiIntegrityEntry {
     # 'unreadable'; one above -MaxHashBytes (nothing the toolkit installs comes near it) is recorded
     # by size, so a huge file dropped there cannot make the watch run for minutes. With -Budget
     # (New-LaiIntegrityBudget) the walk ends where the budget does and says where.
-    param([Parameter(Mandatory)][hashtable]$Map, [Parameter(Mandatory)][System.IO.FileSystemInfo]$Item, [Parameter(Mandatory)][string]$Relative, [long]$MaxHashBytes = 50MB, [hashtable]$Budget = $null)
+    # Which entry, in one of two ways:
+    #   -Item    a file or folder by its path. Where a walk starts (it must not be a link itself; what
+    #            lies above it is the caller's business), and off Windows every entry of a walk.
+    #   -Parent  (Windows) the open handle of the folder the entry is in, with -ParentFinal (where
+    #            that folder really is, as its handle said), -Name (the entry as the folder listed
+    #            it) and -Folder (the listing called it a folder). The walk goes down this way.
+    param([Parameter(Mandatory)][hashtable]$Map, [System.IO.FileSystemInfo]$Item = $null, [Parameter(Mandatory)][string]$Relative, [long]$MaxHashBytes = 50MB, [hashtable]$Budget = $null,
+        $Parent = $null, [string]$ParentFinal = '', [string]$Name = '', [switch]$Folder)
     if ($Budget) {
         if ($Budget['Stopped']) { return }
         if ($Budget['Entries'] -ge $Budget['MaxEntries'] -or $Budget['Bytes'] -ge $Budget['MaxBytes'] -or $Budget['Clock'].Elapsed.TotalSeconds -ge $Budget['MaxSeconds']) { $Budget['Stopped'] = $Relative; return }
         $Budget['Entries'] = [int]$Budget['Entries'] + 1
     }
-    # $Item was listed with its parent, some time ago: what it is, is asked again right before it is
-    # read, and for a folder once more after it was listed. A folder swapped for a link in between is
-    # then a 'link' and whatever was read below it is dropped, so names and hashes from elsewhere do
-    # not end up in a file the user can read. This narrows that gap to the moment between the
-    # question and the read; it does not close it (a swap there, undone before the second question,
-    # is still followed).
+    if (Test-LaiIntegrityOnWindows) {
+        # On Windows no file or folder of the walk is reached by its path, except the place the walk
+        # starts from. The user (or anything running as the user) can swap a folder for a link to a
+        # place only an administrator may read, and back, as often as it likes while the installer
+        # walks. A path that is looked up again for every entry follows such a link: the names and
+        # hashes of that other place then land in a baseline the user can read, and even an entry
+        # that is only opened and then refused tells whether a name of the user's choosing exists
+        # there. So a folder is opened once, and each of its entries is opened by its name in that
+        # open folder (Open-LaiIntegrityHandle -Parent), a link not followed. Everything else is asked
+        # of the entry's own handle: where it really is, whether it is a link, its size, the names in
+        # a folder, the bytes that are hashed. An entry that is a link, or that is not its own name
+        # directly below where its folder was when that folder was listed (the folder was moved
+        # since), is a 'link': nothing in it or below it is listed, read or hashed, whenever the swap
+        # happened and however often, and whatever lies behind the link.
+        # Still taken on trust: the folders above the install folder (Get-LaiIntegrityFiles opens the
+        # install folder by its path, and it must not be a link itself, but a link further up is
+        # followed as in any path), and that a second name for a file (a hard link) is that file:
+        # whether one can be made to a file the user may not read is Windows' rule, not checked here.
+        if (-not (Initialize-LaiIntegrityNative)) { $Map[$Relative] = 'unreadable'; return }
+        # What the listing (or the caller) took the entry for.
+        $entryName = $Name; $listedFolder = [bool]$Folder
+        if (-not $Parent) {
+            if (-not $Item) { $Map[$Relative] = 'unreadable'; return }
+            $entryName = [string]$Item.Name; $listedFolder = ($Item -is [System.IO.DirectoryInfo])
+        }
+        $opened = $null; $stream = $null
+        try {
+            if ($Parent) { $opened = Open-LaiIntegrityHandle -Parent $Parent -ParentFinal $ParentFinal -Name $entryName }
+            else { $opened = Open-LaiIntegrityHandle -Path $Item.FullName }
+            # Gone since it was listed: no entry.
+            if ($opened['State'] -eq 'gone') { return }
+            if ($opened['State'] -ne 'ok') { $Map[$Relative] = [string]$opened['State']; return }
+            $handle = $opened['Handle']; $final = [string]$opened['Final']
+            $isFolder = [bool]$opened['Folder']
+            # What it is, is the handle's answer, not the listing's: a file that has become a folder
+            # called Secrets since (or a folder that has become a file called .env) stays left out.
+            if ($isFolder -ne $listedFolder -and (Test-LaiIntegrityExcluded -Name $entryName -Folder:$isFolder)) { return }
+            if ($isFolder) {
+                # By name, whatever order the file system lists them in, so a walk that runs out of
+                # budget stops at the same entry every time. No more are listed than the budget has
+                # room for: a folder with a million entries is not read to the end just to be sorted.
+                $room = [int]::MaxValue; if ($Budget) { $room = [int]$Budget['MaxEntries'] - [int]$Budget['Entries'] }
+                $cut = $false
+                $children = [LaiIntegrityNative]::List($handle, $room, [ref]$cut)
+                if ($null -eq $children) { $Map[$Relative] = 'unreadable'; return }
+                # (Through the enumerator: to PowerShell, .Keys of a dictionary that holds a file
+                # called 'Keys' is that file's entry, not the list of names.)
+                foreach ($entry in $children.GetEnumerator()) {
+                    $childName = [string]$entry.Key
+                    $childIsFolder = [bool]$entry.Value
+                    if (Test-LaiIntegrityExcluded -Name $childName -Folder:$childIsFolder) { continue }
+                    # Each entry by its name in this open folder, exactly as the folder listed it (a
+                    # closing dot or space included: no path is written out, so nothing is made
+                    # another name of). This folder's path is not looked up again.
+                    Add-LaiIntegrityEntry -Map $Map -Relative ($Relative + '\' + $childName) -MaxHashBytes $MaxHashBytes -Budget $Budget -Parent $handle -ParentFinal $final -Name $childName -Folder:$childIsFolder
+                }
+                if ($cut -and $Budget -and -not $Budget['Stopped']) { $Budget['Stopped'] = $Relative }
+                return
+            }
+            $size = [long]$opened['Size']
+            if ($size -gt $MaxHashBytes) { $Map[$Relative] = 'size ' + $size; return }
+            if ($Budget) { $Budget['Bytes'] = [long]$Budget['Bytes'] + $size }
+            $stream = New-Object System.IO.FileStream($handle, [System.IO.FileAccess]::Read)
+            $Map[$Relative] = [string](Get-FileHash -InputStream $stream -Algorithm SHA256 -ErrorAction Stop).Hash
+        } catch {
+            $Map[$Relative] = 'unreadable'
+        } finally {
+            if ($stream) { $stream.Dispose() }
+            if ($opened -and $opened['Handle']) { $opened['Handle'].Dispose() }
+        }
+        return
+    }
+    # Off Windows (the toolkit installs on Windows only; the test jobs on Linux run this) the walk
+    # goes by path. $Item was listed with its parent, some time ago: what it is, is asked again right
+    # before it is read, and for a folder once more after it was listed. A folder swapped for a link
+    # in between is then a 'link' and whatever was read below it is dropped. That narrows the gap to
+    # the moment between the question and the read; it does not close it (a swap there, undone
+    # before the second question, is still followed).
     try { $Item.Refresh() } catch { $Map[$Relative] = 'unreadable'; return }
     if (-not $Item.Exists) { return }
     if ($Item.Attributes -band [IO.FileAttributes]::ReparsePoint) { $Map[$Relative] = 'link'; return }
@@ -731,13 +1039,63 @@ function Get-LaiIntegrityFiles {
     # Every file under <AIRoot>\Scripts and <AIRoot>\Stack with its SHA-256, keyed by its path below
     # the install folder (always with backslashes, so a baseline reads the same everywhere). Scripts
     # first: when -Budget runs out in Stack, the scripts have all been read.
+    # On Windows the install folder is opened once, by its path, and held open: Scripts and Stack are
+    # opened by their names in that open folder, and so is everything below them, each in its own
+    # folder (Add-LaiIntegrityEntry, -Parent). An install folder that is a link itself is not read
+    # through: Scripts and Stack are each recorded as a 'link' then, without a look at what lies
+    # behind it. When the install folder cannot be opened that way, or the Windows calls for it are
+    # not there, both are 'unreadable', and nothing is read by its path instead. Either way no file
+    # of that folder is in the list: Get-LaiIntegrityUnread is how the comparison and the summary
+    # tell, and both say so.
     param([Parameter(Mandatory)][string]$AIRoot, [long]$MaxHashBytes = 50MB, [hashtable]$Budget = $null)
     $map = @{}
+    if (Test-LaiIntegrityOnWindows) {
+        $root = Open-LaiIntegrityHandle -Path $AIRoot
+        try {
+            # No install folder, or a file of that name: there is nothing to read.
+            if ($root['State'] -eq 'gone' -or ($root['State'] -eq 'ok' -and -not $root['Folder'])) { return $map }
+            foreach ($top in @('Scripts', 'Stack')) {
+                if ($root['State'] -ne 'ok') { $map[$top] = [string]$root['State']; continue }
+                Add-LaiIntegrityEntry -Map $map -Relative $top -MaxHashBytes $MaxHashBytes -Budget $Budget -Parent $root['Handle'] -ParentFinal ([string]$root['Final']) -Name $top -Folder
+            }
+        } finally {
+            if ($root['Handle']) { $root['Handle'].Dispose() }
+        }
+        return $map
+    }
     foreach ($top in @('Scripts', 'Stack')) {
         $item = Get-Item -LiteralPath (Join-Path $AIRoot $top) -Force -ErrorAction SilentlyContinue
-        if ($item) { Add-LaiIntegrityEntry -Map $map -Item $item -Relative $top -MaxHashBytes $MaxHashBytes -Budget $Budget }
+        if (-not $item) { continue }
+        Add-LaiIntegrityEntry -Map $map -Item $item -Relative $top -MaxHashBytes $MaxHashBytes -Budget $Budget
     }
     return $map
+}
+
+function Get-LaiIntegrityUnread {
+    # Pure (unit-tested). Which of Scripts and Stack a walk did not read, from its list of files
+    # (Get-LaiIntegrityFiles): the folder's name = 'link' or 'unreadable'. A folder is in that list
+    # under its own name only when the walk stopped at the folder itself: it is a link, the install
+    # folder above it is one, or it could not be opened or listed. Not one file in it was listed or
+    # hashed then, so not one is compared, and a baseline recorded that way holds none: two such
+    # states read as equal for good while every file in the folder may change. Whoever shows a
+    # comparison or a baseline asks here and says so (Compare-LaiIntegrity, Get-LaiIntegritySummary).
+    param($Files)
+    $unread = @{}
+    if ($Files -is [hashtable]) {
+        foreach ($top in @('Scripts', 'Stack')) {
+            $state = [string]$Files[$top]
+            if ($state -eq 'link' -or $state -eq 'unreadable') { $unread[$top] = $state }
+        }
+    }
+    return $unread
+}
+
+function Get-LaiIntegrityUnreadText {
+    # Pure. Why a folder was not read (a state of Get-LaiIntegrityUnread), as a sentence fragment
+    # after the folder's name: one wording for the notice, the log and the health check.
+    param([string]$State = '')
+    if ($State -eq 'link') { return 'is a link to another place, or lies in an install folder that is one' }
+    return 'could not be read'
 }
 
 function ConvertTo-LaiIntegrityEnv {
@@ -763,7 +1121,55 @@ function Get-LaiIntegrityEnv {
     # The routing settings of <AIRoot>\Stack\.env (ConvertTo-LaiIntegrityEnv). Empty when there is no
     # .env; $null when it cannot be told (a link, which is not followed; not a file; too big to be
     # one; unreadable): the comparison then skips the settings instead of calling them all removed.
+    # On Windows the file is reached the way the walk reaches its files (Add-LaiIntegrityEntry says
+    # why): the install folder is opened by its path, Stack by its name in that open folder and .env
+    # by its name in Stack, none of them through a link, and what is read is the handle's own
+    # stream, no more of it than the size the handle gave. Read by its path, a Stack swapped for a
+    # link to a folder only an administrator may read put the names of that folder's .env settings,
+    # each with a fingerprint of its value, into the baseline the user can read.
     param([Parameter(Mandatory)][string]$AIRoot)
+    if (Test-LaiIntegrityOnWindows) {
+        $held = New-Object System.Collections.Generic.List[object]
+        $stream = $null; $reader = $null
+        try {
+            $at = Open-LaiIntegrityHandle -Path $AIRoot
+            foreach ($name in @('Stack', '.env')) {
+                if ($at['Handle']) { $held.Add($at['Handle']) }
+                if ($at['State'] -eq 'gone') { return @{} }
+                if ($at['State'] -ne 'ok') { return $null }
+                # A file where a folder was expected has no .env in it.
+                if (-not $at['Folder']) { return @{} }
+                $at = Open-LaiIntegrityHandle -Parent $at['Handle'] -ParentFinal ([string]$at['Final']) -Name $name
+            }
+            if ($at['Handle']) { $held.Add($at['Handle']) }
+            if ($at['State'] -eq 'gone') { return @{} }
+            if ($at['State'] -ne 'ok' -or $at['Folder'] -or [long]$at['Size'] -gt 1MB) { return $null }
+            $size = [int]$at['Size']
+            $bytes = New-Object byte[] $size
+            $stream = New-Object System.IO.FileStream($at['Handle'], [System.IO.FileAccess]::Read)
+            $got = 0
+            while ($got -lt $size) {
+                $n = $stream.Read($bytes, $got, $size - $got)
+                if ($n -le 0) { break }
+                $got += $n
+            }
+            # Through a reader, as Get-Content reads it: a byte order mark is no part of the first name.
+            $reader = New-Object System.IO.StreamReader((New-Object System.IO.MemoryStream($bytes, 0, $got)), [System.Text.Encoding]::UTF8)
+            $lines = New-Object System.Collections.Generic.List[string]
+            while ($true) {
+                $line = $reader.ReadLine()
+                if ($null -eq $line) { break }
+                $lines.Add($line)
+            }
+            return (ConvertTo-LaiIntegrityEnv -Lines $lines.ToArray())
+        } catch {
+            return $null
+        } finally {
+            if ($reader) { $reader.Dispose() }
+            if ($stream) { $stream.Dispose() }
+            foreach ($h in $held) { $h.Dispose() }
+        }
+    }
     $item = Get-Item -LiteralPath (Join-Path (Join-Path $AIRoot 'Stack') '.env') -Force -ErrorAction SilentlyContinue
     if (-not $item) { return @{} }
     if (($item -is [System.IO.DirectoryInfo]) -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -or $item.Length -gt 1MB) { return $null }
@@ -881,6 +1287,11 @@ function Compare-LaiIntegrity {
     #              place (an archive unpacked into the wrong folder) are one difference with a count.
     #              A walk that ran out of budget ('filesStopped') cannot say what is gone from there
     #              on and says that instead; a baseline recorded that way cannot say what is new.
+    #              Scripts or Stack not read at all (Get-LaiIntegrityUnread: a link, or not
+    #              readable) is one difference, 'walk|<folder>', that says its files were not
+    #              compared, and none of them is called gone. Not when the baseline was recorded
+    #              the same way: accepted like that, it is the baseline's summary that says no
+    #              file of the folder is watched (Get-LaiIntegritySummary).
     #   settings   the routing settings of Stack\.env (ConvertTo-LaiIntegrityEnv): changed, added,
     #              removed, by name only. Skipped when either side could not read them.
     #   tasks      a different command, account or privilege; new and gone. Skipped when either side
@@ -916,9 +1327,15 @@ function Compare-LaiIntegrity {
         while ($p.LastIndexOf('\') -gt 0) { $p = $p.Substring(0, $p.LastIndexOf('\')); $bFolders[$p] = $true }
     }
     $new = @{}
+    $cUnread = Get-LaiIntegrityUnread -Files $cf
     foreach ($k in @($cf.Keys | Sort-Object)) {
         $now = [string]$cf[$k]
         $tag = $now; if ($now.Length -eq 64) { $tag = $now.Substring(0, 12) }
+        if ($cUnread.ContainsKey([string]$k)) {
+            # Not 'is new' (it was there all along) and not one 'is gone' for every file in it.
+            if ([string]$bf[$k] -ne $now) { & $add "walk|$k" $now ('{0} {1}, so the files in it were not compared' -f (& $q $k), (Get-LaiIntegrityUnreadText -State $now)) }
+            continue
+        }
         if (-not $bf.ContainsKey($k)) {
             if ($bStopped) { continue }
             $parts = ([string]$k).Split('\'); $place = ''
@@ -940,6 +1357,8 @@ function Compare-LaiIntegrity {
     $cTop = ''; if ($cStopped) { $cTop = $cStopped.Split('\')[0] }
     foreach ($k in @($bf.Keys | Sort-Object)) {
         if ($cf.ContainsKey($k)) { continue }
+        # In a folder that was not read: not compared, so not gone.
+        if ($cUnread.ContainsKey(([string]$k).Split('\')[0])) { continue }
         # A walk that stopped early cannot say what is gone from there on. Scripts is read first, so
         # one that stopped in Stack still read all of Scripts.
         $read = (-not $cStopped) -or ($cTop -eq 'Stack' -and ([string]$k -eq 'Scripts' -or ([string]$k).StartsWith('Scripts\', [StringComparison]::OrdinalIgnoreCase)))
@@ -1043,7 +1462,9 @@ function Get-LaiIntegritySnapshot {
     # walk ran out of budget, '' when it read everything), the routing settings of Stack\.env, tasks,
     # listeners.
     param([Parameter(Mandatory)][string]$AIRoot, [string]$TaskPattern = 'LocalAI-*', [hashtable]$Budget = $null)
-    if (-not $Budget) { $Budget = New-LaiIntegrityBudget }
+    # (The Windows calls the walk needs are compiled before its clock starts: the first use in a
+    # process takes a moment that is not the folders' doing.)
+    if (-not $Budget) { [void](Initialize-LaiIntegrityNative); $Budget = New-LaiIntegrityBudget }
     $files = Get-LaiIntegrityFiles -AIRoot $AIRoot -Budget $Budget
     return @{
         files        = $files
@@ -1140,7 +1561,8 @@ function Test-LaiIntegrityStill {
     # still there, the one that was gone is still gone, the program still listens (for a 'now reachable
     # from other devices' entry: still on an address other devices reach). Where the snapshot
     # could not tell (settings, tasks or listeners not read; a file missing from a walk that stopped
-    # early) it counts as still so: saying less would hide it. $false for everything that names no
+    # early, or in a Scripts or Stack that was not read at all: Get-LaiIntegrityUnread) it counts
+    # as still so: saying less would hide it. $false for everything that names no
     # single thing (a walk that stopped, the count that stands for a cut list).
     param([Parameter(Mandatory)][string]$Id, [Parameter(Mandatory)][hashtable]$Snapshot)
     $kind, $name = $Id -split '\|', 2
@@ -1159,7 +1581,9 @@ function Test-LaiIntegrityStill {
         if ($Snapshot['files'] -is [hashtable]) {
             if ($what -eq 'file') { $there = $Snapshot['files'].ContainsKey($name) }
             else { $below = $name + '\'; $there = (@($Snapshot['files'].Keys | Where-Object { ([string]$_).StartsWith($below, [StringComparison]::OrdinalIgnoreCase) }).Count -gt 0) }
-            if (-not $there -and $Snapshot['filesStopped']) { $there = $null }
+            # Not found by a walk that stopped early, or in a folder the walk did not read at all:
+            # that is 'could not tell', not 'no longer there'.
+            if (-not $there -and ($Snapshot['filesStopped'] -or (Get-LaiIntegrityUnread -Files $Snapshot['files']).ContainsKey(([string]$name).Split('\')[0]))) { $there = $null }
         }
     }
     elseif ($what -eq 'env') { if ($Snapshot['env'] -is [hashtable]) { $there = $Snapshot['env'].ContainsKey($name) } }
@@ -1329,9 +1753,21 @@ function Save-LaiIntegrityBaseline {
 function Get-LaiIntegritySummary {
     # '61 files, 3 scheduled tasks, 24 listeners' for messages; says so when tasks or listeners could
     # not be read where the baseline was recorded, or when the folders held more than is read.
+    # And when Scripts or Stack was not read at all (Get-LaiIntegrityUnread): the folder's own entry
+    # is then all the baseline holds of it, and two such states compare as equal whatever happens to
+    # the files. Counted as '2 files' without a word, that read like a small install that is being
+    # watched; the installer's log, the acceptance and the health check all print this line.
     param([Parameter(Mandatory)][hashtable]$Baseline)
     $files = 0; if ($Baseline['files'] -is [hashtable]) { $files = @($Baseline['files'].Keys).Count }
-    $more = ''; if ($Baseline['filesStopped']) { $more = ' (not all of them: the folders hold more than the watch reads)' }
+    $notes = @()
+    if ($Baseline['filesStopped']) { $notes += 'not all of them: the folders hold more than the watch reads' }
+    $unread = Get-LaiIntegrityUnread -Files $Baseline['files']
+    foreach ($top in @($unread.Keys | Sort-Object)) {
+        # The folder's own entry is no file.
+        $files--
+        $notes += ('none in {0}, which {1}: changes there are NOT noticed' -f $top, (Get-LaiIntegrityUnreadText -State ([string]$unread[$top])))
+    }
+    $more = ''; if ($notes.Count) { $more = ' (' + ($notes -join '; ') + ')' }
     $tasks = 'scheduled tasks not read'; if ($Baseline['tasks'] -is [hashtable]) { $tasks = '{0} scheduled tasks' -f @($Baseline['tasks'].Keys).Count }
     $listeners = 'listeners not read'; if ($null -ne $Baseline['listeners']) { $listeners = '{0} listeners' -f @($Baseline['listeners']).Count }
     return ('{0} files{1}, {2}, {3}' -f $files, $more, $tasks, $listeners)
@@ -2169,7 +2605,21 @@ function Merge-LaiPresetForm {
     #   think            Open WebUI 0.11.4 re-applies a preset's think over the per-chat Chat Controls
     #                    switch, so the preset is the only place to turn Uncensored Fast's reasoning on.
     #   image_generation an image button the user wired to ComfyUI (not code execution, which stays off).
-    $createOnly = @{ params = @('think'); capabilities = @('image_generation'); builtinTools = @('image_generation') }
+    #   user_input, files the two tool categories that only ask you a question or read the files of
+    #                    the chat: on when the preset is made, and off for good once you switch them
+    #                    off. (Every other tool category but image_generation is put back to the
+    #                    installer's value: the ones that write, schedule, send or start something
+    #                    stay off.)
+    # A value that is there is the user's. A think or an image capability that is missing or null
+    # gets the installer's value again. One of these three tool switches that is missing from a set
+    # of tool switches the preset already has is ON: Open WebUI takes a missing switch for on, and
+    # (as its 0.11.4 source was read on 2026-10-08, not seen in a running one) its editor stores a
+    # box that was ticked again by deleting the switch. So 'missing' is how a picture tool the owner
+    # switched on arrives here, and writing the installer's false over it switched that tool off
+    # again with every update. It is written out as true instead, which changes nothing in what the
+    # model may do and leaves nothing to a default. (No such set at all: the preset is not the
+    # installer's work yet, and it gets the whole set as a new preset does.)
+    $createOnly = @{ params = @('think'); capabilities = @('image_generation'); builtinTools = @('image_generation', 'user_input', 'files') }
     $old = ConvertTo-LaiHashtable $Existing
     $params = @{}
     if ($old.ContainsKey('params') -and $old['params'] -is [hashtable]) { $params = $old['params'] }
@@ -2180,12 +2630,18 @@ function Merge-LaiPresetForm {
     $meta = @{}
     if ($old.ContainsKey('meta') -and $old['meta'] -is [hashtable]) { $meta = $old['meta'] }
     foreach ($k in $Managed['meta'].Keys) {
-        # capabilities / builtinTools: set the switches the installer manages, keep every other one.
-        # Replacing the whole set erased the user's own choices (Open WebUI treats a missing tool
-        # category as ON, so a calendar or notes tool the user had turned off came back on).
+        # capabilities / builtinTools: set the switches the installer manages, keep every other one
+        # (replacing the whole set erased what the user had chosen for the rest). Among the tools
+        # the installer now manages every category Open WebUI 0.11.4 has (New-LaiPresetForm lists
+        # them), because Open WebUI treats a missing tool category as ON: an install from before
+        # that, where the note, task, automation, calendar, notification, channel and subagent
+        # switches are missing, gets them here, off, and gets them off again when they were
+        # switched on. What is kept is a switch of a newer Open WebUI that the installer does not know.
         if ($Managed['meta'][$k] -is [hashtable] -and $meta.ContainsKey($k) -and $meta[$k] -is [hashtable]) {
             foreach ($leaf in $Managed['meta'][$k].Keys) {
-                if ($createOnly.ContainsKey($k) -and $createOnly[$k] -contains $leaf -and $meta[$k].ContainsKey($leaf) -and $null -ne $meta[$k][$leaf]) { continue }
+                $own = ($createOnly.ContainsKey($k) -and $createOnly[$k] -contains $leaf)
+                if ($own -and $meta[$k].ContainsKey($leaf) -and $null -ne $meta[$k][$leaf]) { continue }
+                if ($own -and $k -eq 'builtinTools' -and -not $meta[$k].ContainsKey($leaf)) { $meta[$k][$leaf] = $true; continue }
                 $meta[$k][$leaf] = $Managed['meta'][$k][$leaf]
             }
         } else { $meta[$k] = $Managed['meta'][$k] }
@@ -3461,12 +3917,43 @@ function New-LaiPresetForm {
             image_generation = $false; code_interpreter = $false; terminal = $false
             citations = $true; status_updates = $true; memory = $true; builtin_tools = $true
         }
-        # chats off: with it the model can search and read every past chat, and a web page or document
-        # it reads could tell it to put what it finds into a URL it fetches (fetch_url reaches any
-        # public site, without asking). Re-runs keep it off.
+        # Every tool category Open WebUI has gets a switch that is written out, true or false: it
+        # takes a MISSING one for ON, so a category left out here is one the model may use without
+        # asking, in a turn that holds a web page's text too. The 16 names are those of Open WebUI
+        # v0.11.4, the version the toolkit pins (its model editor, BuiltinTools.svelte, and
+        # get_builtin_tools in backend/open_webui/utils/tools.py, as read from its source on
+        # 2026-10-08). Nothing asks Open WebUI itself for them yet: no test compares this list with
+        # the names its code reads, so a name spelt differently there would be a switch that does
+        # nothing, and its tools would stay on. (tests/Invoke-IntegrationTest.ps1 already runs
+        # Python inside the real Open WebUI on the Linux job; that is where such a check belongs.)
+        # A category a newer Open WebUI adds is not in this list and is on there until it is added
+        # here.
+        #   on   time, user_input (the model asks you a question), knowledge and files (it reads
+        #        attached collections and the files of the chat), web_search (search_web, fetch_url)
+        #        and memory, which reads AND writes: add_memory, update_memory,
+        #        replace_memory_content, delete_memory. Saving what you tell it is what it is for.
+        #   off  chats: with it the model can search and read every past chat, and a web page or
+        #        document it reads could tell it to put what it finds into a URL it fetches
+        #        (fetch_url reaches any public site, without asking).
+        #        code_interpreter (it runs code) and image_generation (yours to switch on).
+        #        notes, tasks, automations, calendar, notifications, subagents: each can write,
+        #        schedule, send or start something (write_note, create_tasks, create_automation,
+        #        create_calendar_event, notify, delegate_task ...). The owner decided on 2026-10-07
+        #        that none of that is on in any preset. channels: it only reads Open WebUI's
+        #        channels, which the toolkit has no use for.
+        # Re-runs put every 'off' back, all but image_generation, and leave that one, user_input
+        # and files as the owner set them, also when the owner's 'on' is a switch that is no longer
+        # there (Merge-LaiPresetForm). Three things no switch here covers: view_skill (offered
+        # whenever the preset has skills), the terminal tools (the toolkit connects no terminal),
+        # and a chat opened from a note, which gets the note tools whatever 'notes' says. And the
+        # switches are about Open WebUI's built-in tools only: a tool attached to the preset is
+        # called without asking as well (the installer attaches one, the skill notebook, which
+        # saves a skill draft that stays off until the owner switches it on).
         builtinTools      = @{
-            memory = $true; web_search = $true; knowledge = $true; chats = $false; time = $true
-            image_generation = $false; code_interpreter = $false
+            time = $true; user_input = $true; knowledge = $true; files = $true; web_search = $true; memory = $true
+            chats = $false; code_interpreter = $false; image_generation = $false
+            notes = $false; tasks = $false; automations = $false; calendar = $false
+            notifications = $false; channels = $false; subagents = $false
         }
         tags              = @(@{ name = 'local' })
     }

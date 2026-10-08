@@ -1223,6 +1223,30 @@ $managedForm = New-LaiPresetForm -Entry $entry -NativeTools $true -SystemPrompt 
 $offForm = New-LaiPresetForm -Entry @{ Preset = 'official-main'; Alias = 'localai-official-main'; Display = 'Official Main'; Description = 'd'; Vision = $true; Think = $null; Official = $true } -NativeTools $true -SystemPrompt 'sys'
 Assert-That ($managedForm.meta.builtinTools['chats'] -eq $false -and $offForm.meta.builtinTools['chats'] -eq $false) 'no preset gets the past-chat tools'
 Assert-That (@($managedForm.meta['defaultFeatureIds']).Count -eq 0 -and @($offForm.meta['defaultFeatureIds']) -contains 'web_search') 'uncensored presets search only when asked; official ones by default'
+# The tools that write, schedule, send or start something are off in every preset, each with a
+# false that is written out: Open WebUI takes a missing switch for ON, so a category left out of
+# the form is one the model may use without asking. One case per category, on the three kinds of
+# form the installer makes (an Uncensored preset, an Official one, one without native tool calling).
+$legacyForm = New-LaiPresetForm -Entry $entry -NativeTools $false -SystemPrompt 'sys'
+$uTools = $managedForm.meta.builtinTools; $oTools = $offForm.meta.builtinTools; $lTools = $legacyForm.meta.builtinTools
+$toolsOff = @('notes', 'tasks', 'automations', 'calendar', 'notifications', 'channels', 'subagents')
+foreach ($offKey in $toolsOff) {
+    Assert-That ($uTools.ContainsKey($offKey) -and $uTools[$offKey] -is [bool] -and $uTools[$offKey] -eq $false -and
+        $oTools.ContainsKey($offKey) -and $oTools[$offKey] -is [bool] -and $oTools[$offKey] -eq $false -and
+        $lTools.ContainsKey($offKey) -and $lTools[$offKey] -is [bool] -and $lTools[$offKey] -eq $false) "the '$offKey' tools are switched off in every preset with a written-out false (Uncensored: $($uTools[$offKey]); Official: $($oTools[$offKey]); no native tool calling: $($lTools[$offKey]); nothing shown = the switch is missing, which Open WebUI takes for on)"
+}
+# All 16 categories of Open WebUI 0.11.4, so that none is left to a default: six on, ten off.
+$toolsOn = @('time', 'user_input', 'knowledge', 'files', 'web_search', 'memory')
+$toolsAll = @($toolsOn + $toolsOff + @('chats', 'code_interpreter', 'image_generation'))
+$toolsWrong = @()
+foreach ($pair in @(@{ Name = 'Uncensored'; Tools = $uTools }, @{ Name = 'Official'; Tools = $oTools }, @{ Name = 'no native tool calling'; Tools = $lTools })) {
+    foreach ($key in $toolsAll) {
+        $want = ($toolsOn -contains $key)
+        if (-not ($pair.Tools.ContainsKey($key) -and $pair.Tools[$key] -is [bool] -and $pair.Tools[$key] -eq $want)) { $toolsWrong += "$($pair.Name): $key" }
+    }
+    foreach ($key in @($pair.Tools.Keys)) { if ($toolsAll -notcontains $key) { $toolsWrong += "$($pair.Name): $key is not a category" } }
+}
+Assert-That ($toolsAll.Count -eq 16 -and $toolsWrong.Count -eq 0) "every preset form writes out all 16 tool switches: time, user_input, knowledge, files, web_search and memory on, the other ten off (wrong: $($toolsWrong -join '; '))"
 $mergedOld = Merge-LaiPresetForm -Managed $managedForm -Existing ([pscustomobject]@{ id = 'local-main'; meta = [pscustomobject]@{ defaultFeatureIds = @('web_search'); builtinTools = [pscustomobject]@{ chats = $true } }; params = [pscustomobject]@{} })
 Assert-That (@($mergedOld.meta['defaultFeatureIds']).Count -eq 0 -and $mergedOld.meta.builtinTools['chats'] -eq $false) 'an existing install loses auto-search on the uncensored presets and the past-chat tools on update'
 # The preset form never sets 'hidden': a preset the owner hid stays hidden on re-runs. The installer
@@ -1234,11 +1258,29 @@ foreach ($kind in 'Official', 'Trial') {
     Assert-That (-not $of.meta.ContainsKey('hidden') -and $om.meta['hidden'] -eq $true) "a $kind preset the owner hid stays hidden on a re-run"
 }
 Assert-That (-not $managedForm.meta.ContainsKey('hidden')) 'a measured preset form leaves hidden alone (the user may have hidden it)'
+# An install from before the writing tools were switched off, updated: each of those switches may
+# be on (ticked by hand), missing (what every such install has: Open WebUI takes that for on) or
+# null (which Open WebUI's editor shows as ticked). After the update each is a written-out false.
+foreach ($offKey in $toolsOff) {
+    $offAfter = @()
+    foreach ($before in @(@{ Name = 'on'; Tools = @{ $offKey = $true; chats = $false } }, @{ Name = 'missing'; Tools = @{ chats = $false } }, @{ Name = 'null'; Tools = @{ $offKey = $null; chats = $false } })) {
+        $mt = (Merge-LaiPresetForm -Managed $managedForm -Existing ([pscustomobject]@{ id = 'local-main'; name = 'Local Main'; meta = [pscustomobject]@{ builtinTools = [pscustomobject]$before.Tools }; params = [pscustomobject]@{} })).meta.builtinTools
+        if (-not ($mt.ContainsKey($offKey) -and $mt[$offKey] -is [bool] -and $mt[$offKey] -eq $false)) { $offAfter += "$($before.Name) -> '$($mt[$offKey])'" }
+    }
+    Assert-That ($offAfter.Count -eq 0) "an update switches the '$offKey' tools off on an existing preset, whether the switch was on, missing or null (not off after: $($offAfter -join '; '))"
+}
+# user_input (the model asks a question) and files (it reads the files of the chat) are on from the
+# start and then the owner's, like Think: switched off by hand they stay off; a preset that has no
+# such switch yet gets it written out, on (which is what missing meant).
+$mergedOwn = Merge-LaiPresetForm -Managed $managedForm -Existing ([pscustomobject]@{ id = 'local-main'; name = 'Local Main'; meta = [pscustomobject]@{ builtinTools = [pscustomobject]@{ user_input = $false; files = $false } }; params = [pscustomobject]@{} })
+$mergedNone = Merge-LaiPresetForm -Managed $managedForm -Existing ([pscustomobject]@{ id = 'local-main'; name = 'Local Main'; meta = [pscustomobject]@{ builtinTools = [pscustomobject]@{ chats = $true } }; params = [pscustomobject]@{} })
+Assert-That ($mergedOwn.meta.builtinTools['user_input'] -is [bool] -and $mergedOwn.meta.builtinTools['user_input'] -eq $false -and $mergedOwn.meta.builtinTools['files'] -is [bool] -and $mergedOwn.meta.builtinTools['files'] -eq $false) 'the two tool switches that only ask or read (user_input, files) stay off on a re-run when the owner switched them off'
+Assert-That ($mergedNone.meta.builtinTools['user_input'] -is [bool] -and $mergedNone.meta.builtinTools['user_input'] -eq $true -and $mergedNone.meta.builtinTools['files'] -is [bool] -and $mergedNone.meta.builtinTools['files'] -eq $true -and @($mergedNone.meta.builtinTools.Keys).Count -eq 16) "and a preset from before gets them written out, on, with every other switch (16 in all; $(@($mergedNone.meta.builtinTools.Keys).Count) here)"
 $existingPreset = [pscustomobject]@{ id = 'local-main'; name = 'Local Main'; base_model_id = 'localai-main:latest'; params = [pscustomobject]@{ temperature = 0.3 }
-    meta = [pscustomobject]@{ builtinTools = [pscustomobject]@{ calendar = $false; web_search = $false; code_interpreter = $true }
+    meta = [pscustomobject]@{ builtinTools = [pscustomobject]@{ a_tool_of_tomorrow = $false; web_search = $false; code_interpreter = $true }
         capabilities = [pscustomobject]@{ usage = $true; code_interpreter = $true }; myOwnKey = 'kept' } }
 $merged = Merge-LaiPresetForm -Managed $managedForm -Existing $existingPreset
-Assert-That ($merged.meta.builtinTools['calendar'] -eq $false -and $merged.meta.capabilities['usage'] -eq $true -and $merged.meta['myOwnKey'] -eq 'kept') 'a tool category the user turned off, an extra capability and an unknown key are kept'
+Assert-That ($merged.meta.builtinTools['a_tool_of_tomorrow'] -eq $false -and $merged.meta.capabilities['usage'] -eq $true -and $merged.meta['myOwnKey'] -eq 'kept') 'a tool category the installer does not know (one of a newer Open WebUI) that the user turned off, an extra capability and an unknown key are kept'
 Assert-That ($merged.meta.builtinTools['code_interpreter'] -eq $false -and $merged.meta.capabilities['code_interpreter'] -eq $false -and $merged.meta.builtinTools['web_search'] -eq $true) 'what the installer manages is still enforced (no code execution)'
 Assert-That ($merged.params['temperature'] -eq 0.3 -and $merged.params['system'] -eq 'sys') 'user parameters kept, system prompt refreshed'
 Assert-That ((Get-LaiWebUICompat -Version 'v0.11.4') -eq 'tested' -and (Get-LaiWebUICompat -Version 'v0.12.0') -eq 'newer' -and (Get-LaiWebUICompat -Version '0.11.4-dev') -eq 'tested' -and (Get-LaiWebUICompat -Version 'main') -eq 'unknown') 'Open WebUI versions are compared numerically'
@@ -1305,9 +1347,22 @@ $mFast = Merge-LaiPresetForm -Managed $fastForm -Existing $userFast
 Assert-That ($mFast.params['think'] -eq $true -and $mFast.params['system'] -eq 'sys') "Think turned on in the preset survives a re-run (think=$($mFast.params['think'])), the system prompt is still refreshed"
 Assert-That ($mFast.meta.capabilities['image_generation'] -eq $true -and $mFast.meta.builtinTools['image_generation'] -eq $true) 'image generation the user switched on (ComfyUI hookup) survives a re-run'
 Assert-That ($mFast.meta.capabilities['code_interpreter'] -eq $false -and $mFast.meta.builtinTools['code_interpreter'] -eq $false) 'code execution is still forced off'
+# The same switched on the way Open WebUI's own editor stores it: a box that is ticked again is a
+# switch that is deleted (a missing switch counts as on), not one set to true. The update took the
+# missing switch for 'never set' and wrote the installer's false over it, so the picture tool was
+# off again after every update although it is the owner's to set.
+$tickedFast = [pscustomobject]@{ id = 'local-fast'; name = 'Local Fast'; base_model_id = 'localai-fast:latest'; params = [pscustomobject]@{ think = $false }
+    meta = [pscustomobject]@{ capabilities = [pscustomobject]@{ image_generation = $true }; builtinTools = [pscustomobject]@{ time = $true; chats = $false; code_interpreter = $false; notes = $false } } }
+$mTicked = Merge-LaiPresetForm -Managed $fastForm -Existing $tickedFast
+Assert-That ($mTicked.meta.builtinTools.ContainsKey('image_generation') -and $mTicked.meta.builtinTools['image_generation'] -is [bool] -and $mTicked.meta.builtinTools['image_generation'] -eq $true -and $mTicked.meta.capabilities['image_generation'] -eq $true) "the picture tool ticked in Open WebUI's editor (stored as a switch that is no longer there) stays on after a re-run, and is written out as on (after: '$($mTicked.meta.builtinTools['image_generation'])'; nothing shown = still missing)"
+Assert-That ($mTicked.meta.builtinTools['notes'] -eq $false -and $mTicked.meta.builtinTools['calendar'] -is [bool] -and $mTicked.meta.builtinTools['calendar'] -eq $false -and $mTicked.meta.builtinTools['code_interpreter'] -eq $false -and $mTicked.meta.builtinTools['chats'] -eq $false) 'that goes for the three switches that are the owner''s only: a writing tool whose switch is missing is still switched off'
+$mImgOff = Merge-LaiPresetForm -Managed $fastForm -Existing ([pscustomobject]@{ id = 'local-fast'; name = 'Local Fast'; params = [pscustomobject]@{}; meta = [pscustomobject]@{ builtinTools = [pscustomobject]@{ image_generation = $false } } })
+$mImgNull = Merge-LaiPresetForm -Managed $fastForm -Existing ([pscustomobject]@{ id = 'local-fast'; name = 'Local Fast'; params = [pscustomobject]@{}; meta = [pscustomobject]@{ builtinTools = [pscustomobject]@{ image_generation = $null } } })
+Assert-That ($mImgOff.meta.builtinTools['image_generation'] -is [bool] -and $mImgOff.meta.builtinTools['image_generation'] -eq $false -and $mImgNull.meta.builtinTools['image_generation'] -is [bool] -and $mImgNull.meta.builtinTools['image_generation'] -eq $false) 'a picture tool that is switched off stays off, and one that is null (which Open WebUI itself reads as off) is written out as off'
 $resetFast = [pscustomobject]@{ id = 'local-fast'; name = 'Local Fast'; params = [pscustomobject]@{ think = $null }; meta = [pscustomobject]@{} }
 $mReset = Merge-LaiPresetForm -Managed $fastForm -Existing $resetFast
 Assert-That ($mReset.params['think'] -eq $false) 'a preset whose Think was set back to Default gets the catalog value again'
+Assert-That ($mReset.meta.builtinTools['image_generation'] -is [bool] -and $mReset.meta.builtinTools['image_generation'] -eq $false -and @($mReset.meta.builtinTools.Keys).Count -eq 16) 'and a preset that has no tool switches at all gets the whole set as a new preset does, the picture tool off'
 $catData = Import-PowerShellDataFile -Path (Join-Path (Join-Path $src 'config') 'models.psd1')
 $promise = @($catData.Models | Where-Object { $_.Think -eq $false -and $_.Description -match '(?i)chat controls' -and $_.Description -notmatch '(?i)cannot' } | ForEach-Object { $_.Key })
 Assert-That ($promise.Count -eq 0) "no catalog entry with Think = `$false promises a Chat Controls switch that the preset overrides ($($promise -join ', '))"
@@ -1502,6 +1557,90 @@ if ($onWindows) { $prev = $ErrorActionPreference; $ErrorActionPreference = 'Cont
 $igSwapMap = @{}
 Add-LaiIntegrityEntry -Map $igSwapMap -Item $igStale -Relative 'Stack\sub'
 Assert-That ($igWasFolder -and (Test-Path -LiteralPath (Join-Path $igSwap 'elsewhere.txt')) -and @($igSwapMap.Keys).Count -eq 1 -and [string]$igSwapMap['Stack\sub'] -eq 'link') "a folder that became a link after it was listed is not entered: recorded as a link, nothing behind it is named or hashed ($(@($igSwapMap.Keys | Sort-Object) -join ', '))"
+if ($onWindows) {
+    # The swap a walk by path cannot see: not the entry but the folder above it becomes a link, to a
+    # folder that holds entries of the same names, after that folder was listed. Asked again by its
+    # path, the entry is an ordinary file or folder (the path now leads into the other folder), and
+    # the walk hashed or listed what lies there. Done in a loop while the installer records its
+    # baseline as administrator, that put the names and SHA-256 of files the user may not read into
+    # a file the user can read. And a walk that only opens the entry by its path and then refuses it
+    # still tells which of the user's names exist in that other folder: one that exists there is a
+    # 'link', one that does not leaves no entry. So the walk keeps the folder open and opens each
+    # entry by its name in that open folder: what the folder's path leads to by now decides nothing.
+    $igRaceRoot = Join-Path $Work 'integrity-race'; $igRacePar = Join-Path $igRaceRoot 'par'; $igRaceOut = Join-Path $Work 'integrity-race-outside'
+    $igRaceMoved = Join-Path $igRaceRoot 'par-moved'
+    foreach ($d in (Join-Path $igRacePar 'sub'), (Join-Path $igRaceOut 'sub')) { New-Item -ItemType Directory -Force -Path $d | Out-Null }
+    Set-Content -LiteralPath (Join-Path $igRacePar 'same.txt') -Value 'inside the install'
+    Set-Content -LiteralPath (Join-Path $igRacePar 'only-here.txt') -Value 'inside the install; the other folder has no file of this name'
+    Set-Content -LiteralPath (Join-Path (Join-Path $igRacePar 'sub') 'inner.txt') -Value 'inside the install'
+    $igRaceOutFile = Join-Path $igRaceOut 'same.txt'; $igRaceOutInner = Join-Path (Join-Path $igRaceOut 'sub') 'inner.txt'
+    Set-Content -LiteralPath $igRaceOutFile -Value 'outside: for administrators only'
+    Set-Content -LiteralPath $igRaceOutInner -Value 'outside: for administrators only, one folder down'
+    $igRaceOutHashes = @($igRaceOutFile, $igRaceOutInner | ForEach-Object { [string](Get-FileHash -LiteralPath $_ -Algorithm SHA256).Hash })
+    $igRaceErr = ''; $igRaceHeld = @{ State = 'not opened' }; $igTrueHeld = @{ State = 'not opened' }
+    $igRaceMap = @{}; $igRaceOsMap = @{}; $igTrueMap = @{}; $igRacePathName = ''; $igRaceParFinal = ''; $igRaceSetup = $false
+    try {
+        # What the walk holds once it has listed 'par': the open folder, and where it really is.
+        $igRaceHeld = Open-LaiIntegrityHandle -Path $igRacePar
+        $igRaceParFinal = [string]$igRaceHeld['Final']
+        # The swap, while the walk holds the folder open (it lets others rename the folder
+        # meanwhile): the folder is renamed away, and a link of its name to the other folder takes
+        # its place.
+        Rename-Item -LiteralPath $igRacePar -NewName 'par-moved' -ErrorAction Stop
+        $prev = $ErrorActionPreference; $ErrorActionPreference = 'Continue'; & cmd.exe /c mklink /J $igRacePar $igRaceOut 2>&1 | Out-Null; $ErrorActionPreference = $prev
+        # By their paths: same.txt and sub lead into the other folder and look ordinary there, and
+        # only-here.txt is not to be found.
+        $igRaceReached = [string](Get-Content -Encoding UTF8 -LiteralPath (Join-Path $igRacePar 'same.txt') -Raw)
+        $igRaceSetup = ([string]$igRaceHeld['State'] -eq 'ok' -and [bool]$igRaceHeld['Folder'] -and $igRaceParFinal -like '\Device\*\integrity-race\par' -and $igRaceReached -like 'outside:*' -and
+            (Test-Path -LiteralPath (Join-Path $igRacePar 'sub') -PathType Container) -and -not (Test-Path -LiteralPath (Join-Path $igRacePar 'only-here.txt')) -and (Test-Path -LiteralPath (Join-Path $igRaceMoved 'only-here.txt')))
+        foreach ($n in 'same.txt', 'only-here.txt') { Add-LaiIntegrityEntry -Map $igRaceMap -Relative ('Stack\par\' + $n) -Parent $igRaceHeld['Handle'] -ParentFinal $igRaceParFinal -Name $n }
+        Add-LaiIntegrityEntry -Map $igRaceMap -Relative 'Stack\par\sub' -Parent $igRaceHeld['Handle'] -ParentFinal $igRaceParFinal -Name 'sub' -Folder
+        # The same once more with another value in the OS variable. Any program of the user can put
+        # one into the user's own variables (no administrator rights needed), and the elevated
+        # installer starts with it. Read from that variable, 'this is Windows' was no longer true,
+        # and the walk went by path again, which is the walk that can be raced.
+        $savedOS = $env:OS
+        $env:OS = 'not what Windows sets'
+        try {
+            foreach ($n in 'same.txt', 'only-here.txt') { Add-LaiIntegrityEntry -Map $igRaceOsMap -Relative ('Stack\par\' + $n) -Parent $igRaceHeld['Handle'] -ParentFinal $igRaceParFinal -Name $n }
+            Add-LaiIntegrityEntry -Map $igRaceOsMap -Relative 'Stack\par\sub' -Parent $igRaceHeld['Handle'] -ParentFinal $igRaceParFinal -Name 'sub' -Folder
+        } finally { $env:OS = $savedOS }
+        # A name that is a path is no entry of the open folder: it is not handed to Windows.
+        $igRacePathName = [string](Open-LaiIntegrityHandle -Parent $igRaceHeld['Handle'] -ParentFinal $igRaceParFinal -Name 'sub\inner.txt')['State'] + ' / ' + [string](Open-LaiIntegrityHandle -Parent $igRaceHeld['Handle'] -ParentFinal $igRaceParFinal -Name '..')['State']
+        # Entries of a folder that is where it was when the walk opened it are read from their
+        # handles: a file by its SHA-256, a folder entry by entry. (That folder's path is written
+        # with the temp folder's short name on some machines; where it really is, is not, and only
+        # that is compared.)
+        $igTrueHeld = Open-LaiIntegrityHandle -Path $igRaceOut
+        Add-LaiIntegrityEntry -Map $igTrueMap -Relative 'Stack\out\same.txt' -Parent $igTrueHeld['Handle'] -ParentFinal ([string]$igTrueHeld['Final']) -Name 'same.txt'
+        Add-LaiIntegrityEntry -Map $igTrueMap -Relative 'Stack\out\sub' -Parent $igTrueHeld['Handle'] -ParentFinal ([string]$igTrueHeld['Final']) -Name 'sub' -Folder
+    } catch { $igRaceErr = $_.Exception.Message }
+    finally { foreach ($h in $igRaceHeld, $igTrueHeld) { if ($h['Handle']) { $h['Handle'].Dispose() } } }
+    $igRaceShow = { param($Map) (@($Map.Keys | Sort-Object | ForEach-Object { '{0} = {1}' -f $_, $Map[$_] }) -join ', ') }
+    $igRaceLeaked = @(@($igRaceMap.Values) + @($igRaceOsMap.Values) | Where-Object { $igRaceOutHashes -contains [string]$_ })
+    Assert-That ($igRaceSetup -and -not $igRaceErr) "setup: a folder the walk holds open was renamed away and a link to a folder with the same names put in its place; by their paths a file and a folder now lead into that other folder, and a third name is not found there ($([string]$igRaceHeld['State']); $igRaceParFinal) $igRaceErr"
+    Assert-That (-not $igRaceErr -and @($igRaceMap.Keys).Count -eq 3 -and [string]$igRaceMap['Stack\par\same.txt'] -eq 'link' -and [string]$igRaceMap['Stack\par\sub'] -eq 'link' -and $igRaceLeaked.Count -eq 0) "a listed file and a listed folder whose folder was swapped for a link are not read: each is opened in the folder the walk holds, is no longer where that folder was, so it is a link, and nothing of the other folder is named or hashed ($(& $igRaceShow $igRaceMap)) $igRaceErr"
+    Assert-That (-not $igRaceErr -and [string]$igRaceMap['Stack\par\only-here.txt'] -eq 'link' -and [string]$igRaceMap['Stack\par\only-here.txt'] -eq [string]$igRaceMap['Stack\par\same.txt']) "and a name the other folder does not have is recorded the same as one it has: the baseline does not tell which of the user's names exist behind the link ($(& $igRaceShow $igRaceMap)) $igRaceErr"
+    Assert-That (-not $igRaceErr -and @($igRaceOsMap.Keys).Count -eq 3 -and (& $igRaceShow $igRaceOsMap) -eq (& $igRaceShow $igRaceMap)) "with another value in the OS variable it is the same walk and the same three links: whether this is Windows is not read from that variable ($(& $igRaceShow $igRaceOsMap)) $igRaceErr"
+    Assert-That ($igRacePathName -eq 'unreadable / unreadable') "a name with a backslash in it, or '..', is not opened as an entry of the open folder ($igRacePathName)"
+    Assert-That (-not $igRaceErr -and @($igTrueMap.Keys).Count -eq 2 -and [string]$igTrueMap['Stack\out\same.txt'] -eq $igRaceOutHashes[0] -and [string]$igTrueMap['Stack\out\sub\inner.txt'] -eq $igRaceOutHashes[1]) "entries of a folder that is where it was are read from their handles: the file's SHA-256, and the folder's one file ($(& $igRaceShow $igTrueMap)) $igRaceErr"
+    # File names that are also words of the list the walk keeps a folder's entries in: all are read.
+    $igWords = Join-Path $Work 'integrity-words'
+    New-Item -ItemType Directory -Force -Path $igWords | Out-Null
+    foreach ($n in 'Count', 'Keys', 'Values', 'z.txt') { Set-Content -LiteralPath (Join-Path $igWords $n) -Value "the file $n" }
+    $igWordsMap = @{}
+    Add-LaiIntegrityEntry -Map $igWordsMap -Item (Get-Item -LiteralPath $igWords -Force) -Relative 'Stack\words'
+    $igWordsRead = @($igWordsMap.GetEnumerator() | Where-Object { ([string]$_.Value).Length -eq 64 } | ForEach-Object { [string]$_.Key } | Sort-Object)
+    Assert-That (($igWordsRead -join ', ') -eq 'Stack\words\Count, Stack\words\Keys, Stack\words\Values, Stack\words\z.txt' -and @($igWordsMap.Keys).Count -eq 4) "files called Count, Keys and Values hide nothing in their folder: each of them and the file next to them is hashed ($(@($igWordsMap.Keys | Sort-Object | ForEach-Object { '{0} = {1}' -f $_, $igWordsMap[$_] }) -join ', '))"
+} else {
+    # The OS variable the other way round: set as Windows sets it, on a machine that is not Windows.
+    # Read from that variable, the walk took this for Windows, could call none of Windows' own
+    # functions, and recorded Scripts and Stack as unreadable without reading a file.
+    $savedOS = $env:OS
+    $env:OS = 'Windows_NT'
+    try { $igOsFiles = Get-LaiIntegrityFiles -AIRoot $igRoot } finally { $env:OS = $savedOS }
+    Assert-That (@($igOsFiles.Keys).Count -eq 4 -and [string]$igOsFiles['Scripts\tool.ps1'] -eq [string](Get-FileHash -LiteralPath $igTool -Algorithm SHA256).Hash -and [string]$igOsFiles['Stack\linked'] -eq 'link') "with OS set to Windows_NT on a machine that is not Windows the walk still goes by path and hashes the files: the platform is not read from that variable ($(@($igOsFiles.Keys | Sort-Object | ForEach-Object { '{0} = {1}' -f $_, $igOsFiles[$_] }) -join ', '))"
+}
 Assert-That ([string](Get-LaiIntegrityFiles -AIRoot $igRoot -MaxHashBytes 3)['Scripts\tool.ps1'] -like 'size *') 'a file above the size limit is recorded by its size instead of being hashed'
 
 # A folder filled beyond what the watch reads in one go (a container writing into Stack\searxng, an
@@ -1525,6 +1664,55 @@ $igByTime = Get-LaiIntegritySnapshot -AIRoot $igRoot -TaskPattern 'LaiNoSuchTask
 Assert-That ([string]$igByBytes['filesStopped'] -eq 'Scripts\tool.ps1' -and @($igByBytes['files'].Keys).Count -eq 1 -and [string]$igByTime['filesStopped'] -eq 'Scripts' -and @($igByTime['files'].Keys).Count -eq 0) "the walk also has a limit on the bytes it hashes and on its time ($([string]$igByBytes['filesStopped']) / $([string]$igByTime['filesStopped']))"
 Assert-That ((Get-LaiIntegritySummary -Baseline $igPart) -match '^2 files \(not all of them') 'and a baseline that could not read everything says so in its summary'
 
+# Scripts or Stack not read at all: the walk reads nothing through a link, and nothing by its path
+# when Windows' own calls are not there. All the list then holds of the folder is the folder's own
+# name as 'link' or 'unreadable'. That used to read as '"Scripts" is new' plus one 'is gone' for
+# every file, and once it was accepted as nothing at all: two such states are equal, the summary
+# said '2 files', and no file in the folder was watched any more without a word about it.
+$igUnBase = @{ files = @{ 'Scripts\a.ps1' = 'H1'; 'Scripts\lib\b.psm1' = 'H2'; 'Stack\c.yml' = 'H3' } }
+$igUnNow = @{ files = @{ 'Scripts' = 'unreadable'; 'Stack' = 'link' } }
+$igUnread = Get-LaiIntegrityUnread -Files @{ 'Scripts' = ('A' * 64); 'Stack' = 'link'; 'Stack\sub' = 'link'; 'Scripts\x' = 'unreadable' }
+Assert-That ($igUnread -is [hashtable] -and @($igUnread.Keys).Count -eq 1 -and [string]$igUnread['Stack'] -eq 'link' -and @((Get-LaiIntegrityUnread -Files $igUnBase['files']).Keys).Count -eq 0 -and @((Get-LaiIntegrityUnread -Files $null).Keys).Count -eq 0) "a folder that was not read is Scripts or Stack itself recorded as a link or as unreadable, nothing below them and no file of that name ($(@($igUnread.Keys) -join ', '))"
+$igUnDiff = @(Compare-LaiIntegrity -Baseline $igUnBase -Current $igUnNow)
+$igUnText = @($igUnDiff | ForEach-Object { [string]$_.Text })
+Assert-That ($igUnDiff.Count -eq 2 -and ((@($igUnDiff | ForEach-Object { [string]$_.Id }) | Sort-Object) -join ', ') -eq 'walk|Scripts, walk|Stack' -and $igUnText -contains '"Scripts" could not be read, so the files in it were not compared' -and $igUnText -contains '"Stack" is a link to another place, or lies in an install folder that is one, so the files in it were not compared') "a folder that was not read is one difference that says its files were not compared: not 'is new', and no file in it is called gone ($($igUnText -join '; '))"
+$igUnHalf = @(Compare-LaiIntegrity -Baseline $igUnBase -Current @{ files = @{ 'Scripts' = 'link'; 'Stack\c.yml' = 'H9' } } | ForEach-Object { [string]$_.Id } | Sort-Object)
+Assert-That (($igUnHalf -join ', ') -eq 'file|Stack\c.yml, walk|Scripts') "the other folder is still compared file by file ($($igUnHalf -join ', '))"
+$igUnSummary = Get-LaiIntegritySummary -Baseline $igUnNow
+Assert-That (@(Compare-LaiIntegrity -Baseline $igUnNow -Current $igUnNow).Count -eq 0 -and $igUnSummary -eq '0 files (none in Scripts, which could not be read: changes there are NOT noticed; none in Stack, which is a link to another place, or lies in an install folder that is one: changes there are NOT noticed), scheduled tasks not read, listeners not read') "a baseline recorded that way raises nothing by itself, so its summary says that no file of the folder is watched, and counts none ($igUnSummary)"
+Assert-That ((Get-LaiIntegritySummary -Baseline @{ files = @{ 'Scripts' = 'link'; 'Stack\c.yml' = 'H3'; 'Stack\linked' = 'link' } }) -match '^2 files \(none in Scripts, which is a link ') 'next to a folder that was read, the folder that was not is no file of the count'
+Assert-That ((Test-LaiIntegrityStill -Id 'file+|Stack\z.yml' -Snapshot @{ files = @{ 'Stack' = 'unreadable'; 'Scripts\a.ps1' = 'H1' }; filesStopped = '' }) -and -not (Test-LaiIntegrityStill -Id 'file+|Scripts\z.ps1' -Snapshot @{ files = @{ 'Stack' = 'unreadable'; 'Scripts\a.ps1' = 'H1' }; filesStopped = '' })) 'a file that is not found in a folder that was not read counts as still there (it could not be told); one missing from the folder that was read does not'
+if ($onWindows) {
+    # The install folder itself is a link (the folder was moved and a junction left in its place).
+    # Nothing is read through it: Scripts and Stack are each a link, whatever lies behind it.
+    $igJRoot = Join-Path $Work 'integrity-linked-root'
+    $prev = $ErrorActionPreference; $ErrorActionPreference = 'Continue'; & cmd.exe /c mklink /J $igJRoot $igRoot 2>&1 | Out-Null; $ErrorActionPreference = $prev
+    $igJSnap = Get-LaiIntegritySnapshot -AIRoot $igJRoot -TaskPattern 'LaiNoSuchTask-*'
+    $igJSnap['listeners'] = $null
+    $igJShow = (@($igJSnap['files'].Keys | Sort-Object | ForEach-Object { '{0} = {1}' -f $_, $igJSnap['files'][$_] }) -join ', ')
+    Assert-That ((Test-Path -LiteralPath (Join-Path (Join-Path $igJRoot 'Scripts') 'tool.ps1')) -and $igJShow -eq 'Scripts = link, Stack = link' -and [string]$igJSnap['filesStopped'] -eq '') "an install folder that is a link itself is not read through: Scripts and Stack are each recorded as a link and no file behind it is listed or hashed ($igJShow)"
+    $igJDiff = @(Compare-LaiIntegrity -Baseline $igFull -Current $igJSnap)
+    $igJSummary = Get-LaiIntegritySummary -Baseline $igJSnap
+    Assert-That ($igJDiff.Count -eq 2 -and @($igJDiff | Where-Object { [string]$_.Id -like 'walk|*' -and [string]$_.Text -like '*is a link to another place, or lies in an install folder that is one, so the files in it were not compared' }).Count -eq 2 -and $igJSummary -match '^0 files \(none in Scripts, which is a link to another place, or lies in an install folder that is one: changes there are NOT noticed; none in Stack, ') "the comparison says that the files of both folders were not compared, and the summary of such a baseline that none of them is watched ($(@($igJDiff | ForEach-Object { [string]$_.Text }) -join '; ') / $igJSummary)"
+    # With another value in the OS variable (see above) the same: a walk by path went through the link.
+    $savedOS = $env:OS
+    $env:OS = 'not what Windows sets'
+    try { $igJOsFiles = Get-LaiIntegrityFiles -AIRoot $igJRoot } finally { $env:OS = $savedOS }
+    Assert-That (@($igJOsFiles.Keys).Count -eq 2 -and [string]$igJOsFiles['Scripts'] -eq 'link' -and [string]$igJOsFiles['Stack'] -eq 'link') "and with another value in the OS variable the linked install folder is still not read through ($(@($igJOsFiles.Keys | Sort-Object) -join ', '))"
+    # Windows' own calls not there (the helper could not be compiled): nothing is read by its path
+    # instead, and that is said the same way.
+    & (Get-Module LocalAI) { function script:Initialize-LaiIntegrityNative { return $false } }
+    try {
+        $igBlindSnap = Get-LaiIntegritySnapshot -AIRoot $igRoot -TaskPattern 'LaiNoSuchTask-*'
+    } finally { Import-Module (Join-Path (Join-Path $src 'lib') 'LocalAI.psm1') -Force }
+    $igBlindSnap['listeners'] = $null
+    $igBlindShow = (@($igBlindSnap['files'].Keys | Sort-Object | ForEach-Object { '{0} = {1}' -f $_, $igBlindSnap['files'][$_] }) -join ', ')
+    $igBlindDiff = @(Compare-LaiIntegrity -Baseline $igFull -Current $igBlindSnap)
+    $igBlindSummary = Get-LaiIntegritySummary -Baseline $igBlindSnap
+    Assert-That ($igBlindShow -eq 'Scripts = unreadable, Stack = unreadable' -and $null -eq $igBlindSnap['env']) "without Windows' own calls the walk reads nothing, not by path either: Scripts, Stack and the settings of .env are not read ($igBlindShow)"
+    Assert-That ($igBlindDiff.Count -eq 2 -and @($igBlindDiff | Where-Object { [string]$_.Id -like 'walk|*' -and [string]$_.Text -like '*could not be read, so the files in it were not compared' }).Count -eq 2 -and $igBlindSummary -match '^0 files \(none in Scripts, which could not be read: changes there are NOT noticed; none in Stack, which could not be read: ') "and that is two differences that say so, with no file called gone, and a summary that counts no file ($(@($igBlindDiff | ForEach-Object { [string]$_.Text }) -join '; ') / $igBlindSummary)"
+}
+
 # Where chats and searches are sent is a line in Stack\.env: those settings are compared by name, as
 # a fingerprint. Their values, and every other line (versions, ports, keys), are not kept.
 $igEnvMap = ConvertTo-LaiIntegrityEnv -Lines @('# a comment', 'OPEN_WEBUI_VERSION=v1', 'OLLAMA_BASE_URL=http://render-guard:11434', ' OLLAMA_UPSTREAM = http://host.docker.internal:11434 ', 'COMFYUI_URLS=http://host.docker.internal:8188', 'DEEP_RESEARCH_OLLAMA_URL=http://render-guard:11434', 'WEBUI_SECRET_KEY=never-shown', 'WEBUI_EXTRA_ORIGINS=;https://pc.tail.ts.net', 'WEBUI_PORT=3000')
@@ -1532,6 +1720,28 @@ Assert-That (((@($igEnvMap.Keys) | Sort-Object) -join ',') -eq 'COMFYUI_URLS,DEE
 Assert-That ([string]$igEnvMap['OLLAMA_BASE_URL'] -match '^[0-9A-F]{12}$' -and [string]$igEnvMap['OLLAMA_BASE_URL'] -eq [string]$igEnvMap['DEEP_RESEARCH_OLLAMA_URL'] -and [string]$igEnvMap['OLLAMA_BASE_URL'] -ne [string]$igEnvMap['OLLAMA_UPSTREAM'] -and @($igEnvMap.Values | Where-Object { $_ -match 'http|render' }).Count -eq 0) 'each as a short fingerprint of its value: the same address reads the same, another one differs, and no value is kept'
 $igEnvNow = Get-LaiIntegrityEnv -AIRoot $igRoot
 Assert-That ($igEnvNow -is [hashtable] -and @($igEnvNow.Keys).Count -eq 1 -and [string]$igEnvNow['OLLAMA_BASE_URL'] -eq [string]$igEnvMap['OLLAMA_BASE_URL'] -and (Get-LaiIntegrityEnv -AIRoot $igOutside) -is [hashtable] -and @((Get-LaiIntegrityEnv -AIRoot $igOutside).Keys).Count -eq 0) 'read from the real file; no .env at all is an empty answer'
+if ($onWindows) {
+    # Stack\.env is reached like every file of the walk, not by its path: behind a Stack that is a
+    # link (or an install folder that is one) it is not read, and what it holds does not reach the
+    # baseline. Read by its path, the settings of another folder's .env were named there, each with
+    # a fingerprint of its value.
+    $igEnvRoot = Join-Path $Work 'integrity-env-link'; $igEnvOut = Join-Path $Work 'integrity-env-outside'
+    foreach ($d in $igEnvRoot, $igEnvOut) { New-Item -ItemType Directory -Force -Path $d | Out-Null }
+    Set-Content -LiteralPath (Join-Path $igEnvOut '.env') -Value @('ELSEWHERE_UPSTREAM=http://not-this-install:1', 'OLLAMA_BASE_URL=http://elsewhere:11434')
+    $prev = $ErrorActionPreference; $ErrorActionPreference = 'Continue'; & cmd.exe /c mklink /J (Join-Path $igEnvRoot 'Stack') $igEnvOut 2>&1 | Out-Null; $ErrorActionPreference = $prev
+    $igEnvByPath = [string](Get-Content -Encoding UTF8 -Raw -LiteralPath (Join-Path (Join-Path $igEnvRoot 'Stack') '.env'))
+    $igEnvLinked = Get-LaiIntegrityEnv -AIRoot $igEnvRoot
+    $igEnvLinkedRoot = Get-LaiIntegrityEnv -AIRoot $igJRoot
+    $igEnvNamed = @(@($igEnvLinked, $igEnvLinkedRoot) | Where-Object { $_ -is [hashtable] } | ForEach-Object { @($_.Keys) }) -join ', '
+    Assert-That ($igEnvByPath -like 'ELSEWHERE_UPSTREAM=*' -and $null -eq $igEnvLinked -and $null -eq $igEnvLinkedRoot) "a .env behind a Stack that is a link, or behind an install folder that is one, is not read: it cannot be told, and no setting of that file is named (named: $igEnvNamed)"
+    # Read from its handle it is the same file as before: a byte order mark is no part of the first
+    # name (Windows PowerShell writes one with -Encoding UTF8), and a folder called .env is no file.
+    $igEnvBom = Join-Path $Work 'integrity-env-bom'; $igEnvDir = Join-Path $Work 'integrity-env-folder'
+    foreach ($d in (Join-Path $igEnvBom 'Stack'), (Join-Path (Join-Path $igEnvDir 'Stack') '.env')) { New-Item -ItemType Directory -Force -Path $d | Out-Null }
+    Set-Content -LiteralPath (Join-Path (Join-Path $igEnvBom 'Stack') '.env') -Encoding UTF8 -Value @('OLLAMA_BASE_URL=http://render-guard:11434', 'WEBUI_PORT=3000')
+    $igEnvBomMap = Get-LaiIntegrityEnv -AIRoot $igEnvBom
+    Assert-That ($igEnvBomMap -is [hashtable] -and @($igEnvBomMap.Keys).Count -eq 1 -and [string]$igEnvBomMap['OLLAMA_BASE_URL'] -eq [string]$igEnvMap['OLLAMA_BASE_URL'] -and $null -eq (Get-LaiIntegrityEnv -AIRoot $igEnvDir)) "a .env that starts with a byte order mark is read from its handle like any other (its first setting is found), and a folder called .env cannot be told"
+}
 
 # What counts as a difference, and how it reads (pure: made-up baselines).
 $igBase = @{
@@ -2484,6 +2694,26 @@ $odI = Find-PcsOpenDriver -Drivers @() -DriversRead $false -Probe $odProbe
 Assert-That ($odE.Status -eq 'SKIP' -and $odE.Detail -match 'without Run as administrator' -and $odE.Detail -notmatch 'elevated window' -and ($script:odAsked -join ',') -eq 'EneIo' -and $odF.Status -eq 'SKIP' -and $odG.Status -eq 'SKIP' -and $odH.Status -eq 'SKIP' -and $odI.Status -eq 'SKIP') "open driver could not be read: elevated is SKIP and the probe is never asked; no such device, another error, a probe that throws, an unreadable driver list ($($odE.Status) $($odF.Status) $($odG.Status) $($odH.Status) $($odI.Status))"
 $odJ = Find-PcsOpenDriver -Drivers $drvIn -Apps @([pscustomobject]@{ Name = 'Armoury Crate Service'; Version = '5.0'; InstallLocation = '' }) -Probe { 'opened' }
 Assert-That (@($odJ.Hits).Count -eq 1 -and $odJ.Hits[0].Driver -eq 'AsIO.sys' -and $odJ.Hits[0].Device -eq 'Asusgio' -and $odJ.Hits[0].From -match 'installed here: Armoury Crate Service') "open driver: of the vulnerable-driver fixture only AsIO.sys is on this list; a driver in the Windows folder gets its program by name ($(@($odJ.Hits | ForEach-Object { $_.Driver }) -join ', '))"
+# What the probe makes of the status of its open (NTSTATUS, read as it is). One status only says the
+# device refused; 'what was opened is a folder' (0xC00000BA) is not it, although Windows hands a
+# program the same error number, 5, for both: a device name pointed at a folder read 'denied' that way.
+Assert-That ((ConvertFrom-PcsOpenStatus -Status 0) -eq 'opened' -and (ConvertFrom-PcsOpenStatus -Status 0xC0000022) -eq 'denied' -and (ConvertFrom-PcsOpenStatus -Status 0xC0000034) -eq 'absent' -and (ConvertFrom-PcsOpenStatus -Status 0xC000003A) -eq 'absent') 'the status of the open: 0 is opened, 0xC0000022 denied, 0xC0000034 and 0xC000003A no such device'
+$osFolder = ConvertFrom-PcsOpenStatus -Status 0xC00000BA
+$osWin32 = @(5, 2, 3 | ForEach-Object { ConvertFrom-PcsOpenStatus -Status $_ })
+Assert-That ($osFolder -ceq 'error 0xC00000BA' -and ($osWin32 -join ',') -ceq 'error 0x00000005,error 0x00000002,error 0x00000003') "a folder where the device was expected is an error with its status, never 'denied'; the error numbers 5, 2 and 3 of a failed CreateFile are no statuses and mean nothing here ($osFolder; $($osWin32 -join ', '))"
+# Every status in the first 512 of each of the four kinds (success, information, warning, error).
+$osOpened = @(); $osDenied = @(); $osAbsent = @(); $osErrors = 0; $osOdd = @()
+foreach ($osKind in 0, 0x40000000, 0x80000000, 0xC0000000) {
+    for ($i = 0; $i -lt 512; $i++) {
+        $osHex = '0x{0:X8}' -f [int]($osKind + $i)
+        $osSays = [string](ConvertFrom-PcsOpenStatus -Status ($osKind + $i))
+        if ($osSays -ceq 'opened') { $osOpened += $osHex } elseif ($osSays -ceq 'denied') { $osDenied += $osHex } elseif ($osSays -ceq 'absent') { $osAbsent += $osHex }
+        elseif ($osSays -ceq "error $osHex") { $osErrors++ } else { $osOdd += "$osHex = $osSays" }
+    }
+}
+Assert-That (($osOpened -join ',') -eq '0x00000000' -and ($osDenied -join ',') -eq '0xC0000022' -and ($osAbsent -join ',') -eq '0xC0000034,0xC000003A' -and $osErrors -eq 2044 -and $osOdd.Count -eq 0) "of 2048 statuses exactly one is opened, one denied and two no such device; every other one is an error that names it (opened: $($osOpened -join ' '); denied: $($osDenied -join ' '); absent: $($osAbsent -join ' '); errors: $osErrors; odd: $($osOdd -join ' '))"
+$odK = Find-PcsOpenDriver -Drivers $odLoaded -Apps $odApps -Probe { ConvertFrom-PcsOpenStatus -Status 0xC00000BA }
+Assert-That ($odK.Status -eq 'SKIP' -and $odK.Detail -match 'the test ended with: error 0xC00000BA' -and $odK.Detail -notmatch 'refused') "open driver could not be read: a loaded driver whose name led to a folder is not tested, never fine ($($odK.Status): $($odK.Detail))"
 
 $fwPy = 'v2.30|Action=Allow|Active=TRUE|Dir=In|Protocol=6|Profile=Private|Profile=Public|App=C:\Python312\python.exe|Name=python.exe|Desc=python.exe|Defer=User|'
 $fwQuiet = @(
@@ -2510,6 +2740,46 @@ if ($onWindows) {
     $devNone = Test-PcsDeviceOpen -Device ('LaiNoSuchDevice' + (Get-Random -Minimum 100000 -Maximum 999999))
     $devFile = Test-PcsDeviceOpen -Device 'C:\Windows\win.ini'
     Assert-That ($devNul -eq 'opened' -and $devNone -eq 'absent' -and $devFile -like 'error*') "the device-open reader: NUL opens, a made-up device name does not (absent), a file path is turned away unopened ($devNul / $devNone / $devFile)"
+    # A device name of this sign-in session's own, pointed at the Windows folder: what any program may
+    # do without administrator rights to the name of a driver's device (DefineDosDevice, the call
+    # behind 'subst'; declared here for this test only, the script imports no such thing). Opened as
+    # \\.\<name>, as the check once did, the name leads to that folder, and a folder opened like a
+    # device is refused with the same error number as a device that refuses: the check read 'denied'
+    # and said the driver was fine. Asked in Windows' own list of device names, the name is not
+    # there. (Holds for every account but LocalSystem, whose names are the global ones.) The name is
+    # taken away again whatever happens; it would otherwise last until this account signs out.
+    if (-not ('LaiTestDosDevice' -as [type])) {
+        $ddMembers = @(
+            '[System.Runtime.InteropServices.DllImport("kernel32.dll", CharSet = System.Runtime.InteropServices.CharSet.Unicode, SetLastError = true)]'
+            'public static extern bool DefineDosDeviceW(uint dwFlags, string lpDeviceName, string lpTargetPath);'
+            '[System.Runtime.InteropServices.DllImport("kernel32.dll", CharSet = System.Runtime.InteropServices.CharSet.Unicode, SetLastError = true)]'
+            'public static extern uint GetFileAttributesW(string lpFileName);'
+        ) -join "`n"
+        Add-Type -Namespace '' -Name 'LaiTestDosDevice' -MemberDefinition $ddMembers
+    }
+    $ddName = 'LaiShadow' + (Get-Random -Minimum 100000 -Maximum 999999)
+    $ddTarget = [string]$env:SystemRoot
+    $ddBefore = Test-PcsDeviceOpen -Device $ddName
+    $ddSet = $false; $ddSeen = $false; $ddRemoved = $false; $ddAttr = [uint32]::MaxValue; $devShadow = ''
+    try {
+        # 0 = a name for this session, its target a path as a program writes it.
+        $ddSet = [LaiTestDosDevice]::DefineDosDeviceW(0, $ddName, $ddTarget)
+        # FILE_ATTRIBUTE_DIRECTORY is 0x10; 0xFFFFFFFF = nothing of that name.
+        $ddAttr = [LaiTestDosDevice]::GetFileAttributesW('\\.\' + $ddName)
+        $ddSeen = ($ddAttr -ne [uint32]::MaxValue -and ($ddAttr -band 0x10) -ne 0)
+        $devShadow = Test-PcsDeviceOpen -Device $ddName
+    } finally {
+        # 6 = DDD_REMOVE_DEFINITION | DDD_EXACT_MATCH_ON_REMOVE: this definition and no other. Should
+        # Windows not find it that way, 2 with no target takes away the newest one of that name.
+        if ($ddSet) {
+            $ddRemoved = [LaiTestDosDevice]::DefineDosDeviceW(6, $ddName, $ddTarget)
+            if (-not $ddRemoved) { $ddRemoved = [LaiTestDosDevice]::DefineDosDeviceW(2, $ddName, [NullString]::Value) }
+        }
+    }
+    $ddAfter = [LaiTestDosDevice]::GetFileAttributesW('\\.\' + $ddName)
+    Assert-That ($ddBefore -eq 'absent' -and $ddSet -and $ddSeen) "setup: a made-up device name ($ddName) was pointed at the Windows folder for this session without asking anybody, and \\.\$ddName now leads to that folder (before: $ddBefore; set: $ddSet; attributes: $ddAttr)"
+    Assert-That ($devShadow -eq 'absent') "the device-open reader is not fooled by it: the name is in no way a device of this PC, so the answer is 'absent' (not checked), not 'denied' (fine) ($devShadow)"
+    Assert-That ($ddRemoved -and $ddAfter -eq [uint32]::MaxValue) "and the name is gone again afterwards (removed: $ddRemoved; attributes: $ddAfter)"
     $fwReal = Get-PcsFirewallRuleText
     $fwShaped = @($fwReal.Rules | Where-Object { $_ -match '^v\d+\.\d+\|' } | Where-Object { $_ -match '\|Action=(Allow|Block)\|' } | Where-Object { $_ -match '\|Dir=(In|Out)\|' } | Where-Object { $_ -match '\|Active=(TRUE|FALSE)\|' })
     $fwRealVerdict = Find-PcsInterpreterRule -Rules $fwReal.Rules -RulesRead $fwReal.Read
@@ -2538,10 +2808,14 @@ $changing = @($pcsCmds | Where-Object { ($_ -match '^([A-Za-z]+)-' -and $changeV
 Assert-That ($pcsCmds.Count -gt 20 -and $changing.Count -eq 0) "Test-PCSecurity.ps1 runs no command that changes the PC ($($pcsCmds.Count) commands; changing: $($changing -join ', '))"
 # That list sees command names only, not what the script's one piece of compiled code calls in Windows
 # itself (the C# in Test-PcsDeviceOpen). So what that code may do is pinned here: one Add-Type, given
-# $members; two imports from kernel32.dll, CreateFileW and CloseHandle, under their own names; one
-# CreateFileW call, asking for no access (dwDesiredAccess 0) to something that exists (OPEN_EXISTING, 3);
-# and no other call: nothing that reads, writes or sends a driver a control code. Whoever changes that
-# code has to change this list with it.
+# $members; two imports under their own names, NtOpenFile from ntdll.dll and CloseHandle from
+# kernel32.dll, and no CreateFile of any kind; one NtOpenFile call, asking for neither read nor write
+# access (0x00100080 = SYNCHRONIZE | FILE_READ_ATTRIBUTES) to something that exists (NtOpenFile
+# creates nothing); object attributes that leave the path alone to say what is opened (no root
+# directory, 0x40 = the name whatever its case, nothing else set); that path being \GLOBAL??\ and
+# the device name the function has checked, never \\.\ (which a program without administrator rights
+# can point somewhere else); and no other call: nothing that reads, writes or sends a driver a
+# control code. Whoever changes that code has to change this list with it.
 $pcsSource = [string]$pcsAst.Extent.Text
 $pcsAddType = @($pcsAst.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] -and $n.GetCommandName() -eq 'Add-Type' }, $true))
 $pcsMemberSets = @($pcsAst.FindAll({ param($n) $n -is [System.Management.Automation.Language.AssignmentStatementAst] -and $n.Left.Extent.Text -eq '$members' }, $true))
@@ -2552,18 +2826,42 @@ if ($pcsMemberSets.Count -eq 1) {
 }
 $pcsAddTypeOk = ($pcsAddType.Count -eq 1 -and $pcsMemberSets.Count -eq 1 -and ([string]$pcsAddType[0].Extent.Text).EndsWith('-MemberDefinition $members'))
 $pcsExterns = @([regex]::Matches($pcsSource, '\bextern\s+[\w\.]+\s+(\w+)\s*\(') | ForEach-Object { $_.Groups[1].Value })
-$pcsImportsOk = ($pcsExterns.Count -eq 2 -and $pcsExterns -ccontains 'CreateFileW' -and $pcsExterns -ccontains 'CloseHandle' -and
-    [regex]::Matches($pcsSource, 'DllImport').Count -eq 2 -and [regex]::Matches($pcsSource, 'DllImport\("kernel32\.dll"').Count -eq 2 -and $pcsSource -notmatch 'EntryPoint')
-$pcsOpens = @([regex]::Matches($pcsCs, 'CreateFileW\s*\([^)]*\)') | ForEach-Object { $_.Value })
+$pcsImportsOk = ($pcsExterns.Count -eq 2 -and $pcsExterns -ccontains 'NtOpenFile' -and $pcsExterns -ccontains 'CloseHandle' -and [regex]::Matches($pcsSource, 'DllImport').Count -eq 2 -and
+    [regex]::Matches($pcsCs, 'DllImport\("ntdll\.dll"\)\]\s*static extern int NtOpenFile\(').Count -eq 1 -and
+    [regex]::Matches($pcsCs, 'DllImport\("kernel32\.dll", SetLastError = true\)\]\s*static extern bool CloseHandle\(').Count -eq 1 -and
+    $pcsSource -notmatch 'EntryPoint' -and $pcsCs -notmatch 'CreateFile')
+$pcsOpens = @([regex]::Matches($pcsCs, 'NtOpenFile\s*\([^)]*\)') | ForEach-Object { $_.Value })
+# Every field of the object attributes as the code sets it (each once, in this order).
+$pcsFields = @([regex]::Matches($pcsCs, '\battributes\.\w+ = [^;]*;') | ForEach-Object { $_.Value })
+$pcsFieldsWant = @(
+    'attributes.Length = (uint)System.Runtime.InteropServices.Marshal.SizeOf(typeof(OBJECT_ATTRIBUTES));'
+    'attributes.RootDirectory = System.IntPtr.Zero;'
+    'attributes.ObjectName = namePointer;'
+    'attributes.Attributes = 0x40;'
+    'attributes.SecurityDescriptor = System.IntPtr.Zero;'
+    'attributes.SecurityQualityOfService = System.IntPtr.Zero;'
+)
 $pcsOpenOk = ($pcsOpens.Count -eq 2 -and
-    $pcsOpens -ccontains 'CreateFileW(string lpFileName, uint dwDesiredAccess, uint dwShareMode, System.IntPtr lpSecurityAttributes, uint dwCreationDisposition, uint dwFlagsAndAttributes, System.IntPtr hTemplateFile)' -and
-    $pcsOpens -ccontains 'CreateFileW(name, 0, 3, System.IntPtr.Zero, 3, 0, System.IntPtr.Zero)')
-$pcsMayCall = @('DllImport', 'CreateFileW', 'CloseHandle', 'TryOpen', 'IntPtr', 'GetLastWin32Error', 'if')
+    $pcsOpens -ccontains 'NtOpenFile(out System.IntPtr FileHandle, uint DesiredAccess, ref OBJECT_ATTRIBUTES ObjectAttributes, out IO_STATUS_BLOCK IoStatusBlock, uint ShareAccess, uint OpenOptions)' -and
+    $pcsOpens -ccontains 'NtOpenFile(out handle, 0x00100080, ref attributes, out io, 3, 0x60)' -and
+    ($pcsFields -join "`n") -ceq ($pcsFieldsWant -join "`n"))
+$pcsMayCall = @('DllImport', 'NtOpenFile', 'CloseHandle', 'StructLayout', 'TryOpen', 'StringToHGlobalUni', 'AllocHGlobal', 'SizeOf', 'typeof', 'StructureToPtr', 'if', 'FreeHGlobal')
 $pcsCalled = @([regex]::Matches($pcsCs, '([A-Za-z_]\w*)\s*\(') | ForEach-Object { $_.Groups[1].Value } | Select-Object -Unique)
 $pcsStray = @($pcsCalled | Where-Object { $pcsMayCall -cnotcontains $_ })
 $pcsUnseen = @($pcsMayCall | Where-Object { $pcsCalled -cnotcontains $_ })
-Assert-That ($pcsAddTypeOk -and $pcsImportsOk) "the script compiles code once (Add-Type with `$members) and imports CreateFileW and CloseHandle from kernel32.dll, nothing else ($($pcsAddType.Count) Add-Type; imports: $($pcsExterns -join ', '))"
-Assert-That ($pcsOpenOk -and $pcsStray.Count -eq 0 -and $pcsUnseen.Count -eq 0) "and that code makes one CreateFileW call, with no access asked for (name, 0, 3, null, 3, 0, null), closes the handle and calls nothing else ($($pcsOpens.Count) CreateFileW text(s); calls: $($pcsCalled -join ', '); not on the list: $($pcsStray -join ', '); expected and not found: $($pcsUnseen -join ', '))"
+# What that code is given to open: one call in the whole script, the global list's own name before
+# a device name that was checked first; and no text anywhere in the script that begins a path this
+# session's device names decide (\\.\ or \\?\).
+$pcsOpenFn = $pcsAst.Find({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Test-PcsDeviceOpen' }, $true)
+$pcsOpenFnText = ''; if ($pcsOpenFn) { $pcsOpenFnText = [string]$pcsOpenFn.Extent.Text }
+$pcsTryOpens = @($pcsAst.FindAll({ param($n) $n -is [System.Management.Automation.Language.InvokeMemberExpressionAst] -and [string]$n.Member.Extent.Text -eq 'TryOpen' }, $true) | ForEach-Object { [string]$_.Extent.Text })
+$pcsSessionPaths = @($pcsAst.FindAll({ param($n) $n -is [System.Management.Automation.Language.StringConstantExpressionAst] -and ([string]$n.Value) -match '^\\\\[.?]' }, $true) | ForEach-Object { [string]$_.Value })
+$pcsNameCheckAt = $pcsOpenFnText.IndexOf('if ($Device -notmatch ''^[A-Za-z0-9_]{1,64}$'') { return ')
+$pcsTryOpenAt = $pcsOpenFnText.IndexOf('[PcsDevice]::TryOpen(')
+$pcsPathOk = ($pcsTryOpens.Count -eq 1 -and $pcsTryOpens[0] -ceq '[PcsDevice]::TryOpen(''\GLOBAL??\'' + $Device)' -and $pcsSessionPaths.Count -eq 0 -and $pcsNameCheckAt -ge 0 -and $pcsTryOpenAt -gt $pcsNameCheckAt)
+Assert-That ($pcsAddTypeOk -and $pcsImportsOk) "the script compiles code once (Add-Type with `$members) and imports NtOpenFile from ntdll.dll and CloseHandle from kernel32.dll, nothing else and no CreateFile ($($pcsAddType.Count) Add-Type; imports: $($pcsExterns -join ', '))"
+Assert-That ($pcsOpenOk -and $pcsStray.Count -eq 0 -and $pcsUnseen.Count -eq 0) "and that code makes one NtOpenFile call, with neither read nor write access asked for (handle, 0x00100080, attributes, io, 3, 0x60), no root directory and the name whatever its case (0x40), closes the handle and calls nothing else ($($pcsOpens.Count) NtOpenFile text(s); attributes: $($pcsFields.Count) field(s) set; calls: $($pcsCalled -join ', '); not on the list: $($pcsStray -join ', '); expected and not found: $($pcsUnseen -join ', '))"
+Assert-That $pcsPathOk "and what it is given to open is \GLOBAL??\ and a device name checked first, in one place: never a name that this session's own device names decide ($($pcsTryOpens -join ' | '); session paths: $($pcsSessionPaths -join ' | '); name check at $pcsNameCheckAt, call at $pcsTryOpenAt)"
 # Add-Check keeps a hashtable with one of the four results; anything else a row's code returns is no
 # answer. Convert-Verdict is what turns a judge's answer into that hashtable, so the four rows must end in it,
 # and a status it does not know must come out as not checked. (Loaded in a scope of its own: the
