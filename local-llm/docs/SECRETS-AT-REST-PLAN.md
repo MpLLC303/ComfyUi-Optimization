@@ -206,6 +206,14 @@ only switches the admin and deep research reads; the pending file is always plai
 stays.
 
 ## Questions for the owner
+Answered so far (owner's decision of 2026-10-07): he wants a recovery copy to keep offline. That
+bears on questions 2 and 4, which ask whether the passwords are saved somewhere off this PC: such
+a copy is to exist, kept offline, before a file is protected. How the copy is made, what it holds
+and where the owner is told to keep it is not designed yet; it belongs to step 3 (the command that
+switches protection on) and has to be written into this plan before step 3 is cut. Nothing is
+built. Whether he wants protection switched on at all (question 1) and questions 3, 5 and 6 are
+open as written.
+
 1. Do you want this? It protects the text of the stored admin password when a copy of that one
    file leaves this PC (a backup, a synced folder, a disk taken out). It does not protect against
    a program running under your account, nor against another administrator account or anything

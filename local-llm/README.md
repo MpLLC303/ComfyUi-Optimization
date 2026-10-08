@@ -28,9 +28,12 @@ smaller card the installer stops before it downloads anything (a card that holds
 models but not Vision or Code just skips those). With no NVIDIA GPU it says what it found instead.
 With two NVIDIA GPUs it measures the larger one and says how to keep Ollama on it.
 
-It downloads the newest toolkit to your temp folder, unblocks it and starts the installer. You get
-**one UAC prompt**, and then everything runs unattended in a new Administrator window (one more
-prompt after each reboot it needs). The one exception: if Open WebUI already has an admin account
+It downloads the newest toolkit to your temp folder and asks Windows for administrator rights:
+**one UAC prompt**. The step that has those rights copies the download into a folder under Program
+Files that only administrators can change, unpacks it there and starts the installer from that
+folder. Then everything runs unattended in the new Administrator window (one more prompt after
+each reboot it needs). Started from a Windows PowerShell window that already has administrator
+rights, the installer runs in that window instead. The one exception: if Open WebUI already has an admin account
 the installer doesn't know, it asks once for that account's e-mail and password. Only one installer
 run (or model update) can run at a time; a second one says so and stops.
 
@@ -84,20 +87,37 @@ scheduled tasks run without administrator rights, and removes the old `C:\AI\Ins
   to compare and is not asked. The list names the files, not what changed inside them: the review
   prints the address of the full comparison for that.
   - *When GitHub's API does not answer* (its hourly limit, a proxy), the commit is read from its
-    page on github.com instead. It is shown and asked about as usual, and the file list is said to
-    be missing. Only when neither of the two names the commit does the update stop: try again
-    later, or set `$env:LOCALAI_REF` to a full commit id.
+    page on github.com instead and shown, with the file list said to be missing. The update then
+    stops before the question: the list of the commit's files, which the download is compared
+    with (*What is installed* below), comes from the API alone. Try again later. Setting `$env:LOCALAI_REF` to a
+    full commit id names the commit without GitHub, but not the files it holds, so it does not
+    get an update past this either.
   - *For a run nobody watches,* set `$env:LOCALAI_REVIEWED_COMMIT` to the full 40-character id of
     the commit you reviewed. It counts for exactly that commit: when the branch has moved on, the
-    question is asked as usual, and without a typed OK nothing is installed.
+    question is asked as usual, and without a typed OK nothing is installed. Such a run has nobody
+    to click Yes at the prompt of Windows either: start it from Windows PowerShell with
+    administrator rights.
   - `$env:LOCALAI_REF` may name a branch, a tag or a commit id (4 or more hex characters count as
     an id). A commit id is not checked to be on a branch of this repository, and the review says so.
   - The first update that brings this review is not reviewed when you start it from the Start
     menu, because that shortcut runs the copy already on the PC. The one-liner fetches the new
     copy and reviews at once.
-- **A backup comes first:** before the update changes anything, the chats are backed up once
-  (`C:\AI\Backups\open-webui-<time>-before-toolkit-<version>.tar.gz`;
-  `Restore-OpenWebUI.ps1 -Archive <that file>` goes back to it).
+- **What is installed is the commit that was shown:** the download is asked for by that commit's
+  full id and compared with the list of files GitHub's API gives for that commit: every file under
+  `local-llm`, no file more and none less. A download that differs is refused and nothing is
+  installed; without that list an update stops, it is never installed unchecked. The step with
+  administrator rights compares its own copy again in its folder under Program Files, so a download
+  swapped in your temp folder in between is refused too, and it removes that folder at the end. A
+  first install was not reviewed: it says that its download cannot be compared with a reviewed
+  commit, and goes on. The first window removes the two files it put in your temp folder once the
+  Administrator window has read them. When it cannot tell (that window did not answer in the time
+  it waits, or this window could not make the signal that window answers with), it leaves them,
+  says which of the two it was, and the next run removes them.
+- **A backup comes first:** before the update changes anything, the chats are backed up, once per
+  toolkit version and commit
+  (`C:\AI\Backups\open-webui-<time>-before-toolkit-<version>-<commit>.tar.gz`, with the first 7
+  characters of the commit, or the day as `yyyyMMdd` for a ZIP unpacked by hand, which names no
+  commit; `Restore-OpenWebUI.ps1 -Archive <that file>` goes back to it).
 - **Options with the one-liner:** set them first, e.g. `$env:LOCALAI_ARGS = '-OfficialModels none'`, then
   paste the command. Plain options only (no quotes).
 - **The first update that brings the official models** (about 42 GB) says so and waits 20 seconds, so you
@@ -346,7 +366,7 @@ Every item on the guide's V1 list is a real test. It checks:
 - that both models are installed and 100% on the GPU at their tuned context
 - Docker and the containers (Open WebUI, SearXNG, render guard), and that Open WebUI talks to Ollama through the connection the installer set
 - that Open WebUI sees the models
-- the presets: system prompt, native tool calling, and image upload only where Ollama says the model reads images
+- the presets: system prompt, native tool calling, image upload only where Ollama says the model reads images, and that past-chat search and code execution are still off (a preset where either is on again, for example after restoring an older backup, fails; Start menu > Local AI > Update toolkit puts the safety settings back)
 - that no Context Length set in Open WebUI overrides the tuned aliases (your settings, the default parameters, the presets)
 - signup off and memories on
 - the RAG and search settings (including image scaling and the fetched-page limit)
@@ -357,7 +377,7 @@ Every item on the guide's V1 list is a real test. It checks:
 - that the backup task is scheduled (a newest backup older than about two days is a warning)
 - that the health watch is still running (no check for two hours is a warning) and that Windows shows its notifications
 - what the health watch found when it last compared the installed scripts, the Stack folder, the `LocalAI-*` tasks and the listening programs with the baseline of the last install or update (a difference is a warning, not a failure; see *Integrity watch* under Maintain)
-- that ports 11434/3000/8888 listen on loopback only
+- that ports 11434/3000/8888 (and the deep research port, when it is installed) listen on loopback only
 
 The exit code is the number of failures.
 
@@ -376,14 +396,25 @@ The exit code is the number of failures.
 | Changes outside an update | About once an hour the health watch also compares the installed scripts, the Stack folder, the `LocalAI-*` tasks and the listening programs with what the last install or update recorded, and names what differs; see *Integrity watch* below. Accept changes you made yourself with `C:\AI\Scripts\Watch-LocalAI.ps1 -AcceptBaseline` |
 | Gaming / long render: free everything | `C:\AI\Scripts\Stop-LocalAI.ps1` unloads the models, stops the containers (data kept) and pauses the health watch for 12 h. Add `-QuitDocker` to also release the WSL VM's RAM (up to 16 GB), or `-QuitOllama`. `Start-LocalAI.ps1` brings it all back and resumes the watch |
 | Something's wrong / asking for help | `C:\AI\Scripts\Get-LocalAIDiagnostics.ps1 -RunTests` (or Start menu → Local AI → Diagnostics) writes `C:\AI\Logs\diagnostics-<time>.zip` and copies a short summary to the clipboard. It covers versions, GPU/VRAM, Ollama, containers, logs and test results. The admin password, secret keys, tokens, your Windows user name and the admin e-mail are redacted. Nothing is uploaded. The last run of each Start-menu shortcut (Gaming mode, Start again, Health check, Re-check models, ComfyUI) is kept in `C:\AI\Logs\shortcut-<script>.log` and included, and so are the nightly re-check's `model-recheck.json` and `model-recheck.log`, so an error from a window you already closed can still be read |
-| Security check | Start menu → Local AI → *Security check* (or `C:\AI\Scripts\Test-PCSecurity.ps1`) checks this PC's own security and changes nothing; see [Keeping the PC safe](#keeping-the-pc-safe). For every check: right-click the shortcut > More > Run as administrator. The report is `C:\AI\Logs\pc-security-<time>.md` (`-ReportPath` to put it elsewhere) |
-| Uninstall | Start Docker Desktop first, then `C:\AI\Scripts\Uninstall-LocalAI.ps1` (elevated; `-WhatIf` first to preview; it asks you to type YES). It takes a verified final backup (`...-pre-uninstall.tar.gz`), then removes the scheduled tasks (backup, health watch, nightly model re-check), containers, Tailscale mapping, `localai-*` aliases, the shortcuts, the Start-menu folder and `C:\Program Files\LocalAI`. Chats and models are kept unless you add `-RemoveData` / `-RemoveModels`, and `-ResetOllamaSettings` also drops the OLLAMA_* variables (a value you had set yourself before the install, e.g. `OLLAMA_NUM_PARALLEL=4` for another tool, is put back instead; the first install logs each one it finds, and installs from before this toolkit version only remove). If the final backup fails, nothing is removed; with Docker not running, `-RemoveData` refuses. The Backups folder is kept, and the final backup is never pruned, even after a reinstall: get your chats back with `Restore-OpenWebUI.ps1 -Archive <that file>` |
-| After restoring an older backup | The restore puts this install's Ollama connection back. If the backup had a different admin password, run `Set-OpenWebUIPassword.ps1 -PromptCurrent` (type the old one; it then sets a new random password and prints it, add `-Prompt` to choose your own), then re-run the installer to re-apply presets. `Test-LocalAI.ps1` warns if the connection is wrong |
-| Restore a backup | `C:\AI\Scripts\Restore-OpenWebUI.ps1` (newest daily backup) or `-Archive <file>` (local, NAS or UNC path). It takes a verified safety backup first, swaps the data only after the archive checks out, and rolls back automatically if anything fails (deep research: add `-DeepResearch`; its replaced data is kept as `deep-research-<time>-pre-restore.tar.gz`). If even the rollback fails, Open WebUI is **kept stopped on purpose** so nothing writes to half-restored data: Start again, the installer, updates and nightly backups refuse until you run the recovery command the restore printed (also in the health-watch notification and `C:\AI\open-webui-hold.json`) |
+| Security check | Start menu → Local AI → *Security check* (or `C:\AI\Scripts\Test-PCSecurity.ps1`) checks this PC's own security and changes nothing; see [Keeping the PC safe](#keeping-the-pc-safe). No single window makes every check: a normal window for the driver test, Run as administrator (right-click the shortcut > More) for TPM, drive encryption and SMBv1. The report is `C:\AI\Logs\pc-security-<time>.md` (`-ReportPath` to put it elsewhere) |
+| Uninstall | Start Docker Desktop first, then `C:\AI\Scripts\Uninstall-LocalAI.ps1` (elevated; `-WhatIf` first to preview; it asks you to type YES). It takes a verified final backup (`...-pre-uninstall.tar.gz`), then removes the scheduled tasks (backup, health watch, nightly model re-check), the Tailscale mapping (before the containers, so that step cannot bring one back), the containers, `localai-*` aliases, the shortcuts, the Start-menu folder and `C:\Program Files\LocalAI`. Chats and models are kept unless you add `-RemoveData` / `-RemoveModels`, and `-ResetOllamaSettings` also drops the OLLAMA_* variables (a value you had set yourself before the install, e.g. `OLLAMA_NUM_PARALLEL=4` for another tool, is put back instead; the first install logs each one it finds, and installs from before this toolkit version only remove). If the final backup fails, nothing is removed; with Docker not running, `-RemoveData` refuses. A run with Docker Desktop closed and no `-RemoveData`, or with `-RemoveModels` while Ollama is not answering, says in its plan what it will leave, ends `Not finished` with exit code 2, and asks to be run again once they are started; tuned aliases left because Ollama was closed are only listed as kept and do not change the exit code. `-ResetOllamaSettings` keeps the firewall rule that blocks Ollama from the network while Ollama still listens beyond this PC: restart Ollama, then run the uninstaller once more. The Backups folder is kept, and the final backup is never pruned, even after a reinstall: get your chats back with `Restore-OpenWebUI.ps1 -Archive <that file>` |
+| After restoring an older backup | The restore puts this install's Ollama connection back, turns sign-up off again and, on the toolkit's presets, past-chat search and code execution (default web search too, except on the Official presets). When it could not, it says so and names the fix: Start menu > Local AI > Update toolkit. If the backup had a different admin password, run `Set-OpenWebUIPassword.ps1 -PromptCurrent` (type the old one; it then sets a new random password and prints it, add `-Prompt` to choose your own), then re-run the installer to re-apply presets. `Test-LocalAI.ps1` warns if the connection is wrong |
+| Restore a backup | `C:\AI\Scripts\Restore-OpenWebUI.ps1` (newest daily backup; while the data is marked as wiped, the last good one, see below) or `-Archive <file>` (local, NAS or UNC path; naming an `-EMPTY` archive gets one more question). It takes a verified safety backup first, swaps the data only after the archive checks out, and rolls back automatically if anything fails (deep research: add `-DeepResearch`; its replaced data is kept as `deep-research-<time>-pre-restore.tar.gz`). If even the rollback fails, Open WebUI is **kept stopped on purpose** so nothing writes to half-restored data: Start again, the installer, updates and nightly backups refuse until you run the recovery command the restore printed (also in the health-watch notification and `C:\AI\open-webui-hold.json`) |
 
 Every nightly backup is also opened with SQLite in a throwaway volume (with the Open WebUI image named in `C:\AI\Stack\.env`, or the one running if that is not on the PC; when neither is there the check is skipped and counted, and the health watch reports 3 such nights in a row; the restore's own safety copy skips it) (integrity check plus user/chat counts in
 `C:\AI\Logs\backup.log`). An archive that fails is kept as `...-CORRUPT.tar.gz`, never replaces a good one, and makes
 `Test-LocalAI.ps1` fail so you notice.
+
+The same check counts users and chats. A night on which Open WebUI has lost the users or chats the
+last good backup had (Docker's "Purge data", a reset by hand) is saved as
+`open-webui-<time>-EMPTY.tar.gz`, the data is marked as wiped, and no older backup is deleted until
+that is settled. Two `-EMPTY` archives are kept, the first and the newest, here and in the mirror.
+While the mark stands, `Restore-OpenWebUI.ps1` without `-Archive` takes the last good backup, not
+the newest, and of the deep research archives made since only the newest two are kept. The health
+watch tells you on its next run, and it and `Test-LocalAI.ps1` fail their Backups check until it is
+settled. There are two ways out: run `Restore-OpenWebUI.ps1` to get the data back, or, if you
+emptied it yourself, run `Backup-OpenWebUI.ps1 -AcceptEmpty` once. The mark also clears by itself
+when at least half the users and chats of the last good backup are back.
 
 Keep a copy of `C:\AI\Secrets` (session key and admin login) in your password manager. It's
 deliberately not inside the backup archives.
@@ -435,7 +466,12 @@ differs.
   notice, someone who already runs as you and rewrites the baseline together with the change, and
   a program name is only a name.
 
-`Uninstall-LocalAI.ps1 -RemoveData` removes the baseline together with the other state files.
+`Uninstall-LocalAI.ps1 -RemoveData` removes the baseline together with the other state files. Two
+of them can stay for one more run: when the run was also given `-ResetOllamaSettings` or
+`-RemoveModels` and asks to be run again (it ended `Not finished`, Ollama did not answer, or the
+firewall rule was kept), `install-state.json` and `localai-config.json` are named as kept, because
+the follow-up run reads your own Ollama settings from before the install out of them. The first
+run that has nothing left to ask for deletes them.
 
 ## Troubleshooting
 
@@ -540,7 +576,13 @@ failures.
 - **Nothing listens beyond 127.0.0.1**, and `Test-LocalAI.ps1` checks this. For phone access install
   Tailscale, sign in, turn on MagicDNS and HTTPS Certificates at login.tailscale.com/admin/dns, then run
   `C:\AI\Scripts\Enable-TailscaleAccess.ps1`: HTTPS at `https://<this-pc>.<tailnet>.ts.net`, tailnet only, survives
-  reboots, nothing opened on the LAN (`-Disable` removes it). Never port-forward or bind to `0.0.0.0`.
+  reboots, nothing opened on the LAN (`-Disable` removes it). By default every device in your tailnet
+  can open that address, and the PC's Tailscale key expires after 180 days, which ends phone access
+  without a message: `docs/TAILSCALE-ACCESS.md` in the repository (the docs folder is not copied to
+  the PC) has the steps for an access policy that admits only the phone, for switching key expiry
+  off, and for Tailnet Lock. Those steps were written without access to Tailscale's own pages and
+  are labelled so in the guide: check each against Tailscale's documentation before you follow it.
+  Never port-forward or bind to `0.0.0.0`.
 - **The containers are locked down.** Every container drops all Linux capabilities (deep research
   keeps the five its start script needs and nothing more), cannot gain new privileges, and has a
   memory limit and a limit on how many processes it may start: 16 GB for Open WebUI, 8 GB for deep
