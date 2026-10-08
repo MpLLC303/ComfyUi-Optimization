@@ -8,14 +8,18 @@
     Checks, in about a second and without loading any model or signing in:
       Ollama API, Docker engine, Open WebUI /health, SearXNG /healthz, the render-guard container,
       whether Open WebUI reaches Ollama (the path chats take), the newest backup (younger than 50 h
-      and not quarantined as -CORRUPT), and free disk space on the drives holding the models, backups
+      and not quarantined as -CORRUPT) and what the nightly backup recorded about itself (deep
+      research's backup failing for two nights; an Open WebUI found without chats, which is told on
+      the first run that sees it), and free disk space on the drives holding the models, backups
       and Docker's data (at least -MinFreeGB).
     Self-heals what is safe to heal (starts a stopped container, relaunches the Ollama tray app) unless
     -NoHeal. Docker Desktop is never started by the watch (you may have quit it on purpose to free
     RAM); a stopped engine is reported once instead, and so is one that stopped answering (every
     docker call has a time limit). Shows a Windows notification once when a check has failed on two
     runs in a row (and once when it recovers), so neither a slow Docker start nor a lasting outage
-    spams you. Log: <AIRoot>\Logs\watch.log.
+    spams you. Only a check that ran and passed counts as recovered: one that could not run (Docker
+    is down, Open WebUI is stopped for a backup) keeps what was reported about it, with no
+    notification either way. Log: <AIRoot>\Logs\watch.log.
     When Ollama has updated itself since the presets were tuned, the nightly LocalAI-Recheck-Models task
     (Update-Models.ps1 -RecheckOnly -Scheduled) measures them again; the watch notifies only when a
     preset could not be put back fully on the GPU, or the re-check could not run for 3 days (once per
@@ -57,7 +61,15 @@ param(
     [switch]$Unpause,
     # Record the installed scripts, the Stack folder, the LocalAI-* tasks and the listeners as they
     # are now as the integrity baseline (after changes you made yourself), then exit.
-    [switch]$AcceptBaseline
+    [switch]$AcceptBaseline,
+    # Test only (tests/Invoke-WatchTest.ps1; the scheduled task passes none of the three): act as if
+    # Windows' notification switch for PowerShell had this value, e.g. DisabledForUser.
+    [string]$TestToastSetting = '',
+    # Test only: every notification fails, as with a broken notification service.
+    [switch]$TestToastFail,
+    # Test only: end the run where the comparison with the integrity baseline starts, with its mark
+    # written and nothing compared.
+    [switch]$TestIntegrityEnd
 )
 $ErrorActionPreference = 'Stop'
 Import-Module (Join-Path (Join-Path $PSScriptRoot 'lib') 'LocalAI.psm1') -Force
@@ -65,6 +77,8 @@ Import-Module (Join-Path (Join-Path $PSScriptRoot 'lib') 'LocalAI.psm1') -Force
 $config = Read-LaiState -Path (Join-Path $AIRoot 'localai-config.json')
 $webPort = 3000; if ($config.ContainsKey('WebUIPort')) { $webPort = [int]$config['WebUIPort'] }
 $searxPort = 8888; if ($config.ContainsKey('SearxngPort')) { $searxPort = [int]$config['SearxngPort'] }
+# The optional research agent (Install-LocalAI.ps1 -DeepResearch); 0 = not installed.
+$researchPort = 0; if ($config.ContainsKey('DeepResearchPort')) { $researchPort = [int]$config['DeepResearchPort'] }
 $ollamaUrl = 'http://127.0.0.1:11434'; if ($config.ContainsKey('OllamaUrl') -and $config['OllamaUrl']) { $ollamaUrl = $config['OllamaUrl'] }
 $logDir = Join-Path $AIRoot 'Logs'
 if (-not (Test-Path -LiteralPath $logDir)) { New-Item -ItemType Directory -Force -Path $logDir | Out-Null }
@@ -72,6 +86,12 @@ $logFile = Join-Path $logDir 'watch.log'
 $statePath = Join-Path $AIRoot 'watch-state.json'
 $onWindows = ($env:OS -eq 'Windows_NT')
 $notify = $onWindows -and -not $NoNotify
+# The test hooks, as Send-Notification and the integrity comparison read them. They are parameters of
+# this run and nothing else. None is read from the environment: a variable there can be set for good
+# by any program running as this user, and silenced every scheduled run from then on.
+$hookToastSetting = $TestToastSetting
+$hookToastFail = [bool]$TestToastFail
+$hookIntegrityEnd = [bool]$TestIntegrityEnd
 $healAllowed = -not $NoHeal
 # A problem that persists is announced again after this many hours (a single toast is easy to miss:
 # Focus Assist during a game, a busy morning), until it is fixed.
@@ -94,6 +114,13 @@ function ConvertTo-WatchDate($Value) {
     if ($null -eq $Value -or "$Value" -eq '') { return $null }
     if ($Value -is [datetime]) { return $Value }
     try { return [datetime]::Parse([string]$Value, [Globalization.CultureInfo]::InvariantCulture) } catch { return $null }
+}
+function Get-WatchStamp($Value) {
+    # One spelling of a recorded time, to compare two of them by ('' = none): a state file hands the
+    # same value back as a date under PowerShell 7 and as the string under 5.1.
+    $d = ConvertTo-WatchDate $Value
+    if ($d) { return $d.ToString('s') }
+    return ([string]$Value -replace '\s+', ' ').Trim()
 }
 
 # Every docker call has a time limit: a Docker Desktop that stopped answering (it can after sleep)
@@ -142,10 +169,11 @@ function Send-Notification {
     # by Windows' own switch, and the log and banner are the channel), $false when the toast failed:
     # the caller then tries again on the next run.
     param([string]$Title, [string]$Text)
-    # Test hooks (tests/Invoke-WatchTest.ps1): Windows' notification switch for PowerShell turned off
-    # (the toast is dropped silently), and a toast that fails, as with a broken notification service.
-    if ($env:LOCALAI_TEST_TOAST_SETTING) { $script:toastSetting = $env:LOCALAI_TEST_TOAST_SETTING; Write-WatchLog ('{0} NOTIFY (toast not shown, notifications are off: {1}) {2}: {3}' -f (Get-Date -Format 's'), $env:LOCALAI_TEST_TOAST_SETTING, $Title, $Text); return $true }
-    if ($env:LOCALAI_TEST_TOAST_FAIL) { Write-WatchLog ('{0} NOTIFY (toast failed) {1}: {2}' -f (Get-Date -Format 's'), $Title, $Text); return $false }
+    # Test hooks (-TestToastSetting and -TestToastFail, which only tests/Invoke-WatchTest.ps1 passes):
+    # Windows' notification switch for PowerShell turned off (the toast is dropped silently), and a
+    # toast that fails, as with a broken notification service.
+    if ($hookToastSetting) { $script:toastSetting = $hookToastSetting; Write-WatchLog ('{0} NOTIFY (toast not shown, notifications are off: {1}) {2}: {3}' -f (Get-Date -Format 's'), $hookToastSetting, $Title, $Text); return $true }
+    if ($hookToastFail) { Write-WatchLog ('{0} NOTIFY (toast failed) {1}: {2}' -f (Get-Date -Format 's'), $Title, $Text); return $false }
     if (-not $notify) { Write-WatchLog ('{0} NOTIFY {1}: {2}' -f (Get-Date -Format 's'), $Title, $Text); return $true }
     $shown = $false; $why = ''
     try {
@@ -256,11 +284,15 @@ if ($engine -eq 'down' -or $engine -eq 'hung') {
     if ($engine -eq 'hung') { $details['Docker'] = "not responding (no answer within $dockerLimit s) - restart Docker Desktop (whale icon > Restart)" }
     else { $details['Docker'] = 'engine not running - start Docker Desktop' }
 } else {
+    # The engine answered: a result of its own, or a Docker that was reported could never be reported
+    # as working again (only a check that ran and passed is; see the report below). Without a docker
+    # CLI ('missing') it was not looked at, and nothing is recorded.
+    if ($engine -eq 'ok') { $results['Docker'] = $true }
     $watched = @(@{ Name = 'open-webui'; Url = "http://127.0.0.1:$webPort/health"; Key = 'Open WebUI' },
                  @{ Name = 'searxng'; Url = "http://127.0.0.1:$searxPort/healthz"; Key = 'SearXNG' })
-    # The optional research agent (Install-LocalAI.ps1 -DeepResearch), healed like the others.
-    if ($config.ContainsKey('DeepResearchPort') -and [int]$config['DeepResearchPort'] -gt 0) {
-        $watched += @{ Name = 'deep-research'; Url = "http://127.0.0.1:$([int]$config['DeepResearchPort'])/api/v1/health"; Key = 'Deep research' }
+    # The optional research agent, healed like the others.
+    if ($researchPort -gt 0) {
+        $watched += @{ Name = 'deep-research'; Url = "http://127.0.0.1:$researchPort/api/v1/health"; Key = 'Deep research' }
     }
     foreach ($c in $watched) {
         $ok = Test-Url $c.Url
@@ -268,8 +300,10 @@ if ($engine -eq 'down' -or $engine -eq 'hung') {
         if (-not $ok -and @('open-webui', 'deep-research') -contains $c.Name -and (Test-LaiVolumeLockBusy)) {
             # A backup, restore or update is running and stopped (or paused) it on purpose (checked
             # before the hold: a restore in progress has written its hold already, but has not failed).
-            $ok = $true
+            # That is 'not checked', not 'working': no result is recorded, so nothing is reported as
+            # failed and nothing as recovered, and what was reported before stays as it was.
             $maintenance = $true
+            continue
         } elseif (-not $ok -and $hold) {
             # Left stopped on purpose by a failed or interrupted restore: starting it could run on a damaged volume.
             $details[$c.Key] = "kept stopped after a failed restore - $($hold['Recover'])"
@@ -331,14 +365,52 @@ $all = @($all | Where-Object { $_.LastWriteTime -le $soon })
 $daily = @($all | Where-Object { $_.Name -match '^open-webui-\d{8}-\d{6}\.tar\.gz$' })
 $results['Backups'] = ($all.Count -gt 0) -and ($all[0].Name -notlike '*-CORRUPT.tar.gz') -and ($daily.Count -gt 0) -and (((Get-Date) - $daily[0].LastWriteTime).TotalHours -le 50)
 $bstate = Read-LaiState -Path (Join-Path $AIRoot 'backup-state.json')
+$backupLog = Join-Path $logDir 'backup.log'
+# What else makes the backups something not to rely on, the gravest first. Any one fails the check.
+$backupWhy = @()
+# The nightly backup found Open WebUI without chats where earlier backups have some, and recorded it
+# ('emptied': at, archive, lastGood, users, chats, hadUsers, hadChats). The owner may have cleared
+# them, or they are lost. Told on the first run that sees it (the report below): every night that
+# passes is one more backup of the empty state.
+$emptiedKey = ''
+if ($bstate['emptied'] -is [hashtable]) {
+    $emptied = $bstate['emptied']
+    $emptiedKey = Get-WatchStamp $emptied['at']; if (-not $emptiedKey) { $emptiedKey = 'undated' }
+    $emptiedAt = ConvertTo-WatchDate $emptied['at']
+    $onDate = 'at the last backup'; if ($emptiedAt) { $onDate = 'on ' + $emptiedAt.ToString('yyyy-MM-dd') }
+    $lastGood = ([string]$emptied['lastGood'] -replace '\s+', ' ').Trim()
+    if ($lastGood) {
+        # A bare name is a file in the backup folder; anything with a folder in it is taken as it stands.
+        $lastGoodPath = $lastGood; if ($lastGood -notmatch '[\\/]') { $lastGoodPath = Join-Path $backupDir $lastGood }
+        $restoreCmd = '& {0} -AIRoot {1} -Archive {2}' -f (ConvertTo-LaiPsQuoted (Join-Path $PSScriptRoot 'Restore-OpenWebUI.ps1')), (ConvertTo-LaiPsQuoted $AIRoot), (ConvertTo-LaiPsQuoted $lastGoodPath)
+        $backupWhy += "$onDate Open WebUI had no chats; the last backup with chats is $lastGood, put back with: $restoreCmd (nothing is deleted meanwhile)"
+    } else {
+        $backupWhy += "$onDate Open WebUI had no chats, and no earlier backup with chats is on record (nothing is deleted meanwhile)"
+    }
+}
 if ($futureDaily.Count) {
-    $results['Backups'] = $false
-    $details['Backups'] = "$($futureDaily[0].Name) is dated $($futureDaily[0].LastWriteTime.ToString('s')), in the future (the PC clock was wrong when it was made): delete it"
-} elseif ($bstate['deepCheckSkips'] -and [int]$bstate['deepCheckSkips'] -ge 3) {
+    $backupWhy += "$($futureDaily[0].Name) is dated $($futureDaily[0].LastWriteTime.ToString('s')), in the future (the PC clock was wrong when it was made): delete it"
+}
+if ($bstate['deepCheckSkips'] -and [int]$bstate['deepCheckSkips'] -ge 3) {
     # Backups exist, but their database check has not run for 3 nights: an empty or damaged webui.db
     # would not be noticed.
+    $backupWhy += "the database check of the nightly backup could not run for $([int]$bstate['deepCheckSkips']) nights (see backup.log)"
+}
+# Deep research's data goes into its own archive in the same nightly run, and a failure there is a
+# warning that leaves the Open WebUI backup good. One bad night is the health check's to mention;
+# with no good one for 50 h (or none on record) nothing current would be there to restore.
+if ($researchPort -gt 0 -and $bstate['researchError']) {
+    $researchOkAt = ConvertTo-WatchDate $bstate['researchOkAt']
+    if (-not $researchOkAt -or ((Get-Date) - $researchOkAt).TotalHours -gt 50) {
+        $lastOk = 'none on record'; if ($researchOkAt) { $lastOk = $researchOkAt.ToString('yyyy-MM-dd HH:mm') }
+        $researchWhy = ([string]$bstate['researchError'] -replace '\s+', ' ').Trim()
+        if ($researchWhy.Length -gt 300) { $researchWhy = $researchWhy.Substring(0, 300) + '...' }
+        $backupWhy += "deep research's backup fails (last good one: $lastOk): $researchWhy (see $backupLog)"
+    }
+}
+if ($backupWhy.Count) {
     $results['Backups'] = $false
-    $details['Backups'] = "the database check of the nightly backup could not run for $([int]$bstate['deepCheckSkips']) nights (see backup.log)"
+    $details['Backups'] = $backupWhy -join '; '
 }
 # The second copy (NAS, other drive): a mirror that stopped working is otherwise only a line in backup.log.
 $mirrorTarget = ''
@@ -591,15 +663,17 @@ try {
                 # and the next run would send the same one again.
                 foreach ($k in @('announced', 'tried')) { if ($next[$k]) { $markIg[$k] = $next[$k] } }
                 $markIg['startedAt'] = $startedNow
-                # Test hook (tests/Invoke-WatchTest.ps1): the run ends here, with the mark written and
-                # nothing compared yet, as when Task Scheduler ends it in the middle of a comparison.
-                # An environment variable can be set for good by any program running as this user, so
-                # the hook is no switch: it works only while its value is the id of the baseline being
-                # compared (the next install, update or -AcceptBaseline ends it), and the mark says
-                # what ended the run, for watch.log, the health check and the notice after
-                # $integritySkipHours hours.
-                $hookWhy = 'the environment variable LOCALAI_TEST_INTEGRITY_END (a test hook) was set when the comparison started and ended it before anything was compared; remove that variable'
-                $endHere = ($env:LOCALAI_TEST_INTEGRITY_END -and [string]$env:LOCALAI_TEST_INTEGRITY_END -eq $baseId)
+                # Test hook (-TestIntegrityEnd, which only tests/Invoke-WatchTest.ps1 passes): the run
+                # ends here, with the mark written and nothing compared yet, as when Task Scheduler ends
+                # it in the middle of a comparison. It was an environment variable once, meant to work
+                # only while its value was the id of the baseline being compared. That was a switch all
+                # the same: the id is in a file this user can read, so any program running as the owner
+                # could set the variable to it for good, and from then on no comparison ran, across
+                # restarts, while the health check passed. A parameter ends the one run it is passed
+                # to, and the scheduled task passes none. The mark still says what ended the run, for
+                # watch.log, the health check and the notice after $integritySkipHours hours.
+                $hookWhy = 'the test parameter -TestIntegrityEnd was passed when the comparison started and ended it before anything was compared; the scheduled task never passes it, so something else started this run'
+                $endHere = $hookIntegrityEnd
                 if ($endHere) { $markIg['skippedWhy'] = $hookWhy }
                 elseif ([string]$markIg['skippedWhy'] -eq $hookWhy) { $markIg.Remove('skippedWhy') }
                 $mark['integrity'] = $markIg
@@ -692,16 +766,28 @@ if ($previous.ContainsKey('failed') -and $previous['failed']) { $prevFailed = @(
 if ($previous.ContainsKey('notified') -and $previous['notified']) { $prevNotified = @($previous['notified']) }
 $lastToast = ConvertTo-WatchDate $previous['notifiedAt']
 $toNotify = @($failed | Where-Object { ($prevFailed -contains $_) -and ($prevNotified -notcontains $_) })
+# An emptied Open WebUI does not wait for a second run (nothing about it passes by itself), and is
+# told also when Backups was reported for another reason already. Once for each emptying: $emptiedTold
+# is saved when the notification went out ($null = leave the record as it is).
+$emptiedNews = ($emptiedKey -and (Get-WatchStamp $previous['emptiedTold']) -ne $emptiedKey)
+$emptiedTold = $null
+if ($emptiedNews -and $toNotify -notcontains 'Backups') { $toNotify += 'Backups' }
 $stillReported = @($failed | Where-Object { $prevNotified -contains $_ })
 $reminder = ($toNotify.Count -eq 0 -and $stillReported.Count -gt 0 -and (-not $lastToast -or ((Get-Date) - $lastToast).TotalHours -ge $remindHours))
 if ($reminder) { $toNotify = $stillReported }
-$notified = @($failed | Where-Object { ($prevNotified -contains $_) -or ($toNotify -contains $_) })
-$recovered = @($prevNotified | Where-Object { $failed -notcontains $_ })
 $notifiedAt = $previous['notifiedAt']
 # A 'back to normal' that could not be shown is retried (else the last word stays 'problem detected').
 $pendingRecovered = @()
-if ($previous.ContainsKey('pendingRecovered') -and $previous['pendingRecovered']) { $pendingRecovered = @($previous['pendingRecovered'] | Where-Object { $failed -notcontains $_ }) }
-$recovered = @(@($recovered) + @($pendingRecovered | Where-Object { $recovered -notcontains $_ }))
+if ($previous.ContainsKey('pendingRecovered') -and $previous['pendingRecovered']) { $pendingRecovered = @($previous['pendingRecovered']) }
+# Recovered is only what was looked at on this run and passed. A check that did not run says nothing
+# either way: with Docker down none of the containers is looked at, Open WebUI stopped for a backup
+# is left alone, and the chat path is not tried without Open WebUI. Counting those as recovered sent
+# 'recovered Open WebUI' the moment Docker stopped. What was reported and did not run stays reported,
+# with no notification, until its check runs again.
+$owed = @(@($prevNotified) + @($pendingRecovered | Where-Object { $prevNotified -notcontains $_ }))
+$recovered = @($owed | Where-Object { $results.Contains($_) -and $results[$_] })
+$notChecked = @($owed | Where-Object { -not $results.Contains($_) })
+$notified = @(@($failed | Where-Object { ($prevNotified -contains $_) -or ($toNotify -contains $_) }) + $notChecked)
 $recoveryFailed = $false
 
 $failedText = @($failed | ForEach-Object { if ($details.ContainsKey($_)) { '{0} ({1})' -f $_, $details[$_] } else { $_ } }) -join ', '
@@ -717,12 +803,16 @@ function Get-WatchHint([string[]]$Failed) {
     if ($heldNow -and $failed -contains 'Open WebUI') {
         # Start again would refuse; the only fix is the recovery restore (the command is in the details).
         $hint = 'Open WebUI is stopped on purpose after a failed restore. The fix is the Recover line in ' + (Join-Path $AIRoot 'open-webui-hold.json') + ': paste it into PowerShell.'
+    } elseif ($engine -eq 'hung' -and $failed -contains 'Docker') {
+        # Docker Desktop is running and does not answer: Start again would get no answer either, so
+        # restarting it comes first.
+        $hint = 'Restart Docker Desktop (whale icon > Restart). If the stack is not back a few minutes later, use Start menu > Local AI - Start again.'
     } elseif ($failed -contains 'Docker' -or $failed -contains 'Open WebUI' -or $failed -contains 'SearXNG' -or $failed -contains 'Render guard' -or $failed -contains 'Ollama' -or $failed -contains 'Chats reach Ollama') {
         $hint = 'Use Start menu > Local AI - Start again. If that does not help, restart Docker Desktop (whale icon > Restart) and use Start again once more.'
     } elseif ($failed -contains 'Disk space') {
         $hint = 'Free some disk space (old backups in ' + (Join-Path $AIRoot 'Backups') + ', unused models).'
     } elseif ($failed -contains 'Backups') {
-        $hint = 'The reason is at the end of ' + (Join-Path (Join-Path $AIRoot 'Logs') 'backup.log') + '.'
+        $hint = 'The reason is at the end of ' + $backupLog + '.'
     } elseif ($failed -contains 'Backup mirror') {
         $hint = 'Check that the backup mirror drive or NAS share is reachable and has free space.'
     }
@@ -733,8 +823,10 @@ if ($toNotify.Count -gt 0) {
     $hint = Get-WatchHint $failed
     $title = 'Local AI: problem detected'; if ($reminder) { $title = 'Local AI: still not working' }
     $prefix = ''; if ($recovered.Count) { $prefix = 'Working again: ' + ($recovered -join ', ') + '. ' }
-    if (Send-Notification $title ("{0}Not working: {1}. {2}" -f $prefix, $failedText, $hint)) { $notifiedAt = (Get-Date).ToString('s') }
-    else {
+    if (Send-Notification $title ("{0}Not working: {1}. {2}" -f $prefix, $failedText, $hint)) {
+        $notifiedAt = (Get-Date).ToString('s')
+        if ($emptiedNews) { $emptiedTold = $emptiedKey }
+    } else {
         # Not shown: keep them unreported so the next run tries again (and any recovery news too).
         $notified = @($notified | Where-Object { $toNotify -notcontains $_ -or $stillReported -contains $_ })
         if ($recovered.Count) { $recoveryFailed = $true }
@@ -805,6 +897,7 @@ $final = Read-LaiState -Path $statePath
 $final['failed'] = $failed; $final['notified'] = $notified; $final['checked'] = (Get-Date).ToString('s')
 if ($notified.Count -and $notifiedAt) { $final['notifiedAt'] = [string]$notifiedAt } else { $final.Remove('notifiedAt') }
 if ($recoveryFailed) { $final['pendingRecovered'] = @($recovered) } else { $final.Remove('pendingRecovered') }
+if ($emptiedTold) { $final['emptiedTold'] = $emptiedTold } elseif (-not $emptiedKey) { $final.Remove('emptiedTold') }
 if ($null -ne $bannerDone) { if ($bannerDone) { $final['banner'] = $bannerDone } else { $final.Remove('banner') } }
 if ($script:toastSetting) { if ($script:toastSetting -ne 'Enabled') { $final['toastSetting'] = $script:toastSetting } else { $final.Remove('toastSetting') } }
 if ($null -ne $ollamaNotice) { if ($ollamaNotice) { $final['ollamaNotifiedFor'] = $ollamaNotice } else { $final.Remove('ollamaNotifiedFor') } }
