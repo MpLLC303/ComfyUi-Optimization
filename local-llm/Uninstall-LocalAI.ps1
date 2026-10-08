@@ -9,8 +9,8 @@
       1. Final verified backup of the Open WebUI volume (Backups\open-webui-<ts>-pre-uninstall.tar.gz).
       2. Scheduled tasks LocalAI-Backup-OpenWebUI, LocalAI-Watch, LocalAI-Recheck-Models,
          LocalAI-Install-Resume.
-      3. The containers (open-webui, searxng, render-guard) and their network (docker compose down).
-      4. The Tailscale HTTPS mapping to Open WebUI, if there is one.
+      3. The Tailscale HTTPS mapping to Open WebUI, if there is one.
+      4. The containers (open-webui, searxng, render-guard) and their network (docker compose down).
       5. The tuned Ollama aliases (localai-*; they share weights with the source models, ~0 GB).
       6. The "ComfyUI (free GPU first)" desktop shortcut and the "Local AI" Start-menu folder.
     Kept unless asked: the Open WebUI data volume (chats, memories, knowledge), the downloaded models
@@ -23,7 +23,17 @@
       -ResetOllamaSettings  remove the OLLAMA_* user variables the installer set (flash attention,
                         q8_0 KV cache, keep-alive, ...), plus OLLAMA_HOST and its LAN firewall block.
                         A value you had set yourself before the first install (this toolkit
-                        version or later) is put back instead.
+                        version or later) is put back instead. The firewall block stays while the
+                        running Ollama still listens on the network: restart Ollama, run this again.
+
+    Exit code 0: finished. 1: stopped before anything was removed. 2: a step failed, or something
+    could not be removed because Docker Desktop (the containers) or Ollama (the models, with
+    -RemoveModels) was not running; the last lines name it. Start that program and run the
+    uninstaller again: it removes only what is still there. Tuned aliases alone, left because
+    Ollama was not running, are listed as kept and do not make it 2. While a run asks for another
+    one that changes Ollama's settings or models, -RemoveData keeps install-state.json and
+    localai-config.json for it (your own Ollama settings from before the install are read from
+    there); that run deletes them.
 
 .EXAMPLE
     .\Uninstall-LocalAI.ps1 -WhatIf        # show what would happen
@@ -65,6 +75,10 @@ if (-not $OllamaUrl) {
 $stackDir = Join-Path $AIRoot 'Stack'
 $compose = Join-Path $stackDir 'docker-compose.yml'
 $problems = @()
+# What this run cannot remove because the program it needs is not running, and which program that
+# is. Named in the plan and again at the end: the run then ends 'Not finished' with exit 2.
+$left = @()
+$startFirst = @()
 
 function Invoke-Docker {
     param([string[]]$Arguments)
@@ -97,13 +111,28 @@ if ($RemoveData -and -not $dockerUp -and $dockerInstalled -and $WhatIfPreference
     Write-LaiLog FAIL 'Docker is not running, so the final backup cannot be taken and the Open WebUI data cannot be removed. Start Docker Desktop, wait until it says "Engine running", then run this again. Nothing was removed.'
     exit 1
 }
+# Docker is installed but closed: its containers cannot be removed in this run (the data volume is
+# either kept anyway or, with -RemoveData, refused above).
+$dockerDown = ($dockerInstalled -and -not $dockerUp)
+if ($dockerDown) { $left += 'containers open-webui, searxng, render-guard (Docker is not running)'; $startFirst += 'Docker Desktop' }
+# Ollama is asked once, before the plan, so the plan already says what cannot be removed.
+$ollamaUp = $true
+try { $names = @(Get-LaiOllamaModelNames -BaseUrl $OllamaUrl) } catch { $ollamaUp = $false; $names = @() }
+$modelsNow = ($RemoveModels -and $ollamaUp)
+$aliases = 'tuned Ollama aliases localai-*'
+if ($RemoveModels -and -not $ollamaUp) { $left += "$aliases and downloaded models from the catalog (Ollama is not answering at $OllamaUrl)"; $startFirst += 'Ollama' }
 
 # ---- plan + confirmation ------------------------------------------------------------------------
-$plan = @('scheduled tasks (backup, health watch, install resume)', 'containers open-webui, searxng, render-guard',
-    'Tailscale mapping to Open WebUI (if any)', 'tuned Ollama aliases localai-*', 'shortcuts (desktop ComfyUI, Start-menu Local AI folder)')
+$plan = @('scheduled tasks (backup, health watch, install resume)', 'Tailscale mapping to Open WebUI (if any)')
+if (-not $dockerDown) { $plan += 'containers open-webui, searxng, render-guard' }
+if ($ollamaUp) { $plan += $aliases }
+$plan += 'shortcuts (desktop ComfyUI, Start-menu Local AI folder)'
 $kept = @()
 if ($RemoveData) { $plan += 'Open WebUI data volume (chats, memories, knowledge) and C:\AI stack/scripts/secrets/logs' } else { $kept += 'Open WebUI data volume (re-run Install-LocalAI.ps1 and everything comes back)' }
-if ($RemoveModels) { $plan += 'downloaded models from the catalog' } else { $kept += 'downloaded models' }
+if ($modelsNow) { $plan += 'downloaded models from the catalog' } elseif (-not $RemoveModels) { $kept += 'downloaded models' }
+# The aliases alone (about 0 GB) are named as kept and do not make the run 'Not finished': a PC
+# whose Ollama was uninstalled first could then never finish.
+if (-not $ollamaUp -and -not $RemoveModels) { $kept += "$aliases (Ollama is not answering at $OllamaUrl; to remove them, start Ollama and run the uninstaller again)" }
 if ($ResetOllamaSettings) { $plan += 'OLLAMA_* user variables set by the installer (+ OLLAMA_HOST firewall rule)' } else { $kept += 'Ollama settings' }
 $kept += "backups in $(Join-Path $AIRoot 'Backups')"
 # The rules file for an AI coding agent (written by the installer, edited by the owner) is not in the list of what -RemoveData deletes.
@@ -111,6 +140,7 @@ if (Test-Path -LiteralPath (Join-Path $AIRoot 'CLAUDE.md') -PathType Leaf) { $ke
 Write-LaiLog STEP 'Uninstall plan'
 foreach ($p in $plan) { Write-LaiLog INFO "remove: $p" }
 foreach ($k in $kept) { Write-LaiLog INFO "keep:   $k" }
+foreach ($l in $left) { Write-LaiLog WARN "cannot remove in this run: $l" }
 if (-not $Force -and -not $WhatIfPreference) {
     $answer = Read-Host 'Type YES to continue'
     if ($answer -cne 'YES') { Write-LaiLog INFO 'Nothing changed.'; exit 1 }
@@ -138,7 +168,24 @@ if (Get-Command Unregister-ScheduledTask -ErrorAction SilentlyContinue) {
     }
 }
 
-# ---- 3. containers ------------------------------------------------------------------------------
+# ---- 3. Tailscale -------------------------------------------------------------------------------
+# Before the containers are removed, never after: -Disable recreates Open WebUI ('compose up') to
+# take the phone's address off its allowed list. Run after the removal, that brought the stack back
+# with restart: always, and after -RemoveData on an empty volume with no account, where the first
+# visitor becomes the administrator. The script now leaves a missing container alone as well; this
+# order does not rely on it.
+$ts = Get-Command tailscale -ErrorAction SilentlyContinue
+if (-not $ts -and $env:ProgramFiles -and (Test-Path -LiteralPath (Join-Path $env:ProgramFiles 'Tailscale\tailscale.exe'))) { $ts = Join-Path $env:ProgramFiles 'Tailscale\tailscale.exe' }
+if ($ts) {
+    $port = 3000; if ($config.ContainsKey('WebUIPort')) { $port = [int]$config['WebUIPort'] }
+    $prev = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
+    try { $json = (& $ts serve status --json 2>$null) -join "`n" } finally { $ErrorActionPreference = $prev }
+    if ($json -match [regex]::Escape("http://127.0.0.1:$port")) {
+        Invoke-Step 'Tailscale mapping' { & (Join-Path $PSScriptRoot 'Enable-TailscaleAccess.ps1') -AIRoot $AIRoot -Port $port -Disable }
+    }
+}
+
+# ---- 4. containers ------------------------------------------------------------------------------
 if ($dockerUp) {
     Invoke-Step 'containers' {
         if (Test-Path -LiteralPath $compose) {
@@ -179,21 +226,7 @@ if ($dockerUp) {
     Write-LaiLog WARN 'Docker engine is not running: containers and the data volume were left in place. Start Docker Desktop and re-run to remove them.'
 }
 
-# ---- 4. Tailscale -------------------------------------------------------------------------------
-$ts = Get-Command tailscale -ErrorAction SilentlyContinue
-if (-not $ts -and $env:ProgramFiles -and (Test-Path -LiteralPath (Join-Path $env:ProgramFiles 'Tailscale\tailscale.exe'))) { $ts = Join-Path $env:ProgramFiles 'Tailscale\tailscale.exe' }
-if ($ts) {
-    $port = 3000; if ($config.ContainsKey('WebUIPort')) { $port = [int]$config['WebUIPort'] }
-    $prev = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
-    try { $json = (& $ts serve status --json 2>$null) -join "`n" } finally { $ErrorActionPreference = $prev }
-    if ($json -match [regex]::Escape("http://127.0.0.1:$port")) {
-        Invoke-Step 'Tailscale mapping' { & (Join-Path $PSScriptRoot 'Enable-TailscaleAccess.ps1') -AIRoot $AIRoot -Port $port -Disable }
-    }
-}
-
 # ---- 5. Ollama aliases / models / settings --------------------------------------------------------
-$ollamaUp = $true
-try { $names = @(Get-LaiOllamaModelNames -BaseUrl $OllamaUrl) } catch { $ollamaUp = $false; $names = @() }
 if ($ollamaUp) {
     $toRemove = @($names | Where-Object { $_ -like 'localai-*' })
     if ($RemoveModels) {
@@ -214,13 +247,15 @@ if ($ollamaUp) {
     Write-LaiLog WARN "Ollama is not answering at $OllamaUrl; its aliases/models were left in place. Start Ollama and re-run."
 }
 
-if ($onWindows -and ($ResetOllamaSettings -or $RemoveModels)) {
+# OLLAMA_MODELS goes only with the models: while they are still there (Ollama did not answer), the
+# next run finds them through it.
+if ($onWindows -and ($ResetOllamaSettings -or $modelsNow)) {
     $vars = @()
     if ($ResetOllamaSettings) {
         $vars += 'OLLAMA_FLASH_ATTENTION', 'OLLAMA_KV_CACHE_TYPE', 'OLLAMA_NUM_PARALLEL', 'OLLAMA_MAX_LOADED_MODELS', 'OLLAMA_GPU_OVERHEAD',
             'OLLAMA_KEEP_ALIVE', 'OLLAMA_NO_CLOUD', 'OLLAMA_IGPU_ENABLE', 'OLLAMA_HOST'
     }
-    if ($RemoveModels) { $vars += 'OLLAMA_MODELS' }
+    if ($modelsNow) { $vars += 'OLLAMA_MODELS' }
     # A value the user had before the install (for other Ollama clients) goes back instead of away.
     $prevEnv = @{}
     $instState = Read-LaiState -Path (Join-Path $AIRoot 'install-state.json')
@@ -234,13 +269,36 @@ if ($onWindows -and ($ResetOllamaSettings -or $RemoveModels)) {
             Invoke-Step "user variable $v" { [Environment]::SetEnvironmentVariable($v, $null, 'User'); Write-LaiLog OK "Removed user variable $v" }
         }
     }
-    # The firewall block only exists because Ollama listened on all interfaces; drop it with OLLAMA_HOST.
-    if ($ResetOllamaSettings -and (Get-Command Get-NetFirewallRule -ErrorAction SilentlyContinue)) {
-        if (Get-NetFirewallRule -DisplayName 'LocalAI - Block Ollama from LAN' -ErrorAction SilentlyContinue) {
-            Invoke-Step 'firewall rule' { Remove-NetFirewallRule -DisplayName 'LocalAI - Block Ollama from LAN'; Write-LaiLog OK 'Removed firewall rule' }
+    Write-LaiLog INFO 'Quit Ollama from the tray and start it again so it picks up the changed settings.'
+}
+# The firewall block only exists because Ollama listened on all interfaces; drop it with OLLAMA_HOST.
+# But not yet while something still listens on 11434 beyond loopback: the running Ollama keeps the
+# address it started with until it is restarted, and without the rule every device on the network
+# could reach it.
+$blockRule = 'LocalAI - Block Ollama from LAN'
+$ruleKept = $false
+if ($ResetOllamaSettings -and (Get-Command Get-NetFirewallRule -ErrorAction SilentlyContinue)) {
+    if (Get-NetFirewallRule -DisplayName $blockRule -ErrorAction SilentlyContinue) {
+        # 'Could not be read' is not 'nothing listens': the rule goes only when the list was read and
+        # shows nothing on 11434 beyond loopback. All listeners are asked for and filtered here (asking
+        # for the one port is an error when nothing listens on it); a missing cmdlet is caught as well.
+        $why = ''; $after = ''
+        try {
+            $rows = @(Get-NetTCPConnection -State Listen -ErrorAction Stop | Where-Object { $_ -and $_.LocalPort -eq 11434 })
+            $set = ConvertTo-LaiListenerSet -Connections $rows
+            if (@($set | Where-Object { $_['Network'] }).Count -gt 0) { $why = 'port 11434 is still open beyond this PC (the running Ollama keeps listening there until it is restarted)' }
+        } catch {
+            $why = "this PC's list of listening ports could not be read ($($_.Exception.Message)), so it is not known whether Ollama still listens on the network"
+            $after = ' If this message comes back after that, the rule can stay: all it does is keep other devices away from port 11434.'
+        }
+        if ($why) {
+            $ruleKept = $true
+            Write-LaiLog WARN "The firewall rule '$blockRule' stays for now: $why, and without the rule other devices on your network could use it. Quit Ollama from its tray icon, start it again, then run this once more.$after"
+            $kept += "firewall rule '$blockRule' (until Ollama is restarted; then run this once more)"
+        } else {
+            Invoke-Step 'firewall rule' { Remove-NetFirewallRule -DisplayName $blockRule; Write-LaiLog OK 'Removed firewall rule' }
         }
     }
-    Write-LaiLog INFO 'Quit Ollama from the tray and start it again so it picks up the changed settings.'
 }
 
 # ---- 6. shortcut + files -------------------------------------------------------------------------
@@ -251,10 +309,32 @@ if ($desktop) {
 }
 
 # The administrators-only copy the resume task runs (see Install-LocalAI.ps1, $ElevatedDir).
-if ($env:ProgramFiles) {
-    $elevated = Join-Path $env:ProgramFiles 'LocalAI'
-    $dlDir = Join-Path $env:ProgramFiles 'LocalAI-Downloads'
+# Windows is asked where Program Files is, as the update does for the folder it makes there: a
+# variable of this session could name another folder, and this run deletes what it names.
+$programFiles = [Environment]::GetFolderPath('ProgramFiles')
+if ($programFiles) {
+    $elevated = Join-Path $programFiles 'LocalAI'
+    $dlDir = Join-Path $programFiles 'LocalAI-Downloads'
     if (Test-Path -LiteralPath $dlDir) { Invoke-Step $dlDir { Remove-LaiTree -Path $dlDir; Write-LaiLog OK "Deleted $dlDir" } }
+    # The folder an update unpacks into before it starts the installer (Get-LocalAI.ps1). The update
+    # removes it itself; an Administrator window closed mid-run leaves it until the next update.
+    $updDir = Join-Path $programFiles 'LocalAI-Update'
+    if (Test-Path -LiteralPath $updDir) {
+        # An update that is still installing holds the file 'in-use' in that folder open (the update
+        # itself looks at it the same way before it takes the folder). Then the folder stays: the
+        # toolkit would be deleted from under the installer that is running from it.
+        $updLock = Join-Path $updDir 'in-use'
+        $updBusy = $false
+        if (-not $WhatIfPreference -and (Test-Path -LiteralPath $updLock -PathType Leaf)) {
+            try { [System.IO.File]::Delete($updLock) } catch { $updBusy = $true }
+        }
+        if ($updBusy) {
+            Write-LaiLog WARN "A Local AI update is still running, so $updDir stays: it is in use, and the update removes it when it ends. That update installs the toolkit again: let it finish, then run the uninstaller once more."
+            $kept += "$updDir (a Local AI update is still running; it removes the folder when it ends)"
+        } else {
+            Invoke-Step $updDir { Remove-LaiTree -Path $updDir; Write-LaiLog OK "Deleted $updDir" }
+        }
+    }
     if (Test-Path -LiteralPath $elevated) { Invoke-Step $elevated { Remove-LaiTree -Path $elevated; Write-LaiLog OK "Deleted $elevated" } }
 }
 if ($env:ProgramData) {
@@ -264,9 +344,19 @@ if ($env:ProgramData) {
 
 if ($RemoveData) {
     $here = (Resolve-Path -LiteralPath $PSScriptRoot).Path
+    # This run asks for another one (Ollama did not answer, or the firewall rule waits for Ollama's
+    # restart). When that run changes Ollama's settings or models it reads two files: your own
+    # Ollama settings from before the install, and Ollama's address. Deleted now, it would remove
+    # the settings this run has just put back. So they stay, and that run deletes them.
+    $again = ($left.Count -gt 0 -or -not $ollamaUp -or $ruleKept)
+    $forNextRun = @()
+    if ($again -and ($ResetOllamaSettings -or $RemoveModels)) { foreach ($j in 'install-state.json', 'localai-config.json') { $forNextRun += @($j, "$j.bak") } }
+    $stay = @($forNextRun | Where-Object { Test-Path -LiteralPath (Join-Path $AIRoot $_) })
+    if ($stay.Count -gt 0) { $kept += "$($stay -join ', ') in $AIRoot (the next run reads them, then deletes them)" }
     $stateFiles = @()
     foreach ($j in 'install-state.json', 'localai-config.json', 'watch-state.json', 'backup-state.json', 'model-recheck.json', 'integrity-baseline.json') { $stateFiles += @($j, "$j.bak", "$j.bad", "$j.tmp") }
     foreach ($item in (@('Stack', 'Secrets', 'Logs', 'Downloads', 'install-report.md', 'open-webui-hold.json') + $stateFiles)) {
+        if ($forNextRun -contains $item) { continue }
         $path = Join-Path $AIRoot $item
         if (-not (Test-Path -LiteralPath $path)) { continue }
         # Never Remove-Item -Recurse here: this runs as administrator in a folder the user controls,
@@ -288,8 +378,13 @@ if ($RemoveData) {
 if ($problems.Count -gt 0) {
     Write-LaiLog WARN "Finished with $($problems.Count) problem(s):"
     foreach ($p in $problems) { Write-LaiLog WARN "  $p" }
-    exit 2
+    Write-LaiLog INFO 'Next step: fix what these lines name, then run the uninstaller again. It removes only what is still there.'
 }
-Write-LaiLog OK 'Uninstall finished.'
+# Under -WhatIf nothing was attempted: the plan above already names what a real run would leave.
+$unfinished = ($left.Count -gt 0 -and -not $WhatIfPreference)
+if ($problems.Count -eq 0 -and $left.Count -eq 0) { Write-LaiLog OK 'Uninstall finished.' }
+# Also before a 'Not finished': the files kept for the run it asks for are named here.
 foreach ($k in $kept) { Write-LaiLog INFO "kept: $k" }
+if ($unfinished) { Write-LaiLog WARN "Not finished: $($left -join '; '). Start $($startFirst -join ' and '), then run the uninstaller again with the same options." }
+if ($problems.Count -gt 0 -or $unfinished) { exit 2 }
 exit 0

@@ -10,8 +10,9 @@
 
       GPU + driver, Ollama, models installed, presets measured on the running Ollama version (and
       the nightly re-check that keeps them so), models 100% on GPU at their tuned context, a direct SearXNG search (names failed engines),
-      Docker, containers, Open WebUI login, presets (system prompt + native tool calling, image
-      upload matching what Ollama reports for the model), no context size set in Open WebUI over
+      Docker, containers, Open WebUI login, presets (system prompt + native tool calling, past-chat
+      search and code execution still off, image upload matching what Ollama reports for the model),
+      no context size set in Open WebUI over
       the tuned aliases, signup off / memories on, RAG + web search settings, a chat per preset, an
       image read by each preset with images (Uncensored Vision), memory recall, document retrieval, web
       search, backups, the health watch (and what it found changed in the installed scripts, tasks
@@ -64,8 +65,10 @@ $results = New-Object System.Collections.ArrayList
 function Add-Check {
     param([string]$Name, [scriptblock]$Body)
     try {
-        $r = & $Body
-        if ($null -eq $r) { $r = @{ Status = 'PASS'; Detail = '' } }
+        # The verdict is the last answer with one of the four results. A body that gives none (nothing
+        # at all, plain text, a result this script does not know) has checked nothing: never a PASS.
+        $r = @(& $Body | Where-Object { $_ -is [hashtable] -and @('PASS', 'WARN', 'FAIL', 'SKIP') -ccontains [string]$_['Status'] }) | Select-Object -Last 1
+        if ($null -eq $r) { $r = @{ Status = 'SKIP'; Detail = 'this check gave no answer' } }
     } catch {
         $r = @{ Status = 'FAIL'; Detail = $_.Exception.Message }
     }
@@ -77,6 +80,23 @@ function Pass([string]$d) { @{ Status = 'PASS'; Detail = $d } }
 function Fail([string]$d) { @{ Status = 'FAIL'; Detail = $d } }
 function Warn([string]$d) { @{ Status = 'WARN'; Detail = $d } }
 function Skip([string]$d) { @{ Status = 'SKIP'; Detail = $d } }
+# What a preset lets the assistant do that the installer switches off, from the preset's meta as Open
+# WebUI returns it (pure: reads only its argument; unit-tested in tests\Invoke-WindowsUnitTests.ps1).
+# Open WebUI treats a missing tool category as on, so a switch counts as off only when it is false: a
+# missing one (a preset restored from an older backup, or written by hand) counts as on, and the row
+# never says 'off' for a switch it did not read as off. Code execution has two switches and counts as
+# on when either of them does.
+function Get-PresetToolRisk($Meta) {
+    $tools = $null; $caps = $null
+    if ($null -ne $Meta) { $tools = $Meta.builtinTools; $caps = $Meta.capabilities }
+    $chats = $null; $toolCode = $null; $capCode = $null
+    if ($null -ne $tools) { $chats = $tools.chats; $toolCode = $tools.code_interpreter }
+    if ($null -ne $caps) { $capCode = $caps.code_interpreter }
+    $risks = @()
+    if (-not ($chats -is [bool] -and -not $chats)) { $risks += 'read past chats' }
+    if (-not ($toolCode -is [bool] -and -not $toolCode -and $capCode -is [bool] -and -not $capCode)) { $risks += 'run code' }
+    return $risks
+}
 
 Write-LaiLog STEP 'Local AI acceptance test'
 $gpu = Get-LaiGpuInfo
@@ -294,11 +314,10 @@ $token = $null
 Add-Check 'Open WebUI version' {
     if (-not $script:webUp) { return (Skip 'Open WebUI not reachable') }
     $ver = [string](Invoke-LaiApi -Uri "$webUrl/api/version" -TimeoutSec 15).version
-    switch (Get-LaiWebUICompat -Version $ver) {
-        'tested' { Pass "$ver (the version this toolkit was tested with)" }
-        'newer' { Warn "$ver is newer than the tested 0.11.4; if a check below fails, Update-OpenWebUI.ps1 -Rollback goes back" }
-        default { Warn "$ver (tested with 0.11.4)" }
-    }
+    $compat = Get-LaiWebUICompat -Version $ver
+    if ($compat -eq 'tested') { return (Pass "$ver (the version this toolkit was tested with)") }
+    if ($compat -eq 'newer') { return (Warn "$ver is newer than the tested 0.11.4; if a check below fails, Update-OpenWebUI.ps1 -Rollback goes back") }
+    Warn "$ver (tested with 0.11.4)"
 }
 Add-Check 'Open WebUI admin login' {
     if (-not $script:webUp) { return (Skip 'Open WebUI not reachable') }
@@ -345,6 +364,9 @@ if ($script:token) {
             if (-not $p) { return (Fail 'not found') }
             if ($p.base_model_id -ne "$($m.Alias):latest") { return (Fail "base is $($p.base_model_id)") }
             if (-not $p.params.system) { return (Fail 'no system prompt') }
+            # Before the image switch: its warning would otherwise be all this row says.
+            $risks = @(Get-PresetToolRisk $p.meta)
+            if ($risks.Count) { return (Fail "the assistant can $($risks -join ' and ') again; run Start menu > Local AI - Update toolkit to put the safety settings back") }
             # Image upload on the preset against what Ollama reports for the model (no model load).
             $presetVision = $false
             if ($p.meta -and $p.meta.capabilities -and $p.meta.capabilities.vision -eq $true) { $presetVision = $true }
@@ -357,7 +379,7 @@ if ($script:token) {
                 }
             }
             if ($p.params.function_calling -ne 'native') { return (Warn "function calling = $($p.params.function_calling) (model template has no tool support)") }
-            Pass "system prompt set, native tool calling, memory/web/knowledge tools on$(if ($presetVision) { ', images on' })"
+            Pass "system prompt set, native tool calling, past-chat search and code execution off$(if ($presetVision) { ', images on' })"
         }
     }
     Add-Check 'Context decided by the tuned aliases' {
@@ -383,7 +405,8 @@ if ($script:token) {
         }
         # Open WebUI answers {"version": false} when its Ollama API is switched off: not a working link.
         if (-not ([string]$v.version -match '^\d')) { return (Fail "Open WebUI reports no Ollama version through $via ($($v.version)): its Ollama connection is switched off or not working - re-run the installer") }
-        if ($expected -like '*render-guard*') { Pass "$expected (render guard), Ollama $($v.version)" } else { Pass "$expected (direct), Ollama $($v.version)" }
+        if ($expected -like '*render-guard*') { return (Pass "$expected (render guard), Ollama $($v.version)") }
+        Pass "$expected (direct), Ollama $($v.version)"
     }
     Add-Check 'Signup disabled, memories enabled' {
         $a = Invoke-LaiApi -Uri "$webUrl/api/v1/auths/admin/config" -Token $token
@@ -463,11 +486,34 @@ if ($script:token) {
 Add-Check 'Backups' {
     $dir = Join-Path $AIRoot 'Backups'
     $all = @(Get-ChildItem -LiteralPath $dir -Filter 'open-webui-*.tar.gz' -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending)  # lai-ok: objects
-    $newest = $all | Where-Object { $_.Name -notlike '*-CORRUPT.tar.gz' } | Select-Object -First 1
+    # An -EMPTY archive (made on a night Open WebUI had lost its users or chats) is no backup to name
+    # as the newest good one, or to restore from, any more than a -CORRUPT one.
+    $newest = $all | Where-Object { $_.Name -notlike '*-CORRUPT.tar.gz' -and $_.Name -notlike '*-EMPTY.tar.gz' } | Select-Object -First 1
     # Age is judged on the nightly archives only, so a tagged one cannot hide a broken nightly task.
     $daily = $all | Where-Object { $_.Name -match '^open-webui-\d{8}-\d{6}\.tar\.gz$' } | Select-Object -First 1
     if ($all.Count -gt 0 -and $all[0].Name -like '*-CORRUPT.tar.gz') {
         return (Fail "the newest backup $($all[0].Name) failed its database check; the live Open WebUI data may be damaged (restore the last good one with Restore-OpenWebUI.ps1 -Archive $(if ($newest) { "'$($newest.FullName)'" } else { '<an older archive>' }), see the README's Maintain section)")
+    }
+    # The nightly backup found Open WebUI without its users or chats and recorded it (backup-state.json,
+    # 'emptied': at, lastGood, users, chats, hadUsers, hadChats). It stands until the data is back or
+    # the owner accepts it; the watch reports the same. 'at' is text under Windows PowerShell 5.1 and
+    # a date under PowerShell 7. It is the first night the data looked wiped; the counts are those
+    # of the last backup. The mark goes when a backup counts the data again, not when a restore ends,
+    # so the line says that too: it stays for some hours after a restore that did its work.
+    $wiped = (Read-LaiState -Path (Join-Path $AIRoot 'backup-state.json'))['emptied']
+    if ($wiped -is [hashtable]) {
+        $since = $wiped['at']; if ($since -is [datetime]) { $since = $since.ToString('s') }
+        $good = ([string]$wiped['lastGood'] -replace '\s+', ' ').Trim()
+        if ($good.Length -gt 300) { $good = $good.Substring(0, 300) + '...' }
+        if (-not $good) { $good = 'none on record' }
+        return (Fail ("Open WebUI's data has looked wiped since the nightly backup of {0}; at the last backup {1} user(s) and {2} chat(s), {3} and {4} at the last good one ({5}). Nightly archives are kept as -EMPTY and no older backup is deleted until this is settled: run Restore-OpenWebUI.ps1 to get the data back (it takes that last good backup), or, if you emptied it yourself, Backup-OpenWebUI.ps1 -AcceptEmpty once. After a restore this line stays until the next nightly backup has counted the data again; Backup-OpenWebUI.ps1 run by hand does that at once" -f $since, $wiped['users'], $wiped['chats'], $wiped['hadUsers'], $wiped['hadChats'], $good))
+    }
+    # The same archive with its record gone (a backup-state.json that was damaged or deleted): the
+    # old backups may be held back by nothing any more, and the watch fails Backups for it as well.
+    if ($all.Count -gt 0 -and $all[0].Name -like '*-EMPTY.tar.gz') {
+        $way = "no nightly backup from before it is in $dir"
+        if ($daily) { $way = "if you did not empty it yourself, first put back the newest nightly backup from before it: Restore-OpenWebUI.ps1 -Archive '$($daily.FullName)'" }
+        return (Fail "the newest backup $($all[0].Name) was made when Open WebUI's data looked wiped, and the record of it is gone from backup-state.json: without it the next nightly backup can take the data as it is now for normal and delete old backups by age again; $way")
     }
     if (-not $newest) { return (Fail "no archive in $dir") }
     if (-not $daily) { return (Warn "no nightly archive yet (newest: $($newest.Name)); the nightly backup task has not run yet; if this stays, run Start menu > Local AI - Update toolkit to set it up again") }
@@ -644,13 +690,15 @@ Add-Check 'Integrity watch' {
 Add-Check 'Nothing exposed beyond localhost' {
     if (-not $onWindows) { return (Skip 'Windows-only check') }
     $bad = @()
-    foreach ($port in @(11434, $webPort, $searxPort)) {
+    $ports = @(11434, $webPort, $searxPort)
+    if ($researchPort -gt 0) { $ports += $researchPort }
+    foreach ($port in $ports) {
         $listeners = @(Get-NetTCPConnection -State Listen -LocalPort $port -ErrorAction SilentlyContinue)
         foreach ($l in $listeners) {
             if (@('127.0.0.1', '::1') -notcontains $l.LocalAddress) { $bad += "${port}@$($l.LocalAddress)" }
         }
     }
-    if ($bad.Count -eq 0) { return (Pass "11434, $webPort, $searxPort bound to loopback only") }
+    if ($bad.Count -eq 0) { return (Pass "$($ports -join ', ') bound to loopback only") }
     $onlyOllama = @($bad | Where-Object { $_ -notlike '11434@*' }).Count -eq 0
     if ($onlyOllama -and (Get-NetFirewallRule -DisplayName 'LocalAI - Block Ollama from LAN' -ErrorAction SilentlyContinue)) {
         return (Warn "Ollama listens on all interfaces (Docker fallback) but the LAN block rule is in place: $($bad -join ', ')")

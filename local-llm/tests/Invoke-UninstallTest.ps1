@@ -10,6 +10,17 @@
       2. Default: verified pre-uninstall backup, containers + aliases + tasks removed, data kept.
       3. -RemoveData -RemoveModels: volume, stack files and catalog models removed, Backups kept.
       4. A failing final backup aborts before anything is removed.
+      5. -RemoveData while the Docker engine is down refuses.
+      6. Phone access on (a fake tailscale on PATH reports the mapping): the Tailscale step runs
+         before the containers are removed and brings nothing back; Enable-TailscaleAccess.ps1
+         -Disable on its own recreates nothing when the containers are gone, leaves Open WebUI
+         stopped under a failed restore's hold, and waits for the volume lock.
+      7. -ResetOllamaSettings keeps the firewall block while something listens on 11434 beyond
+         loopback or the listeners cannot be read, and removes it once that is loopback only
+         (stand-in firewall and listener cmdlets).
+      8. Docker closed and Ollama not answering: named in the plan, 'Not finished', exit 2.
+         Ollama alone not answering: the aliases are not promised; with -RemoveData the two files
+         the next run reads stay until that run.
     A sandbox container named searxng is renamed out of the way for the duration and restored.
 #>
 param([string]$Work = '/home/user/lai-test/uninstall-test')
@@ -25,11 +36,24 @@ function Assert-That([bool]$Condition, [string]$Message) {
 function Invoke-DockerQuiet([string[]]$DockerArgs) { $prev = $ErrorActionPreference; $ErrorActionPreference = 'Continue'; & /usr/bin/docker @DockerArgs 2>&1 | Out-Null; $ErrorActionPreference = $prev; return $LASTEXITCODE }
 function Test-Container([string]$Name) { (Invoke-DockerQuiet -DockerArgs @('container', 'inspect', $Name)) -eq 0 }
 function Test-Volume([string]$Name) { (Invoke-DockerQuiet -DockerArgs @('volume', 'inspect', $Name)) -eq 0 }
+function Test-Running([string]$Name) {
+    $prev = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
+    $running = (& /usr/bin/docker inspect -f '{{.State.Running}}' $Name 2>$null) -join ''
+    $ErrorActionPreference = $prev
+    return ($running.Trim() -eq 'true')
+}
+function Get-OutLine([string]$Pattern) {
+    # Index of the first line of the last run's output that matches, -1 when none does.
+    for ($i = 0; $i -lt $script:lastOut.Count; $i++) { if ($script:lastOut[$i] -match $Pattern) { return $i } }
+    return -1
+}
 
 $aiRoot = Join-Path $Work 'AI'
 $fakePort = 11499
 $deletes = Join-Path $Work 'ollama-deletes.txt'
 $tasksLog = Join-Path $Work 'tasks.txt'
+$firewallLog = Join-Path $Work 'firewall-removed.txt'
+$tsLog = Join-Path $Work 'tailscale-calls.txt'
 $catalog = Import-PowerShellDataFile (Join-Path $src 'config/models.psd1')
 $sourceModel = @($catalog.Models)[0].Source
 
@@ -63,15 +87,24 @@ volumes:
     & /usr/bin/docker compose --project-directory (Join-Path $aiRoot 'Stack') -f (Join-Path $aiRoot 'Stack/docker-compose.yml') up -d 2>&1 | Out-Null
     $ErrorActionPreference = $prev
     if (-not $NoDb) { Invoke-DockerQuiet -DockerArgs @('run', '--rm', '-v', 'open-webui:/d', 'alpine:3.20', 'sh', '-c', 'head -c 4096 /dev/urandom > /d/webui.db') | Out-Null }
-    foreach ($f in $deletes, $tasksLog) { if (Test-Path $f) { Remove-Item $f } }
+    foreach ($f in $deletes, $tasksLog, $firewallLog, $tsLog) { if (Test-Path $f) { Remove-Item $f } }
 }
 
 function Invoke-Uninstall {
     # Child process so the script's 'exit' does not end this harness; scheduled-task cmdlets mocked.
-    param([string[]]$Arguments)
+    # The Windows firewall and listener cmdlets are stand-ins too (only -ResetOllamaSettings reaches
+    # them): the block rule exists, a removal is logged, and one listener holds Ollama's port at
+    # -ListenAddress. No real listener is opened: CI's real Ollama owns 11434. Port 135 on every
+    # adapter is another program's and must decide nothing. 'unreadable': the query itself fails.
+    param([string[]]$Arguments, [string]$ListenAddress = '127.0.0.1')
+    $listen = "[pscustomobject]@{ LocalAddress = '0.0.0.0'; LocalPort = 135; OwningProcess = 4 }; [pscustomobject]@{ LocalAddress = '$ListenAddress'; LocalPort = 11434; OwningProcess = 4 }"
+    if ($ListenAddress -eq 'unreadable') { $listen = "throw 'stand-in: the list of listening ports cannot be read'" }
     $mock = @"
 function global:Get-ScheduledTask { param(`$TaskName, `$ErrorAction) [pscustomobject]@{ TaskName = `$TaskName } }
 function global:Unregister-ScheduledTask { param(`$TaskName, `$Confirm) Add-Content -LiteralPath '$tasksLog' -Value `$TaskName }
+function global:Get-NetFirewallRule { param(`$DisplayName, `$ErrorAction) [pscustomobject]@{ DisplayName = `$DisplayName } }
+function global:Remove-NetFirewallRule { param(`$DisplayName) Add-Content -LiteralPath '$firewallLog' -Value `$DisplayName }
+function global:Get-NetTCPConnection { param(`$State, `$ErrorAction) $listen }
 & '$src/Uninstall-LocalAI.ps1' -AIRoot '$aiRoot' $($Arguments -join ' ')
 exit `$LASTEXITCODE
 "@
@@ -83,6 +116,18 @@ exit `$LASTEXITCODE
     $ErrorActionPreference = $prev
     $out | Select-Object -Last 4 | ForEach-Object { Write-Host "    | $_" }
     # The whole output for the asserts that read it; never emitted, so the function still returns one exit code.
+    $script:lastOut = @($out)
+    return $code
+}
+
+function Invoke-TailscaleOff {
+    # Enable-TailscaleAccess.ps1 -Disable on its own, as its help says to run it (real docker, the
+    # fake tailscale on PATH).
+    $prev = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
+    $out = & pwsh -NoProfile -File (Join-Path $src 'Enable-TailscaleAccess.ps1') -AIRoot $aiRoot -Disable 2>&1 | ForEach-Object { "$_" }
+    $code = $LASTEXITCODE
+    $ErrorActionPreference = $prev
+    $out | Select-Object -Last 4 | ForEach-Object { Write-Host "    | $_" }
     $script:lastOut = @($out)
     return $code
 }
@@ -222,6 +267,153 @@ try {
     Assert-That ($code -ne 0) "exits non-zero (got $code)"
     Assert-That (Test-Path -LiteralPath (Join-Path $aiRoot 'Secrets/openwebui-admin.json')) 'the stored admin password is kept (its data volume is still there)'
     Assert-That ((Test-Container 'open-webui') -and (Test-Volume 'open-webui') -and -not (Test-Path $tasksLog)) 'nothing removed'
+
+    Write-Host "`n=== 6. phone access on: the Tailscale step brings no container back ===" -ForegroundColor Cyan
+    # A fake tailscale that is signed in and reports the HTTPS mapping to Open WebUI. Written with LF
+    # line ends whatever this file has: a CR after '#!/bin/sh' names an interpreter that does not exist.
+    $shimDir = Join-Path $Work 'tsshim'
+    New-Item -ItemType Directory -Force -Path $shimDir | Out-Null
+    $shim = Join-Path $shimDir 'tailscale'
+    $shimLines = @(
+        '#!/bin/sh',
+        ('echo "$*" >> ''{0}''' -f $tsLog),
+        'case "$*" in',
+        '  ''status --json'') echo ''{"BackendState":"Running","Self":{"DNSName":"pc.tail.ts.net."}}'' ;;',
+        '  ''serve status --json'') echo ''{"Web":{"pc.tail.ts.net:443":{"Handlers":{"/":{"Proxy":"http://127.0.0.1:3000"}}}}}'' ;;',
+        '  ''serve --https=443 off'') ;;',
+        '  *) exit 2 ;;',
+        'esac',
+        'exit 0'
+    )
+    [IO.File]::WriteAllText($shim, (($shimLines -join "`n") + "`n"))
+    & chmod +x $shim
+    $envFile = Join-Path $aiRoot 'Stack/.env'
+    $phoneOrigin = 'WEBUI_EXTRA_ORIGINS=;https://pc.tail.ts.net'
+    $holdFile = Join-Path $aiRoot 'open-webui-hold.json'
+    $holder = $null
+    $savedPath = $env:PATH
+    $env:PATH = $shimDir + [IO.Path]::PathSeparator + $savedPath
+    try {
+        # 6a. The uninstaller, with the data: before the fix it removed the containers and the volume,
+        # then its Tailscale step ran 'compose up' and both were back (an empty Open WebUI, no account).
+        New-Stack
+        $code = Invoke-Uninstall @('-Force', '-RemoveData')
+        Assert-That ($code -eq 0) "phone access on, -RemoveData: exits 0 (got $code)"
+        $calls = @(); if (Test-Path $tsLog) { $calls = @(Get-Content $tsLog) }
+        Assert-That ($calls -contains 'serve --https=443 off') "phone access on: the Tailscale mapping is taken off ($($calls -join ' | '))"
+        Assert-That (-not (Test-Container 'open-webui') -and -not (Test-Container 'render-guard')) 'phone access on: no open-webui or render-guard container is left after the uninstall'
+        Assert-That (-not (Test-Volume 'open-webui')) 'phone access on, -RemoveData: no open-webui volume is left (no empty one for a first visitor to claim)'
+        $tsAt = Get-OutLine 'Tailscale access to Open WebUI removed'
+        $rmAt = Get-OutLine 'Containers removed'
+        Assert-That ($tsAt -ge 0 -and $rmAt -gt $tsAt) "the Tailscale step runs before the containers are removed (output lines $tsAt and $rmAt)"
+
+        # 6b. The same script on its own once the stack is gone: only .env changes.
+        New-Stack
+        Add-Content -LiteralPath $envFile -Value $phoneOrigin
+        foreach ($c in 'open-webui', 'render-guard') { Invoke-DockerQuiet -DockerArgs @('rm', '-f', $c) | Out-Null }
+        Invoke-DockerQuiet -DockerArgs @('volume', 'rm', 'open-webui') | Out-Null
+        $code = Invoke-TailscaleOff
+        Assert-That ($code -eq 0 -and -not (Test-Container 'open-webui') -and -not (Test-Container 'render-guard') -and -not (Test-Volume 'open-webui')) "Enable-TailscaleAccess.ps1 -Disable with the containers gone recreates nothing: no open-webui or render-guard container, no open-webui volume (exit $code)"
+        $envNow = @(Get-Content -LiteralPath $envFile -Encoding UTF8)
+        Assert-That (@($envNow | Where-Object { $_ -like 'WEBUI_EXTRA_ORIGINS=*' }).Count -eq 0 -and $envNow -contains 'OPEN_WEBUI_VERSION=v0.11.4') "-Disable with the containers gone still takes the phone's address out of .env ($($envNow -join ' | '))"
+        Assert-That ((Get-OutLine 'address list is saved; Start menu > Local AI > Start again applies it') -ge 0) '-Disable with the containers gone names what applies the saved list (Start again recreates Open WebUI; a plain start does not)'
+
+        # 6c. A failed restore keeps Open WebUI stopped on purpose (the hold): -Disable must not start it.
+        New-Stack
+        Add-Content -LiteralPath $envFile -Value $phoneOrigin
+        Invoke-DockerQuiet -DockerArgs @('stop', '-t', '0', 'open-webui') | Out-Null
+        ConvertTo-Json @{ Reason = 'the test restore failed'; Recover = 'run the test restore again' } | Set-Content -LiteralPath $holdFile
+        $code = Invoke-TailscaleOff
+        Assert-That ($code -eq 0 -and (Test-Container 'open-webui') -and -not (Test-Running 'open-webui')) "a failed restore's hold: -Disable leaves Open WebUI stopped (exit $code)"
+        Assert-That ((Get-OutLine 'the test restore failed.*after the recovery, Start menu > Local AI > Start again applies it.*run the test restore again') -ge 0) "a failed restore's hold: -Disable says why, what applies the saved list afterwards, and how to recover"
+        $envNow = @(Get-Content -LiteralPath $envFile -Encoding UTF8)
+        Assert-That (@($envNow | Where-Object { $_ -like 'WEBUI_EXTRA_ORIGINS=*' }).Count -eq 0) "a failed restore's hold: the phone's address is out of .env all the same"
+
+        # 6d. The same stopped container without the hold, while a backup, restore or update works
+        # on the volume (another process holds the lock): -Disable waits, then starts it as before.
+        Remove-Item -LiteralPath $holdFile -Force
+        # The other process writes a second file just before it lets go: -Disable can only be back
+        # after that. Without the lock it is back in a few seconds, about 10 s before that file exists.
+        $heldFlag = Join-Path $Work 'lock-held.txt'
+        $freedFlag = Join-Path $Work 'lock-freed.txt'
+        foreach ($f in $heldFlag, $freedFlag) { if (Test-Path $f) { Remove-Item $f } }
+        $holdScript = Join-Path $Work 'hold-lock.ps1'
+        Set-Content -LiteralPath $holdScript -Value ("Import-Module '{0}' -Force; `$l = Enter-LaiVolumeLock; Set-Content -LiteralPath '{1}' -Value held; Start-Sleep -Seconds 15; Set-Content -LiteralPath '{2}' -Value freed; Exit-LaiVolumeLock `$l" -f (Join-Path (Join-Path $src 'lib') 'LocalAI.psm1'), $heldFlag, $freedFlag)
+        $holder = Start-Process -FilePath 'pwsh' -ArgumentList @('-NoProfile', '-File', $holdScript) -PassThru
+        $deadline = (Get-Date).AddSeconds(30)
+        while (-not (Test-Path $heldFlag) -and (Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 300 }
+        Assert-That (Test-Path $heldFlag) 'setup: another process holds the volume lock'
+        $code = Invoke-TailscaleOff
+        Assert-That (Test-Path $freedFlag) 'the volume lock is taken: -Disable is back only after the other process let go of it (it did not recreate Open WebUI under a backup or restore)'
+        Assert-That ((Get-OutLine 'Waiting for a backup/restore/update to finish first') -ge 0) 'the volume lock is taken: -Disable says that it waits'
+        Assert-That ($code -eq 0 -and (Test-Running 'open-webui')) "once the lock is free, -Disable starts the existing Open WebUI container again (exit $code)"
+    } finally {
+        $env:PATH = $savedPath
+        if ($holder -and -not $holder.HasExited) { Stop-Process -Id $holder.Id -Force }
+    }
+
+    Write-Host "`n=== 7. -ResetOllamaSettings: the firewall block stays while Ollama listens beyond loopback ===" -ForegroundColor Cyan
+    # First run: the running Ollama still listens on every adapter. Second run, 'once more' as the
+    # message asks: Ollama was restarted and listens on loopback only.
+    New-Stack
+    $code = Invoke-Uninstall @('-Force', '-NoBackup', '-ResetOllamaSettings') -ListenAddress '0.0.0.0'
+    Assert-That ($code -eq 0 -and -not (Test-Path $firewallLog)) "a listener on 0.0.0.0:11434: the firewall rule is not removed (exit $code)"
+    Assert-That ((Get-OutLine 'LocalAI - Block Ollama from LAN.*Quit Ollama from its tray icon, start it again, then run this once more') -ge 0) 'a listener on 0.0.0.0:11434: the message names the rule and the three steps (quit Ollama, start it again, run this once more)'
+    Assert-That ((Get-OutLine 'kept: firewall rule') -ge 0) 'a listener on 0.0.0.0:11434: the closing list names the firewall rule as kept'
+    # The listeners cannot be read: that is not 'nothing listens', so the rule stays here too.
+    $code = Invoke-Uninstall @('-Force', '-NoBackup', '-ResetOllamaSettings') -ListenAddress 'unreadable'
+    Assert-That ($code -eq 0 -and -not (Test-Path $firewallLog)) "the listening ports cannot be read: the firewall rule is not removed, and the run still reaches its end (exit $code)"
+    Assert-That ((Get-OutLine 'LocalAI - Block Ollama from LAN.*could not be read.*run this once more') -ge 0 -and (Get-OutLine 'kept: firewall rule') -ge 0) 'the listening ports cannot be read: the message says so and the closing list names the firewall rule as kept'
+    # With -RemoveData the run that keeps the rule also keeps the two files the 'once more' run reads
+    # (-WhatIf: the closing list is the same, and section 8b deletes for real).
+    $code = Invoke-Uninstall @('-WhatIf', '-RemoveData', '-ResetOllamaSettings') -ListenAddress '0.0.0.0'
+    Assert-That ((Get-OutLine 'kept: install-state\.json, localai-config\.json') -ge 0) "a listener on 0.0.0.0:11434, -RemoveData: install-state.json and localai-config.json are named as kept for the next run (exit $code)"
+    $code = Invoke-Uninstall @('-Force', '-NoBackup', '-ResetOllamaSettings') -ListenAddress '127.0.0.1'
+    $fw = @(); if (Test-Path $firewallLog) { $fw = @(Get-Content $firewallLog) }
+    Assert-That ($code -eq 0 -and $fw.Count -eq 1 -and $fw[0] -eq 'LocalAI - Block Ollama from LAN') "a listener on 127.0.0.1 only (and another program's port open to the network): the firewall rule is removed (exit $code; removed: $($fw -join ', '))"
+    Assert-That ((Get-OutLine 'once more') -lt 0) 'a listener on 127.0.0.1 only: nothing asks for another run'
+
+    Write-Host "`n=== 8. Docker closed and Ollama not answering: 'Not finished', exit 2 ===" -ForegroundColor Cyan
+    New-Stack
+    $deadOllama = @('-RemoveModels', '-OllamaUrl', 'http://127.0.0.1:1')
+    $savedDockerHost = $env:DOCKER_HOST
+    $env:DOCKER_HOST = 'unix:///nonexistent/lai-docker.sock'
+    try {
+        $code = Invoke-Uninstall (@('-WhatIf') + $deadOllama)
+        Assert-That ($code -eq 0) "engine down, -WhatIf: exits 0 (got $code)"
+        Assert-That ((Get-OutLine 'cannot remove in this run: containers .*Docker is not running') -ge 0 -and (Get-OutLine 'cannot remove in this run: tuned Ollama aliases localai-\* and downloaded models .*Ollama is not answering') -ge 0) 'engine down, -WhatIf: the plan names the containers, the aliases and the models as what cannot be removed'
+        Assert-That ((Get-OutLine 'remove: containers') -lt 0 -and (Get-OutLine 'remove: downloaded models') -lt 0 -and (Get-OutLine 'remove: tuned Ollama aliases') -lt 0) 'engine down, -WhatIf: the plan does not also promise to remove them'
+        Assert-That ((Get-OutLine 'Not finished') -lt 0 -and (Get-OutLine 'Uninstall finished\.') -lt 0) "engine down, -WhatIf: neither 'Not finished' nor 'Uninstall finished.'"
+        $code = Invoke-Uninstall (@('-Force') + $deadOllama)
+    } finally { $env:DOCKER_HOST = $savedDockerHost }
+    Assert-That ($code -eq 2) "engine down: exits 2 (got $code)"
+    $notFinished = @($script:lastOut | Where-Object { $_ -match 'Not finished: ' })
+    Assert-That ($notFinished.Count -eq 1 -and $notFinished[0] -match 'containers open-webui' -and $notFinished[0] -match 'tuned Ollama aliases localai-\* and downloaded models' -and $notFinished[0] -match 'Start Docker Desktop and Ollama, then run the uninstaller again') "engine down: one 'Not finished' line names the containers, the aliases, the models and what to start ($($notFinished -join ' | '))"
+    Assert-That ((Get-OutLine 'Uninstall finished\.') -lt 0 -and (Get-OutLine 'Finished with') -lt 0) "engine down: no 'Uninstall finished.', and no step is reported as failed"
+    Assert-That ((Test-Container 'open-webui') -and (Test-Container 'render-guard') -and -not (Test-Path $deletes)) 'engine down: the containers are still there and no model was deleted'
+
+    Write-Host "`n=== 8b. Docker running, Ollama not answering ===" -ForegroundColor Cyan
+    # Without -RemoveModels only the aliases are left: not promised, named as kept, still exit 0
+    # (-WhatIf prints the same plan and closing list).
+    $code = Invoke-Uninstall @('-WhatIf', '-OllamaUrl', 'http://127.0.0.1:1')
+    Assert-That ($code -eq 0 -and (Get-OutLine 'remove: tuned Ollama aliases') -lt 0 -and (Get-OutLine 'keep:\s+tuned Ollama aliases localai-\* \(Ollama is not answering') -ge 0) "Ollama down, default: the plan does not promise the aliases and says why they stay (exit $code)"
+    Assert-That ((Get-OutLine 'kept: tuned Ollama aliases localai-\*.*start Ollama and run the uninstaller again') -ge 0 -and (Get-OutLine 'cannot remove in this run') -lt 0) 'Ollama down, default: the closing list names the aliases and what removes them'
+    # The help's own example. The run asks for another one, and that one reads install-state.json
+    # (your own Ollama settings from before the install) and localai-config.json: both must still be there.
+    $statePath = Join-Path $aiRoot 'install-state.json'
+    $configPath = Join-Path $aiRoot 'localai-config.json'
+    $code = Invoke-Uninstall (@('-Force', '-RemoveData') + $deadOllama)
+    $notFinished = @($script:lastOut | Where-Object { $_ -match 'Not finished: ' })
+    Assert-That ($code -eq 2 -and $notFinished.Count -eq 1 -and $notFinished[0] -match 'Start Ollama, then run the uninstaller again with the same options') "Ollama down, -RemoveData -RemoveModels: 'Not finished', exit 2 (got $code; $($notFinished -join ' | '))"
+    Assert-That (-not (Test-Volume 'open-webui') -and -not (Test-Path (Join-Path $aiRoot 'Stack')) -and -not (Test-Path (Join-Path $aiRoot 'Secrets'))) 'Ollama down, -RemoveData -RemoveModels: the data volume, stack and secrets are deleted all the same'
+    Assert-That ((Test-Path -LiteralPath $statePath) -and (Test-Path -LiteralPath $configPath)) 'Ollama down, -RemoveData -RemoveModels: install-state.json and localai-config.json are kept for the run it asks for'
+    Assert-That ((Get-OutLine 'kept: install-state\.json, localai-config\.json') -ge 0) "Ollama down, -RemoveData -RemoveModels: both files are named as kept, also on a 'Not finished' run"
+    # The run it asks for. The address is given here so that a lost config file can never send this
+    # test to the machine's real Ollama on 11434.
+    $code = Invoke-Uninstall @('-Force', '-RemoveData', '-RemoveModels', '-OllamaUrl', "http://127.0.0.1:$fakePort")
+    $del = @(); if (Test-Path $deletes) { $del = @(Get-Content $deletes) }
+    Assert-That ($code -eq 0 -and ($del -contains $sourceModel) -and ($del -contains 'localai-main:latest') -and (Get-OutLine 'Uninstall finished\.') -ge 0) "Ollama answers again: the models and aliases go and the uninstall is finished (exit $code)"
+    Assert-That (-not (Test-Path -LiteralPath $statePath) -and -not (Test-Path -LiteralPath $configPath) -and (Get-OutLine 'kept: install-state') -lt 0) 'Ollama answers again: the two kept files are deleted now'
 } finally {
     foreach ($c in 'open-webui', 'render-guard') { Invoke-DockerQuiet -DockerArgs @('rm', '-f', $c) | Out-Null }
     Invoke-DockerQuiet -DockerArgs @('volume', 'rm', 'open-webui') | Out-Null

@@ -13,6 +13,9 @@
     - Uninstall-LocalAI -WhatIf and Stop-LocalAI on an empty AI root must not throw.
     - Scheduled tasks: the no-window launch (conhost --headless), the daily-time math, and native
       calls with a time limit (a CLI that never answers is stopped, not waited on).
+    - Test-LocalAI: the judge of a preset's past-chat and code switches on canned input, a check
+      that gives no verdict (SKIP with words in both check scripts, never a PASS), every row ending
+      in a verdict, and on Windows a port listening beyond localhost (the research agent's too).
     - Test-PCSecurity: its helpers (driver matcher, redaction, ACL/port verdicts, ComfyUI scan), the
       judges for what a real PC audit found (a snoozed or expired antivirus behind a passive Defender,
       a hardware-access driver any program can open, firewall openings for script runners, a stopped
@@ -33,6 +36,34 @@ function Assert-That([bool]$Condition, [string]$Message) {
     else { Write-Host "  ASSERT FAIL $Message" -ForegroundColor Red; $script:failures++ }
 }
 function Skip([string]$Message) { Write-Host "  SKIP        $Message" -ForegroundColor DarkGray }
+function Start-TestListener {
+    # A started HttpListener on a loopback port that is free now, and that port (Listener, Port).
+    # The port is asked of the system (a TcpListener on port 0, closed again at once), never drawn
+    # blind: a number from Get-Random can be a port that is taken. On Linux the ports a program is
+    # handed for its own connections are 32768 to 60999, and one that a connection to 127.0.0.1 used
+    # stays taken for a minute after the connection closed. The step before this suite on the Linux
+    # job (the render guard's test) makes many such connections, and one run of this suite ended
+    # in its first Start() with 'Address already in use' (which port, and who held it, the log did
+    # not say). If somebody takes the port between the asking and the listening, the next one is
+    # asked for.
+    $why = ''
+    for ($try = 1; $try -le 5; $try++) {
+        $ask = New-Object System.Net.Sockets.TcpListener([System.Net.IPAddress]::Loopback, 0)
+        $ask.Start()
+        $port = $ask.LocalEndpoint.Port
+        $ask.Stop()
+        $listener = New-Object System.Net.HttpListener
+        $listener.Prefixes.Add("http://127.0.0.1:$port/")
+        try {
+            $listener.Start()
+            return [pscustomobject]@{ Listener = $listener; Port = $port }
+        } catch {
+            $why = 'port {0}: {1}' -f $port, $_.Exception.Message
+            Write-Host ('  (try {0} of 5: no test listener on {1}; asking for another port)' -f $try, $why) -ForegroundColor DarkGray
+        }
+    }
+    throw "no test listener on 127.0.0.1 after 5 ports the system named free (last: $why)"
+}
 
 Write-Host "PowerShell $($PSVersionTable.PSVersion) ($($PSVersionTable.PSEdition)) on $(if ($onWindows) { 'Windows' } else { 'non-Windows' })"
 if (Test-Path -LiteralPath $Work) { Remove-Item -LiteralPath $Work -Recurse -Force }
@@ -74,10 +105,8 @@ Assert-That (((Get-Content -LiteralPath $statePath -Raw) | ConvertFrom-Json).mod
 Write-Host "`n=== Invoke-LaiApi UTF-8 both ways ===" -ForegroundColor Cyan
 # Both directions: the request body must be UTF-8, and a reply sent as plain 'application/json'
 # (no charset, as Open WebUI does) must be decoded as UTF-8, not ISO-8859-1 (5.1's default).
-$port = Get-Random -Minimum 20000 -Maximum 40000
-$listener = New-Object System.Net.HttpListener
-$listener.Prefixes.Add("http://127.0.0.1:$port/")
-$listener.Start()
+$started = Start-TestListener
+$listener = $started.Listener; $port = $started.Port
 $async = $listener.BeginGetContext($null, $null)
 # The client runs in its own process, exactly as the scripts do.
 $client = Join-Path $Work 'client.ps1'
@@ -112,10 +141,8 @@ $pRoot = Join-Path $Work 'pending'
 New-Item -ItemType Directory -Force -Path (Join-Path $pRoot 'Secrets') | Out-Null
 $pendingFile = Join-Path (Join-Path $pRoot 'Secrets') 'openwebui-admin.pending.json'
 Set-Content -LiteralPath $pendingFile -Value '{"email": "admin@localhost", "password": "Pending-Password-1"}' -Encoding UTF8
-$port2 = Get-Random -Minimum 20000 -Maximum 40000
-$listener2 = New-Object System.Net.HttpListener
-$listener2.Prefixes.Add("http://127.0.0.1:$port2/")
-$listener2.Start()
+$started = Start-TestListener
+$listener2 = $started.Listener; $port2 = $started.Port
 $pOut = Join-Path $Work 'pending-out.txt'
 $client2 = Join-Path $Work 'client2.ps1'
 Set-Content -LiteralPath $client2 -Value (("Import-Module '{0}' -Force`n" -f (Join-Path (Join-Path $src 'lib') 'LocalAI.psm1')) +
@@ -140,9 +167,9 @@ if (-not $proc2.WaitForExit(30000)) { $proc2.Kill() }
 $listener2.Stop()
 $res = ''; if (Test-Path -LiteralPath $pOut) { $res = (Get-Content -LiteralPath $pOut -Raw).Trim() }
 # Open WebUI's sign-in rate limit (429) is waited out, not reported as a failure.
-$listener2 = New-Object System.Net.HttpListener
-$listener2.Prefixes.Add("http://127.0.0.1:$port2/")
-$listener2.Start()
+# (A listener and a port of its own: the port the one above just gave up is not asked for again.)
+$started = Start-TestListener
+$listener2 = $started.Listener; $port2 = $started.Port
 $client3 = Join-Path $Work 'client3.ps1'
 $tOut = Join-Path $Work 'token-out.txt'
 Set-Content -LiteralPath $client3 -Value (("Import-Module '{0}' -Force`n`$env:LOCALAI_TEST_SIGNIN_WAIT = '1'`n" -f (Join-Path (Join-Path $src 'lib') 'LocalAI.psm1')) +
@@ -511,21 +538,170 @@ if ($onWindows) {
     Assert-That ($got -and $got.SkipCoderPresent -and -not $got.SkipCoder -and $got.Resume -and $got.Gpu -eq 512) 'explicit -SkipCoder:$false, -Resume and the number survive'
 } else { Skip 'resume round trip runs on Windows only' }
 
+Write-Host "`n=== Test-LocalAI: a preset that can read past chats again, and a check without a verdict ===" -ForegroundColor Cyan
+# The rows of a script (its Add-Check calls) that do not give a verdict on every path. A row does when
+# its code is a literal scriptblock whose last statement calls Pass, Fail, Warn, Skip or Convert-Verdict
+# and whose own returns each hand one of them back. Add-Check reports a row without a verdict as SKIP
+# 'this check gave no answer', so a row that has one on some paths only would change its result.
+# Add-Check keeps the last verdict, so one that is neither handed back with 'return (...)' nor the
+# row's last statement would be lost without a sound (a FAIL under the closing PASS): no row has one.
+$looseRows = { param($Ast)
+    $verdict = '(Pass|Fail|Warn|Skip|Convert-Verdict) '
+    $verdictNames = @('Pass', 'Fail', 'Warn', 'Skip', 'Convert-Verdict')
+    $rows = @($Ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] -and $n.GetCommandName() -eq 'Add-Check' }, $true))
+    $loose = @()
+    foreach ($cmd in $rows) {
+        $ok = $false
+        if ($cmd.CommandElements.Count -eq 3 -and $cmd.CommandElements[2] -is [System.Management.Automation.Language.ScriptBlockExpressionAst]) {
+            $body = $cmd.CommandElements[2].ScriptBlock
+            $st = @($body.EndBlock.Statements)
+            $returns = @($body.FindAll({ param($n) $n -is [System.Management.Automation.Language.ReturnStatementAst] }, $false))
+            # Where a kept verdict starts: the last statement, and right after each 'return (' (8 characters).
+            $kept = @($st | Select-Object -Last 1 | ForEach-Object { $_.Extent.StartOffset }) + @($returns | ForEach-Object { $_.Extent.StartOffset + 8 })
+            $lost = @($body.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] -and $verdictNames -contains $n.GetCommandName() -and $kept -notcontains $n.Extent.StartOffset }, $true))
+            $ok = ($st.Count -gt 0 -and [string]$st[$st.Count - 1].Extent.Text -match ('^' + $verdict) -and
+                @($returns | Where-Object { [string]$_.Extent.Text -notmatch ('^return \(' + $verdict) }).Count -eq 0 -and $lost.Count -eq 0)
+        }
+        if (-not $ok) { $loose += [string]$cmd.CommandElements[1].Extent.Text }
+    }
+    [pscustomobject]@{ Rows = $rows.Count; Loose = $loose }
+}
+# That rule on four rows written for it: a verdict that is returned, one that lost its 'return', one
+# inside a nested scriptblock (its 'return' would leave that block, not the row), and no last word.
+$looseCanary = & $looseRows ([System.Management.Automation.Language.Parser]::ParseInput((@('Add-Check "kept" { if ($a) { return (Fail "x") }; Pass "y" }', 'Add-Check "dropped" { if ($a) { Fail "x" }; Pass "y" }',
+            'Add-Check "nested" { $a | ForEach-Object { return (Warn "x") }; Pass "y" }', 'Add-Check "no last word" { if ($a) { return (Fail "x") } }') -join "`n"), [ref]$null, [ref]$null))
+Assert-That ($looseCanary.Rows -eq 4 -and ($looseCanary.Loose -join ' ') -ceq '"dropped" "nested" "no last word"') "a row whose verdict is neither returned nor its last statement is found, also inside a nested scriptblock, and a row that returns its verdicts is not (found: $($looseCanary.Loose -join ' '))"
+# Add-Check as a script has it, with that script's own Pass/Fail/Warn/Skip, given bodies with no verdict,
+# with one, and with an error. In a scope of its own: a script's Skip is not this file's, whose Skip
+# prints a line CI counts. What a row would print is collected instead, and Test-PCSecurity's
+# Protect-Out (it needs the PC's names) hands its text back.
+$addCheckRows = { param([object[]]$Functions)
+    foreach ($fd in $Functions) { . ([scriptblock]::Create($fd.Extent.Text)) }
+    $results = New-Object System.Collections.ArrayList
+    $said = New-Object System.Collections.ArrayList
+    function Write-LaiLog([string]$Level, [string]$Message) { [void]$said.Add("[$Level] $Message") }
+    function Protect-Out([string]$Text) { $Text }
+    Add-Check 'empty' { }
+    Add-Check 'words only' { 'some words'; 42 }
+    Add-Check 'no result' { @{ Detail = 'a table without a result' } }
+    Add-Check 'unknown result' { @{ Status = 'DONE'; Detail = 'not one of the four' } }
+    Add-Check 'passes' { Pass 'x' }
+    Add-Check 'words, then a verdict' { 'some words'; Warn 'w' }
+    Add-Check 'throws' { throw 'boom' }
+    $rows = @{ Said = @($said) }
+    foreach ($x in $results) { $rows[[string]$x.Check] = "$($x.Status) $($x.Detail)" }
+    $rows
+}
+$noAnswerRows = @('empty', 'words only', 'no result', 'unknown result')
+$hcAst = [System.Management.Automation.Language.Parser]::ParseFile((Join-Path $src 'Test-LocalAI.ps1'), [ref]$null, [ref]$null)
+$hcTop = @($hcAst.EndBlock.Statements | Where-Object { $_ -is [System.Management.Automation.Language.FunctionDefinitionAst] })
+$hcFns = @($hcTop | Where-Object { @('Add-Check', 'Pass', 'Fail', 'Warn', 'Skip') -contains $_.Name })
+$hcAc = @{ Said = @() }
+try { $hcAc = & $addCheckRows $hcFns } catch { Write-Host "  the Add-Check cases stopped: $($_.Exception.Message)" }
+$hcSilent = @($noAnswerRows | Where-Object { $hcAc[$_] -ne 'SKIP this check gave no answer' })
+Assert-That ($hcFns.Count -eq 5 -and $hcSilent.Count -eq 0 -and $hcAc['Said'] -contains '[INFO] SKIP empty: this check gave no answer') "a health check that gives no verdict (an empty body, plain text, a table without a result, a result that is none of the four) is SKIP 'this check gave no answer', never a PASS without words (not: $($hcSilent -join ', '))"
+Assert-That ($hcAc['passes'] -eq 'PASS x' -and $hcAc['words, then a verdict'] -eq 'WARN w' -and $hcAc['throws'] -eq 'FAIL boom') "a verdict is kept as given, also after other output, and a health check that throws is still FAIL with the error ($($hcAc['passes']) | $($hcAc['words, then a verdict']) | $($hcAc['throws']))"
+$hcVerdicts = & $looseRows $hcAst
+Assert-That ($hcVerdicts.Rows -ge 25 -and $hcVerdicts.Loose.Count -eq 0) "every health check row ends in Pass, Fail, Warn or Skip, returns nothing else and gives no verdict it does not hand back, so none of them meets that SKIP or loses a FAIL ($($hcVerdicts.Rows) rows; not: $($hcVerdicts.Loose -join ', '))"
+# The judge of a preset's switches: one function at the top of the script that calls nothing (no
+# command, no method, no static member) and reads no variable but its argument and its own.
+$riskDefs = @($hcTop | Where-Object { $_.Name -eq 'Get-PresetToolRisk' })
+$riskCalls = @(); $riskOutside = @()
+if ($riskDefs.Count -eq 1) {
+    $riskCalls = @($riskDefs[0].FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] -or $n -is [System.Management.Automation.Language.InvokeMemberExpressionAst] -or
+                ($n -is [System.Management.Automation.Language.MemberExpressionAst] -and $n.Static) }, $true))
+    $riskOwn = @('Meta', 'null', 'true', 'false') + @($riskDefs[0].FindAll({ param($n) $n -is [System.Management.Automation.Language.AssignmentStatementAst] -and $n.Left -is [System.Management.Automation.Language.VariableExpressionAst] }, $true) |
+        ForEach-Object { [string]$_.Left.VariablePath.UserPath })
+    $riskOutside = @($riskDefs[0].FindAll({ param($n) $n -is [System.Management.Automation.Language.VariableExpressionAst] }, $true) | ForEach-Object { [string]$_.VariablePath.UserPath } | Where-Object { $riskOwn -notcontains $_ } | Select-Object -Unique)
+}
+Assert-That ($riskDefs.Count -eq 1 -and $riskCalls.Count -eq 0 -and $riskOutside.Count -eq 0) "Get-PresetToolRisk is one top-level function that only reads its argument ($($riskDefs.Count) definition(s); calls: $(@($riskCalls | ForEach-Object { [string]$_.Extent.Text }) -join ', '); other variables: $($riskOutside -join ', '))"
+$riskOf = { param([string]$Json)
+    . ([scriptblock]::Create($riskDefs[0].Extent.Text))
+    $meta = $null; if ($Json) { $meta = $Json | ConvertFrom-Json }
+    '[' + (@(Get-PresetToolRisk $meta) -join ' and ') + ']'
+}
+$chatsOn = @(); $nothingOff = @(); $switchesOff = ''; $codeOn = @(); $codeUnread = @(); $bothOn = ''
+if ($riskDefs.Count -eq 1) {
+    $chatsOn = @((& $riskOf '{"builtinTools":{"chats":true,"code_interpreter":false},"capabilities":{"code_interpreter":false}}'),
+        (& $riskOf '{"builtinTools":{"code_interpreter":false},"capabilities":{"code_interpreter":false}}'))
+    $nothingOff = @((& $riskOf '{"capabilities":{"vision":true}}'), (& $riskOf '{}'), (& $riskOf ''))
+    $switchesOff = & $riskOf '{"builtinTools":{"chats":false,"code_interpreter":false},"capabilities":{"code_interpreter":false}}'
+    $codeOn = @((& $riskOf '{"builtinTools":{"chats":false,"code_interpreter":true},"capabilities":{"code_interpreter":false}}'),
+        (& $riskOf '{"builtinTools":{"chats":false,"code_interpreter":false},"capabilities":{"code_interpreter":true}}'),
+        (& $riskOf '{"builtinTools":{"chats":false,"code_interpreter":true},"capabilities":{"code_interpreter":true}}'))
+    # A code switch that is not there, or is null, was not read as off: both missing (with and without
+    # capabilities), then each one missing and each one null beside the other set to false.
+    $codeUnread = @((& $riskOf '{"builtinTools":{"chats":false}}'),
+        (& $riskOf '{"builtinTools":{"chats":false},"capabilities":{"vision":true}}'),
+        (& $riskOf '{"builtinTools":{"chats":false},"capabilities":{"code_interpreter":false}}'),
+        (& $riskOf '{"builtinTools":{"chats":false,"code_interpreter":false},"capabilities":{"vision":true}}'),
+        (& $riskOf '{"builtinTools":{"chats":false,"code_interpreter":null},"capabilities":{"code_interpreter":false}}'),
+        (& $riskOf '{"builtinTools":{"chats":false,"code_interpreter":false},"capabilities":{"code_interpreter":null}}'))
+    $bothOn = & $riskOf '{"builtinTools":{"chats":true,"code_interpreter":true},"capabilities":{"code_interpreter":true}}'
+}
+Assert-That ($chatsOn.Count -eq 2 -and @($chatsOn | Where-Object { $_ -ceq '[read past chats]' }).Count -eq 2) "past-chat search counts as on when the preset says so and when the chats key is missing, as Open WebUI treats it ($($chatsOn -join ' | '))"
+Assert-That ($nothingOff.Count -eq 3 -and @($nothingOff | Where-Object { $_ -ceq '[read past chats and run code]' }).Count -eq 3) "a preset without builtinTools, with an empty meta or with no meta at all has switched nothing off: past chats and code both count as on ($($nothingOff -join ' | '))"
+Assert-That ($switchesOff -ceq '[]') "a preset with all three switches set to false is clean (found: $switchesOff)"
+Assert-That ($codeOn.Count -eq 3 -and @($codeOn | Where-Object { $_ -ceq '[run code]' }).Count -eq 3 -and $bothOn -ceq '[read past chats and run code]') "code execution counts as on with either of its two switches, is named once with both, and comes after past chats when both are back ($($codeOn -join ' | ') | $bothOn)"
+Assert-That ($codeUnread.Count -eq 6 -and @($codeUnread | Where-Object { $_ -ceq '[run code]' }).Count -eq 6) "a code switch that is missing or null counts as on like a missing chats key, so the row never prints 'code execution off' for a switch it did not read as off ($($codeUnread -join ' | '))"
+# The Preset row asks that judge before the image switch and before any warning (either would otherwise
+# be all the row says), and its sentence, taken from the row's source, is word for word the one below.
+$presetRow = $hcAst.Find({ param($n) $n -is [System.Management.Automation.Language.CommandAst] -and $n.GetCommandName() -eq 'Add-Check' -and $n.CommandElements.Count -eq 3 -and [string]$n.CommandElements[1].Extent.Text -like '"Preset $*' }, $true)
+$presetAt = @{}; $presetText = @(); $presetNot = @('the sentence is not in the row')
+if ($presetRow) {
+    foreach ($name in 'Get-PresetToolRisk', 'Test-LaiPresetVision', 'Warn') {
+        $hit = $presetRow.CommandElements[2].Find({ param($n) $n -is [System.Management.Automation.Language.CommandAst] -and $n.GetCommandName() -eq $name }, $true)
+        if ($hit) { $presetAt[$name] = $hit.Extent.StartOffset }
+    }
+    $presetSays = $presetRow.CommandElements[2].Find({ param($n) $n -is [System.Management.Automation.Language.ExpandableStringExpressionAst] -and $n.Value -like 'the assistant can *' }, $true)
+    if ($presetSays) {
+        # $risks is the row's own variable for what Get-PresetToolRisk found.
+        $sayIt = [scriptblock]::Create('param($risks) ' + $presetSays.Extent.Text)
+        $presetText = @([string](& $sayIt @('read past chats')), [string](& $sayIt @('read past chats', 'run code')))
+        # How the sentence leaves the row: as Fail's own words in a 'return (Fail ...)' that is all the
+        # row's own 'if ($risks.Count)' does, $risks being what the judge said of this preset's meta,
+        # ahead of the image switch and of every warning. A Warn there, or a lost 'return' (the row's
+        # closing Pass is then the last verdict), would let such a preset through.
+        $presetNot = @()
+        $presetBody = $presetRow.CommandElements[2].ScriptBlock
+        if (-not ($presetSays.Parent -is [System.Management.Automation.Language.CommandAst] -and $presetSays.Parent.GetCommandName() -eq 'Fail')) { $presetNot += 'it is not what Fail is given' }
+        $sayReturn = @($presetBody.FindAll({ param($n) $n -is [System.Management.Automation.Language.ReturnStatementAst] -and $n.Extent.StartOffset -le $presetSays.Extent.StartOffset -and $n.Extent.EndOffset -ge $presetSays.Extent.EndOffset }, $false))
+        if (-not ($sayReturn.Count -eq 1 -and [string]$sayReturn[0].Extent.Text -cmatch '^return \(Fail "the assistant can ')) { $presetNot += "it is not handed back with 'return (Fail ...)'" }
+        $sayIf = $null; if ($sayReturn.Count -eq 1 -and $sayReturn[0].Parent) { $sayIf = $sayReturn[0].Parent.Parent }
+        if (-not ($sayIf -is [System.Management.Automation.Language.IfStatementAst] -and [object]::ReferenceEquals($sayIf.Parent, $presetBody.EndBlock) -and $sayIf.Clauses.Count -eq 1 -and
+                [string]$sayIf.Clauses[0].Item1.Extent.Text -cmatch '^\$risks\.Count( -gt 0)?$' -and $sayIf.Clauses[0].Item2.Statements.Count -eq 1)) { $presetNot += "that return is not all the row's own 'if (`$risks.Count)' does" }
+        elseif (-not ($presetAt.Count -eq 3 -and $sayIf.Extent.StartOffset -lt $presetAt['Test-LaiPresetVision'] -and $sayIf.Extent.StartOffset -lt $presetAt['Warn'])) { $presetNot += 'it comes after the image switch or a warning' }
+        $riskSet = @($presetBody.FindAll({ param($n) $n -is [System.Management.Automation.Language.AssignmentStatementAst] -and [string]$n.Left.Extent.Text -eq '$risks' }, $true))
+        if (-not ($riskSet.Count -eq 1 -and [string]$riskSet[0].Right.Extent.Text -cmatch '^@\(Get-PresetToolRisk \$p\.meta\)$' -and [object]::ReferenceEquals($riskSet[0].Parent, $presetBody.EndBlock))) { $presetNot += '$risks is not, once and for every preset, what Get-PresetToolRisk says of $p.meta' }
+    }
+}
+Assert-That ($presetAt.Count -eq 3 -and $presetAt['Get-PresetToolRisk'] -lt $presetAt['Test-LaiPresetVision'] -and $presetAt['Get-PresetToolRisk'] -lt $presetAt['Warn']) "the Preset row judges the past-chat and code switches before the image switch and before any warning (found: $(@($presetAt.Keys) -join ', '))"
+Assert-That ($presetNot.Count -eq 0) "the Preset row hands that sentence back as a failure: 'return (Fail ...)' is all its 'if (`$risks.Count)' does, on what Get-PresetToolRisk says of the preset's meta, ahead of the image switch and of every warning (not so: $($presetNot -join '; '))"
+$presetFix = ' again; run Start menu > Local AI - Update toolkit to put the safety settings back'
+Assert-That ($presetText.Count -eq 2 -and $presetText[0] -ceq "the assistant can read past chats$presetFix" -and $presetText[1] -ceq "the assistant can read past chats and run code$presetFix" -and ([string]$hcAst.Extent.Text) -notmatch 'memory/web/knowledge tools on') "a preset that can read past chats fails with what it can do again and the one step that puts it back, and the row no longer says 'tools on' without having read them ($($presetText -join ' | '))"
+
 Write-Host "`n=== Test-LocalAI: anything listening beyond localhost is reported ===" -ForegroundColor Cyan
 if ($onWindows) {
     $expRoot = Join-Path $Work 'exposure'
     New-Item -ItemType Directory -Force -Path $expRoot | Out-Null
     ConvertTo-Json @{ WebUIPort = 39998; SearxngPort = 39997; OllamaUrl = 'http://127.0.0.1:1' } | Set-Content -LiteralPath (Join-Path $expRoot 'localai-config.json')
-    $line = { param($Addr)
-        $l = New-Object System.Net.Sockets.TcpListener([System.Net.IPAddress]::Parse($Addr), 39998)
+    $line = { param($Addr, [int]$Port = 39998, [string]$Root = $expRoot)
+        $l = New-Object System.Net.Sockets.TcpListener([System.Net.IPAddress]::Parse($Addr), $Port)
         $l.Start()
-        try { $res = Invoke-Child 'Test-LocalAI.ps1' @('-AIRoot', $expRoot, '-NoContainers', '-Quick') } finally { $l.Stop() }
+        try { $res = Invoke-Child 'Test-LocalAI.ps1' @('-AIRoot', $Root, '-NoContainers', '-Quick') } finally { $l.Stop() }
         return (@($res.Text -split "`n" | Where-Object { $_ -match 'Nothing exposed beyond localhost' }) -join ' ')
     }
     $open = & $line '0.0.0.0'
     $closed = & $line '127.0.0.1'
     Assert-That ($open -match 'FAIL' -and $open -match '39998@0\.0\.0\.0') "a port bound to all interfaces fails the check ($open)"
-    Assert-That ($closed -match 'PASS') "the same port on 127.0.0.1 passes ($closed)"
+    Assert-That ($closed -match 'PASS' -and $closed -match ': 11434, 39998, 39997 bound to loopback only') "the same port on 127.0.0.1 passes, and without the research agent no fourth port is on the list ($closed)"
+    # The optional research agent's port is one of them once it is installed (DeepResearchPort above 0).
+    # In a root of its own: with that port set the run also waits for the agent to answer.
+    $expResearch = Join-Path $Work 'exposure-research'
+    New-Item -ItemType Directory -Force -Path $expResearch | Out-Null
+    ConvertTo-Json @{ WebUIPort = 39998; SearxngPort = 39997; DeepResearchPort = 39993; OllamaUrl = 'http://127.0.0.1:1' } | Set-Content -LiteralPath (Join-Path $expResearch 'localai-config.json')
+    $research = & $line '0.0.0.0' 39993 $expResearch
+    Assert-That ($research -match 'FAIL' -and $research -match '39993@0\.0\.0\.0') "the research agent's port bound to all interfaces fails the check too ($research)"
 } else { Skip 'exposure check runs on Windows only' }
 
 Write-Host "`n=== Test-LocalAI: the Integrity watch line for an install baseline ===" -ForegroundColor Cyan
@@ -553,6 +729,31 @@ if ($onWindows) {
     Assert-That ($ihStale -match 'WARN Integrity watch: .*on its next run\. That install or update carried on 1 thing\(s\) already accepted by hand \(-AcceptBaseline\), which still count as normal: "Scripts\\extra\.ps1" is new\. It also kept 1 thing\(s\) it did not install, which now count as normal: "Stack\\planted\.yml" is new\. That is 2 in all\. If that acceptance was not yours, or you did not add what was kept, do not repair this with Update toolkit' -and [regex]::Matches($ihStale, 'do not repair this with Update toolkit').Count -eq 1 -and $ihStale -notmatch 'first remove what was added|Start menu > Local AI - Update toolkit' -and [regex]::Matches($ihStale, 'this goes away with: ').Count -eq 1 -and $ihStale -match 'If both were you, this goes away with: .*-AcceptBaseline' -and $ihStale -notmatch 'the comparison is not running|did not finish') "a settled script and a kept Stack file: one advice, which names no shortcut, the number in all, and no reason from the record of another baseline ($ihStale)"
     Assert-That ($ihOwn -match 'WARN Integrity watch: .*has not compared the PC with it yet: the comparison is not running \(the comparison started at 09:00 did not finish\)\. That install or update carried on 1 thing\(s\) already accepted by hand' -and $ihOwn -match 'If that acceptance was not yours, do not repair this with Update toolkit.*If it was, this goes away with: .*-AcceptBaseline' -and $ihOwn -notmatch 'on its next run|kept \d+ thing\(s\) it did not install') "the watch's record under this baseline's id: its reason is shown, and an all-settled list still ends in the command ($ihOwn)"
     Assert-That ($ihPlain -match 'WARN Integrity watch: .*on its next run\. That install or update kept 1 thing\(s\) it did not install, which now count as normal: "Stack\\planted\.yml" is new\. If you did not add them, first remove what was added.*If you did, this goes away with: .*-AcceptBaseline' -and $ihPlain -notmatch 'carried on|in all') "only kept things: the line reads as before ($ihPlain)"
+    # The Backups row of such a run, in the same root: the nightly backup found Open WebUI without its
+    # users or chats and recorded it (backup-state.json, 'emptied'), and the newest archive is the
+    # -EMPTY one of that night. The row fails with the counts, the last good backup and both ways out,
+    # and does not name the -EMPTY archive as a backup.
+    $ihBk = Join-Path $ihRoot 'Backups'
+    New-Item -ItemType Directory -Force -Path $ihBk | Out-Null
+    $ihGood = Join-Path $ihBk 'open-webui-20260101-030000.tar.gz'
+    $ihEmpty = Join-Path $ihBk 'open-webui-20260102-030000-EMPTY.tar.gz'
+    Set-Content -LiteralPath $ihGood -Value 'x'
+    (Get-Item -LiteralPath $ihGood).LastWriteTime = (Get-Date).AddHours(-30)
+    Set-Content -LiteralPath $ihEmpty -Value 'x'
+    Save-LaiState -Path (Join-Path $ihRoot 'backup-state.json') -State @{ emptied = @{ at = '2026-01-02T03:00:00'; archive = $ihEmpty; lastGood = $ihGood; users = 0; chats = 0; hadUsers = 3; hadChats = 40 } }
+    $ihRes = Invoke-Child 'Test-LocalAI.ps1' @('-AIRoot', $ihRoot, '-NoContainers', '-Quick')
+    $ihBackups = @($ihRes.Text -split "`n" | Where-Object { $_ -match ' Backups: ' }) -join ' '
+    Assert-That ($ihBackups -match 'FAIL Backups: ' -and $ihBackups -match 'has looked wiped since the nightly backup of 2026-01-02T03:00:00; at the last backup 0 user\(s\) and 0 chat\(s\), 3 and 40 at the last good one' -and $ihBackups -match [regex]::Escape($ihGood) -and $ihBackups -match 'Restore-OpenWebUI\.ps1' -and $ihBackups -match '-AcceptEmpty' -and $ihBackups -notmatch 'EMPTY\.tar\.gz') "an Open WebUI the nightly backup found wiped fails the Backups row with the first night, the counts of the last backup and of the last good one, that backup and both ways out, and its -EMPTY archive is not named as a backup ($ihBackups)"
+    # A restore does not clear the mark, the next backup that counts the data does: the row says so,
+    # or an owner who restored as told reads 'run Restore-OpenWebUI.ps1' again.
+    Assert-That ($ihBackups -match 'After a restore this line stays until the next nightly backup has counted the data again; Backup-OpenWebUI\.ps1 run by hand does that at once') "and the row says that it stays after a restore until a backup has counted the data again ($ihBackups)"
+    # The same folder with the record gone (backup-state.json saved without it): the newest archive is
+    # still the -EMPTY one, so the row fails as the watch does, names that archive and gives the
+    # restore of the nightly backup from before it. It passed here, on the 30 h old nightly archive.
+    Save-LaiState -Path (Join-Path $ihRoot 'backup-state.json') -State @{ deepCheck = 'ok' }
+    $ihRes = Invoke-Child 'Test-LocalAI.ps1' @('-AIRoot', $ihRoot, '-NoContainers', '-Quick')
+    $ihOrphan = @($ihRes.Text -split "`n" | Where-Object { $_ -match ' Backups: ' }) -join ' '
+    Assert-That ($ihOrphan -match 'FAIL Backups: the newest backup open-webui-20260102-030000-EMPTY\.tar\.gz was made when Open WebUI''s data looked wiped, and the record of it is gone from backup-state\.json' -and $ihOrphan -match 'Restore-OpenWebUI\.ps1 -Archive ''[^'']*open-webui-20260101-030000\.tar\.gz''') "a newest -EMPTY archive whose record is gone fails the Backups row too, with the restore of the nightly backup from before it ($ihOrphan)"
 } else { Skip 'the Integrity watch line of the health check runs on Windows only' }
 
 Write-Host "`n=== diagnostics bundle: redaction ===" -ForegroundColor Cyan
@@ -659,6 +860,17 @@ $tn = Invoke-LaiTimedNative -File $childExe -Arguments @('-NoProfile', '-Command
 Assert-That ($tn.TimedOut -and $tn.ExitCode -eq -1 -and $sw.Elapsed.TotalSeconds -lt 30) ("a program that never answers is stopped after the limit ({0:N0} s)" -f $sw.Elapsed.TotalSeconds)
 $tn = Invoke-LaiTimedNative -File $childExe -Arguments @('-NoProfile', '-Command', "Write-Output 'a b|c'; exit 7") -TimeoutSec 120
 Assert-That (-not $tn.TimedOut -and $tn.ExitCode -eq 7 -and ([string]$tn.Out).Trim() -eq 'a b|c') "arguments with spaces arrive intact; output and exit code come back (exit $($tn.ExitCode): $($tn.Out))"
+# The limit itself. LOCALAI_DOCKER_TIMEOUT is a test hook; the nightly backup and the model update
+# ask for the limit at their start, so a value left in the owner's own variables that is no positive
+# whole number must not end them (it was cast with [int], which fails on 'x').
+$dtSaved = $env:LOCALAI_DOCKER_TIMEOUT
+$dtGot = @()
+try { foreach ($dtValue in 'x', '0', '-5', '7', '') { $env:LOCALAI_DOCKER_TIMEOUT = $dtValue; $dtGot += [string](Get-LaiDockerTimeout) } }
+catch { $dtGot += "stopped: $($_.Exception.Message)" }
+finally { $env:LOCALAI_DOCKER_TIMEOUT = $dtSaved }
+Assert-That (($dtGot -join ',') -eq '30,30,30,7,30') "the docker time limit takes LOCALAI_DOCKER_TIMEOUT only as a positive whole number: 'x', 0 and -5 keep 30 s, 7 is 7, unset is 30 ($($dtGot -join ','))"
+$libTextDt = Get-Content -LiteralPath (Join-Path (Join-Path $src 'lib') 'LocalAI.psm1') -Raw -Encoding UTF8
+Assert-That ($libTextDt -notmatch '\[int\]\$env:LOCALAI_DOCKER_TIMEOUT' -and $libTextDt -notmatch '\[int\]\$env:LOCALAI_TEST_SIGNIN_WAIT' -and $libTextDt -match 'TryParse\(\[string\]\$env:LOCALAI_TEST_SIGNIN_WAIT') 'the library casts neither that variable nor the sign-in wait of the tests to a number unchecked (text of lib\LocalAI.psm1)'
 
 Write-Host "`n=== context search (Find-LaiMaxContext) with a mocked Ollama and nvidia-smi ===" -ForegroundColor Cyan
 # The integration test runs the tuner on a CPU box with -AllowCpu, so the search itself (step-down,
@@ -1214,10 +1426,8 @@ if ($missingFn.Count -eq 0) {
 }
 Import-Module (Join-Path (Join-Path $src 'lib') 'LocalAI.psm1') -Force
 # A moved endpoint: Open WebUI answers any unknown path with its web page (status 200).
-$htmlPort = Get-Random -Minimum 41000 -Maximum 49000
-$hl = New-Object System.Net.HttpListener
-$hl.Prefixes.Add("http://127.0.0.1:$htmlPort/")
-$hl.Start()
+$started = Start-TestListener
+$hl = $started.Listener; $htmlPort = $started.Port
 $hAsync = $hl.BeginGetContext($null, $null)
 $hClient = Join-Path $Work 'html-client.ps1'; $hOut = Join-Path $Work 'html-out.txt'
 Set-Content -LiteralPath $hClient -Value (("Import-Module '{0}' -Force`n" -f (Join-Path (Join-Path $src 'lib') 'LocalAI.psm1')) +
@@ -1249,6 +1459,12 @@ foreach ($c in 'de-DE', 'tr-TR', 'ja-JP') {
 }
 [System.Globalization.CultureInfo]::CurrentCulture = $savedCulture
 Assert-That ($null -eq (ConvertTo-WatchDate 'not a date') -and $null -eq (ConvertTo-WatchDate '')) 'a damaged value reads as no date (no crash)'
+# The counts the watch's notice for an emptied Open WebUI prints come from backup-state.json, a file
+# any program of the owner can write: a whole number from 0 up is a count, anything else is none.
+. ([scriptblock]::Create($wAst.Find({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'ConvertTo-WatchCount' }, $true).Extent.Text))
+$wc0 = ConvertTo-WatchCount 0
+Assert-That ($null -ne $wc0 -and $wc0 -eq 0 -and (ConvertTo-WatchCount 40) -eq 40 -and (ConvertTo-WatchCount '3') -eq 3) 'a count from backup-state.json reads as that number, 0 included'
+Assert-That ($null -eq (ConvertTo-WatchCount $null) -and $null -eq (ConvertTo-WatchCount 'many') -and $null -eq (ConvertTo-WatchCount (-1)) -and $null -eq (ConvertTo-WatchCount 2.5) -and $null -eq (ConvertTo-WatchCount $true)) 'and a missing value, text, a negative number, a fraction or a switch reads as no count'
 
 Write-Host "`n=== integrity watch: files, settings, scheduled tasks and listeners against a baseline ===" -ForegroundColor Cyan
 # The watch compares the installed scripts, the Stack folder, the LocalAI-* tasks and the listeners
@@ -1873,6 +2089,22 @@ if ($onWindows) {
 # Keep-awake for long installs: takes on Windows (Windows CI), a no-op elsewhere.
 if ($env:OS -eq 'Windows_NT') { Assert-That (Enable-LaiKeepAwake) 'Windows does not sleep while the installer runs (SetThreadExecutionState took)' }
 else { Assert-That (-not (Enable-LaiKeepAwake)) 'keep-awake is a no-op off Windows' }
+# Stop-Install takes the request back (the -NoExit window and its thread outlive the installer).
+# Its own 'LaiPower' statement is run here, taken from the function, not a copy of it. The call
+# hands back the state before it: 0x80000001 after Enable-LaiKeepAwake, and 0x80000000
+# (ES_CONTINUOUS alone) only when that statement really ran and took.
+if ($env:OS -eq 'Windows_NT') {
+    $kaAst = [System.Management.Automation.Language.Parser]::ParseFile((Join-Path $src 'Install-LocalAI.ps1'), [ref]$null, [ref]$null)
+    $kaStop = $kaAst.Find({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Stop-Install' }, $true)
+    $kaIf = $null; if ($kaStop) { $kaIf = $kaStop.Find({ param($n) $n -is [System.Management.Automation.Language.IfStatementAst] -and $n.Extent.Text -match 'LaiPower' }, $true) }
+    Assert-That ($null -ne $kaIf) 'Stop-Install has a statement that clears the keep-awake request'
+    if ($kaIf) {
+        Enable-LaiKeepAwake | Out-Null
+        . ([scriptblock]::Create($kaIf.Extent.Text))
+        $kaAfter = [LaiPower]::SetThreadExecutionState([uint32]2147483648)
+        Assert-That ($kaAfter -eq [uint32]2147483648) ("after Stop-Install's clear the thread asks for ES_CONTINUOUS alone (the state before the next call: 0x{0:X8})" -f $kaAfter)
+    }
+}
 Write-Host "`n=== other hardware: GPU size, several GPUs, no NVIDIA GPU, RAM ===" -ForegroundColor Cyan
 Import-Module (Join-Path (Join-Path $src 'lib') 'LocalAI.psm1') -Force
 # The owner's card must keep passing: every model of the real catalog fits a 24 GB RTX 3090.
@@ -2014,6 +2246,11 @@ $instText = Get-Content -LiteralPath (Join-Path $src 'Install-LocalAI.ps1') -Raw
 Assert-That ($instText -match "-InstallerSetBefore:\(\[bool\]\`$State\.stages\['Ollama'\]\)") 'the installer records only before its Ollama stage first completed'
 $ustText = Get-Content -LiteralPath (Join-Path $src 'Uninstall-LocalAI.ps1') -Raw -Encoding UTF8
 Assert-That ($ustText -match 'Get-LaiEnvResetPlan' -and $ustText -match 'prevOllamaEnv') 'Uninstall-LocalAI.ps1 restores from the recorded values instead of only deleting'
+# An update whose Administrator window was closed mid-run leaves its folder under Program Files.
+Assert-That ($ustText -match "Join-Path \`$programFiles 'LocalAI-Update'" -and $ustText -match 'Remove-LaiTree -Path \$updDir') 'Uninstall-LocalAI.ps1 also removes LocalAI-Update under Program Files, the folder an update unpacks into (text of the script)'
+# The three folders it deletes there are named by what Windows says Program Files is, never by the
+# session's variable, and an update that still holds its 'in-use' file keeps its folder.
+Assert-That ($ustText -match "\`$programFiles = \[Environment\]::GetFolderPath\('ProgramFiles'\)" -and $ustText -notmatch "Join-Path \`$env:ProgramFiles 'LocalAI" -and $ustText -match "Join-Path \`$updDir 'in-use'" -and $ustText -match 'A Local AI update is still running') 'Uninstall-LocalAI.ps1 asks Windows where Program Files is for the folders it deletes there, and leaves LocalAI-Update alone while an update holds it (text of the script)'
 
 Write-Host "`n=== installer port choice: a port Docker holds for another project is not this stack's ===" -ForegroundColor Cyan
 $instAst4 = [System.Management.Automation.Language.Parser]::ParseFile((Join-Path $src 'Install-LocalAI.ps1'), [ref]$null, [ref]$null)
@@ -2327,8 +2564,8 @@ $pcsStray = @($pcsCalled | Where-Object { $pcsMayCall -cnotcontains $_ })
 $pcsUnseen = @($pcsMayCall | Where-Object { $pcsCalled -cnotcontains $_ })
 Assert-That ($pcsAddTypeOk -and $pcsImportsOk) "the script compiles code once (Add-Type with `$members) and imports CreateFileW and CloseHandle from kernel32.dll, nothing else ($($pcsAddType.Count) Add-Type; imports: $($pcsExterns -join ', '))"
 Assert-That ($pcsOpenOk -and $pcsStray.Count -eq 0 -and $pcsUnseen.Count -eq 0) "and that code makes one CreateFileW call, with no access asked for (name, 0, 3, null, 3, 0, null), closes the handle and calls nothing else ($($pcsOpens.Count) CreateFileW text(s); calls: $($pcsCalled -join ', '); not on the list: $($pcsStray -join ', '); expected and not found: $($pcsUnseen -join ', '))"
-# Add-Check keeps a hashtable; anything else a row's code returns it reads as PASS with no words.
-# Convert-Verdict is what turns a judge's answer into that hashtable, so the four rows must end in it,
+# Add-Check keeps a hashtable with one of the four results; anything else a row's code returns is no
+# answer. Convert-Verdict is what turns a judge's answer into that hashtable, so the four rows must end in it,
 # and a status it does not know must come out as not checked. (Loaded in a scope of its own: the
 # script's Skip is not this file's.)
 $pcsVerdictRows = @('Antivirus', 'Hardware-access drivers any program can open', 'Firewall openings for script runners', 'Cloud sync the backups rely on')
@@ -2347,6 +2584,24 @@ $cv = @(& {
     })
 Assert-That ($pcsLoose.Count -eq 0 -and $cvFns.Count -eq 5 -and $cv.Count -eq 4 -and @($cv | Where-Object { $_ -is [hashtable] }).Count -eq 4 -and $cv[0].Status -eq 'WARN' -and $cv[0].Detail -eq 'the detail' -and $cv[0].Fix -eq 'the fix' -and
     $cv[1].Status -eq 'PASS' -and $cv[1].Detail -eq 'fine' -and $cv[2].Status -eq 'SKIP' -and [string]$cv[2].Detail -and $cv[3].Status -eq 'SKIP') "a judge's answer reaches Add-Check as a hashtable with its words; a status that is none of the four, or no answer, is SKIP, never a silent PASS; the four rows end in Convert-Verdict (not: $($pcsLoose -join ', '))"
+# Add-Check itself: no verdict is SKIP with words, and a row whose code throws is still 'could not be
+# read (<error>)'. Every row gives a verdict on every path, so none of them meets that SKIP.
+$pcsAcFns = @($cvFns) + @($pcsAst.EndBlock.Statements | Where-Object { $_ -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $_.Name -eq 'Add-Check' })
+$pcsAc = @{ Said = @() }
+try { $pcsAc = & $addCheckRows $pcsAcFns } catch { Write-Host "  the Add-Check cases stopped: $($_.Exception.Message)" }
+$pcsSilent = @($noAnswerRows | Where-Object { $pcsAc[$_] -ne 'SKIP this check gave no answer' })
+Assert-That ($pcsAcFns.Count -eq 6 -and $pcsSilent.Count -eq 0 -and $pcsAc['Said'] -contains '[INFO] SKIP empty: this check gave no answer') "a security check that gives no verdict (an empty body, plain text, a table without a result, a result that is none of the four) is SKIP 'this check gave no answer', never a PASS without words (not: $($pcsSilent -join ', '))"
+Assert-That ($pcsAc['passes'] -eq 'PASS x' -and $pcsAc['words, then a verdict'] -eq 'WARN w' -and $pcsAc['throws'] -eq 'SKIP could not be read (boom)') "a verdict is kept as given, also after other output, and a security check that throws is still SKIP 'could not be read (<error>)' ($($pcsAc['passes']) | $($pcsAc['words, then a verdict']) | $($pcsAc['throws']))"
+$pcsVerdicts = & $looseRows $pcsAst
+Assert-That ($pcsVerdicts.Rows -ge 25 -and $pcsVerdicts.Loose.Count -eq 0) "every security check row ends in Pass, Fail, Warn, Skip or Convert-Verdict, returns nothing else and gives no verdict it does not hand back ($($pcsVerdicts.Rows) rows; not: $($pcsVerdicts.Loose -join ', '))"
+# Which window: no single one makes every check, so the help and the line a normal window starts with
+# name both, and neither sends the reader to 'the full check' any more.
+$pcsWindowWords = @('a normal window for the driver test', 'Run as administrator for TPM, drive encryption and SMBv1')
+$pcsFile = [System.IO.File]::ReadAllText((Join-Path $src 'Test-PCSecurity.ps1'))
+# The help is what stands before the param block.
+$pcsWindowTexts = @([string]@($pcsFile -split "`nparam\(", 2)[0], [string](@($pcsFile -split "`n" | Where-Object { $_ -cmatch "Write-LaiLog INFO 'Not elevated: " }) -join ' '))
+$pcsWindowOk = @($pcsWindowTexts | Where-Object { $_.Contains($pcsWindowWords[0]) -and $_.Contains($pcsWindowWords[1]) })
+Assert-That ($pcsWindowOk.Count -eq 2 -and $pcsFile -cnotmatch 'For the full check|a few checks are skipped|For all of them') "the help and the 'Not elevated' line both name a normal window for the driver test and Run as administrator for TPM, drive encryption and SMBv1 ($($pcsWindowOk.Count) of 2)"
 
 # The whole script in its own process: runs to the end, never throws, writes a report without names.
 $pcsRoot = Join-Path $Work 'pcs-root'
@@ -2360,8 +2615,8 @@ $checkLines = @($r.Text -split "`n" | Where-Object { $_ -match '\[(OK|WARN|FAIL|
 $failLines = @($checkLines | Where-Object { $_ -match '\] FAIL ' })
 Assert-That ($r.Text -match 'PC SECURITY CHECK COMPLETE: \d+ checks, \d+ warnings, \d+ failures' -and $checkLines.Count -ge 20) "the security check runs to its summary line ($($checkLines.Count) checks, $pcsSecs s)"
 $pcsNewRows = @('Hardware-access drivers any program can open', 'Firewall openings for script runners', 'Cloud sync the backups rely on')
-# Each of them with words after the colon: a row whose code hands Add-Check no verdict prints PASS and
-# nothing else, which would otherwise pass here as a row that is there.
+# Each of them with words after the colon: a row that prints its result and nothing else would
+# otherwise pass here as a row that is there.
 $pcsMissing = @($pcsNewRows | Where-Object { $r.Text -notmatch ('\] (PASS|WARN|FAIL|SKIP) ' + [regex]::Escape($_) + ': \S') })
 $pcsAvRows = @($checkLines | Where-Object { $_ -match '\] (PASS|WARN|FAIL|SKIP) Antivirus: \S' })
 $pcsWordlessRx = '\] (PASS|WARN|FAIL|SKIP) (Antivirus|' + (@($pcsNewRows | ForEach-Object { [regex]::Escape($_) }) -join '|') + '):\s*$'
@@ -2381,7 +2636,20 @@ $leaks = @($names | Where-Object { $pcsText -match ('(?i)(?<![\p{L}\p{N}])' + [r
 Assert-That ($names.Count -ge 1 -and $leaks.Count -eq 0) "the report names neither the user nor the computer ($($names.Count) name(s) checked, $($leaks.Count) found)"
 if ($env:USERPROFILE) { Assert-That (-not $pcsText.ToLowerInvariant().Contains($env:USERPROFILE.ToLowerInvariant())) 'and shows no profile path' } else { Skip 'profile path check needs USERPROFILE' }
 if ($onWindows) {
-    Assert-That (@($checkLines | Where-Object { $_ -notmatch '\] SKIP ' }).Count -ge 8) "on Windows the checks really run ($(@($checkLines | Where-Object { $_ -notmatch '\] SKIP ' }).Count) not skipped)"
+    # On Windows the checks really run. These rows read a plain setting or this account, which every
+    # Windows answers in any window, so each of them must say PASS, WARN or FAIL here.
+    $pcsMustJudge = @('Restart to finish updates', 'User Account Control', 'Microsoft vulnerable driver blocklist', 'Local Security Authority protection', 'SmartScreen for apps and files', 'Remote Desktop', 'Daily account type')
+    $pcsNotJudged = @($pcsMustJudge | Where-Object { $r.Text -notmatch ('\] (PASS|WARN|FAIL) ' + [regex]::Escape($_) + ': \S') })
+    Assert-That ($pcsNotJudged.Count -eq 0) "on Windows the checks really run: each of these $($pcsMustJudge.Count) rows says PASS, WARN or FAIL (without a verdict: $($pcsNotJudged -join ', '))"
+    # 'could not be read (<error>)' is a row whose own code threw. Only the rows that ask the firmware or
+    # BitLocker, which a CI machine may not have, may end that way; on any other row it is a bug in the row.
+    $pcsMayThrow = @('Secure Boot', 'TPM', 'Drive encryption')
+    $pcsMayThrowRx = '\] SKIP (' + (@($pcsMayThrow | ForEach-Object { [regex]::Escape($_) }) -join '|') + '): could not be read \('
+    $pcsThrew = @($checkLines | Where-Object { $_ -match 'could not be read \(' -and $_ -notmatch $pcsMayThrowRx })
+    Assert-That ($pcsThrew.Count -eq 0) "no row ends in an error of its own, but for $($pcsMayThrow -join ', ') ($($pcsThrew -join ' | '))"
+    $pcsNoWordsRx = '\] (PASS|WARN|FAIL|SKIP) (' + (@($pcsRows.Keys | ForEach-Object { [regex]::Escape([string]$_) }) -join '|') + '):\s*$'
+    $pcsNoWords = @($checkLines | Where-Object { $_ -match $pcsNoWordsRx })
+    Assert-That ($pcsRows.Count -ge 25 -and $pcsNoWords.Count -eq 0) "and not one of the $($pcsRows.Count) rows prints a result with nothing after the colon ($($pcsNoWords -join ' | '))"
 } else {
     $notSkipped = @($checkLines | Where-Object { $_ -notmatch '\] SKIP ' })
     Assert-That ($notSkipped.Count -le 2 -and $r.Code -eq 0) "off Windows the checks are skipped, none fails ($($notSkipped.Count) of $($checkLines.Count) not skipped)"

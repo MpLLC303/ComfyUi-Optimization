@@ -26,7 +26,10 @@ env:
 jobs:
   windows-ps51:
     runs-on: windows-latest
-    timeout-minutes: 20
+    # 30, not 20: the bootstrap suite now starts several dozen child PowerShell runs on this job and the
+    # unit tests grew by about a minute, and no run has timed the two together yet. The bootstrap
+    # suite prints its seconds part by part, so the first log shows what 20 would have left.
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v5
 
@@ -102,8 +105,17 @@ jobs:
 
       # Needs administrator rights (the runner has them): its end-to-end block creates the empty
       # all-users Start-menu folder 'Local AI' for one run and removes it again.
+      # One part needs the network: it asks GitHub itself for the list of files and for the archive
+      # of this run's commit (-ProbeCommit: the head commit of a pull request, else the commit that
+      # was pushed; -ProbeRepo: this repository), and holds the two against each other, here with
+      # Windows PowerShell 5.1 as a PC does. GITHUB_TOKEN goes to GitHub's API only; the archive is
+      # asked for without it. Started without -ProbeCommit that part prints 'SKIP GitHub itself
+      # ...', which this job does not declare (it declares none): the step then fails.
       - name: Bootstrap update review (Get-LocalAI.ps1)
         shell: powershell
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          LAI_PROBE_COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
         run: |
-          & .\local-llm\tests\Invoke-AllTests.ps1 -Step .\local-llm\tests\Invoke-GetLocalAITest.ps1
+          & .\local-llm\tests\Invoke-AllTests.ps1 -Step .\local-llm\tests\Invoke-GetLocalAITest.ps1 -StepArgs '-ProbeCommit', $env:LAI_PROBE_COMMIT, '-ProbeRepo', $env:GITHUB_REPOSITORY
           exit $LASTEXITCODE
