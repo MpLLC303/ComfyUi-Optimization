@@ -8,11 +8,12 @@ can run DPAPI, so the Windows tests of step 1 are the first evidence. Where the 
 it says "treat as lost".
 
 Added 2026-10-08, still plan only: the recovery copy the owner asked for (step 3), questions 2,
-4 and 7 to 9, two additions under step 1, and the smaller points of IMPROVEMENTS.md row 121.
+4 and 7 to 10, two additions under step 1, and the smaller points of IMPROVEMENTS.md row 121.
 What these additions say about the toolkit was read at commit 1e9e510; they name functions, or
 say "at 1e9e510" where they give a line. The older line numbers are still those of ea191d1.
-Nothing of the toolkit was run for them. One statement, about `ConvertFrom-Json` under step 1,
-comes from a one-line check outside the toolkit and says so.
+Nothing of the toolkit was run for them. Three statements come from one-line checks outside the
+toolkit, under Windows PowerShell 5.1, and say so: two about `ConvertFrom-Json` under step 1 and
+one about how a folder name is resolved under step 3.
 
 Today every secret is plain text and only folder permissions protect it: `Set-LaiPrivateAcl`
 (lib/LocalAI.psm1:335) through `Protect-Path` (Install-LocalAI.ps1:483) leaves the installing
@@ -57,8 +58,9 @@ Does not add:
   protects the password that is in the file on that day; it does not change it. So every earlier
   copy still holds that password in plain: an image or a backup of `<AIRoot>`, a Secrets folder
   copied to where secrets are kept (what the help text of Backup-OpenWebUI.ps1 advises), a
-  synced or zipped folder. Such a copy stops being worth anything only when the password is
-  changed afterwards. That is why the protect switch of step 3 ends by naming
+  synced or zipped folder. Such a copy stops opening a new sign-in only when the password is
+  changed afterwards; what somebody set up with it while it worked stays ("What a finder of the
+  copy gets"). That is why the protect switch of step 3 ends by naming
   `Set-OpenWebUIPassword.ps1 -Prompt`, and after it a new recovery copy.
 - **A way to change the deep research password.** The toolkit has none (read at 1e9e510). For
   Local Deep Research the module makes the account through the program's own sign-up form
@@ -141,16 +143,23 @@ A session in which Windows does not hand out the account's key fails the same wa
 lost (some remote and SSH sessions; documented behaviour, not tested): run again from a normal
 sign-in before treating anything as lost.
 
-The two cases below differ: `Set-OpenWebUIPassword.ps1` signs in to a running Open WebUI before
+The cases below differ: `Set-OpenWebUIPassword.ps1` signs in to a running Open WebUI before
 it changes anything (line 64), and after a reinstall there is none.
 
-Both start from the recovery copy (step 3, "The recovery copy") and its date. With several
-copies the newest date counts. A copy is in date when no password was changed after it was made.
-For the admin password the listing of the step 3 command helps: it shows when the password
-script last changed it (`rotated`, readable in a protected file as well; a file the installer
-wrote has none). The proof is the sign-in, and trying costs nothing, because the password script
-signs in before it changes anything. Where a step says "from the copy", an owner without a copy
-uses a password he knows from elsewhere; without either, the step says what is left.
+All of them start from the recovery copy (step 3, "The recovery copy") and its date. A copy is in
+date when no password was changed after it was made. With several copies, the newest is the one
+for the passwords in use. An older one that was kept carries the day it was replaced and is the
+one for a backup made before that day ("How it goes out of date"). A copy that says a password
+is not on it sends the reader to an older copy for that password. For the admin password the
+listing of the step 3 command helps: it shows when the password script last changed it
+(`rotated`, readable in a protected file as well; a file the installer wrote has none).
+
+After a reset Windows password the proof is the sign-in, and trying costs nothing there, because
+the password script signs in before it changes anything. After a reinstall, or with the Secrets
+folder gone, trying is not free: the sign-in comes after a restore has replaced the data. Those
+two paths say which dates to hold against each other first, and how a restore made in vain is
+undone. Where a step says "from the copy", an owner without a copy uses a password he knows from
+elsewhere; without either, the step says what is left.
 
 After a reset Windows password (same Windows; Open WebUI still runs with its data):
 1. Take the recovery copy and read its date.
@@ -169,7 +178,11 @@ After a reset Windows password (same Windows; Open WebUI still runs with its dat
    `deep-research-*.tar.gz` backup cannot be opened again by anyone; only starting over is left.
 6. Run `Test-LocalAI.ps1` and read what it reports.
 7. The admin password is a new one now and the copy holds the old one: make a new copy
-   (`-RecoveryCopy <folder>`) and destroy the old one.
+   (`-RecoveryCopy <folder>`). Keep the old one and write on it the day it was replaced. It
+   holds the admin password of every backup made before today. And when step 5 could not bring
+   the deep research password back into its file, the new copy does not hold that password and
+   the old one is the only place it is written. "How it goes out of date" says when a replaced
+   copy may be destroyed.
 
 After a Windows reinstall, or on another PC or account with `<AIRoot>` copied over, when Docker's
 data went with the old Windows: there is no Open WebUI to sign in to, so `-PromptCurrent` cannot
@@ -181,18 +194,62 @@ runs with its old data, use the steps above instead. This path was read in the c
    first; it needs nothing running. The file is then what a plain one would be after a
    reinstall; how the installer and `Restore-OpenWebUI.ps1 -DeepResearch` go on from there was
    not read for this plan.
-4. Admin file protected: move `Secrets\openwebui-admin.json` out of the Secrets folder. Keep it,
-   do not delete it.
+4. Admin file protected: write down its `rotated` value first, if it has one. The listing shows
+   it, and it is a line of plain text in the file that needs no opening. Then move
+   `Secrets\openwebui-admin.json` out of the Secrets folder. Keep it, do not delete it. After
+   the move the listing no longer shows `rotated`, and the installer's new file has none.
 5. Run the installer. Without an admin file it makes a new login (Install-LocalAI.ps1:1643-1646)
    and shows the password once at the end: save it.
-6. To get the old chats back: `Restore-OpenWebUI.ps1`, then
-   `Set-OpenWebUIPassword.ps1 -PromptCurrent -Prompt` with the password from when that backup was
-   made (Restore-OpenWebUI.ps1:417-418 says the same). That is the admin password from the copy
-   when no password change lies between that backup and the copy; the backup's date is in its
-   file name. If nobody knows that password, do not restore: the new install works with its new
-   login, and this plan has no answer for the old chats.
-7. Run `Test-LocalAI.ps1` and read what it reports.
-8. The admin password is a new one after step 5 or 6: make a new copy and destroy the old one.
+6. To get the old chats back, hold three dates against each other before anything is restored:
+   the copy's, the backup's (in its file name) and `rotated` from step 4. The copy fits a backup
+   when no password change lies between the two, and `rotated` is the last change only:
+   - `rotated` earlier than both: the copy fits that backup.
+   - `rotated` between the two: it does not. When the backup is the older of the two, it needs
+     an older password: look for a replaced copy that was kept. When the copy is the older, the
+     backup needs the password set at `rotated`, which is on no copy made before then.
+   - `rotated` later than both, or no `rotated`: this settles nothing. An earlier change may lie
+     between them, and a change made on Open WebUI's own settings page moves no date.
+
+   Then `Restore-OpenWebUI.ps1`, and `Set-OpenWebUIPassword.ps1 -PromptCurrent -Prompt` with the
+   password from when that backup was made (Restore-OpenWebUI.ps1:417-418 says the same). If
+   nobody knows that password, do not restore: the new install works with its new login, and
+   this plan has no answer for the old chats.
+7. If Open WebUI refuses the password after the restore, the restore was made in vain: the data
+   that runs now is data nobody here can sign in to as administrator. Put the data from before
+   the restore back. `Restore-OpenWebUI.ps1` took a safety backup of it first, an archive in
+   `<AIRoot>\Backups` whose name ends in `-pre-restore.tar.gz` (its help text, and its call of
+   Backup-OpenWebUI.ps1 with `-Tag 'pre-restore'`, at 1e9e510): restore that archive with
+   `-Archive`. The login of step 5 then works again, because a restore reads the admin file and
+   does not write it (read at 1e9e510). There is no such archive when the restore was run with
+   `-SkipSafetyBackup`: do not give that switch here.
+8. Run `Test-LocalAI.ps1` and read what it reports.
+9. The admin password is a new one after step 5 or 6: make a new copy. Keep the old one, with
+   the day it was replaced written on it ("How it goes out of date").
+
+With the Secrets folder gone together with its disk (a new disk or a new PC, nothing of
+`<AIRoot>` copied over, the archives taken from the mirror): nothing is protected and nothing can
+be opened; there is only the copy. This path was read in the code, not run.
+1. Take the recovery copy, and any older one that was kept, and read the dates.
+2. Run the installer, with deep research if it was used before. It makes a new admin login and
+   shows the password once at the end: save it. With deep research it makes a new account
+   `localai` with a password of its own, in a new deep-research.json (`Invoke-DeepResearchSetup`).
+3. Old chats: copy an `open-webui-*` archive back from the mirror and hold its date against the
+   copy's, as in step 6 above. There is no `rotated` to help, the old admin file is gone. Then
+   `Restore-OpenWebUI.ps1` with `-Archive`, and `Set-OpenWebUIPassword.ps1 -PromptCurrent -Prompt`
+   with the admin password from the copy. The script signs in with the e-mail of the admin file
+   that is there now, the new install's. When the e-mail on the copy is another one, run the
+   installer again instead: its early sign-in check finds that the stored login is refused, asks
+   for the e-mail and the password in use, and stores both. A restore made in vain is undone as
+   in step 7 above.
+4. Old research: `Restore-OpenWebUI.ps1 -DeepResearch` with `-Archive`. After it the new
+   deep-research.json still holds the password of the account the restore has just replaced,
+   and the restored research opens only with the password on the copy (the comment above the
+   deep research part of Restore-OpenWebUI.ps1: a restore does not change that file). Move the
+   new deep-research.json out of the Secrets folder, keep it, and let the paste switch of the
+   step 3 command write the file again from the user name and the password on the copy ("The
+   command").
+5. Run `Test-LocalAI.ps1` and read what it reports: it signs in to both.
+6. Make a new copy. Keep the old one, with today written on it ("How it goes out of date").
 
 Before a planned reinstall, a new PC or a new account:
 1. Take the recovery copy and read its date. If a password was changed since, make a new one
@@ -271,7 +328,7 @@ Answered so far (owner's decision of 2026-10-07): he wants a recovery copy of th
 passwords to keep offline. The copy is designed under step 3, "The recovery copy": what it holds,
 its form, the switch that makes it, where it may not be written, and that a file is protected
 only after its password was typed back from the copy. Questions 2 and 4 are rewritten around it
-and 7 to 9 are new. Each of those five carries a recommended answer, and step 3 is built to the
+and 7 to 10 are new. Each of those six carries a recommended answer, and step 3 is built to the
 recommended answers unless he says otherwise. Nothing is built. Whether he wants protection
 switched on at all (question 1) and questions 3, 5 and 6 are open as written.
 
@@ -287,8 +344,10 @@ switched on at all (question 1) and questions 3, 5 and 6 are open as written.
    copy, or the command that shows it on the screen, is where you read it. Shall the admin file
    be protected once you have typed its password back from the copy? Recommended: yes, if your
    answer to 1 is yes. Without the typing back the file stays plain. After every password change
-   the copy has to be made again (the password script tells you), and a copy that gets lost can
-   be made worthless for this password by changing it and making a new copy.
+   the copy has to be made again (the password script tells you). When a copy gets lost,
+   changing the password stops it from opening a new sign-in. It does not undo what somebody did
+   with it before that, so the users and the tools in Open WebUI are looked through as well
+   ("What a finder of the copy gets").
 3. Do you sign in to Windows with a password you know and will still know? If it is ever reset
    instead of changed, the protected passwords are lost and you type the Open WebUI password in
    again.
@@ -314,7 +373,11 @@ switched on at all (question 1) and questions 3, 5 and 6 are open as written.
    Or go back to plain until you have typed the new password back from a new copy? Staying
    protected means: between the change and the new copy, the new password exists outside the
    file only if you typed it yourself or saved the one that was shown once. Going back to plain
-   means: every password change switches protection off until you switch it on again.
+   means: every password change switches protection off until you switch it on again. Know
+   before you answer: the toolkit tells you about the copy at the window where the change is
+   made or stored. It cannot tell you when a change that was cut off is settled later by a run
+   nobody watches, nor when the password is changed on Open WebUI's own settings page ("How it
+   goes out of date", "Not closed").
 9. Where will the copy live: on paper (recommended) or on a USB stick? Paper: write the copy to
    a stick, print it from the stick, keep the paper where you keep papers that matter. No program
    reads paper and it does not stop working in a drawer; the price is typing a password back by
@@ -325,6 +388,15 @@ switched on at all (question 1) and questions 3, 5 and 6 are open as written.
    this PC, not with the backups, and after printing the stick still holds the file, because
    deleting it does not wipe it (documented behaviour of file systems, not tested): keep the
    stick with the paper or use it for nothing else.
+10. A copy that was replaced: keep it for a time (recommended), or destroy it at once? Every
+    backup made before a password change signs in with the admin password of its day, and the
+    replaced copy is the only place that password is written down. Kept, with the day it was
+    replaced written on it, until no backup from before that day is left that you would restore
+    (archives are kept 14 days unless `BackupRetentionDays` says otherwise, on the mirror as
+    well, and a few stay longer: "How it goes out of date"), it lets you use an older backup.
+    The price: it also holds the deep research password, which never goes out of date, so until
+    then two papers have to be kept safe. Destroyed at once, there is one paper, and a backup
+    from before the change is one that nobody can sign in to as administrator.
 
 ## Build steps
 Nothing from the repository may run on the owner's PC. The tests run in CI only: DPAPI assertions
@@ -511,6 +583,42 @@ above as it stands plus these two:
   of the password. (Both under Windows PowerShell 5.1, not tested in CI: seen in a one-line check
   on 2026-10-08.) So M7 does not carry that error's text. This last sentence is not in what
   step 1 is built from: hold the reader as built against it.
+
+  Three more points are not in what step 1 is built from either. Hold the reader, the password
+  script and test 32 as built against them. Whatever is missing is built before step 2 switches
+  its first reader, and step 2 takes `lib/LocalAI.psm1` and `Set-OpenWebUIPassword.ps1` into its
+  files for that:
+  - M7 is thrown whenever the parsed text is not one JSON object, not only when the file is
+    empty or does not parse. White space alone and the text `null` parse to nothing without an
+    error, and `[]`, a quoted text and a number parse to something that has no `password`
+    (Windows PowerShell 5.1, not tested in CI: seen in a one-line check on 2026-10-08, outside
+    the toolkit). A file that holds only a byte order mark and a line end is the white space
+    case once `Get-Content -Encoding UTF8` has read it (documented behaviour, not tested). Each
+    of them would leave the caller with the empty password M7 is there to prevent. Left as it
+    is: a JSON object with neither a marker nor a `password` is a plain file for the reader and
+    is returned as it is (the text above), so step 2 says per reader what an object without a
+    password means there.
+  - M7 is thrown with `-NoPassword` too. That switch means "do not open the value". It does not
+    mean "take a file with nothing in it", and there is no e-mail to hand back.
+  - Call site 2 passes M7 on as it is: without the `-PromptCurrent` sentence, and without the
+    second read. The text of call site 2 adds that sentence to any failure of the reader, and
+    with `-PromptCurrent` it reads again with `-NoPassword`. For M7 that advice leads only back
+    to M7, because the script takes the e-mail from the same file. What the message names
+    instead: move the file out of Secrets, keep it, and run the installer. With no admin file
+    the installer makes a new login, Open WebUI refuses it, and the installer then asks for the
+    e-mail and the password in use and stores both (`Save-AdminCredential` after the refused
+    sign-in in its Configure stage; read at 1e9e510, not run). Step 2 has the same shape twice
+    and gives the same answer: the installer's stop message offers `-PromptCurrent` for a file
+    it cannot open, and the Diagnostics catch reads again with `-NoPassword`. For M7 the stop
+    message names the move instead, and the second Diagnostics read sits in a try of its own:
+    there is no e-mail to blank out, and the file is listed as unreadable as before.
+
+  Test 32 then covers an empty file, a cut-off file, a file of white space only and the text
+  `null`, each read with and without `-NoPassword`, and each refused with M7. One more assertion,
+  both jobs, in the harness of test 24: over an empty admin file the password script ends with
+  an exit code that is not 0, says M7's words, does not name `-PromptCurrent`, and leaves the
+  file empty. Without the three points the white space file is not refused at all, and the
+  script's message names `-PromptCurrent`.
 - Three refusals are asserted on both jobs. "A save that fails stops before the file is touched"
   is proved above through M1, on the Linux job only (29-31), while the loss it prevents, a
   pending file removed although the new password is not on disk, can only happen on Windows,
@@ -606,16 +714,21 @@ the installer was not read for this plan. Hand to the integrator: any new skip m
 ### Step 3: the writers, the command, the registrations
 Files: `Install-LocalAI.ps1` (`Save-AdminCredential` 676-687, the write at 974, the deep research
 write at 773: all through `Save-LaiSecretFile`, form Keep, so the installer never changes a form;
+after each of its two saves of a login the owner typed in, the sentence about the recovery copy
+("How it goes out of date");
 and its messages that send the owner to a file to read a password: 2045 and 2079 for the admin
 file, 2047 and 2074 for deep research. Against a protected file they name the command's show
 action instead. 2076 stays: a login the installer has just made is in a plain file),
 a new command (working name `Protect-LocalAISecrets.ps1`), `Backup-OpenWebUI.ps1` (the advice at
 22-23: a copied protected file opens nowhere else, so the copy to keep is the recovery copy),
-`Set-OpenWebUIPassword.ps1` (two sentences, below), `tests/Invoke-WindowsUnitTests.ps1`,
+`Set-OpenWebUIPassword.ps1` (three messages, below), `lib/LocalAI.psm1` (the same sentence added
+to the log line of a promotion in `Resolve-LaiPendingPassword`; nothing else in the module
+changes), `tests/Invoke-WindowsUnitTests.ps1`,
 `tests/Invoke-StaticChecks.ps1` (the static rule of the Tests paragraph with its canaries; the
 file lists in it stay with the integrator). For the integrator: the installer copy list, the
 uninstaller, the static-check file lists, README.md (lines 38 and 51 send the owner to the admin
-file as well; it also has to say what the recovery copy is and where it must not be kept),
+file as well; it also has to say what the recovery copy is and where it must not be kept, and to
+carry the Recovery paths in full, which the copy's "TO USE IT" lines only shorten),
 tests/README.md, any new skip message (Skips), the backlog row.
 
 The command:
@@ -641,13 +754,24 @@ The command:
 - Deep research is protected only after the owner pastes its password back from where it is
   saved and it matches. After a loss the same paste writes that file back plain, with nothing
   running and nothing to compare it with: the next sign-in (the installer or `Test-LocalAI.ps1`)
-  is the check.
+  is the check. Two losses make it write, and nothing else does. A protected file this account
+  cannot open: the user name and the address are kept from the file. And no file at all
+  (Recovery, "With the Secrets folder gone"): it then asks for the user name as well and takes
+  the address from `DeepResearchPort` in localai-config.json, the port the installer writes
+  there; without that port deep research is not installed and nothing is written. It never
+  writes over a password it can read: a plain file whose password is not the pasted one is left
+  as it is, and the message says so. Why: nothing makes that password again, and a typing slip
+  must not be able to replace it. An empty or cut-off file (M7) is not written over either; the
+  message says to move it out of Secrets first.
 - `-RecoveryCopy <folder>` writes the recovery copy (below) and changes nothing.
-- It never touches the pending file, the key file or `.env`.
+- It never changes the pending file, the key file or `.env`. It reads the pending file for the
+  listing and for the recovery copy, and `.env` for the listing.
 - A typed password can also come as a parameter, for automation only, as in
   Set-OpenWebUIPassword.ps1:23-29: that is how the tests supply it.
 
-`Set-OpenWebUIPassword.ps1` in step 3: two sentences, nothing else.
+`Set-OpenWebUIPassword.ps1` in step 3: three messages, nothing else. Each of the three is an end
+of the script at which the password may be a new one, and each carries the sentence about the
+recovery copy (below, "How it goes out of date").
 - The catch after the save (line 84 at 1e9e510) ends with "The new password is in <the pending
   file>; copy it over." Copying the plain pending file over a protected admin file turns that
   file plain, without the gate and without a word (IMPROVEMENTS.md row 121 (5)). No protected
@@ -655,18 +779,24 @@ The command:
   here and not in step 1. The new sentence: copy nothing; the new password is in the pending file
   and is printed below; the next run of this script, or of `Test-LocalAI.ps1`, moves it into the
   admin file in the form that file has (`Resolve-LaiPendingPassword`, call site 1 of step 1).
-- After a change that went through, one more line says that a recovery copy made before now
-  holds the old password (below, "How it goes out of date").
+  The sentence about the copy follows it.
+- After a change that went through, one more line: the sentence about the copy.
+- The exit after a change request that failed (lines 75 to 77 at 1e9e510). Its second line
+  begins "If the change went through anyway" and says where the new password then is. The
+  sentence about the copy is added to that line, under the same "if". Why here as well: Open
+  WebUI can make the change although its answer never arrives, the script then ends with exit
+  code 1, and a new password that was a random one has never been shown to anybody.
 
 #### The recovery copy
 The owner's decision of 2026-10-07 (IMPROVEMENTS.md rows 109 and 121): he wants a copy of the
 stored passwords to keep offline. It is designed here so that step 3 can be cut from this plan
 alone. None of it is built and none of it was run. Each point carries its reason.
 
-What it is for. Two days: the day Windows can no longer open a protected file (Recovery), and
-the day the Secrets folder is gone together with its disk. The second can come whether or not
-protection is ever switched on (question 1). So the copy has a switch of its own and is made
-from plain files as well as from protected ones.
+What it is for. Two days: the day Windows can no longer open a protected file (the first two
+paths of Recovery), and the day the Secrets folder is gone together with its disk (Recovery,
+"With the Secrets folder gone"). The second can come whether or not protection is ever switched
+on (question 1). So the copy has a switch of its own and is made from plain files as well as
+from protected ones.
 
 What it holds:
 - Open WebUI: the address (`url`), the admin e-mail and the admin password. The password is what
@@ -675,9 +805,9 @@ What it holds:
 - Deep research: the address, the user name and the password. Without that password the saved
   research and every `deep-research-*.tar.gz` backup cannot be opened by anyone ("Per file"),
   and nothing makes it again. The three are all the fields deep-research.json has
-  (`Invoke-DeepResearchSetup`), so the copy alone is enough to write that file again by hand if
-  the Secrets folder is lost. The command does not do that: it pastes a password into a file
-  that is there.
+  (`Invoke-DeepResearchSetup`), so the copy alone is enough to write that file again when the
+  Secrets folder is lost. The paste switch of the command does that from the user name and the
+  password on the copy ("The command"; Recovery, "With the Secrets folder gone").
 - Not the signing key (question 7). It is never protected, so none of the losses under Recovery
   takes it away. When its file is missing the installer makes a new one, and by the installer's
   own comment the price is that existing sessions end ("reuse the guide's key file if present so
@@ -691,38 +821,61 @@ What it holds:
   is not told where to go.
 - A part that cannot be filled says so in the copy: deep research is not installed (there is no
   such file), or this account cannot open the password (below). No gap is left unexplained,
-  because on the day the copy is read nobody remembers why a line is missing.
+  because on the day the copy is read nobody remembers why a line is missing. Where a password
+  is missing because it could not be opened, the gap also says, in capitals, to keep any older
+  copy that holds this password: that copy may be the only place it is written.
 
 Its form:
-- One plain text file, `LocalAI-recovery-<yyyy-MM-dd>.txt`, UTF-8, lines ending in CR LF. Not
-  encrypted, not an archive, no code to scan: it has to be readable years from now on any device
-  and from paper, without the toolkit and without one more password. An encrypted copy only
-  moves the question to where its password is kept. To print it or to put it on a USB stick is
-  all it is for. (That Notepad shows and prints such a file line by line is documented
+- One plain text file, `LocalAI-recovery-<yyyy-MM-dd>-<HHmm>.txt`, UTF-8, lines ending in
+  CR LF. Not encrypted, not an archive, no code to scan: it has to be readable years from now on
+  any device and from paper, without the toolkit and without one more password. An encrypted
+  copy only moves the question to where its password is kept. To print it or to put it on a USB
+  stick is all it is for. (That Notepad shows and prints such a file line by line is documented
   behaviour, not tested.)
-- Dated: the day in the name, the day and the time in its first lines. Two copies can then be
-  told apart, and a copy can be held against a password change ("How it goes out of date"). For
-  the same reason it repeats `rotated` when the admin file has one.
+- Dated: the day and the time in the name and in its first lines. Two copies can then be told
+  apart, also two of one day, and a copy can be held against a password change ("How it goes
+  out of date"). For the same reason it repeats `rotated` when the admin file has one. Why the
+  time is in the name: the first day alone makes two copies. The owner makes one to type from,
+  protects, changes the password as the protect switch tells him, and makes the second. A name
+  with the day only would make him delete the first before the second exists.
 - Every line explained, in the copy itself and in plain words: what each value is, where it is
   typed, what the copy does not hold, and the two commands that use it. It is read on a bad day,
   perhaps years later and perhaps by somebody else, with no documentation at hand.
 - Each password alone on its line, from the first column, with its length on the line above. A
   paste then carries nothing but the password, and a character lost while typing from paper
   shows.
-- No private permissions are set on it. `Protect-Path` would name this account of this Windows,
-  which is in the way on the day the copy is needed: another account, or another Windows. (How
-  file permissions behave on another Windows is documented behaviour, not tested.) The copy is
-  protected by where it is kept and by nothing else, and its first lines say so.
+- Private permissions only where the copy is not meant to stay. On the drive of `<AIRoot>` or of
+  Windows the command sets them on the file before the passwords are written into it: this
+  account, SYSTEM and Administrators (`Set-LaiPrivateAcl`, what the installer uses for Secrets).
+  Why: a folder made under a drive root can be read by the other accounts of the PC (the
+  installer's comment in `Protect-Path` says so of folders under the system drive; documented
+  behaviour, not tested). The copy would be the one file with these passwords that such an
+  account can read, and both programs answer every account of the PC on the PC's own address
+  (that the 127.0.0.1 of stack/docker-compose.yml is the same for every account signed in to
+  the PC is documented behaviour, not tested).
+  From there the copy is moved to a stick or printed, and then deleted, so permissions that
+  name this account are in nobody's way. When they cannot be set, the command removes the empty
+  file it made, writes nothing and says why. Everywhere else none are set: they would name this
+  account of this Windows, which is in the way on the day the copy is needed, under another
+  account or another Windows. (How permissions behave on another Windows, and that many sticks
+  are formatted in a way that keeps none, is documented behaviour, not tested.) There the copy
+  is protected by where it is kept and by nothing else; its first lines and the command's
+  closing lines say so.
+- A replaced copy is kept for a time, with the day it was replaced written on it by hand ("How
+  it goes out of date"). The first lines of every copy say so.
 
 A sketch of the copy. The wording is step 3's; the parts and their order are not:
 
 ```text
 Local AI: recovery copy of the stored passwords
 Made 2026-10-08 14:05 on the PC that runs Local AI.
-Keep it offline: on paper, or on a stick that is not left plugged in. Not in a synced folder
-and not next to the backups. Nothing protects this text: whoever reads it can sign in to both
-programs below.
-A password changed after the time above is NOT on this copy. Make a new copy, destroy this one.
+Keep it offline: on paper, or on a stick that is not left plugged in. Not in a synced folder,
+not on a network drive and not on a drive that holds the backups. Nothing protects this text:
+whoever reads it can sign in to both programs below.
+A password changed after the time above is NOT on this copy. Make a new copy then and KEEP this
+one: write on it the day it was replaced. A backup made before that day signs in to Open WebUI
+with the password on this copy, not with the new one. Destroy this copy only when the new one
+holds both passwords and no backup from before that day is left that you would restore.
 
 OPEN WEBUI (the chat pages)
 Address, opened in a browser on that PC:
@@ -746,11 +899,27 @@ NOT ON THIS COPY
 Your Windows sign-in password. Your chats: they are in the Backups folder, which is not
 encrypted and which this copy neither replaces nor protects. The key file openwebui-secret.txt.
 
-TO USE IT (after a Windows password reset, a Windows reinstall, or on a new PC)
-Set-OpenWebUIPassword.ps1 -PromptCurrent -Prompt asks for the Open WebUI password above.
-Protect-LocalAISecrets.ps1 asks for the deep research password above (its paste switch).
-Test-LocalAI.ps1 then checks that both sign in.
+TO USE IT
+Delete nothing in the Secrets folder, whatever a message advises.
+The Windows password was reset and Open WebUI still runs with its chats:
+  Set-OpenWebUIPassword.ps1 -PromptCurrent -Prompt asks for the Open WebUI password above.
+  Protect-LocalAISecrets.ps1 asks for the deep research password above (its paste switch).
+  Test-LocalAI.ps1 then checks that both sign in.
+Windows was reinstalled, or this is a new disk or a new PC: the first command above cannot work
+yet, there is nothing to sign in to. In this order:
+  Install-LocalAI.ps1. It makes new logins: save the password it shows.
+  Restore-OpenWebUI.ps1 brings the chats back from a backup. A backup made before the time above
+  may need an older copy.
+  Then Set-OpenWebUIPassword.ps1 -PromptCurrent -Prompt, with the Open WebUI password above.
+  Restore-OpenWebUI.ps1 -DeepResearch brings the research back. Then Protect-LocalAISecrets.ps1
+  (its paste switch), with the deep research user name and password above.
+  Test-LocalAI.ps1 then checks that both sign in.
 ```
+
+The second half of "TO USE IT" is the short form of the two Recovery paths that have no running
+Open WebUI. It leaves out what does not fit on a page: the dates to hold against each other, the
+files to move out of Secrets, the way back after a restore made in vain. The README carries
+those (handed to the integrator, above), and one more line of the copy says where they are.
 
 The switch: `-RecoveryCopy <folder>` (working name), given alone. With any other switch the
 command stops with its usage line.
@@ -767,33 +936,91 @@ command stops with its usage line.
 - No default folder. Every default would be a place on this PC, and Desktop and Documents can
   lie inside the OneDrive folder (its folder backup: documented behaviour, not tested). Where
   plain passwords go is named by the owner, each time.
-- It never replaces a file. When a copy of the same day is already in the folder it stops and
-  says so. Why: a run on a day when one file cannot be opened must not wipe out an older copy
-  that is complete.
-- With a leftover pending file it stops and names `Test-LocalAI.ps1`, whose admin sign-in check
-  settles the change (`Resolve-LaiPendingPassword`). Why: until then the admin file may hold a
-  password that is no longer the one in use, and the copy would carry it.
+- It never replaces a file and never refuses because one is there. When the name of this minute
+  is taken, it puts `-2` before `.txt`, then `-3`, and so on, and writes beside what is there.
+  The file is made with a call that fails when the name exists (`[System.IO.FileMode]::CreateNew`;
+  documented behaviour, not tested), so the rule does not rest on a look taken a moment before.
+  Why never replace: a run on a day when one file cannot be opened must not wipe out an older
+  copy that is complete. Why never refuse: a refusal would make the owner delete the copy he
+  has in order to get the next one, and if that next run then stopped for any reason he would
+  hold none, with the admin file protected.
+- A leftover pending file does not stop it. A pending file means that a password change was cut
+  off and that it is not settled which of two admin passwords Open WebUI accepts: the stored one
+  or the one in the pending file. The copy then holds both, each on a line of its own and each
+  named, under a line in capitals that says so. The deep research part is written as always.
+  The copy and the command's closing lines name `Test-LocalAI.ps1`, whose admin sign-in check
+  settles the change when Open WebUI runs (`Resolve-LaiPendingPassword`), and a new copy after
+  it. Why not stop and send the owner to that check first: the check settles nothing while Open
+  WebUI does not answer (it is skipped then, and `Resolve-LaiPendingPassword` leaves the pending
+  file alone when it gets no answer; read at 1e9e510). A stop could then not be cleared on the
+  very day the copy is wanted most, with Docker down before a reinstall, and it would also hold
+  back the deep research password, which the pending file has nothing to do with. The pending
+  file is read through `Read-LaiSecretFile` and never changed. One that is cut off or holds no
+  password adds nothing to the copy: the change request is sent only after that file is complete
+  (the comment in `Resolve-LaiPendingPassword`), so the stored password is the one in use.
 - A file this account cannot open is left out. The command warns and names the file, and the
-  copy says in that place, in capitals, that this password is not on it and why (the reader's
-  message). The rest is written. When no password at all can be read, nothing is written: a copy
-  without a password is paper that only looks like safety.
+  copy says in that place, in capitals, that this password is not on it, why (the reader's
+  message), and to keep any older copy that holds it. The rest is written. When no password at
+  all can be read, nothing is written: a copy without a password is paper that only looks like
+  safety.
+- On the drive of `<AIRoot>` or of Windows it sets private permissions on the file before it
+  writes the passwords into it ("Its form"): the empty file is made, the permissions are set,
+  and only then the text is written into that file, in place.
 - It does not sign in anywhere. The copy holds what the files hold; `Test-LocalAI.ps1` is the
   check that those are the passwords in use, and the command's closing lines say so.
 
-Where it may not be written. The folder is made a full path, `/` becomes `\`, a trailing `\` is
-dropped, and the result is compared as text, by whole folder names, capitals ignored: is it this
-place, or does it lie below it? That is how `Get-PcsSyncVerdict` (Test-PCSecurity.ps1) compares,
-and it runs the same on both jobs. The judge is one function in the command's script that reads
-nothing itself: the folder, `<AIRoot>`, the mirror and the sync folders come in as parameters,
-and the reason for a refusal, or nothing, comes out. Refused, with a message that names the
-reason and with nothing written:
+Where it may not be written. Two parts: the command resolves the folder, the judge compares.
+
+The command resolves the folder once, against PowerShell's location, with
+`$ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath`. That call works on
+the text alone, opens nothing, and names the provider the path belongs to; any provider but the
+file system is refused. The one string it gives goes to the judge, then to the check that the
+folder exists, then to the write. No other form of the folder is used anywhere. Why this call
+and not `[System.IO.Path]::GetFullPath`, which the toolkit uses elsewhere (`Get-LaiReparsePath`):
+that one resolves a relative folder against the directory the process was started in, which
+`Set-Location` does not move, while `Test-Path` and `Set-Content` go by PowerShell's location
+(for those two cmdlets: documented behaviour, not tested).
+With `.` as the folder the judge would look at one folder and the write would go to another:
+into `<AIRoot>\Backups` unrefused, or onto the PC's disk although the owner had changed to the
+stick and believes the copy went there. (Seen in a one-line check outside the toolkit, Windows
+PowerShell 5.1, 2026-10-08: after `Set-Location` the first call followed the location and
+`GetFullPath` did not; a `\\<server>\<share>` text came back at once, still beginning with
+`\\`, also when a provider name stood in front of it; a drive letter that does not exist made
+the call fail. PowerShell 7 was not checked: the both-jobs test with a relative folder is its
+evidence.) A call that fails is the refusal of a folder that does not exist.
+
+The judge is one function in the command's script. It reads nothing and resolves nothing: the
+resolved folder, `<AIRoot>`, the mirror, the sync folders, the Public folder and the drive of
+Windows come in as parameters, and out comes the reason for a refusal, or else which closing
+lines apply. Why it must not resolve: on the Linux job a made-up `C:\Users\a\OneDrive - Org` is
+not a full path, a judge that resolved it would put the working directory in front, and no rule
+would match. It cleans every path the same way (`/` becomes `\`, a trailing `\` is dropped) and
+compares as text, by whole folder names, capitals ignored: is it this place, or does it lie
+below it? That is how `Get-PcsSyncVerdict` (Test-PCSecurity.ps1) compares, and it runs the same
+on both jobs. Refused, with a message that names the reason and with nothing written:
+- A network path: every folder whose cleaned text begins with `\\`. This rule comes first, and
+  the command asks the judge before it looks whether the folder exists. Why: a network place is
+  not offline, and merely asking whether such a folder exists makes Windows connect to that
+  server and offer it this account's sign-in (documented behaviour, not tested). The long form
+  of a local path (`\\?\C:\...`) is refused with it: the plain form is given instead. A share
+  that has a drive letter is not seen by this rule ("Not recognised").
 - `<AIRoot>` and everything below it: the install folder, Secrets and Backups in one rule. Why:
   a copy there is lost together with what it is for, it lies next to the chats, and it travels
   with every copy of `<AIRoot>`, the very copy protection is meant to make useless.
 - The folder that `BackupMirror` in localai-config.json names, when one is set, and everything
-  below it (`Backup-OpenWebUI.ps1` reads the same key). Why: the archives go there. With the
-  copy beside them one find gives the chats and both logins, and a mirror is by its purpose a
-  place that other copies are made of.
+  below it (`Backup-OpenWebUI.ps1` reads the same key). And every other folder on the drive of
+  that mirror, compared by the drive letter, unless that drive is the drive of `<AIRoot>` or of
+  Windows: there the closing lines for a disk of this PC apply instead. Why: the archives go
+  there. With the copy beside them, or anywhere else on the same stick or disk, one find gives
+  the chats and both logins, and a mirror is by its purpose a place that other copies are made
+  of. The toolkit's own example of a mirror is a folder on a second drive (the help of
+  Backup-OpenWebUI.ps1), and the root of that drive is where a copy would be put first. Why
+  refused and not only warned of: a file once written to a drive is not gone when it is deleted
+  (below), so a warning after the write comes too late. A mirror without a drive letter (a
+  network path) has no drive for this rule.
+- The Public folder and everything below it: the folder in the environment variable `PUBLIC`,
+  and as text `<drive>:\Users\Public`. Why: it is the one folder that is there to be read by
+  every account of the PC (documented behaviour, not tested).
 - The OneDrive folders of this account and everything below them: the folders in the environment
   variables `OneDrive`, `OneDriveConsumer` and `OneDriveCommercial`, the same three that
   `Get-PcsSyncClient` (Test-PCSecurity.ps1) reads. That function lives in a script and not in
@@ -806,15 +1033,23 @@ reason and with nothing written:
   variables, and whose they are in such a window, is what the comments in Test-PCSecurity.ps1
   say: documented behaviour, not tested.)
 
+For a folder it does not refuse, the judge says which closing lines apply:
+- On the drive of `<AIRoot>` or of Windows: this is a disk of this PC; the file has private
+  permissions ("Its form"); move it to a stick or print it, then delete it here, and know that a
+  deleted file can be read from a disk until it is overwritten (documented behaviour of file
+  systems, not tested).
+- On any other drive: nothing protects the file there, and while that drive is connected the
+  other accounts of this PC may be able to read it (documented behaviour, not tested).
+
 Not recognised, so the command's help, its closing lines and the first lines of the copy say it
 and the owner checks it himself: any other sync program (Dropbox, Google Drive, iCloud Drive and
-the like), a network share or a mapped drive, a folder that some backup program copies, and a
-link that leads into a refused place (the comparison is text). The command also does not go by
-whether the drive calls itself removable: that does not settle it (some USB drives report as
-fixed disks: documented behaviour, not tested). When the folder is on the drive of `<AIRoot>` or
-of Windows, the closing lines add: this is a disk of this PC; move the file to a stick or print
-it, then delete it here, and know that a deleted file can be read from a disk until it is
-overwritten (documented behaviour of file systems, not tested).
+the like), a network share behind a drive letter, a folder that some backup program copies, and
+a link that leads into a refused place (the comparison is text). The same goes for a mirror
+that can be reached under two names: a second drive letter on the same stick or disk, or a
+mirror named as a network path while the same place is given by a drive letter. The rule for
+the mirror's drive compares letters and sees neither. The command also does not go by whether
+the drive calls itself removable: that does not settle it (some USB drives report as fixed
+disks: documented behaviour, not tested).
 
 Confirmed, and only then protected. A file is protected only after the owner confirmed the copy
 for that file, and "confirmed" means one thing: at the prompt of the protect switch he typed or
@@ -832,12 +1067,37 @@ place to read from.
   a later protect that trusted it would skip the one check there is. So every protect asks
   again, and the only trace is the file itself: it is protected because the typed text matched.
 
-How it goes out of date. Only a password change does it, and the change says so.
-- After every change that went through, `Set-OpenWebUIPassword.ps1` says that a recovery copy
-  made before now holds the old password, and names `Protect-LocalAISecrets.ps1 -RecoveryCopy
-  <folder>` and destroying the old copy. Over a protected file the sentence is firm (a copy was
-  confirmed for it); over a plain file it begins "If you keep a recovery copy". Why both: no
-  record of copies is kept, and a copy can exist beside a plain file.
+How it goes out of date. Whenever the stored admin password becomes another one. The toolkit
+says so in the places where it makes or stores that change; where nobody reads what it says, and
+where the toolkit is not there at all, is listed under "Not closed".
+- One sentence, the same in every place: a recovery copy made before now holds the old password;
+  make a new one (`Protect-LocalAISecrets.ps1 -RecoveryCopy <folder>`) and keep the old one,
+  with today written on it, until no backup from before today is left that you would restore.
+  Over a protected file the sentence is firm (a copy was confirmed for it); over a plain file it
+  begins "If you keep a recovery copy". Why both: no record of copies is kept, and a copy can
+  exist beside a plain file.
+- The places (read at 1e9e510). The three ends of `Set-OpenWebUIPassword.ps1` at which the
+  password may be a new one: a change that went through, a save that failed after the change,
+  and a change request that failed, where the sentence stands under "if the change went through
+  anyway" ("`Set-OpenWebUIPassword.ps1` in step 3"). After the last two a pending file is
+  there, so a copy made at once carries both passwords ("The switch"). The promotion in
+  `Resolve-LaiPendingPassword`, which moves a pending password into the admin file: the
+  sentence is added to its log line, and the words `had gone through` stay in that line
+  (tests/Invoke-UpdateWebUITest.ps1 matches them). And the installer's two saves of a login the
+  owner typed in because the stored one was refused: `Save-AdminCredential` after the refused
+  sign-in in the Configure stage, and the write in the early sign-in check. The owner is at the
+  window there; he has just typed.
+- A replaced copy is kept, not destroyed. Every backup made before a change holds the admin
+  password of its day: `Restore-OpenWebUI.ps1` says so when its sign-in after a restore is
+  refused, and Recovery pairs a backup with a copy by date. The replaced copy is the only place
+  that password is written. So the day goes on it, it stays with the new one, and it is
+  destroyed only when both are true: the new copy holds both passwords, and no backup from
+  before that day is left that the owner would restore. The Open WebUI archives are kept 14 days
+  unless `BackupRetentionDays` says otherwise, in Backups and on the mirror alike. Some stay
+  longer: the three newest nightly ones whatever their age, and the last backup of an uninstall
+  (the prune in Backup-OpenWebUI.ps1, read at 1e9e510). The cost: the replaced copy still holds the
+  deep research password, which never goes out of date, so until then two copies have to be
+  kept safe (question 10).
 - A protected file stays protected through a change (form Keep, step 1), although the copy that
   was confirmed for it is now out of date (question 8). Why: otherwise the everyday act of
   changing a password would switch protection off. The price is a window, from the change to the
@@ -848,9 +1108,21 @@ How it goes out of date. Only a password change does it, and the change says so.
 - The deep research password has no such moment: the toolkit cannot change it ("Does not add").
   Its line on the copy goes out of date only when that account is made anew ("start over"), or
   when the password is changed in Local Deep Research itself, should that program be able to.
-- Not closed by this plan: a password changed on Open WebUI's own settings page says nothing,
-  because the toolkit is not there. File and copy are then both out of date, and the installer
-  asks for the current login at its next run.
+- Not closed by this plan, in three places:
+  - A password changed on Open WebUI's own settings page says nothing, because the toolkit is
+    not there. File and copy are then both out of date. The installer asks for the current login
+    at its next run and says the sentence then, which can be months later.
+  - A promotion that nobody reads. `Resolve-LaiPendingPassword` is also called by
+    `Test-LocalAI.ps1`, `Restore-OpenWebUI.ps1`, the installer and `Update-Models.ps1` (in its
+    `Hide-InWebUI`), and its line goes wherever that run's output goes. Whether a run that
+    Windows starts by itself, with no window, reaches the call was not read for this plan:
+    assume it can. The sentence is then in a log at best, and the new password is in the
+    protected file only, never shown if it was a random one. What is left to the owner: after a
+    password change that ended with exit code 1, make a copy at once (with the pending file
+    there it carries both passwords), run `Test-LocalAI.ps1`, and make a new copy. The two
+    messages of the password script that end with exit code 1 name the copy for that reason.
+  - A login the installer makes anew because there was no admin file is shown once at the end
+    of that run, without the sentence. The Recovery paths that lead there end with a new copy.
 
 What a finder of the copy gets: both logins in plain text, with the names and the addresses
 that go with them.
@@ -859,14 +1131,22 @@ that go with them.
   Enable-TailscaleAccess.ps1; what that opens was not read for this plan. So the finder also has
   to sit at this PC in a signed-in session, run a program on it, or be on that private network.
 - With that: the sign-in of the Open WebUI administrator. What an administrator can see there
-  was not read for this plan; assume every user's chats and every setting. And the deep research
-  sign-in, with the means to open the saved research and every `deep-research-*.tar.gz` he gets
-  hold of.
+  was not read for this plan; assume every user's chats and every setting. And code of his own,
+  run inside the Open WebUI container: tools are Python that an administrator installs. The
+  toolkit installs its own that way with the administrator's sign-in (`Set-LaiWebUITool`), and
+  stack/docker-compose.yml notes that the container installs the requirements of tools with
+  pip. What such code reaches from inside the container was not read for this plan. And the
+  deep research sign-in, with the means to open the saved research and every
+  `deep-research-*.tar.gz` he gets hold of.
 - Not: the Windows sign-in, the signing key, or anything on a PC he cannot reach.
 - When a copy is lost: change the admin password (`Set-OpenWebUIPassword.ps1 -Prompt`) and make
-  a new copy; the lost one is then worth nothing for Open WebUI. For deep research the lost copy
-  stays good: the toolkit cannot change that password, and the only end this plan knows is to
-  start over, which deletes the saved research.
+  a new copy. The lost one then opens no new sign-in to Open WebUI, and the change signs out the
+  sessions that exist (the help of the password script). It does not undo what a finder did
+  while the password worked: a user he added, a tool he installed, a setting he changed are all
+  still there. So after a loss the users and the tools are looked through as well. What else an
+  administrator can leave behind there was not read for this plan. For deep research the lost
+  copy stays good: the toolkit cannot change that password, and the only end this plan knows is
+  to start over, which deletes the saved research.
 
 What the copy does not cover: the chats in Backups. It holds no chat and no research, so it
 brings nothing back when the archives are lost. And it adds nothing to their safety: the
@@ -879,7 +1159,10 @@ the settings, `.env` or the signing key either.
 The order that needs one copy only: change the admin password (`Set-OpenWebUIPassword.ps1
 -Prompt`), make the copy, protect. Every earlier copy of the admin file then holds a password
 that no longer works. The protect switch prints its closing line all the same: it cannot know
-how old the password is (`rotated` is missing in a file the installer wrote).
+how old the password is (`rotated` is missing in a file the installer wrote). The price of this
+order: the backups made before that change sign in with the old password, and it is on no
+recovery copy. Whoever wants to be able to restore one of them makes a copy before the change as
+well, and keeps it as a replaced copy is kept.
 
 Tests: [W] plain to protected to plain gives the same fields back; the listing names each of the
 three states (changed blob for the third); deep research is refused without a matching paste and
@@ -890,10 +1173,11 @@ cannot be opened changes nothing and says so. Both jobs:
 an installer run leaves a plain file plain. A static rule with canaries: no `Set-Content` to
 openwebui-admin.json or deep-research.json outside `Save-LaiSecretFile`.
 
-Tests for the recovery copy and the two messages. None can pass before step 3: the command, its
-switch and both sentences do not exist. Both jobs, with plain files:
+Tests for the recovery copy and the messages. None can pass before step 3: the command, its
+switch and the sentence about the copy do not exist. Both jobs, with plain files:
 - the copy holds the address, e-mail and password of the admin file and the address, user name
-  and password of the deep research file, and its name and its first lines carry the day;
+  and password of the deep research file, and its name and its first lines carry the day and
+  the time;
 - the key in openwebui-secret.txt appears nowhere in the copy;
 - every file under `<AIRoot>` has the same bytes after the run and none was added;
 - what the command prints holds neither password;
@@ -901,32 +1185,87 @@ switch and both sentences do not exist. Both jobs, with plain files:
   no `LocalAI-recovery-*` file in it: `<AIRoot>` itself, Secrets, Backups, the folder
   `BackupMirror` names and a folder below that one; a folder that does not exist is refused and
   is not made;
-- the judge on made-up paths, no file touched: a OneDrive folder and a folder below it are
-  refused; a folder beside it whose name only starts the same (`OneDriveArchive`) is not;
-  `OneDrive - <organisation>` under another profile is;
-- a second copy on the same day says so and leaves the first byte for byte;
-- a leftover pending file refuses the copy and the message names `Test-LocalAI.ps1`;
+- a relative folder goes by PowerShell's location. The child is started in an accepted folder,
+  and its client script sets the location to `<AIRoot>\Backups` and gives `.`: refused, and no
+  `LocalAI-recovery-*` file in either folder. Then the location is a second accepted folder and
+  `.` is given: the copy is in that folder and not in the one the child was started in. (A
+  command that resolved with `GetFullPath` judges the folder the child was started in: it
+  accepts in the first case and writes a file into one of the two folders.)
+- the three OneDrive variables reach the judge. For each of `OneDrive`, `OneDriveConsumer` and
+  `OneDriveCommercial` in turn, the test sets that one for the child to a temp folder
+  (`Set-LaiProcessEnv`, put back afterwards), removes the other two, and gives a folder below
+  it: an exit code that is not 0, the reason named, no `LocalAI-recovery-*` file. With none of
+  the three set, the same folder is accepted. (A command that read one variable only, or handed
+  the folders to the wrong parameter of the judge, passes every test of the judge and fails
+  here.) The same once for `PUBLIC`;
+- the judge on made-up paths, no file touched:
+  - a OneDrive folder and a folder below it are refused; a folder beside it whose name only
+    starts the same (`OneDriveArchive`) is not; `OneDrive - <organisation>` under another
+    profile is;
+  - `\\<server>\<share>`, a folder below it, the same written with `/`, and
+    `\\?\UNC\<server>\<share>` are refused as a network path;
+  - with the mirror at `E:\LocalAI-Backups` and `<AIRoot>` and Windows on `C:`: `E:\` and
+    `E:\Other` are refused for the mirror's drive, `F:\Other` is not. With `<AIRoot>` on `E:` as
+    well, `E:\Other` is not refused and gets the lines for a disk of this PC;
+  - `C:\Users\Public` and a folder below it are refused; `C:\Users\Publicity` is not;
+  - a folder on the drive of `<AIRoot>` or of Windows gets the lines for a disk of this PC, a
+    folder on another drive the line about other accounts;
+- two runs one after the other give two files, and the first is byte for byte what it was;
+- with files of this minute's and of the next minute's name already in the folder (the test
+  writes both, so a minute that turns over in between does not matter), the command writes a
+  third whose name ends in `-2.txt` and leaves the two byte for byte;
+- a leftover pending file does not stop the copy: the exit code is 0, the copy holds the stored
+  admin password and the pending one, says that a password change was cut off, and holds the
+  deep research values; what the command prints names `Test-LocalAI.ps1`; the pending file is
+  byte for byte what it was;
+- a pending file that is cut off adds no password to the copy and is still there afterwards;
 - without deep-research.json the copy says deep research is not installed and still holds the
   admin values;
-- a password change over a plain file names `-RecoveryCopy` (the harness of test 24).
+- the paste switch with no deep-research.json writes a plain file with the given user name and
+  password and the address built from `DeepResearchPort`; with a plain file that holds another
+  password it writes nothing, says so, and the file is byte for byte what it was;
+- a password change over a plain file names `-RecoveryCopy` (the harness of test 24);
+- a change request that fails (the reply to it is a 500) ends with exit code 1, leaves the
+  pending file and names `-RecoveryCopy`;
+- a promoted pending password names `-RecoveryCopy` and still says `had gone through` (the
+  harness of test 22; its client also writes everything the call prints, `*>&1`, into the
+  result file).
 
 [W]:
 - the copy made from protected files holds the same four values as the one made from plain ones;
 - with a changed blob in the admin file the command names that file, the copy says in that place
-  that the password is not on it, and the deep research values are there;
+  that the password is not on it and to keep any older copy that holds it, and the deep
+  research values are there; the same with the changed blob in the deep research file;
 - with a changed blob in both files nothing is written;
+- a copy written to a folder on the drive of `<AIRoot>` has permissions for this account, SYSTEM
+  and Administrators and for nobody else (read the way the `=== private ACLs` section reads
+  them), and the closing lines say so;
+- a made-up network path (`\\<a name that does not exist>\<share>`) is refused as a network
+  path and not as a folder that does not exist: the judge is asked before the folder is looked
+  for;
 - a password change over a protected file names `-RecoveryCopy` and leaves the file protected
   (the harness of tests 25 to 28);
+- a promoted pending password over a protected file names `-RecoveryCopy` and leaves the file
+  protected (the harness of test 23);
 - what the protect switch prints names `Set-OpenWebUIPassword.ps1 -Prompt` for the admin file,
   and for deep research says that the toolkit cannot change that password;
-- a save that fails after the change went through names the pending file and no longer says
-  "copy it over"; the pending file still holds the new password and the admin file is byte for
-  byte what it was. The test makes the save fail by setting the admin file read-only; that
-  `Set-Content` then fails under Windows PowerShell 5.1 is documented behaviour, not tested.
+- a save that fails after the change went through names the pending file and `-RecoveryCopy`
+  and no longer says "copy it over"; the pending file still holds the new password and the
+  admin file is byte for byte what it was. The test makes the save fail by setting the admin
+  file read-only; that `Set-Content` then fails under Windows PowerShell 5.1 is documented
+  behaviour, not tested.
 
-Not tested: the command's own reading of the three OneDrive variables (the Windows job may have
-none of them set; the judge behind it is tested on made-up paths), and everything the owner does
-with the copy afterwards. Say both in tests/README.md. The judge is taken out of the command's
+The installer's two sentences need an assertion as well. No test at 1e9e510 matches the words of
+either prompt (searched in tests/), so whether the installer mock run reaches one of them is not
+known here. Step 3 finds out and asserts there, or reports the two sentences as untested; a
+search for the words in the source is not a test of them.
+
+Not tested: what OneDrive itself does (that it keeps its folders in the three variables and
+uploads what lies in them); a write to a drive other than the one the job runs on, and that no
+permissions are set there (the judge decides it from made-up paths); that Windows offers a
+sign-in to a network path, the reason for that rule; that other accounts can read a folder under
+a drive root, the reason for the permissions; and everything the owner does with the copy
+afterwards. Say so in tests/README.md. The judge is taken out of the command's
 script by its name, the way the suite already takes single functions out of the installer (the
 `ParseFile` and `FunctionDefinitionAst` lines of tests/Invoke-WindowsUnitTests.ps1 at 1e9e510).
 Static rule DOCPARAM reads every script message: a message that names the switch gives it its
