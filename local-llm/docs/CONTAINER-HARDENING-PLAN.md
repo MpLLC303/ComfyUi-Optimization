@@ -70,9 +70,10 @@ Every service: `cap_drop: [ALL]`, `security_opt: ["no-new-privileges:true"]`, a 
     does not bound what a request costs to parse: one long text holding a character beyond
     U+FFFF costs 9 to 12 times its size, and millions of empty lists or objects cost more than
     20 times. No chat with pictures looks like that, but a program in one of the stack's
-    containers (the guard has no port on the host) can send one below the cap. Also: a setting
-    that is not a number stops the guard at its start, and 0 or less makes it refuse every chat.
-    See "Still to do".
+    containers (the guard has no port on the host) can send one below the cap. See "Still to do"
+    for both. A setting that is no whole number above 0 counts as 256, with a line in the guard's
+    log at its start (until batch 6 a value that was no number stopped the guard at its start,
+    and 0 or less made it refuse every chat).
   - It runs from the SearXNG image, so it would carry that image's volumes too, if the image
     declares any. The compose file mounts nothing over them for the guard: the smoke test checks
     instead that the guard's user (65534) can write nowhere outside /dev.
@@ -159,9 +160,11 @@ matches it with a regex.
 
 ## Still to do
 - **What the render guard's size cap does not cover** (`stack/render-guard/render_guard.py`; the cap
-  itself and the pass-through for other bodies are in): several large chats at the same moment,
-  a request that is expensive to parse, and a setting that is 0, less, or not a number. They are
-  rows 100, 101 and 103 of `IMPROVEMENTS.md`.
+  itself and the pass-through for other bodies are in): several large chats at the same moment
+  and a request that is expensive to parse. They are rows 101 and 100 of `IMPROVEMENTS.md`; row
+  101 is closed without a change by the owner's decision, so the first of the two stays as it
+  is. A setting that is 0, less, or not a number is no longer on this list: it counts as 256
+  since batch 6 (row 103 (2)).
 - **By hand on a real install** (the smoke test has no browser and no model): upload a document
   (embedding and reranking), run a web search from a chat, save the skill notebook tool (that path
   runs pip install), and run one deep research report, all with the hardening on.

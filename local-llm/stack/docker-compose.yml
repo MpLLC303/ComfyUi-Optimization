@@ -130,8 +130,8 @@ services:
       RENDER_GUARD_MODE: ${RENDER_GUARD_MODE:-cpu}
       FREE_COMFYUI_WHEN_IDLE: ${FREE_COMFYUI_WHEN_IDLE:-1}
       # Largest chat or generate request the guard takes, in MiB (see the memory limit above). A
-      # whole number above 0: a value that is not a number stops the guard at its start, and 0 or
-      # less makes it refuse every chat.
+      # whole number above 0: any other value counts as 256, and the guard says so in its log at
+      # its start.
       RENDER_GUARD_MAX_BODY_MIB: ${RENDER_GUARD_MAX_BODY_MIB:-256}
     healthcheck:
       test: ["CMD", "python3", "-c", "import urllib.request;urllib.request.urlopen('http://127.0.0.1:11434/render-guard/status',timeout=5)"]

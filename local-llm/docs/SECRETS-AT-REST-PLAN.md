@@ -1,4 +1,4 @@
-# Secrets at rest under Windows DPAPI (security track item 4): a plan, nothing built yet
+# Secrets at rest under Windows DPAPI (security track item 4): step 1 is built, steps 2 and 3 are a plan
 
 Status (2026-10-07): plan only. No code has changed and nothing here has been run. What it says
 about the toolkit was read from the code at commit ea191d1 and carries a function name and a line
@@ -15,9 +15,20 @@ Nothing of the toolkit was run for them. Three statements come from one-line che
 toolkit, under Windows PowerShell 5.1, and say so: two about `ConvertFrom-Json` under step 1 and
 one about how a folder name is resolved under step 3.
 
+Added 2026-10-08 with the merge of batch 6: step 1 is built. That is the four functions in
+lib/LocalAI.psm1, `Set-OpenWebUIPassword.ps1` reading and saving through them, and the section
+`secret files: plain and protected form` of tests/Invoke-WindowsUnitTests.ps1. No file on a PC
+changes form by it: nothing in the toolkit passes `-Form Protected` yet, only the tests do. Steps
+2 and 3 are still a plan. Nothing of step 1 had run when this was written: the first CI run of
+that merge is the first run of its tests, and the Windows job is the first run of DPAPI. The text
+of step 1 below is kept as what the step was built from. Where the build differs from it, "Step
+1 as built" at the end of that step says so, and there the build counts.
+
 Today every secret is plain text and only folder permissions protect it: `Set-LaiPrivateAcl`
 (lib/LocalAI.psm1:335) through `Protect-Path` (Install-LocalAI.ps1:483) leaves the installing
-account, SYSTEM and Administrators.
+account, SYSTEM and Administrators. Since step 1 it also takes out an entry any other account was
+given by name on the file or folder it is handed, and makes Administrators the owner where
+another account owned it; each is logged ("Step 1 as built", point 10).
 
 ## What DPAPI adds and what it does not
 DPAPI (.NET class `ProtectedData`, scope CurrentUser) encrypts a value with a key Windows keeps
@@ -329,8 +340,9 @@ passwords to keep offline. The copy is designed under step 3, "The recovery copy
 its form, the switch that makes it, where it may not be written, and that a file is protected
 only after its password was typed back from the copy. Questions 2 and 4 are rewritten around it
 and 7 to 10 are new. Each of those six carries a recommended answer, and step 3 is built to the
-recommended answers unless he says otherwise. Nothing is built. Whether he wants protection
-switched on at all (question 1) and questions 3, 5 and 6 are open as written.
+recommended answers unless he says otherwise. Of the three build steps only step 1 is built, and
+it protects no file on a PC, so every question below is still his to answer. Whether he wants
+protection switched on at all (question 1) and questions 3, 5 and 6 are open as written.
 
 1. Do you want this? It protects the text of the stored admin password when a copy of that one
    file leaves this PC (a backup, a synced folder, a disk taken out). It does not protect against
@@ -422,6 +434,9 @@ write the protected form. Hand to the integrator, both for the merge of the step
   .github/workflows/local-llm-linux.yml, and the count in the comment above that list (line 60:
   twenty-three becomes twenty-four). The Linux job of the step 1 branch is red until then (Skips, above).
 
+Both were done in the merge of batch 6: the line is the first of the list, and the comment says
+twenty-four.
+
 Four functions, inserted after `New-LaiPassword` (lib/LocalAI.psm1:384-393):
 - `Protect-LaiSecretText -Text <string>` returns the Base64 text. Off Windows it throws M1. When
   Windows cannot protect it throws M6. It never returns nothing or an empty text.
@@ -434,12 +449,18 @@ Four functions, inserted after `New-LaiPassword` (lib/LocalAI.psm1:384-393):
   failure throws `Cannot read the password in <Path>: ` followed by M1, M2 or M6. Any other
   `protected` value: throws M3, checked before anything else, on every system. `-NoPassword`
   never opens anything: a protected file comes back with `password` set to ''.
+  As built, two refusals come before all of this (the build counts, "Step 1 as built"): text
+  that is not one JSON object throws M7, with `-NoPassword` too; and a plain file is returned as
+  it is only when it holds a non-empty `password`. Without one it throws M8, and only
+  `-NoPassword` returns it as it is.
 - `Save-LaiSecretFile -Path <string> -Value <hashtable or object> [-Form Keep|Plain|Protected]`,
   default Keep. In this order:
   1. No non-empty `password` in `-Value`: throws M5.
   2. The form. Keep looks only at the marker of the file that is there and opens nothing:
      `dpapi-user-1` gives Protected; no `protected` field, no file, or text that is not JSON gives
-     Plain; any other marker throws M3.
+     Plain; any other marker throws M3. (As built, M3 is thrown for such a marker whatever
+     `-Form` says, `-Form Plain` included: a file in a form this version does not know is left
+     alone.)
   3. The whole new text, in memory: every field of `-Value` except `password`, `protected` and
      `passwordProtected`, then `password` (Plain) or the two protected fields (Protected).
      `Protect-LaiSecretText` is called here; a failure throws `Cannot store the password in
@@ -462,6 +483,12 @@ Messages (the tests match parts of them):
 - M5 `Nothing to store in <Path>: the value has no password.`
 - M6 `Windows data protection did not work in this session (<reason>).` The reason is what
   Windows said, or `no result`.
+- M7 `<Path> is empty or was cut off: it holds no stored password.` (As built; the addition of
+  2026-10-08 below says when.)
+- M8 `<Path> holds no password.` When the file has a `passwordProtected` value and no `protected`
+  field, this follows: ` It has a 'passwordProtected' value, but not the 'protected' field that
+  says in which form.` (As built, and not in the text step 1 was built from: a plain file whose
+  `password` is empty, null or not there.)
 
 The core of the two text functions (a sketch, not run anywhere). Every .NET call and the
 `Add-Type` sit in a try that throws (trap 2):
@@ -499,9 +526,13 @@ Three call sites:
    try. In the catch: with `-PromptCurrent` or `-CurrentPassword` given, read again with
    `-NoPassword` (the owner is supplying the live password; only the e-mail is needed);
    otherwise throw the same message plus ` If you know the password Open WebUI accepts now, run
-   this again with -PromptCurrent.`
+   this again with -PromptCurrent.` As built, that sentence is added only where the switch gets
+   the owner on: a value that cannot be opened, a marker without its value (M4) and a plain file
+   without a password (M8). M3 and M7 are passed on without it ("Step 1 as built", point 6).
 3. Set-OpenWebUIPassword.ps1:82 (script body). `Save-LaiSecretFile -Path $credFile -Value $updated`
-   inside the existing try. Line 71 stays: the pending file is always plain.
+   inside the existing try. Line 71 stays: the pending file is always plain. As built, the catch
+   around the save prints a password only when the script made it and `-Quiet` was not given; one
+   the owner gave is never printed back ("Step 1 as built", point 7).
 
 Tests: a new section `=== secret files: plain and protected form ===` after
 Invoke-WindowsUnitTests.ps1:170, before the `=== private ACLs` header. [W] = inside
@@ -574,20 +605,23 @@ above as it stands plus these two:
 - M7: the reader refuses an empty or cut-off file with a message of its own. `Read-LaiSecretFile`
   throws M7 when the file is empty or when its text is not JSON (cut off while it was written),
   on every system and before it looks for a marker: such a file has none. M7 names the file and
-  says that it is empty or cut off. Its wording is the one step 1 is built with; this plan does
-  not fix it, and test 32 matches a part of it. Why: the text above promises a refusal only when
+  says that it is empty or cut off. Its wording is the one step 1 was built with, which is now
+  in the Messages list above, and test 32 matches a part of it. Why: the text above promises a refusal only when
   a protected value cannot be opened. Read with the old line, an empty file gives nothing and no
   error, and the caller that then asks for `.password` holds an empty one, which the reader must
   never hand out (Diagnostics redaction). A cut-off file ends in the error of `ConvertFrom-Json`,
   which names no file and repeats the text it could not read; in this file that text can be part
   of the password. (Both under Windows PowerShell 5.1, not tested in CI: seen in a one-line check
   on 2026-10-08.) So M7 does not carry that error's text. This last sentence is not in what
-  step 1 is built from: hold the reader as built against it.
+  step 1 is built from: hold the reader as built against it. Held against it at the merge of
+  batch 6: the reader as built judges the text itself, and M7 is the file's name and one fixed
+  sentence, with nothing of the file's content and nothing of that error.
 
   Three more points are not in what step 1 is built from either. Hold the reader, the password
   script and test 32 as built against them. Whatever is missing is built before step 2 switches
   its first reader, and step 2 takes `lib/LocalAI.psm1` and `Set-OpenWebUIPassword.ps1` into its
-  files for that:
+  files for that. What the merge of batch 6 found is said after each point, and once more in
+  "Step 1 as built":
   - M7 is thrown whenever the parsed text is not one JSON object, not only when the file is
     empty or does not parse. White space alone and the text `null` parse to nothing without an
     error, and `[]`, a quoted text and a number parse to something that has no `password`
@@ -598,8 +632,13 @@ above as it stands plus these two:
     is: a JSON object with neither a marker nor a `password` is a plain file for the reader and
     is returned as it is (the text above), so step 2 says per reader what an object without a
     password means there.
+    As built: M7 is thrown for each of these; the reader takes only text that begins an object
+    and parses to one. The "Left as it is" sentence is settled the other way, by the build: an
+    object with no marker and no non-empty `password` is refused with M8 and is returned as it
+    is only under `-NoPassword`. So no reader of step 2 is handed an object without a password,
+    and none has to say what that would mean.
   - M7 is thrown with `-NoPassword` too. That switch means "do not open the value". It does not
-    mean "take a file with nothing in it", and there is no e-mail to hand back.
+    mean "take a file with nothing in it", and there is no e-mail to hand back. As built: yes.
   - Call site 2 passes M7 on as it is: without the `-PromptCurrent` sentence, and without the
     second read. The text of call site 2 adds that sentence to any failure of the reader, and
     with `-PromptCurrent` it reads again with `-NoPassword`. For M7 that advice leads only back
@@ -612,6 +651,11 @@ above as it stands plus these two:
     it cannot open, and the Diagnostics catch reads again with `-NoPassword`. For M7 the stop
     message names the move instead, and the second Diagnostics read sits in a try of its own:
     there is no e-mail to blank out, and the file is listed as unreadable as before.
+    As built, in part: the `-PromptCurrent` sentence is withheld for M7. The second read is
+    still made when `-PromptCurrent` or `-CurrentPassword` is given; it ends in M7 once more,
+    so the script stops there as well, and nothing is signed in with. But M7's words do not
+    name the move out of Secrets. Taking the second read out for M7 and naming the move are
+    step 2's to build.
 
   Test 32 then covers an empty file, a cut-off file, a file of white space only and the text
   `null`, each read with and without `-NoPassword`, and each refused with M7. One more assertion,
@@ -619,6 +663,11 @@ above as it stands plus these two:
   an exit code that is not 0, says M7's words, does not name `-PromptCurrent`, and leaves the
   file empty. Without the three points the white space file is not refused at all, and the
   script's message names `-PromptCurrent`.
+  As built, the tests cover less than this: test 32 reads an empty file, a cut-off file and a
+  JSON list, and the empty file once more with `-NoPassword`. A file of white space only, the
+  text `null`, a quoted text and a number are refused by the reader's code and by no test, and
+  the assertion over an empty admin file in the harness of test 24 is not built. Both are step
+  2's to add (IMPROVEMENTS.md has the row).
 - Three refusals are asserted on both jobs. "A save that fails stops before the file is touched"
   is proved above through M1, on the Linux job only (29-31), while the loss it prevents, a
   pending file removed although the new password is not on disk, can only happen on Windows,
@@ -632,10 +681,16 @@ above as it stands plus these two:
 Four tests for them, no mark (both jobs), after 31 in the same section; no new skip message. The
 marker no version knows is hand-written, for example `not-a-known-form`.
 
-32. `an empty file and a cut-off file are refused with a message of their own`
-33. `saving with no -Form over a marker this version does not know is refused and leaves the file byte for byte`
-34. `a pending password stays in the pending file when the admin file has a marker this version does not know, and the admin file is unchanged`
-35. `a file marked protected that holds no protected password is refused with a message of its own`
+The names below are the built ones (the plan's own wording differed in 32, 33 and 35). As built,
+all four run on both jobs and print no skip. Their place differs from "after 31": 32, 33 and 35
+stand with the other both-jobs assertions on the reader and the save, before the two writers are
+started in child processes, and 34 stands right after 22. The hand-written marker is
+`dpapi-user-9`.
+
+32. `a secret file that is empty, was cut off or holds no JSON object is refused with a message of its own, with -NoPassword too`
+33. `a save over a file with a marker this version does not know is refused, with -Form Plain too, and leaves it byte for byte`
+34. `a pending password stays in the pending file when the admin file has a marker this version does not know, and the admin file is unchanged (got '<result>', sign-ins: <n>)`
+35. `a file marked as protected without its value is refused with a message of its own, on every system`
 
 32, 33 and 35 are refusals as trap 11 means it: each matches part of its message (M7, M3, M4),
 never only that something was thrown. 34 uses the harness of 31, with the admin file carrying the
@@ -688,11 +743,91 @@ Traps:
     something was thrown. A call to a function that does not exist throws too, and a try in the
     test also catches a .NET error that the function itself let through (trap 2).
 
+#### Step 1 as built (merge of batch 6, 2026-10-08)
+Read from the merged code, not run: the first CI run of the merge is the first run of the
+section's tests. The functions are in lib/LocalAI.psm1 after `New-LaiPassword`; find them by
+name. Where a point below differs from the text of step 1 above, the build counts, and steps 2
+and 3 are cut from the build.
+
+1. A plain file without a password is refused. `Read-LaiSecretFile` returns a plain file as it
+   is only when it holds a non-empty `password`. With the field empty, null or not there it
+   throws M8, and when the file has a `passwordProtected` value without the `protected` field
+   (the marker lost in an edit by hand) M8 says that too. Under `-NoPassword` such a file is
+   returned as it is: that caller asks for the e-mail. The text of step 1 returned every plain
+   file as it is, and the addition of 2026-10-08 said so once more ("Left as it is", in the M7
+   block). Here plan and build said opposite things, and it is settled for the build.
+2. M7 is thrown whenever the text is not one JSON object: an empty file, a cut-off one, white
+   space only, `null`, a list, a quoted text, a number. With `-NoPassword` too. It carries the
+   file's name and one fixed sentence, nothing of the file's content and nothing of
+   `ConvertFrom-Json`'s error. M4 is checked before anything is opened, so before the M1 guard.
+3. M3 on a save applies in every `-Form`. A file whose marker this version does not know is left
+   byte for byte, also under `-Form Plain`.
+4. Trap 8 is incomplete. `-ErrorAction Stop` on a cmdlet does not stop a function when a
+   statement ends in an error of its own (a missing drive, a parameter that does not bind; tried
+   by the builder under Windows PowerShell 5.1, not in CI). Both file functions therefore set
+   `$ErrorActionPreference = 'Stop'` for themselves. The code of steps 2 and 3 needs the same
+   wherever a function in the module must not run past a failed statement.
+5. The DPAPI type is reached by its name (`'System.Security.Cryptography.ProtectedData' -as
+   [type]`, after `Add-Type -AssemblyName System.Security`), and the scope is handed over as the
+   text `CurrentUser`. The sketch above writes both types out; PSScriptAnalyzer's rule for
+   Windows PowerShell 5.1 types refuses that. Not verified: that the type loads this way under
+   PowerShell 7 on Windows. When it does not, both text functions refuse with M6; the Windows
+   job runs 5.1 only.
+6. Call site 2. The sentence that names `-PromptCurrent` is added only for a value that cannot
+   be opened, for a marker without its value (M4) and for M8. M3 and M7 are passed on without
+   it. With `-PromptCurrent` or `-CurrentPassword` given, the script reads once more with
+   `-NoPassword` after any failure of the first read. For M7 and M3 that second read fails the
+   same way, so the script still stops; but M7's words do not name the move out of Secrets.
+   Open for step 2 (its file list has the two files).
+7. Call site 3 and the end of a run. A password the owner gave (`-NewPassword`, `-Prompt`) is
+   never printed back: the script says which file holds it. One the script made is shown once,
+   and not at all under `-Quiet`, also when the save of the admin file fails (the pending file,
+   which the message names, holds it then). `-Prompt` compares its two entries with `-cne`, so
+   two that differ only in capitals do not match. Not changed: the failed save still ends with
+   "copy it over", which step 3 rewords (below, "`Set-OpenWebUIPassword.ps1` in step 3").
+8. The skip count went from twenty-three to twenty-four with the one new line, as this plan
+   already said; done in the merge.
+9. `-Form Keep` over an admin file that was cut off gives Plain: the form goes by the marker of
+   the file that is there, and a cut-off file has none to read. Harmless while no file is
+   protected. From step 3 on, a protected admin file that was cut off would be written plain by
+   the next promotion of a pending password. Step 3 says what a promotion does then (refuse and
+   keep the pending file, or keep Plain and say so) before any file can be protected.
+10. `Set-LaiPrivateAcl` does more than set its three names. On Windows it first reads the owner
+    and the entries the file or folder holds as its own. An entry of any other account is taken
+    out, and an owner that is none of the three (the user, SYSTEM, Administrators) is replaced
+    by Administrators, because an owner can give itself an entry again. Each is logged with the
+    account it was. What could not be read, changed or taken out is a failure in words, with an
+    exit code that is not 0, although the three names are set all the same. It works on the one
+    path it is given. On a usual install the installer hands it the AI folder itself, Scripts,
+    Secrets and the files it protects by name when it writes them, so an entry or an owner on
+    Backups, on the other sub-folders or on a password file that an earlier run wrote is not
+    reached (IMPROVEMENTS.md has the row). Under `-UserAccess ReadOnly` a user who owns the
+    folder stays its owner, and can so give itself write access again (the same row).
+
+Tests as built, where they differ from the lists above. 32 to 35: their names and their place
+are given with the four names above, and 32 reads fewer kinds of file than the M7 block asks
+for. Built and not in the lists: the M8 cases (a refusal for an empty, a null and a missing
+password, and the same files returned under `-NoPassword`); a rotation over an admin file
+without a password (stopped before any sign-in, `-PromptCurrent` named, nothing changed) and
+the same file rotated with `-CurrentPassword`; that a given password is not printed back and a
+made one is shown once; the comparison of the two typed entries, taken from the script's own
+text; and three rotations whose save fails because the admin file is read-only. For
+`Set-LaiPrivateAcl`, on Windows only: an entry of a fourth name taken out and logged, a fourth
+name as owner replaced and logged, and stand-ins for `icacls /remove` and for `Get-Acl` for what
+cannot be removed or read. Not tested, as before: M6 and the empty-result check of the save.
+Not tested either: the two failure branches of the owner change (an owner that cannot be read,
+an owner that cannot be changed).
+
 ### Step 2: the other seven readers
 Files: `Get-LocalAIDiagnostics.ps1` (58), `Install-LocalAI.ps1` (`Get-AdminCredential`, 672, and
 the deep research read at 757), `Restore-OpenWebUI.ps1` (411), `Sync-LocalAISkills.ps1` (34),
 `Test-LocalAI.ps1` (308, and the deep research read at 257), `Update-Models.ps1` (178),
 `Watch-LocalAI.ps1` (770), `tests/Invoke-WindowsUnitTests.ps1`, `tests/Invoke-StaticChecks.ps1`.
+Also in step 2's files, for what step 1 left of the M7 block above (the paragraphs that begin "As
+built"): `Set-OpenWebUIPassword.ps1` (for M7 no second read under `-PromptCurrent` or
+`-CurrentPassword`, and words that name the move out of Secrets, as the installer's stop message
+and the Diagnostics catch get them here) and `lib/LocalAI.psm1` (only if those words are to come
+from the reader itself). They are built before step 2 switches its first reader.
 Each read becomes `Read-LaiSecretFile`. Each script decides what "cannot open" means for it. The
 installer: `Get-AdminCredential` (670-674) is its one read of the admin file, called at 965, 1643,
 1646, 1777, 1791, 1820 and 2068. A file it cannot open stops the run at the first of them it
@@ -701,6 +836,12 @@ data, `Set-OpenWebUIPassword.ps1 -PromptCurrent -Prompt`; its data is gone, move
 Secrets and run the installer again. It never makes a new login over a file it cannot open; it
 makes one only when the file is missing, as today (1643-1646). The Diagnostics reads come after
 the backlog row named under Diagnostics redaction. Still nothing on disk changes.
+
+Tests, first what step 1 left (both jobs, in the section `secret files: plain and protected
+form`): test 32 also reads a file of white space only, the text `null`, `[]`, a quoted text and
+a number, each with and without `-NoPassword`, each matched on M7; and in the harness of test 24,
+over an empty admin file, the password script ends with an exit code that is not 0, says M7's
+words and the move out of Secrets, does not name `-PromptCurrent`, and leaves the file empty.
 
 Tests: [W] the diagnostics section (Invoke-WindowsUnitTests.ps1:558) once more with a protected
 admin file: the password is still redacted; with a changed blob: exit 0, the warning names the
@@ -777,7 +918,8 @@ recovery copy (below, "How it goes out of date").
   file plain, without the gate and without a word (IMPROVEMENTS.md row 121 (5)). No protected
   file can exist before step 3, so the sentence does no harm until then; that is why it changes
   here and not in step 1. The new sentence: copy nothing; the new password is in the pending file
-  and is printed below; the next run of this script, or of `Test-LocalAI.ps1`, moves it into the
+  (a password the script made is also printed below unless `-Quiet` was given, as step 1 is
+  built; one the owner gave is not); the next run of this script, or of `Test-LocalAI.ps1`, moves it into the
   admin file in the form that file has (`Resolve-LaiPendingPassword`, call site 1 of step 1).
   The sentence about the copy follows it.
 - After a change that went through, one more line: the sentence about the copy.
