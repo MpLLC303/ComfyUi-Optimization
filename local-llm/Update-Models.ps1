@@ -23,8 +23,17 @@
 
     Before it loads and measures a model, a run someone started waits up to -GpuWaitMinutes (10) for
     other programs (ComfyUI, a game) to free the GPU, and ends with their names when they do not;
-    -GpuWaitMinutes 0 does not wait at all. -CatalogPath names another model catalog than
-    config\models.psd1 next to this script; the health check at the end reads the same one.
+    -GpuWaitMinutes 0 does not wait at all.
+
+    -CatalogPath names another model catalog than config\models.psd1 next to this script. It counts
+    for this one run and the health check at its end, and for nothing after it: the nightly re-check,
+    the Start menu shortcuts Local AI - Re-check models and Local AI - Health check, a later run
+    without -CatalogPath and the installer read config\models.psd1 again. The next of them that
+    rebuilds a preset builds it from the model named there, and the health check judges the presets
+    by that file. To change a model for longer than one run, change config\models.psd1 itself, the
+    way README.md says under 'Add or swap a model': in a downloaded copy of the toolkit, then run
+    the installer from that copy (the next Update toolkit replaces the copy next to the installed
+    scripts).
 
     -RecheckOnly downloads nothing. It loads, on the Ollama installed now, only the presets measured
     on another Ollama version (the Ollama app updates itself) or left partly on the CPU by an earlier
@@ -72,7 +81,9 @@ param(
     # How many minutes a run someone started waits for other programs to free the GPU before it loads
     # and measures a model (the installer's -GpuWaitMinutes). 0 = no waiting: a busy GPU ends the run.
     [int]$GpuWaitMinutes = 10,
-    # The model catalog. Defaults to config\models.psd1 next to this script.
+    # The model catalog of this one run and the health check at its end (default: config\models.psd1
+    # next to this script). The nightly re-check, the shortcuts, a later run without it and the
+    # installer read config\models.psd1 again: see the description above before using it.
     [string]$CatalogPath = '',
     # Test only (tests/Invoke-ModelUpdateTest.ps1, whose machine has no GPU; no shortcut and no
     # scheduled task passes it): a preset placed partly on the CPU counts as fitting. The run says so.

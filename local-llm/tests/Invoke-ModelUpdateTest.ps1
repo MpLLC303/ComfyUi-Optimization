@@ -159,6 +159,13 @@ try {
     Assert-That $umGuarded "the rollback's pin and its re-tune stand in one try whose finally gives the not-rebuilt warning for every model still open: that is what Ctrl+C in between runs ($($umTries.Count) such try)"
     $umHealth = @($umAst.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] -and $n.InvocationOperator -eq 'Ampersand' -and $n.Extent.Text -match 'Test-LocalAI\.ps1' }, $true))
     Assert-That ($umHealth.Count -eq 1 -and @($umHealth | ForEach-Object { $_.CommandElements } | Where-Object { $_ -is [System.Management.Automation.Language.CommandParameterAst] -and $_.ParameterName -eq 'CatalogPath' }).Count -eq 1) "the health check at the end is handed the same catalog with -CatalogPath ($($umHealth.Count) call)"
+    # -CatalogPath holds for one run and its health check. Nothing else is told about it: the nightly
+    # task, the shortcuts and the installer read config\models.psd1, and the next of them that
+    # rebuilds a preset builds it from that one. The help's paragraph on the parameter says both, so
+    # that it does not read as a setting that stays.
+    $umHelpParas = @(([string]$umAst.GetHelpContent().Description) -split '(?:\r?\n)[ \t]*(?:\r?\n)' | ForEach-Object { ($_ -replace '\s+', ' ').Trim() } | Where-Object { $_ })
+    $umCatalogHelp = @($umHelpParas | Where-Object { $_ -match '-CatalogPath names' })
+    Assert-That ($umCatalogHelp.Count -eq 1 -and $umCatalogHelp[0] -match 'this one run' -and $umCatalogHelp[0] -match 'nightly re-check' -and $umCatalogHelp[0] -match 'shortcuts' -and $umCatalogHelp[0].Contains('read config\models.psd1 again')) "the help says that -CatalogPath counts for one run only, and that the nightly re-check and the shortcuts read config\models.psd1 again ($($umCatalogHelp.Count) paragraph on it)"
 
     Write-Host "`n=== 1. nothing changed upstream ===" -ForegroundColor Cyan
     $r = Invoke-Update @() $tag
