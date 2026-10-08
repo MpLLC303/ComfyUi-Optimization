@@ -197,7 +197,26 @@ function global:Register-ScheduledTask {
     Record "Register-ScheduledTask $TaskName"
 }
 function global:Unregister-ScheduledTask { param($TaskName, $Confirm) $global:Tasks.Remove($TaskName); Record "Unregister-ScheduledTask $TaskName" }
-function global:Start-Process { param($FilePath, $ArgumentList, [switch]$Wait, [switch]$PassThru, $Verb, $ErrorAction) Record "Start-Process $FilePath $ArgumentList"; if ($Verb -eq 'RunAs') { Record "RUNAS $($ArgumentList -join ' ')" }; if ($PassThru) { [pscustomobject]@{ ExitCode = 0 } } }
+# A phase can say what a start of the Ollama app leaves in server.log ($global:MockOllamaLog: the
+# 'server config' line of a start through Explorer, User, and of one from the installer's own session,
+# Session), with the time of the start, as each real start logs a new line. The OLLAMA_HOST a start
+# from the session would inherit from the installer's process is kept as well.
+$global:MockOllamaLog = $null
+$global:SessionStartHosts = New-Object System.Collections.ArrayList
+function global:Start-Process {
+    param($FilePath, $ArgumentList, [switch]$Wait, [switch]$PassThru, $Verb, $ErrorAction)
+    Record "Start-Process $FilePath $ArgumentList"
+    if ($Verb -eq 'RunAs') { Record "RUNAS $($ArgumentList -join ' ')" }
+    if ("$FilePath $ArgumentList" -like '*ollama app.exe*') {
+        $asUser = "$FilePath" -like '*explorer.exe'
+        if (-not $asUser) { [void]$global:SessionStartHosts.Add([string]$env:OLLAMA_HOST) }
+        if ($global:MockOllamaLog) {
+            $line = $global:MockOllamaLog['Session']; if ($asUser) { $line = $global:MockOllamaLog['User'] }
+            Set-Content -LiteralPath (Join-Path $env:LOCALAPPDATA 'Ollama/server.log') -Value ('time=' + [DateTime]::UtcNow.ToString('o') + ' ' + ($line -replace '^time=\S+\s*', ''))
+        }
+    }
+    if ($PassThru) { [pscustomobject]@{ ExitCode = 0 } }
+}
 function global:docker {
     $a = @($args)
     if ($a[0] -eq 'compose') { Record "docker $($a -join ' ')"; $global:LASTEXITCODE = 0; return }
@@ -463,6 +482,8 @@ Assert-That ($cfgAfter.KeepAlive -eq '7m' -and [int]$cfgAfter.BackupRetentionDay
 Assert-That (@((Get-Content -Encoding UTF8 -Raw (Join-Path $aiRoot 'install-state.json') | ConvertFrom-Json).flags.selectedModels) -contains 'trial-ok') 're-run without -TrialModels keeps the chosen trial'
 $p3Log = Get-Content -Raw (Get-ChildItem (Join-Path $aiRoot 'Logs') -Filter 'install-*.log' | Sort-Object LastWriteTime | Select-Object -Last 1).FullName  # lai-ok: objects
 Assert-That ($p3Log -match 'Official: missing tag is not set up: it failed before' -and $p3Log -notmatch 'Downloading testorg/official-does-not-exist') 'a re-run does not try the failed official model again, and says how to'
+$choice3 = @($st3.flags.trialChoice)
+Assert-That ($p3Log -notmatch 'Downloading testorg/does-not-exist' -and $choice3 -contains 'trial-ok' -and $choice3 -notcontains 'trial-missing') "a trial that failed for a reason of its own (its tag is gone) left the choice: a re-run without -TrialModels does not download it again (trialChoice: $($choice3 -join ', '))"
 Assert-That (@((Get-Content -Encoding UTF8 -Raw (Join-Path $aiRoot 'install-state.json') | ConvertFrom-Json).flags.selectedModels) -contains 'official-ok') 're-run keeps the official model'
 Assert-That ((Get-FileHash -LiteralPath $agentFile).Hash -eq $ownerRulesHash -and [System.IO.File]::ReadAllText($agentFile) -ceq $ownerRules) 're-run leaves a rules file the owner edited byte for byte as it is (not restored from the template, not merged)'
 Assert-That ($p3Log -match 'already exists: left as it is' -and $p3Log -notmatch 'Rules for an AI agent opened in this folder placed') 'and the re-run log says it was left, not placed'
@@ -553,17 +574,23 @@ Write-Host "`n=== PHASE 4f: the owner's own default model and hidden presets sur
 $tokF = Connect-LaiWebUI -BaseUrl 'http://127.0.0.1:3000' -Email $Email -Password $Password
 Set-LaiWebUIModelsConfig -BaseUrl 'http://127.0.0.1:3000' -Token $tokF -DefaultModel 'local-fast' | Out-Null
 Hide-LaiWebUIModel -BaseUrl 'http://127.0.0.1:3000' -Token $tokF -Id 'official-standin' | Out-Null
-# On the same run, the wrong settings in server.log again, and this time the start as the signed-in
-# user does not take either (test hook): Ollama stays up from the installer's session, and the owner
-# is told so. The end screen is captured (and still shown), as in phase 3.
+# On the same run, the wrong settings in server.log again, and this time Explorer goes on handing out
+# the old environment: every start through it logs the wrong setting, every start from the installer's
+# session the right one (the Start-Process mock writes the line a real start would). The start as the
+# signed-in user at the end of Tuning answers, but with the wrong setting: Ollama stays up from the
+# installer's session, and the owner is told so. No test hook in the installer does this. The end
+# screen is captured (and still shown), as in phase 3.
 $elevatedNotice = 'Ollama is running with administrator rights: quit it from its tray icon and start it from the Start menu'
+$restoreFn = [regex]::Match($text, '(?s)function Restore-OllamaAsUser \{.*?\r?\n\}').Value
+Assert-That ($restoreFn -match 'Start-OllamaAsUser' -and $restoreFn -notmatch 'LOCALAI_TEST_') 'the restart of Ollama without administrator rights has no test switch that could turn it off'
 Set-Content -LiteralPath $srvLog4 -Value $srvWrong4
-$env:LOCALAI_TEST_OLLAMA_USER_FAIL = '1'
+$global:MockOllamaLog = @{ User = $srvWrong4; Session = $srvGood4 }
+$global:SessionStartHosts.Clear()
 $calls4f = $global:Calls.Count
 try {
     $screen4f = @(& (Join-Path $aiRoot 'Scripts/Install-LocalAI.ps1') -AIRoot $aiRoot -SkipTests -TrialModels none 6>&1 | ForEach-Object { $l = "$_"; Write-Host $l; $l })
     $c4f = $LASTEXITCODE
-} finally { $env:LOCALAI_TEST_OLLAMA_USER_FAIL = ''; Set-Content -LiteralPath $srvLog4 -Value $srvGood4 }
+} finally { $global:MockOllamaLog = $null; Set-Content -LiteralPath $srvLog4 -Value $srvGood4 }
 $tokF = Connect-LaiWebUI -BaseUrl 'http://127.0.0.1:3000' -Email $Email -Password $Password
 $mcfgF = Invoke-LaiApi -Uri 'http://127.0.0.1:3000/api/v1/configs/models' -Token $tokF
 $opF = Get-TestPreset 'official-standin'
@@ -574,6 +601,10 @@ $rep4f = Get-Content -Encoding UTF8 -Raw (Join-Path $aiRoot 'install-report.md')
 $starts4f = @(& $ollamaStarts $calls4f)
 Assert-That (@($screen4f | Where-Object { $_ -like "*Needs attention: $elevatedNotice*" }).Count -eq 1 -and $rep4f -match '## Settings that need attention' -and $rep4f.Contains("- $elevatedNotice")) 'Ollama could not be started as the signed-in user: the end screen says once, under Needs attention, that it runs with administrator rights and what to do, and so does the report'
 Assert-That (@($screen4f | Where-Object { $_ -like "*WARN*$elevatedNotice*" }).Count -eq 1 -and $st4f.flags.ollamaElevated -eq $true -and $starts4f.Count -ge 1 -and $starts4f[-1] -notlike '*explorer.exe*') "it is said where it happens too, remembered for the next run, and Ollama was started again, from the installer's session, so the run could go on ($($starts4f.Count) starts)"
+Assert-That (@($screen4f | Where-Object { $_ -like '*WARN*could not be left running without administrator rights: started as the signed-in user it shows OLLAMA_FLASH_ATTENTION=false*' }).Count -eq 1) 'an answer from the API was not taken for a good start: the line that start logged was read, and the screen names the setting it shows wrong'
+# That last start is the first one from the session after the Models stage pointed OLLAMA_HOST at
+# loopback for the ollama CLI: the server must get the user's own value (none here), the CLI its own back.
+Assert-That ($global:SessionStartHosts.Count -ge 2 -and [string]$global:SessionStartHosts[$global:SessionStartHosts.Count - 1] -ne '127.0.0.1:11434' -and $env:OLLAMA_HOST -eq '127.0.0.1:11434') "the Ollama started from the session does not inherit the CLI's OLLAMA_HOST (it got '$($global:SessionStartHosts -join "', '")'; the installer's own is '$($env:OLLAMA_HOST)' again)"
 Write-Host "`n=== PHASE 4g: an older toolkit over a newer install; a folder in AI that is not ours ===" -ForegroundColor Cyan
 $cfgPathG = Join-Path $aiRoot 'localai-config.json'
 $cfgG = Read-LaiState -Path $cfgPathG; $cfgG['ToolkitVersion'] = '2099.01.01'; Save-LaiState -State $cfgG -Path $cfgPathG
@@ -754,7 +785,11 @@ Assert-That ($log7b -notmatch '=+ Models =+' -and $log7b -notmatch 'Downloading 
 Assert-That ($log7b -match 'Expose Ollama to the network') 'Ollama on 0.0.0.0 that the installer did not set is reported'
 # The restart for the Model location runs Ollama as the signed-in user (through Explorer) first; the
 # elevated start from the installer's own session only because the log still shows the other folder.
-Assert-That ($asUser7b -eq $mainRestarts7b + 1 -and $starts7b.Count -ge 2 -and $starts7b[-2] -like '*explorer.exe*' -and $starts7b[-1] -notlike '*explorer.exe*') "Model location restart: as the user first, from the elevated session only as the fallback ($($starts7b.Count) starts, $asUser7b via Explorer, $mainRestarts7b settings restart(s))"
+Assert-That ($asUser7b -eq $mainRestarts7b + 2 -and $starts7b.Count -ge 3 -and $starts7b[-3] -like '*explorer.exe*' -and $starts7b[-2] -notlike '*explorer.exe*') "Model location restart: as the user first, from the elevated session only as the fallback ($($starts7b.Count) starts, $asUser7b via Explorer, $mainRestarts7b settings restart(s))"
+# The run stopped right after that start from its own session, long before the end of Tuning: it
+# must not end with Ollama running as administrator and nothing said.
+$failAt7b = $log7b.IndexOf('Nothing was downloaded'); $restoreAt7b = $log7b.IndexOf('Restarting Ollama without administrator rights')
+Assert-That ($starts7b.Count -ge 3 -and $starts7b[-1] -like '*explorer.exe*' -and $failAt7b -ge 0 -and $restoreAt7b -gt $failAt7b -and -not (Read-LaiState -Path $statePath)['flags'].ContainsKey('ollamaElevated')) 'a run that fails after starting Ollama from its own session starts it as the signed-in user again before it ends: the last start is through Explorer, after the failure, and nothing is left to remember'
 
 Write-Host "`n=== PHASE 7c: Ollama installed to a custom folder (OllamaSetup.exe /DIR=...) ===" -ForegroundColor Cyan
 $defaultOllama = Join-Path $env:LOCALAPPDATA 'Programs/Ollama'

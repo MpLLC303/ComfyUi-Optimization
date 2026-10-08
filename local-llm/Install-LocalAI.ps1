@@ -327,13 +327,14 @@ function Skip-OptInModel {
     # retried on every run (each try loads up to 18 GB), only when the model itself is the reason:
     # its tag, an Ollama that cannot load it, no fit on this card. A download this run made for such a
     # model is removed again. A busy GPU, a dropped connection or a full disk: the next run tries again.
+    # A trial that is itself the reason leaves flags.trialChoice, so only naming it again retries it.
     param([Parameter(Mandatory)]$Model, [string]$Why, [string]$OllamaVersion = '', [switch]$GpuBusy, [switch]$PulledNow)
     $short = ([string]$Why -replace '\s+', ' ').Trim(); $short = $short.Substring(0, [Math]::Min(200, $short.Length))
+    $own = -not $GpuBusy -and $short -match '(?i)file does not exist|not found|manifest|incompatible|requires a newer version|unknown model architecture|unsupported|on the GPU even at 8K|could not be loaded at any context|empty answer'
+    $again = 'the next run tries it again'
     if ($GpuBusy) {
         Write-LaiLog WARN "$($Model.Display) is set up on the next run: the GPU was busy ($short)"
     } elseif ($Model.Official) {
-        $own = $short -match '(?i)file does not exist|not found|manifest|incompatible|requires a newer version|unknown model architecture|unsupported|on the GPU even at 8K|could not be loaded at any context|empty answer'
-        $again = 'the next run tries it again'
         if ($own) {
             if (-not $State.flags.ContainsKey('officialFailed') -or -not $State.flags['officialFailed']) { $State.flags['officialFailed'] = @{} }
             $State.flags['officialFailed'][$Model.Key] = @{ Source = $Model.Source; Why = $short; OllamaVersion = $OllamaVersion }
@@ -346,7 +347,13 @@ function Skip-OptInModel {
         }
         Write-LaiLog WARN "Official model $($Model.Display) ($($Model.Source)) skipped: $short. The uncensored presets are unaffected; $again."
     } else {
-        Write-LaiLog WARN "Trial $($Model.Display) ($($Model.Source)) skipped: $short"
+        if ($own) {
+            # Named with the trials that stay chosen: a bare key would select only that one.
+            $kept = @($State.flags['trialChoice'] | Where-Object { $_ -and $_ -ne $Model.Key })
+            $State.flags['trialChoice'] = $kept
+            $again = "it is tried again when it is named: -TrialModels $(($kept + $Model.Key) -join ',')"
+        }
+        Write-LaiLog WARN "Trial $($Model.Display) ($($Model.Source)) skipped: $short; $again."
     }
     if ($script:DroppedOptIn -notcontains $Model.Key) { $script:DroppedOptIn += $Model.Key }
 }
@@ -426,29 +433,60 @@ function Start-OllamaAsUser {
 }
 
 $OllamaElevatedNotice = 'Ollama is running with administrator rights: quit it from its tray icon and start it from the Start menu'
+$script:OllamaRestoreTried = $false
 function Restore-OllamaAsUser {
     # The Ollama stage starts Ollama from this elevated session when a start through Explorer did not
     # take (flags.ollamaElevated): it and its model runners then run as administrator. Once the
     # presets are measured it is started as the signed-in user again. The flag is in the state file,
-    # so a run that stopped in between is put right by the next one.
+    # so a run that stopped in between is put right by the next one (a run that fails does it too).
     if (-not $State.flags['ollamaElevated']) { return }
+    $script:OllamaRestoreTried = $true
     Write-LaiLog INFO 'Restarting Ollama without administrator rights'
     $stop = {
         Get-Process -Name 'ollama app', 'ollama', 'llama-server' -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
         Start-Sleep -Seconds 3
     }
+    $log = Join-Path $env:LOCALAPPDATA 'Ollama\server.log'
+    $lastConfig = {
+        $l = $null
+        if (Test-Path -LiteralPath $log) { $l = Select-String -LiteralPath $log -Pattern 'msg="server config"' -Encoding UTF8 | Select-Object -Last 1 }
+        if ($l) { $l.Line } else { '' }
+    }
+    $modelsOf = { param([string]$Line) $c = Get-LaiOllamaServerConfig -Line $Line; if ($c) { [string]$c['Models'] } else { '' } }
+    # What the Ollama being replaced logged when it started: the presets were measured on that one.
+    $was = & $lastConfig
     try {
         & $stop
         Start-OllamaAsUser
-        if ($env:LOCALAI_TEST_OLLAMA_USER_FAIL) { throw 'Test hook: Ollama did not start as the user' }
         Wait-LaiHttp -Uri "$OllamaUrl/api/version" -TimeoutSec 60 | Out-Null
+        Start-Sleep -Seconds 2
+        # An answer is not enough: Explorer may still hand out the old environment, which is why Ollama
+        # was started from this session. A line this start logged (another one than before) is compared
+        # with the one before it, not with the plan: a model folder set in the Ollama app, or a setting
+        # the session start showed wrong as well, is no reason to go back to administrator rights.
+        $now = & $lastConfig
+        if ($now -and $now -cne $was) {
+            $lost = @()
+            $chk = Test-LaiOllamaServerSettings -Line $now -KvCacheType $KvCacheType
+            if ($chk.Status -eq 'wrong' -and (Test-LaiOllamaServerSettings -Line $was -KvCacheType $KvCacheType).Status -ne 'wrong') { $lost += $chk.Wrong }
+            $dirNow = & $modelsOf $now; $dirWas = & $modelsOf $was
+            if ($dirNow -and $dirWas -and -not (Test-LaiSamePath $dirNow $dirWas)) { $lost += "models in $dirNow (were in $dirWas)" }
+            if ($lost.Count) { throw "started as the signed-in user it shows $($lost -join ', '); signing out of Windows and in again puts that right" }
+        }
         $State.flags.Remove('ollamaElevated')
     } catch {
-        # Running with too many rights is better than not running: the stages that follow need it.
-        # The flag stays, for the end screen, the report and the next run.
-        Write-Verbose "Ollama did not start as the user: $($_.Exception.Message)"
+        # Running with too many rights is better than not running, or than running with other settings
+        # than the presets were measured with: the stages that follow need it. The flag stays, for the
+        # end screen, the report and the next run.
+        Write-LaiLog WARN "Ollama could not be left running without administrator rights: $($_.Exception.Message)"
         & $stop
-        Start-LaiOllamaApp -Path (Join-Path $OllamaDir 'ollama app.exe')
+        # The Models stage points this process's OLLAMA_HOST at loopback for the ollama CLI, and a
+        # server started from here inherits it: with the LAN fallback, Open WebUI could no longer
+        # reach Ollama. The user's own value for the start (none: no variable), then the CLI's again.
+        $cliHost = $env:OLLAMA_HOST
+        Set-LaiProcessEnv -Name 'OLLAMA_HOST' -Value ([Environment]::GetEnvironmentVariable('OLLAMA_HOST', 'User'))
+        try { Start-LaiOllamaApp -Path (Join-Path $OllamaDir 'ollama app.exe') }
+        finally { Set-LaiProcessEnv -Name 'OLLAMA_HOST' -Value $cliHost }
         Wait-LaiHttp -Uri "$OllamaUrl/api/version" -TimeoutSec 90 | Out-Null
         Write-LaiLog WARN $OllamaElevatedNotice
     }
@@ -1791,6 +1829,8 @@ Invoke-Stage 'Stack' {
             Start-Sleep -Seconds 3
             Start-OllamaAsUser
             Wait-LaiHttp -Uri "$OllamaUrl/api/version" -TimeoutSec 90 | Out-Null
+            # Started through Explorer and answering: no longer the one this session started.
+            $State.flags.Remove('ollamaElevated')
         }
         $r = Invoke-Native -File 'docker' -Arguments @('exec', 'open-webui', 'python', '-c', $probe) -Capture -AllowFail
         if ($r.Text -notmatch '"version"') {
@@ -2155,6 +2195,14 @@ Stop-Install $testExit
         } else {
             Write-LaiLog WARN 'The installer tries once more at the next sign-in.'
         }
+    }
+    # A run that stops between a start of Ollama from this session and the end of Tuning would leave
+    # it running as administrator until some later run gets that far, with nothing on the screen.
+    # Put right here; when this run tried already (or it cannot be done), the owner is told again.
+    if ($State -and $State.flags -and $State.flags['ollamaElevated']) {
+        $told = $false
+        if (-not $script:OllamaRestoreTried) { try { Restore-OllamaAsUser; $told = $true } catch { Write-Verbose "Ollama not restarted: $($_.Exception.Message)" } }
+        if (-not $told) { Write-LaiLog WARN $OllamaElevatedNotice }
     }
     Save-State
     Stop-Install 1
