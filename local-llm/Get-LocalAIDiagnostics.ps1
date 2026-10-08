@@ -10,6 +10,8 @@
     loaded and its OLLAMA_* settings, the Ollama server log tail, Docker and container states, container
     log tails, the render guard status, Open WebUI health, the config/state/report files, the watch and
     backup logs, the newest install log, free disk space and (with -RunTests) Test-LocalAI -Quick.
+    A program that gives no answer within its time limit (a Docker Desktop that stopped answering
+    after sleep) is written down as such, and the bundle is made without its parts.
 
     Redaction, applied to every file before it is zipped:
       - the exact secret values this install uses (admin password, WEBUI_SECRET_KEY, SearXNG secret,
@@ -109,19 +111,25 @@ function Protect-Text([string]$Text) {
 function Save-Part([string]$Name, [string]$Text) {
     [System.IO.File]::WriteAllText((Join-Path $work $Name), (Protect-Text $Text), (New-Object System.Text.UTF8Encoding($false)))
 }
+# Every program run for the bundle has a time limit. After sleep Docker Desktop can stop answering
+# while its commands still start: without a limit this script would wait on the first docker call
+# without a word, and no bundle would be made. A program that gave no answer is not asked again
+# (ten more docker calls would each wait for the limit): every later capture of it gets the same line.
+$dockerLimit = Get-LaiDockerTimeout
+$hungMsg = 'Docker Desktop is not responding. Restart it (whale icon > Restart), wait for Engine running, then run this again.'
+$script:noAnswer = @{}
 function Invoke-Capture([string]$File, [string[]]$Arguments) {
-    if (-not (Get-Command $File -ErrorAction SilentlyContinue)) { return "($File not found)" }
-    $prev = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
-    # docker/ollama/nvidia-smi write UTF-8: decode it as such, or a non-ASCII user name in a path is
-    # mangled and slips past the redaction.
-    $prevEnc = $null
-    try { $prevEnc = [Console]::OutputEncoding; [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false) } catch { $prevEnc = $null }
-    try { $out = @(& $File @Arguments 2>&1 | ForEach-Object { "$_" }) }
-    finally {
-        $ErrorActionPreference = $prev
-        if ($prevEnc) { try { [Console]::OutputEncoding = $prevEnc } catch { Write-Verbose 'console encoding not restored' } }
+    if ($script:noAnswer.ContainsKey($File)) { return $script:noAnswer[$File] }
+    if (-not (Get-Command $File -CommandType Application -ErrorAction SilentlyContinue)) { return "($File not found)" }
+    # Invoke-LaiTimedNative reads the output as UTF-8, which is what docker/ollama/nvidia-smi write:
+    # read as anything else, a non-ASCII user name in a path is mangled and slips past the redaction.
+    try { $r = Invoke-LaiTimedNative -File $File -Arguments $Arguments -TimeoutSec $dockerLimit }
+    catch { return "($File could not be run: $($_.Exception.Message))" }
+    if ($r.TimedOut) {
+        $script:noAnswer[$File] = "($File did not answer within $dockerLimit s)"
+        return $script:noAnswer[$File]
     }
-    return ($out -join "`n")
+    return $r.Text
 }
 function Get-Tail([string]$Path, [int]$Lines = 200) {
     if (-not (Test-Path -LiteralPath $Path)) { return "(missing: $Path)" }
@@ -225,6 +233,9 @@ Write-Host $summaryText
 Write-Host ''
 try { Set-Clipboard -Value $summaryText; $clip = ' (summary copied to the clipboard)' } catch { $clip = '' }
 Write-LaiLog OK "Diagnostics: $zip$clip. Secrets, tokens$(if (-not $KeepNames) { ', your user and computer names and e-mail addresses' }) are redacted; still, skim it before sharing."
+if ($script:noAnswer.ContainsKey('docker')) {
+    Write-LaiLog WARN "$hungMsg The bundle was made without the Docker parts (engine, containers, their logs, the render guard status)."
+}
 if ($script:unreadableSecrets.Count) {
     Write-LaiLog WARN "Could not read $($script:unreadableSecrets -join ', ') (run this as the account that installed Local AI): the admin password may not be redacted. Check the bundle before sharing it."
 }
