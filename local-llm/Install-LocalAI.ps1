@@ -648,6 +648,53 @@ function Get-OllamaLiveConfig {
     return (Get-LaiOllamaLiveConfig -LogPath (Join-Path $env:LOCALAPPDATA 'Ollama\server.log'))
 }
 
+function Get-ModelFolderContent {
+    # What a models folder holds, as far as it can be looked at: 'models' (at least one manifest),
+    # 'empty' (it was read, and there is none), 'absent' (no such folder, on a drive that is there:
+    # nothing can be in it) or 'unknown' (nothing can be said: its drive is unplugged or offline, or
+    # reading it failed). Only 'empty' and 'absent' say that no models are there.
+    # Test-Path first: on a drive that is not there, Join-Path and -File stop the script.
+    param([Parameter(Mandatory)][string]$Path)
+    if (-not (Test-Path -LiteralPath $Path)) {
+        $root = ''
+        try { $root = [string][System.IO.Path]::GetPathRoot($Path) } catch { Write-Verbose "no root in $Path" }
+        if ($root -and (Test-Path -LiteralPath $root)) { return 'absent' }
+        return 'unknown'
+    }
+    $manifests = Join-Path $Path 'manifests'
+    if (-not (Test-Path -LiteralPath $manifests)) { return 'empty' }
+    $readErrors = @()
+    $first = @(Get-ChildItem -LiteralPath $manifests -Recurse -File -Force -ErrorAction SilentlyContinue -ErrorVariable readErrors | Select-Object -First 1)
+    if ($first.Count -gt 0) { return 'models' }
+    if (@($readErrors).Count -gt 0) { return 'unknown' }
+    return 'empty'
+}
+
+function Get-OllamaModelsVarPlan {
+    # OLLAMA_MODELS once Ollama's default folder is planned. No variable is written then, so the
+    # ones that are there decide where Ollama keeps its models.
+    # Remove: the user's variable is the installer's own, and goes. That is: it holds the value the
+    # installer wrote last (-Own, the state's ollamaModelsEnv), and not one the owner had there
+    # before the first install (Save-PrevUserEnv's record, which Uninstall puts back).
+    # Kept: the value Ollama reads after that ('' when none): the user's variable when it stays,
+    # else a system-wide one, which the installer never writes. Where and Editor say which of the
+    # two it is, in the words Windows uses.
+    # Preflight and the Ollama stage both ask here, so that the first never sends the owner where
+    # the second does not follow.
+    param([AllowEmptyString()][string]$Own)
+    $user = [string][Environment]::GetEnvironmentVariable('OLLAMA_MODELS', 'User')
+    $prev = ''; if ($State.flags['prevOllamaEnv'] -is [hashtable]) { $prev = [string]$State.flags['prevOllamaEnv']['OLLAMA_MODELS'] }
+    $remove = [bool]$user -and (Test-LaiSamePath $user $Own) -and -not (Test-LaiSamePath $user $prev)
+    $plan = @{ User = $user; Remove = $remove; Kept = ''; Where = ''; Editor = '' }
+    if ($user -and -not $remove) {
+        $plan['Kept'] = $user; $plan['Where'] = 'your user variables'; $plan['Editor'] = 'Edit environment variables for your account'
+    } else {
+        $machine = [string][Environment]::GetEnvironmentVariable('OLLAMA_MODELS', 'Machine')
+        if ($machine) { $plan['Kept'] = $machine; $plan['Where'] = 'the system variables'; $plan['Editor'] = 'Edit the system environment variables' }
+    }
+    return $plan
+}
+
 function Install-App {
     # winget first (hash-verified manifest); direct download from the vendor as the fallback.
     param(
@@ -656,8 +703,10 @@ function Install-App {
         [Parameter(Mandatory)][string]$FileName,
         [Parameter(Mandatory)][string[]]$InstallerArgs,
         [Parameter(Mandatory)][scriptblock]$IsInstalled,
-        # The vendor name the signing certificate must carry: a valid signature from anyone else
-        # (a hijacked download, a look-alike) is refused.
+        # The word the signing certificate's CN= or O= must begin with. Only that leading word is
+        # compared, not the whole name: a valid signature from 'Docker <anything>' or
+        # 'Ollama-<anything>' passes too. A look-alike is NOT refused until the whole name is
+        # compared with the vendors' exact signer names, which have not been supplied yet.
         [Parameter(Mandatory)][string]$Publisher
     )
     $winget = Get-Command winget -ErrorAction SilentlyContinue
@@ -679,8 +728,9 @@ function Install-App {
     Invoke-LaiRetry -What "download $FileName" -Action { Invoke-WebRequest -Uri $Url -OutFile $dest -UseBasicParsing } | Out-Null
     $sig = Get-AuthenticodeSignature -FilePath $dest
     if ($sig.Status -ne 'Valid') { throw "$FileName has an invalid Authenticode signature ($($sig.Status)); refusing to run it." }
-    # The vendor must BE the certificate's CN= or O= (whole word): 'O=Docker, Inc.' passes,
-    # 'O=Dockerize LLC' does not.
+    # The certificate's CN= or O= must BEGIN with the vendor's name as a whole word: 'O=Docker, Inc.'
+    # passes and 'O=Dockerize LLC' does not. So does 'O=Docker Tools Ltd' or 'O=Ollama-Apps GmbH',
+    # though: the rest of the name is not looked at (see -Publisher above).
     if ([string]$sig.SignerCertificate.Subject -notmatch ('(^|,\s*)(CN|O)="?' + [regex]::Escape($Publisher) + '\b')) { throw "$FileName is signed by '$($sig.SignerCertificate.Subject)', not $Publisher; refusing to run it." }
     Write-LaiLog INFO "Running $FileName (signed by $($sig.SignerCertificate.Subject.Split(',')[0]))"
     try { $proc = Start-Process -FilePath $dest -ArgumentList $InstallerArgs -Wait -PassThru }
@@ -1257,26 +1307,47 @@ Invoke-Stage 'Preflight' {
     elseif ($envModels) { $inUse = $envModels }
     elseif ($State.flags['modelDir']) { $inUse = [string]$State.flags['modelDir'] }
     $otherModelDir = [bool]$ModelDir -and -not (Test-LaiSamePath $target $inUse)
-    # Test-Path first: on a drive that is not there (an unplugged disk named by an old log line)
-    # Join-Path and -File stop the script. Nothing on it can be looked at, so the run goes on.
-    $inUseHasModels = $false
-    if ($otherModelDir -and (Test-Path -LiteralPath $inUse)) {
-        $inUseHasModels = @(Get-ChildItem -LiteralPath (Join-Path $inUse 'manifests') -Recurse -File -Force -ErrorAction SilentlyContinue | Select-Object -First 1).Count -gt 0
-    }
-    if ($inUseHasModels) {
+    # What that folder holds, as far as it can be looked at (an unplugged disk named by an old log
+    # line cannot): 'models', 'empty', 'absent' or 'unknown'.
+    $inUseContent = 'empty'
+    if ($otherModelDir) { $inUseContent = Get-ModelFolderContent -Path $inUse }
+    # What the installer itself last wrote into OLLAMA_MODELS (the Ollama stage keeps it from now on):
+    # an install from before this was kept wrote its plan there whenever that was not the default.
+    # Worked out before the refusal, which asks whose the variable is; kept in the state after it.
+    $ownModelsVar = ''
+    if ($State.flags.ContainsKey('ollamaModelsEnv')) { $ownModelsVar = [string]$State.flags['ollamaModelsEnv'] }
+    elseif ($State.flags['modelDir'] -and -not (Test-LaiSamePath ([string]$State.flags['modelDir']) $defaultModels)) { $ownModelsVar = [string]$State.flags['modelDir'] }
+    if ($inUseContent -eq 'models') {
         # What keeps them where they are: no -ModelDir when that plans the folder in use (the usual
         # case), else that folder by name (the Ollama app's own Model location is not the plan).
+        # A folder in a command to type is written as a PowerShell literal (ConvertTo-PsLiteral):
+        # the owner pastes the command into this Administrator window, a bare '...' ends at the
+        # first apostrophe in the path, and the folder in use is read from Ollama's log, which any
+        # program of the user's can write.
         $planWithout = $defaultModels
         if ($State.flags['modelDir']) { $planWithout = [string]$State.flags['modelDir'] } elseif ($envModels) { $planWithout = $envModels }
         $keep = 'without -ModelDir'
-        if (-not (Test-LaiSamePath $planWithout $inUse)) { $keep = "with -ModelDir '$inUse'" }
-        throw ("-ModelDir {0} is not the folder Ollama keeps its models in now: they are in {1} (about {2}). Going on would download every model again into {0} and leave the old copy where it is. Nothing was changed. Either run the installer again {3} (the models stay in {1}), or quit Ollama from its tray icon, move everything in {1} into {0}, and run the installer again with -ModelDir '{0}'." -f $target, $inUse, (Get-FolderSizeText (Join-Path $inUse 'blobs')), $keep)
+        if (-not (Test-LaiSamePath $planWithout $inUse)) { $keep = 'with -ModelDir ' + (ConvertTo-PsLiteral $inUse) }
+        $move = 'quit Ollama from its tray icon, move everything in {0} into {1}, and run the installer again with -ModelDir {2}' -f $inUse, $target, (ConvertTo-PsLiteral $target)
+        # With Ollama's default folder as the target no variable is written, and one that is not the
+        # installer's own stays, as the Ollama stage decides it (Get-OllamaModelsVarPlan). Ollama
+        # would go on using the folder that variable names, and every model moved out of it would
+        # count as missing: the move is only offered after the variable is gone.
+        if (Test-LaiSamePath $target $defaultModels) {
+            $stays = Get-OllamaModelsVarPlan -Own $ownModelsVar
+            if ($stays['Kept'] -and -not (Test-LaiSamePath $stays['Kept'] $target)) {
+                $move = ("first remove the OLLAMA_MODELS variable from {0} (Start menu > '{1}'): it names {2} and is not the installer's own setting, so the installer leaves it, and while it is there Ollama keeps its models in that folder, not in {3}. Then " -f $stays['Where'], $stays['Editor'], $stays['Kept'], $target) + $move
+            }
+        }
+        throw ("-ModelDir {0} is not the folder Ollama keeps its models in now: they are in {1} (about {2}). Going on would download every model again into {0} and leave the old copy where it is. Nothing was changed. Either run the installer again {3} (the models stay in {1}), or {4}." -f $target, $inUse, (Get-FolderSizeText (Join-Path $inUse 'blobs')), $keep, $move)
     }
-    # What the installer itself last wrote into OLLAMA_MODELS (the Ollama stage keeps it from now on):
-    # an install from before this was kept wrote its plan there whenever that was not the default.
-    if (-not $State.flags.ContainsKey('ollamaModelsEnv') -and $State.flags['modelDir'] -and -not (Test-LaiSamePath ([string]$State.flags['modelDir']) $defaultModels)) {
-        $State.flags['ollamaModelsEnv'] = [string]$State.flags['modelDir']
+    if ($inUseContent -eq 'unknown') {
+        # Not refused: a disk that is gone for good must not keep the owner from another folder. But
+        # said, and with time to stop: what follows is the very download this check is there for.
+        Write-LaiLog WARN ("The folder Ollama uses now, {0}, cannot be looked at (its drive is unplugged or offline, or the folder cannot be read), so the installer cannot tell whether models are in it. This run goes on with {1}: models in {0} are not used any more, and every model that is not in {1} yet is downloaded again. Not wanted? Close this window now, connect the drive, and run the installer again with -ModelDir {2}. Continuing in 20 seconds." -f $inUse, $target, (ConvertTo-PsLiteral $inUse))
+        Start-Sleep -Seconds 20
     }
+    if ($ownModelsVar -and -not $State.flags.ContainsKey('ollamaModelsEnv')) { $State.flags['ollamaModelsEnv'] = $ownModelsVar }
     $State.flags['modelDir'] = $target
     if (-not (Test-Path -LiteralPath $target)) { New-Item -ItemType Directory -Force -Path $target | Out-Null }
 
@@ -1298,7 +1369,10 @@ Invoke-Stage 'Preflight' {
         if ($otherModelDir) {
             $inFolder = @($present | Select-Object -Unique)
             $inFolderText = 'none there yet'; if ($inFolder.Count) { $inFolderText = $inFolder -join ', ' }
-            Write-LaiLog INFO "-ModelDir $target is not the folder Ollama uses now ($inUse, which holds no models): what is installed is read from $(Join-Path $target 'manifests'): $inFolderText"
+            # 'holds no models' only of a folder that was read.
+            $inUseText = 'which holds no models'
+            if ($inUseContent -eq 'absent') { $inUseText = 'a folder that is not there' } elseif ($inUseContent -eq 'unknown') { $inUseText = 'which could not be looked at' }
+            Write-LaiLog INFO "-ModelDir $target is not the folder Ollama uses now ($inUse, $inUseText): what is installed is read from $(Join-Path $target 'manifests'): $inFolderText"
         } elseif ($present.Count) { Write-LaiLog INFO "Ollama is not answering yet; found $($present.Count) installed model(s) in $target" }
     }
     $budget = $freeGB - 15
@@ -1396,25 +1470,31 @@ Invoke-Stage 'Ollama' {
     Save-PrevUserEnv -Names (@($settings.Keys) + @('OLLAMA_HOST', 'OLLAMA_MODELS') | Select-Object -Unique)
     $changed = $false
     foreach ($k in $settings.Keys) { if (Set-UserEnv -Name $k -Value $settings[$k]) { $changed = $true; Write-LaiLog INFO "set $k=$($settings[$k])" } }
+    # The OLLAMA_MODELS variable that is still there when this stage wrote none (see below).
+    $keptModelsVar = $null
     if (-not $settings.Contains('OLLAMA_MODELS')) {
         # The default folder is planned again (-ModelDir with that folder, after another one): with
         # the variable left behind, Ollama would go on using the other folder. Removed only when it
         # is the installer's own: the value this stage wrote last, and not one the owner had there
-        # before the first install (Save-PrevUserEnv's record, which Uninstall puts back).
-        $userModels = [Environment]::GetEnvironmentVariable('OLLAMA_MODELS', 'User')
+        # before the first install (Get-OllamaModelsVarPlan, which Preflight asks as well).
         $ownModels = [string]$State.flags['ollamaModelsEnv']
-        $prevModels = ''; if ($State.flags['prevOllamaEnv'] -is [hashtable]) { $prevModels = [string]$State.flags['prevOllamaEnv']['OLLAMA_MODELS'] }
-        $removeModelsVar = $userModels -and (Test-LaiSamePath $userModels $ownModels) -and -not (Test-LaiSamePath $userModels $prevModels)
-        if ($removeModelsVar) {
+        $varPlan = Get-OllamaModelsVarPlan -Own $ownModels
+        $userModels = $varPlan['User']
+        if ($varPlan['Remove']) {
             Set-UserEnv -Name 'OLLAMA_MODELS' -Value '' | Out-Null
             $changed = $true
-            Write-LaiLog INFO "removed OLLAMA_MODELS (the installer had set it to $userModels): Ollama's own default folder is used again, $defaultModels"
+            $nowUsed = "Ollama's own default folder is used again, $defaultModels"
+            if ($varPlan['Kept']) { $nowUsed = "the OLLAMA_MODELS in $($varPlan['Where']) is what Ollama reads now, $($varPlan['Kept'])" }
+            Write-LaiLog INFO "removed OLLAMA_MODELS (the installer had set it to $userModels): $nowUsed"
         } elseif ($userModels) {
             Write-LaiLog INFO "OLLAMA_MODELS=$userModels is not the installer's own setting and is left as it is: Ollama keeps its models there, not in $defaultModels"
         }
         # Once the variable no longer holds that value (removed just now, or changed by hand since),
         # nothing in it is the installer's.
-        if ($removeModelsVar -or -not (Test-LaiSamePath $userModels $ownModels)) { $State.flags.Remove('ollamaModelsEnv') }
+        if ($varPlan['Remove'] -or -not (Test-LaiSamePath $userModels $ownModels)) { $State.flags.Remove('ollamaModelsEnv') }
+        # What Ollama reads from now on, if anything: named as the cause further down when Ollama's
+        # log shows that folder and not the planned one.
+        if ($varPlan['Kept']) { $keptModelsVar = $varPlan }
     }
 
     $up = $false
@@ -1499,10 +1579,23 @@ Invoke-Stage 'Ollama' {
     }
     if ($live -and $live['Models'] -and -not (Test-LaiSamePath $live['Models'] $State.flags['modelDir'])) {
         $why = "Ollama keeps its models in $($live['Models']), not in $($State.flags['modelDir']): the Ollama app's own Settings > Model location overrides the OLLAMA_MODELS variable."
-        if ($missing.Count) {
-            throw "$why Nothing was downloaded. Open the Ollama app > Settings and set Model location to $($State.flags['modelDir']) (or re-run the installer with -ModelDir '$($live['Models'])'), quit Ollama from the tray, then run the installer again."
+        $cure = "Open the Ollama app > Settings and set Model location to $($State.flags['modelDir'])"
+        $cureShort = 'Set Model location in the Ollama app'
+        # Not the app's setting when a variable this stage left in place (it is not the installer's
+        # own) names that very folder: then the variable is the cause, and removing it the cure.
+        if ($keptModelsVar -and (Test-LaiSamePath $keptModelsVar['Kept'] $live['Models'])) {
+            $why = "Ollama keeps its models in $($live['Models']), not in $($State.flags['modelDir']): the OLLAMA_MODELS variable in $($keptModelsVar['Where']) names that folder. It is not the installer's own setting, so the installer left it as it is."
+            $cure = "Remove that variable with '$($keptModelsVar['Editor'])' from the Start menu"
+            $cureShort = $cure
         }
-        Write-LaiLog WARN "$why Every model is already there, so nothing changes now. Set Model location in the Ollama app (or re-run the installer with -ModelDir '$($live['Models'])') so the disk checks and the health watch look at the right drive."
+        # The folder as a PowerShell literal (ConvertTo-PsLiteral): it comes from Ollama's log, which
+        # any program of the user's can write, and the command is pasted into this Administrator
+        # window; a bare '...' would end at the first apostrophe in the path.
+        $liveLit = ConvertTo-PsLiteral ([string]$live['Models'])
+        if ($missing.Count) {
+            throw "$why Nothing was downloaded. $cure (or re-run the installer with -ModelDir $liveLit), quit Ollama from the tray, then run the installer again."
+        }
+        Write-LaiLog WARN "$why Every model is already there, so nothing changes now. $cureShort (or re-run the installer with -ModelDir $liveLit) so the disk checks and the health watch look at the right drive."
     }
 }
 #endregion
@@ -1809,13 +1902,14 @@ Invoke-Stage 'Stack' {
         }
         if ($data) {
             $f = $data.Split('|')
-            if ($f[0] -eq 'volume' -and $f[1] -eq 'open-webui') {
-                & (Join-Path $SourceRoot 'Backup-OpenWebUI.ps1') -AIRoot $AIRoot -NoStop -Tag 'pre-compose'
-                if ($LASTEXITCODE -ne 0) { throw (& $backupFailure 'open-webui') }
-            } elseif ($f[0] -eq 'volume') {
+            if ($f[0] -eq 'volume') {
+                # One backup and one check of its result for every volume. A volume with the guide's
+                # own name (open-webui, also what -Volume is when it is not given) is the managed
+                # one already; any other is copied into it below (Docker tells volume names apart
+                # by case, hence -cne).
                 & (Join-Path $SourceRoot 'Backup-OpenWebUI.ps1') -AIRoot $AIRoot -NoStop -Tag 'pre-compose' -Volume $f[1]
                 if ($LASTEXITCODE -ne 0) { throw (& $backupFailure $f[1]) }
-                $from = "$($f[1]):/from:ro"
+                if ($f[1] -cne 'open-webui') { $from = "$($f[1]):/from:ro" }
             } elseif ($f[0] -eq 'bind') {
                 $from = "$($f[2]):/from:ro"
             }
