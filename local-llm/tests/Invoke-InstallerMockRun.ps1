@@ -9,7 +9,8 @@
     Mocked: winget, wsl.exe, icacls, shutdown, nvidia-smi, CIM/registry/optional-feature cmdlets,
             local groups, scheduled tasks, Start-Process/explorer, docker compose, docker exec probe.
     A patched copy of the installer replaces four Windows-only expressions (admin check, user
-    name/SID, OS build, drive free space). Nothing else in the installer is changed.
+    name/SID, OS build, drive free space) and, only in a phase that asks for it, the user's
+    environment variables ($global:MockUserEnv). Nothing else in the installer is changed.
 
     Prerequisites: same as Invoke-IntegrationTest.ps1, plus a running SearXNG container is optional.
 #>
@@ -104,7 +105,14 @@ $patches = @(
     @('[Security.Principal.WindowsIdentity]::GetCurrent().User.Value', "'S-1-5-21-1-2-3-1001'"),
     @('[Environment]::OSVersion.Version.Build', '22631'),
     # A fixed free-space figure ($global:MockFreeBytes): the sandbox's real one is often under 5 GB.
-    @('$qualifier = Split-Path -Qualifier $Path', 'return [Math]::Round($global:MockFreeBytes / 1GB, 1)')
+    @('$qualifier = Split-Path -Qualifier $Path', 'return [Math]::Round($global:MockFreeBytes / 1GB, 1)'),
+    # Windows keeps a user's environment variables in the registry; this machine has no such scope (a
+    # read gives nothing, a write is dropped). A phase that needs one sets $global:MockUserEnv to a
+    # hashtable, which then stands in for it: Set-UserEnv's read and write, and every read of the
+    # user's OLLAMA_MODELS. While it is $null (every other phase) the installer's own code runs.
+    @('$current = [Environment]::GetEnvironmentVariable($Name, ''User'')', '$current = $(if ($null -ne $global:MockUserEnv) { $global:MockUserEnv[$Name] } else { [Environment]::GetEnvironmentVariable($Name, ''User'') })'),
+    @('[Environment]::SetEnvironmentVariable($Name, $Value, ''User'')', 'if ($null -ne $global:MockUserEnv) { if ($Value -eq '''') { $global:MockUserEnv.Remove($Name) } else { $global:MockUserEnv[$Name] = $Value } } else { [Environment]::SetEnvironmentVariable($Name, $Value, ''User'') }'),
+    @('[Environment]::GetEnvironmentVariable(''OLLAMA_MODELS'', ''User'')', '$(if ($null -ne $global:MockUserEnv) { $global:MockUserEnv[''OLLAMA_MODELS''] } else { [Environment]::GetEnvironmentVariable(''OLLAMA_MODELS'', ''User'') })')
 )
 foreach ($p in $patches) {
     if (-not $text.Contains($p[0])) { throw "patch target not found: $($p[0])" }
@@ -217,10 +225,21 @@ function global:Start-Process {
     }
     if ($PassThru) { [pscustomobject]@{ ExitCode = 0 } }
 }
+# A phase can make the copy of a manual install's data into the managed volume fail part-way
+# ($global:MockCopyFail), as a disk that fills up does: something is written, then the copy stops.
+$global:MockCopyFail = $false
+# The user's environment variables, for a phase that sets a hashtable here (see $patches).
+$global:MockUserEnv = $null
 function global:docker {
     $a = @($args)
     if ($a[0] -eq 'compose') { Record "docker $($a -join ' ')"; $global:LASTEXITCODE = 0; return }
     if ($a[0] -eq 'exec' -and $a[1] -eq 'open-webui') { $global:LASTEXITCODE = 0; return '{"version":"0.35.1"}' }
+    if ($global:MockCopyFail -and $a[0] -eq 'run' -and $a -contains 'open-webui:/to') {
+        & /usr/bin/docker run --rm -v open-webui:/to alpine:3.20 sh -c 'echo half > /to/half-copied.txt' | Out-Null
+        Record 'docker copy into open-webui failed part-way (mock)'
+        $global:LASTEXITCODE = 1
+        return 'cp: write error: No space left on device'
+    }
     & /usr/bin/docker @a
 }
 
@@ -328,9 +347,10 @@ Assert-That ($base2 -and [string]$base2['reason'] -eq 'install' -and [string]$ba
 Assert-That (@($base2Files | Where-Object { $_ -match '(^|\\)\.env$|\\Secrets\\|\.log$' }).Count -eq 0 -and $base2 -and @($base2['accepted'] | Where-Object { $_ -is [hashtable] }).Count -eq 0) 'not .env, logs or anything under a Secrets folder; and a first install took nothing in that it did not put there'
 $igNow = @(& $igDiffs)
 Assert-That ($igNow.Count -eq 0) "right after the install no file, setting or task differs from that baseline ($($igNow -join '; '))"
-# Every phase here passes -SkipTests, so the installer's Verify stage (the health check, which then
-# prints 'SKIP Integrity watch: an install, update or model update is running') never runs in this
-# suite; Invoke-WatchTest.ps1 section 10 runs that case with a stand-in for the installer. What
+# Every phase here passes -SkipTests (phase 6d does not, but puts a stand-in in the health check's
+# place), so the installer's Verify stage never runs the real health check (which then prints 'SKIP
+# Integrity watch: an install, update or model update is running') in this suite;
+# Invoke-WatchTest.ps1 section 10 runs that case with a stand-in for the installer. What
 # makes it true is read from the installer instead: it takes the setup lock into $script:SetupLock,
 # runs the health check in its own process (not a child, which could not see that lock as its own)
 # and records the baseline only after it.
@@ -613,10 +633,18 @@ $foreignDir = Join-Path $aiRoot 'ComfyUI'; New-Item -ItemType Directory -Force -
 $c4g = $LASTEXITCODE
 $log4g = Get-Content -Raw (Get-ChildItem (Join-Path $aiRoot 'Logs') -Filter 'install-*.log' | Sort-Object LastWriteTime | Select-Object -Last 1).FullName  # lai-ok: objects
 Assert-That ($c4g -eq 1 -and $log4g -match 'older than the installed 2099\.01\.01\. Nothing was changed') "an older toolkit refuses to run over a newer install (exit $c4g)"
+$calls4h = $global:Calls.Count
 & (Join-Path $aiRoot 'Scripts/Install-LocalAI.ps1') -AIRoot $aiRoot -SkipTests -TrialModels none -AllowDowngrade
 $c4h = $LASTEXITCODE
 $log4h = Get-Content -Raw (Get-ChildItem (Join-Path $aiRoot 'Logs') -Filter 'install-*.log' | Sort-Object LastWriteTime | Select-Object -Last 1).FullName  # lai-ok: objects
 Assert-That ($c4h -eq 0 -and $log4h -match 'also holds ComfyUI: their permissions are left alone') "-AllowDowngrade runs it; a folder in AI that is not the toolkit's keeps its permissions (exit $c4h)"
+# One by one reaches only what is there at that moment, so the pass runs twice: in Preflight, and
+# again once the last stage is done, for what the stages created in between. The user's own grant
+# on the folder itself (the path, then a space: not a file inside it).
+$aclCount = { param([object[]]$Recorded, [string]$Folder) @($Recorded | Where-Object { $_ -like ('icacls ' + $Folder + ' /inheritance:r /grant:r *' + $userSid + ':(OI)(CI)F *') }).Count }
+$acl4h = @($global:Calls | Select-Object -Skip $calls4h)
+$aclStack4h = & $aclCount $acl4h (Join-Path $aiRoot 'Stack'); $aclSkills4h = & $aclCount $acl4h (Join-Path $aiRoot 'Skills')
+Assert-That ($aclStack4h -eq 2 -and $aclSkills4h -eq 2 -and $log4h -match "Permissions on the toolkit's own folders and files in .* set once more") "with such a folder there, the toolkit's own folders are locked down in Preflight and once more after the last stage (icacls calls in that run: Stack $aclStack4h, Skills $aclSkills4h)"
 # The first run to complete after the one that left Ollama running as administrator puts that right.
 $st4h = Get-Content -Encoding UTF8 -Raw (Join-Path $aiRoot 'install-state.json') | ConvertFrom-Json
 Assert-That ($log4h -match 'Restarting Ollama without administrator rights' -and $log4h -notmatch [regex]::Escape($elevatedNotice) -and -not $st4h.flags.PSObject.Properties['ollamaElevated']) 'the next run that reaches the end of Tuning starts Ollama as the signed-in user and forgets the notice'
@@ -745,6 +773,71 @@ Assert-That (-not $managedVol -and $oldKept -and $legacyAfter.Count -eq $legacyB
 & /usr/bin/docker rm -f open-webui 2>$null | Out-Null
 & /usr/bin/docker volume rm owui-empty 2>$null | Out-Null
 
+Write-Host "`n=== PHASE 6d: the copy of a manual install's data stops part-way; the next run; a failed acceptance check ===" -ForegroundColor Cyan
+# A manual install with real data, and a disk that fills up while it is copied: the volume the run
+# created a moment before must not stay. Left behind, the next run would find 'both exist', copy
+# nothing and start Open WebUI on the half copy.
+& /usr/bin/docker rm -f open-webui 2>$null | Out-Null
+& /usr/bin/docker volume rm open-webui owui-6d 2>$null | Out-Null
+& /usr/bin/docker volume create owui-6d | Out-Null
+& /usr/bin/docker run --rm -v owui-6d:/data alpine:3.20 sh -c 'head -c 65536 /dev/urandom > /data/webui.db; echo marker-6d > /data/marker.txt' | Out-Null
+& /usr/bin/docker create --name open-webui --label lai-test=1 -v owui-6d:/app/backend/data alpine:3.20 sleep 3600 | Out-Null
+$legacyBefore6d = @(& /usr/bin/docker ps -a --filter 'name=^/open-webui-legacy-' --format '{{.Names}}')
+$preCompose6d = @(Get-ChildItem (Join-Path $aiRoot 'Backups') -Filter 'open-webui-*-pre-compose.tar.gz').Count
+$global:MockCopyFail = $true
+$env:LOCALAI_TEST_FAIL_STAGE = 'Configure'
+try { & (Join-Path $aiRoot 'Scripts/Install-LocalAI.ps1') -AIRoot $aiRoot -SkipTests } finally { $global:MockCopyFail = $false; $env:LOCALAI_TEST_FAIL_STAGE = '' }
+$c6d = $LASTEXITCODE
+$log6d = Get-Content -Raw -LiteralPath (Get-ChildItem (Join-Path $aiRoot 'Logs') -Filter 'install-*.log' | Sort-Object LastWriteTime | Select-Object -Last 1).FullName  # lai-ok: objects
+$legacyAfter6d = @(& /usr/bin/docker ps -a --filter 'name=^/open-webui-legacy-' --format '{{.Names}}')
+$prevEap = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
+& /usr/bin/docker volume inspect open-webui 2>&1 | Out-Null; $managedVol6d = ($LASTEXITCODE -eq 0)
+& /usr/bin/docker container inspect open-webui 2>&1 | Out-Null; $oldKept6d = ($LASTEXITCODE -eq 0)
+$ErrorActionPreference = $prevEap
+Assert-That ($c6d -ne 0 -and $log6d -match 'Copying the old Open WebUI data failed: .*No space left on device' -and $log6d -match 'half-filled open-webui volume was removed again' -and $log6d -notmatch 'Test hook') "a copy that stops part-way stops the run, which says why and what it did about the volume (exit $c6d)"
+Assert-That (-not $managedVol6d -and $oldKept6d -and $legacyAfter6d.Count -eq $legacyBefore6d.Count) "the volume that run created is gone again, the old container untouched under its name (volume there: $managedVol6d, container there: $oldKept6d)"
+Assert-That (@(Get-ChildItem (Join-Path $aiRoot 'Backups') -Filter 'open-webui-*-pre-compose.tar.gz').Count -eq $preCompose6d + 1) 'and the old data was backed up before the copy was tried (a backup that works does not stop the run)'
+# The next run, with room on the disk again: it finds no volume in the way and copies the data. This
+# one also runs the acceptance checks (no -SkipTests), and three of them fail: a stand-in for
+# Test-LocalAI.ps1 in the installer's own folder, which is where the installer runs it from. The end
+# screen is captured with its colours (and still shown).
+$realTest6d = Join-Path $aiRoot 'Scripts/Test-LocalAI.ps1'
+$testAside6d = Join-Path $Work 'Test-LocalAI-aside-6d.ps1'
+Copy-Item -LiteralPath $realTest6d -Destination $testAside6d -Force
+# The integrity baseline that run records would take the stand-in for the installed health check:
+# the one from before is put back with the script.
+$baseline6d = Get-LaiIntegrityPath -AIRoot $aiRoot
+$baselineAside6d = Join-Path $Work 'integrity-baseline-aside-6d.json'
+$baselineKept6d = Test-Path -LiteralPath $baseline6d
+if ($baselineKept6d) { Copy-Item -LiteralPath $baseline6d -Destination $baselineAside6d -Force }
+Set-Content -LiteralPath $realTest6d -Value @('param([string]$AIRoot)', "Write-Host ('12:00:00 [FAIL] FAIL Stand-in check: one of three that fail in ' + `$AIRoot) -ForegroundColor Red", 'exit 3')
+$screen6d = @()
+try {
+    $screen6d = @(& (Join-Path $aiRoot 'Scripts/Install-LocalAI.ps1') -AIRoot $aiRoot 6>&1 | ForEach-Object {
+            $line6d = "$_"; $colour6d = ''
+            if ($_ -is [System.Management.Automation.InformationRecord] -and $_.MessageData -is [System.Management.Automation.HostInformationMessage]) { $colour6d = [string]$_.MessageData.ForegroundColor }
+            if ($colour6d) { Write-Host $line6d -ForegroundColor $colour6d } else { Write-Host $line6d }
+            [pscustomobject]@{ Text = $line6d; Colour = $colour6d }
+        })
+    $c6d2 = $LASTEXITCODE
+} finally {
+    Copy-Item -LiteralPath $testAside6d -Destination $realTest6d -Force
+    if ($baselineKept6d) { Copy-Item -LiteralPath $baselineAside6d -Destination $baseline6d -Force }
+}
+$copied6d = (& /usr/bin/docker run --rm -v open-webui:/d:ro alpine:3.20 sh -c 'cat /d/marker.txt; ls /d') -join ' '
+$legacyNow6d = @(& /usr/bin/docker ps -a --filter 'name=^/open-webui-legacy-' --format '{{.Names}}')
+Assert-That ($copied6d -match '^marker-6d ' -and $copied6d -notmatch 'half-copied' -and $legacyNow6d.Count -eq $legacyBefore6d.Count + 1) "the next run copies the old data into a new volume, with nothing of the half copy in it, and keeps the old container under another name ($copied6d)"
+$shown6d = @($screen6d | Where-Object { $_.Text.Trim() })
+$last6d = $null; if ($shown6d.Count) { $last6d = $shown6d[-1] }
+Assert-That ($c6d2 -eq 3 -and $last6d -and $last6d.Colour -eq 'Red' -and $last6d.Text -match '^3 of the acceptance checks FAILED' -and $last6d.Text -match 'run the installer again') "three failed acceptance checks: the installer exits 3, and the last line on the screen is red, with the count and what to do (exit $c6d2; last line $($last6d.Colour): $($last6d.Text))"
+$block6d = @($shown6d | Where-Object { $_.Text -match '^(Open WebUI|Login|Password): ' })
+Assert-That ($block6d.Count -eq 3 -and @($block6d | Where-Object { $_.Colour -ne 'Yellow' }).Count -eq 0 -and @($shown6d | Where-Object { $_.Colour -eq 'Green' -and $_.Text -match '^(Open WebUI|Login|Password|Research): ' }).Count -eq 0) "and the address, login and password lines above it are yellow, not the green of an install that passed ($(@($block6d | ForEach-Object { $_.Colour }) -join ', '))"
+# As phase 6c left the simulated PC: no managed volume, no manual install, the health check itself.
+foreach ($legacy6d in @($legacyNow6d | Where-Object { $legacyBefore6d -notcontains $_ })) { & /usr/bin/docker rm -f $legacy6d 2>$null | Out-Null }
+& /usr/bin/docker rm -f open-webui 2>$null | Out-Null
+& /usr/bin/docker volume rm open-webui owui-6d 2>$null | Out-Null
+Remove-Item -LiteralPath $testAside6d, $baselineAside6d -Force -ErrorAction SilentlyContinue
+
 # ---- phase 7: hardware and setups other than the owner's ----------------------------------------
 function Get-NewestLog { Get-Content -Raw -Encoding UTF8 -LiteralPath (Get-ChildItem (Join-Path $aiRoot 'Logs') -Filter 'install-*.log' | Sort-Object LastWriteTime | Select-Object -Last 1).FullName }  # lai-ok: objects
 
@@ -848,6 +941,12 @@ New-Item -ItemType Directory -Force -Path $ai3 | Out-Null
 $theirRules = "# Notes of the owner`r`nThis file was here before the toolkit.`r`n"
 [System.IO.File]::WriteAllText($theirRulesFile, $theirRules, (New-Object System.Text.UTF8Encoding($false)))
 $theirRulesHash = (Get-FileHash -LiteralPath $theirRulesFile).Hash
+# The folder also holds something that is not the toolkit's (ComfyUI kept next to it), so its
+# permissions are set one by one, on what is there. On a first install Stack and Skills are not: the
+# Stack and Configure stages make them, long after Preflight, and they must not be left open to
+# every account until the next run.
+New-Item -ItemType Directory -Force -Path (Join-Path $ai3 'ComfyUI') | Out-Null
+$calls7f = $global:Calls.Count
 $env:LOCALAI_TEST_FAIL_STAGE = 'Ollama'
 & (Join-Path $aiRoot 'Scripts/Install-LocalAI.ps1') -AIRoot $ai3 -SkipTests -TrialModels none
 $env:LOCALAI_TEST_FAIL_STAGE = ''
@@ -855,6 +954,13 @@ $log7f = (@(Get-ChildItem -LiteralPath (Join-Path $ai3 'Logs') -Filter 'install-
 Assert-That ($log7f -match '=+ Preflight =+' -and $log7f -match 'Test hook: stage Ollama failed' -and (Test-Path -LiteralPath (Join-Path $ai3 'Scripts/Install-LocalAI.ps1'))) 'the first run in a new folder went through Preflight and stopped at the Ollama stage'
 Assert-That ((Get-FileHash -LiteralPath $theirRulesFile).Hash -eq $theirRulesHash -and [System.IO.File]::ReadAllText($theirRulesFile) -ceq $theirRules) 'a CLAUDE.md that was there before the first install is not replaced (byte for byte)'
 Assert-That ($log7f -match 'already exists: left as it is' -and $log7f -notmatch 'Rules for an AI agent opened in this folder placed') 'and the log says it was left, not placed'
+$acl7f = @($global:Calls | Select-Object -Skip $calls7f)
+$aclStack7f = & $aclCount $acl7f (Join-Path $ai3 'Stack'); $aclSkills7f = & $aclCount $acl7f (Join-Path $ai3 'Skills')
+Assert-That ($log7f -match 'also holds ComfyUI: their permissions are left alone' -and (Test-Path -LiteralPath (Join-Path $ai3 'Stack') -PathType Container) -and $aclStack7f -ge 1 -and $aclSkills7f -ge 1) "a first install next to a folder that is not the toolkit's: Stack and Skills are made in Preflight and locked down with the rest (icacls calls: Stack $aclStack7f, Skills $aclSkills7f)"
+# Made early, Skills still gets the starter skills: the skills step puts them only into a folder it
+# creates itself, and would find this one there already.
+$skills7f = @(Get-ChildItem -LiteralPath (Join-Path $ai3 'Skills') -Directory -ErrorAction SilentlyContinue | ForEach-Object { $_.Name })
+Assert-That ($skills7f.Count -eq 3 -and $skills7f -contains 'remember-and-improve' -and (Test-Path -LiteralPath (Join-Path $ai3 'Skills/remember-and-improve/SKILL.md') -PathType Leaf) -and $log7f -match 'with the starter skills: ') "and Skills holds the three starter skills ($($skills7f -join ', '))"
 # An install made before the installer placed this file has none: the update places it.
 Remove-Item -LiteralPath $agentFile -Force
 # The same update, and one more after it, on an install that is also from before the official models
@@ -878,6 +984,84 @@ Assert-That ((Test-Path -LiteralPath $agentFile -PathType Leaf) -and (Get-FileHa
 Assert-That ($log7fb -match 'Rules for an AI agent opened in this folder placed' -and $log7fb -notmatch 'already exists: left as it is') 'and the log says it was placed'
 $told7f = [regex]::Matches($log7fb + "`n" + $log7fc, 'This update adds the official models').Count
 Assert-That ($log7fb -match 'This update adds the official models .* -OfficialModels none' -and $told7f -eq 1 -and $log7fc -match 'Test hook: stage Ollama failed' -and $choice7f.Count -eq 1 -and [string]$choice7f[0] -eq 'all') "an install from before the official models is told once what the update adds and how to skip it, not again on the next update; the choice is recorded as all (said $told7f time(s) in two runs; choice: $($choice7f -join ', '))"
+
+Write-Host "`n=== PHASE 7g: another -ModelDir, and back to Ollama's default folder ===" -ForegroundColor Cyan
+# Ollama keeps its models in its default folder: its start-up log says so, and they are there (the
+# manifest of the catalog's model and a 3 MB blob stand in for them). A run with another -ModelDir
+# used to point Ollama at the empty folder: every model downloaded again, the old copy left, and
+# passing the old folder again did not bring it back. The user's environment variables are
+# $global:MockUserEnv for this phase; the state of the other phases is set aside meanwhile.
+$stateAside7g = Join-Path $Work 'install-state-before-7g.json'
+Copy-Item -LiteralPath $statePath -Destination $stateAside7g -Force
+$srv7g = (Get-Content -Raw -Encoding UTF8 -LiteralPath $serverLog).TrimEnd()
+$otherModels = Join-Path $Work 'OtherModels'
+$srvOther7g = $srv7g -replace 'OLLAMA_MODELS:[^ \]]*', ('OLLAMA_MODELS:' + $otherModels.Replace('\', '\\'))
+$modelName7g = Resolve-LaiModelName 'testorg/qwen3-abliterated:1.7b'
+$manifest7g = Get-LaiModelManifestPath -ModelDir $plannedModels -Name $modelName7g
+New-Item -ItemType Directory -Force -Path (Split-Path -Parent $manifest7g), (Join-Path $plannedModels 'blobs') | Out-Null
+Set-Content -LiteralPath $manifest7g -Value '{}'
+Set-Content -LiteralPath (Join-Path (Join-Path $plannedModels 'blobs') 'sha256-stand-in') -Value ('x' * 3MB) -NoNewline
+$moveModels7g = { param([string]$From, [string]$To)
+    New-Item -ItemType Directory -Force -Path $To | Out-Null
+    foreach ($part in 'manifests', 'blobs') { Move-Item -LiteralPath (Join-Path $From $part) -Destination (Join-Path $To $part) }
+}
+$global:MockUserEnv = @{}
+try {
+    # A: refused in Preflight, before anything changes. (Should it not be, the run stops at the next
+    # stage instead of installing into the other folder.)
+    $env:LOCALAI_TEST_FAIL_STAGE = 'Ollama'
+    & (Join-Path $aiRoot 'Scripts/Install-LocalAI.ps1') -AIRoot $aiRoot -SkipTests -TrialModels none -ModelDir $otherModels
+    $c7gA = $LASTEXITCODE
+    $log7gA = Get-NewestLog
+    $flags7gA = (Read-LaiState -Path $statePath)['flags']
+    Assert-That ($c7gA -ne 0 -and $log7gA -notmatch '=+ Ollama =+' -and $log7gA.Contains("they are in $plannedModels (about 3 MB)") -and $log7gA -match 'Nothing was changed') "another -ModelDir while the folder in use holds models: refused in Preflight, naming that folder and its size (exit $c7gA)"
+    Assert-That ($log7gA -match 'run the installer again without -ModelDir' -and $log7gA.Contains("move everything in $plannedModels into $otherModels")) 'and both ways on: keep the folder (no -ModelDir), or quit Ollama, move the models and run again'
+    Assert-That ((Test-LaiSamePath ([string]$flags7gA['modelDir']) $plannedModels) -and -not $flags7gA.ContainsKey('ollamaModelsEnv') -and -not (Test-Path -LiteralPath $otherModels) -and -not $global:MockUserEnv.ContainsKey('OLLAMA_MODELS')) "nothing changed: the state still plans the folder in use, the new folder was not created, no variable was set (state: $($flags7gA['modelDir']))"
+
+    # B: the models moved by hand, as the message says. The folder in use is empty now, so the run
+    # goes on, and it reads what is installed from the new folder's manifests (the running Ollama
+    # still lists the old one). Each start of Ollama logs the folder its variable names.
+    & $moveModels7g $plannedModels $otherModels
+    $env:LOCALAI_TEST_FAIL_STAGE = 'Models'
+    $global:MockOllamaLog = @{ User = $srvOther7g; Session = $srvOther7g }
+    & (Join-Path $aiRoot 'Scripts/Install-LocalAI.ps1') -AIRoot $aiRoot -SkipTests -TrialModels none -ModelDir $otherModels
+    $log7gB = Get-NewestLog
+    $flags7gB = (Read-LaiState -Path $statePath)['flags']
+    Assert-That ($log7gB -match 'Test hook: stage Models failed' -and $log7gB.Contains("what is installed is read from $(Join-Path $otherModels 'manifests'): $modelName7g")) 'after the move the same -ModelDir passes Preflight and the Ollama stage, and the log names the manifests the installed models were read from, and the model found there'
+    Assert-That ((Test-LaiSamePath ([string]$global:MockUserEnv['OLLAMA_MODELS']) $otherModels) -and $log7gB.Contains("set OLLAMA_MODELS=$otherModels") -and (Test-LaiSamePath ([string]$flags7gB['modelDir']) $otherModels) -and (Test-LaiSamePath ([string]$flags7gB['ollamaModelsEnv']) $otherModels)) "OLLAMA_MODELS is set to the new folder, and the state keeps that value as the installer's own (variable: $($global:MockUserEnv['OLLAMA_MODELS']))"
+
+    # C: back. The models moved back, -ModelDir with the default folder: the variable, which is the
+    # installer's own, has to go, or Ollama would stay with the other folder.
+    & $moveModels7g $otherModels $plannedModels
+    $global:MockOllamaLog = @{ User = $srv7g; Session = $srv7g }
+    & (Join-Path $aiRoot 'Scripts/Install-LocalAI.ps1') -AIRoot $aiRoot -SkipTests -TrialModels none -ModelDir $plannedModels
+    $log7gC = Get-NewestLog
+    $flags7gC = (Read-LaiState -Path $statePath)['flags']
+    Assert-That ($log7gC -match 'Test hook: stage Models failed' -and -not $global:MockUserEnv.ContainsKey('OLLAMA_MODELS') -and -not $env:OLLAMA_MODELS -and $log7gC.Contains("removed OLLAMA_MODELS (the installer had set it to $otherModels)")) 'back to the default folder: the OLLAMA_MODELS the installer had set is removed (from the user''s variables and from this process), and the log says so'
+    Assert-That ((Test-LaiSamePath ([string]$flags7gC['modelDir']) $plannedModels) -and -not $flags7gC.ContainsKey('ollamaModelsEnv') -and $log7gC.Contains("what is installed is read from $(Join-Path $plannedModels 'manifests'): $modelName7g") -and $log7gC -match 'Restarting Ollama so it picks up the settings') "the state plans the default folder again and keeps no value of its own; Ollama is restarted to drop the variable (state: $($flags7gC['modelDir']))"
+
+    # D: the same run when the variable is the owner's, set before the first install (the record
+    # Uninstall puts back): it is not the installer's to remove.
+    $st7gD = Read-LaiState -Path $statePath
+    $st7gD['flags']['ollamaModelsEnv'] = $otherModels
+    if (-not ($st7gD['flags']['prevOllamaEnv'] -is [hashtable])) { $st7gD['flags']['prevOllamaEnv'] = @{} }
+    $st7gD['flags']['prevOllamaEnv']['OLLAMA_MODELS'] = $otherModels
+    Save-LaiState -State $st7gD -Path $statePath
+    $global:MockUserEnv['OLLAMA_MODELS'] = $otherModels
+    & (Join-Path $aiRoot 'Scripts/Install-LocalAI.ps1') -AIRoot $aiRoot -SkipTests -TrialModels none -ModelDir $plannedModels
+    $log7gD = Get-NewestLog
+    Assert-That ($log7gD -match 'Test hook: stage Models failed' -and (Test-LaiSamePath ([string]$global:MockUserEnv['OLLAMA_MODELS']) $otherModels) -and $log7gD -notmatch 'removed OLLAMA_MODELS' -and $log7gD.Contains("OLLAMA_MODELS=$otherModels is not the installer's own setting and is left as it is")) "a value the owner had before the first install is left alone, and the log says why (variable: $($global:MockUserEnv['OLLAMA_MODELS']))"
+} finally {
+    $env:LOCALAI_TEST_FAIL_STAGE = ''
+    $global:MockOllamaLog = $null
+    $global:MockUserEnv = $null
+    Remove-Item -LiteralPath Env:OLLAMA_MODELS -ErrorAction SilentlyContinue
+    Set-Content -LiteralPath $serverLog -Value $srv7g
+    Copy-Item -LiteralPath $stateAside7g -Destination $statePath -Force
+    foreach ($made7g in @((Join-Path $plannedModels 'manifests'), (Join-Path $plannedModels 'blobs'), $otherModels)) {
+        if (Test-Path -LiteralPath $made7g) { Remove-Item -LiteralPath $made7g -Recurse -Force }
+    }
+}
 
 Write-Host "`n=== PHASE 8: -DeepResearch (Local Deep Research), then -NoDeepResearch ===" -ForegroundColor Cyan
 # compose is mocked: a real Local Deep Research container stands in for the one compose would start
@@ -955,7 +1139,8 @@ if ((& /usr/bin/docker image inspect $ldrImage 2>$null) -and $LASTEXITCODE -eq 0
     if ($parkedSearxng) { & /usr/bin/docker rename searxng-uninstall-test-keep searxng 2>$null | Out-Null }
     & /usr/bin/docker volume rm owui-empty 2>$null | Out-Null
     & /usr/bin/docker ps -aq --filter 'name=^/open-webui-legacy-' | ForEach-Object { & /usr/bin/docker rm -f $_ | Out-Null }
-    & /usr/bin/docker volume rm open-webui owui-old 2>$null | Out-Null
+    & /usr/bin/docker volume rm open-webui owui-old owui-6d 2>$null | Out-Null
+    $global:MockCopyFail = $false; $global:MockUserEnv = $null
     # The installer pointed the shared Open WebUI at the guard on :11435; point it back at Ollama.
     try {
         Import-Module (Join-Path $src 'lib/LocalAI.psm1') -Force
