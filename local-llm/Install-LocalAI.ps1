@@ -2344,7 +2344,17 @@ $lockedOneByOne = Protect-InstallFolder -Again
 # writes): one WARN line each here, and the health watch names them once in a notification.
 try {
     $integrityBaseline = Save-LaiIntegrityBaseline -AIRoot $AIRoot -Reason 'install' -SourceRoot $SourceRoot -OwnTasks @($BackupTask, $WatchTask, $RecheckTask) -OwnSettings @('OLLAMA_BASE_URL', 'DEEP_RESEARCH_OLLAMA_URL')
-    Write-LaiLog OK "Integrity baseline recorded: $(Get-LaiIntegritySummary -Baseline $integrityBaseline). The health watch tells you when they change outside an update (Watch-LocalAI.ps1 -AcceptBaseline accepts changes you made yourself)."
+    $integritySummary = Get-LaiIntegritySummary -Baseline $integrityBaseline
+    # Scripts or Stack not read (a link, or the Windows calls for the walk are not there): the
+    # baseline holds no file of that folder and compares as equal from then on, whatever happens in
+    # it. No OK line that promises a watch then; the summary names the folder and why.
+    $integrityUnread = @((Get-LaiIntegrityUnread -Files $integrityBaseline['files']).Keys | Sort-Object)
+    if ($integrityUnread.Count) {
+        $integrityUnreadText = $integrityUnread -join ' and '
+        Write-LaiLog WARN "Integrity baseline recorded without the files in ${integrityUnreadText}: $integritySummary. The health watch does NOT tell you when a file there changes. Running the installer again records a new baseline, with those files once the folder can be read."
+    } else {
+        Write-LaiLog OK "Integrity baseline recorded: $integritySummary. The health watch tells you when they change outside an update (Watch-LocalAI.ps1 -AcceptBaseline accepts changes you made yourself)."
+    }
     # By name only what the baseline names: an entry that stands for the rest ('more|...') is no name,
     # it is part of the count. The rest is counted from the number the baseline kept.
     $integrityKeptAll = @($integrityBaseline['accepted'] | Where-Object { $_ -is [hashtable] }).Count

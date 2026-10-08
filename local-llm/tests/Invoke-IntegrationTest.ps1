@@ -369,6 +369,14 @@ asyncio.run(main())
 # pins), found with Open WebUI's own Python; nothing of the package is imported or run. A package
 # this check cannot read the names from (no such call, or a call that hands the name over another
 # way) is a FAIL that shows the lines it found: never a pass, never a skip.
+# The names alone do not show where Open WebUI looks them up. The preset writes its switches under
+# meta.builtinTools: were they read from another key, all 16 names would still be the same and every
+# switch would do nothing. So a file that names is_builtin_tool_enabled must also name builtinTools
+# in a line of code (in quotes, or as .builtinTools; a comment does not count), else FAIL. And one
+# category could be asked for past the helper, by a read of that key with the name in it: what this
+# check cannot judge it shows. The OK line ends with every line that names builtinTools without the
+# helper, and every line that reads from a name such a line fills (x = ...builtinTools..., then
+# x.get( or x[ ), for a person to read once in the first green log.
 $tnDir = Join-Path ([System.IO.Path]::GetTempPath()) ('lai-toolnames-' + [guid]::NewGuid().ToString('N'))
 try {
     New-Item -ItemType Directory -Path $tnDir | Out-Null
@@ -377,7 +385,10 @@ try {
 import importlib.util, json, os, re
 from importlib import metadata
 helper = "is_builtin_tool_enabled"
-out = {"version": "unknown", "base": "", "error": "", "names": [], "calls": 0, "literal": 0, "files": [], "lines": []}
+key = "builtinTools"
+key_in_code = re.compile("[\"']" + key + "[\"']|[.]" + key + r"\b")
+filled_from_key = re.compile(r"^\s*([A-Za-z_]\w*)\s*=[^=].*" + key)
+out = {"version": "unknown", "base": "", "error": "", "names": [], "calls": 0, "literal": 0, "files": [], "lines": [], "keylines": [], "otherlines": [], "othermore": 0}
 try:
     try:
         out["version"] = metadata.version("open-webui")
@@ -393,7 +404,7 @@ try:
             path = os.path.join(folder, name)
             with open(path, encoding="utf-8", errors="replace") as f:
                 src = f.read()
-            if helper not in src and "builtinTools" not in src:
+            if helper not in src and key not in src:
                 continue
             rel = os.path.relpath(path, base)
             found = re.findall(helper + r"\s*\(\s*[\"']([^\"']*)[\"']", src)
@@ -403,11 +414,30 @@ try:
             names.update(found)
             out["literal"] += len(found)
             out["calls"] += calls
-            for line in src.splitlines():
-                if helper in line or "builtinTools" in line:
-                    out["lines"].append(rel + ": " + line.strip()[:140])
+            rows = src.splitlines()
+            # The names a line of this file fills from the key, and the reads from those names.
+            filled = set()
+            for line in rows:
+                m = filled_from_key.match(line)
+                if m:
+                    filled.add(m.group(1))
+            reads = None
+            if filled:
+                reads = re.compile(r"\b(?:" + "|".join(sorted(filled)) + r")\s*(?:[.]get\s*\(|\[)")
+            for line in rows:
+                text = line.strip()
+                shown = rel + ": " + text[:140]
+                if helper in line or key in line:
+                    out["lines"].append(shown)
+                if helper in src and not text.startswith("#") and key_in_code.search(line):
+                    out["keylines"].append(shown)
+                if helper not in line and (key in line or (reads is not None and reads.search(line))):
+                    out["otherlines"].append(shown)
     out["names"] = sorted(names)
     out["lines"] = out["lines"][:40]
+    out["keylines"] = out["keylines"][:10]
+    out["othermore"] = max(0, len(out["otherlines"]) - 12)
+    out["otherlines"] = out["otherlines"][:12]
 except Exception as e:
     out["error"] = type(e).__name__ + ": " + str(e)
 print(json.dumps(out))
@@ -420,10 +450,15 @@ print(json.dumps(out))
     $tn = $null; try { $tn = ($tnOut | Where-Object { $_ -like '{*' } | Select-Object -Last 1) | ConvertFrom-Json } catch { $tn = $null }
     $tnEntry = @($catalog.Models)[0]
     $tnWritten = @((New-LaiPresetForm -Entry $tnEntry -NativeTools $true -SystemPrompt 'x')['meta']['builtinTools'].Keys | ForEach-Object { [string]$_ } | Sort-Object)
-    $tnRead = @(); $tnSeen = ''
+    $tnRead = @(); $tnSeen = ''; $tnKey = @(); $tnOther = @(); $tnOtherText = 'none'
     if ($tn) {
         $tnRead = @($tn.names | Where-Object { $null -ne $_ } | ForEach-Object { [string]$_ })
         $tnSeen = " Open WebUI $($tn.version), $($tn.base). Lines found: $(@($tn.lines) -join ' || ')"
+        # Where the key is named in code, and the lines a person has to read (see above).
+        $tnKey = @($tn.keylines | Where-Object { $null -ne $_ } | ForEach-Object { [string]$_ })
+        $tnOther = @($tn.otherlines | Where-Object { $null -ne $_ } | ForEach-Object { [string]$_ })
+        if ($tnOther.Count) { $tnOtherText = $tnOther -join ' || ' }
+        if ([int]$tn.othermore -gt 0) { $tnOtherText += " || and $([int]$tn.othermore) more line(s)" }
     }
     # Asked for by Open WebUI and not written by the preset: ON. Written and never asked for: does nothing.
     $tnOn = @($tnRead | Where-Object { $tnWritten -cnotcontains $_ })
@@ -436,12 +471,14 @@ print(json.dumps(out))
         Write-LaiLog FAIL "tool switches: no call is_builtin_tool_enabled('<name>') was found in the open_webui package, so the names of its tool categories could not be read. Open WebUI may ask for them another way now: change this check to read that.$tnSeen"; $failures++
     } elseif ([int]$tn.calls -ne [int]$tn.literal) {
         Write-LaiLog FAIL "tool switches: $($tn.literal) of the $($tn.calls) calls of is_builtin_tool_enabled have the name written out in quotes. The others hand it over another way, so the list read here ($($tnRead -join ', ')) may be short: change this check to read them.$tnSeen"; $failures++
+    } elseif ($tnKey.Count -eq 0) {
+        Write-LaiLog FAIL "tool switches: no line of code names builtinTools, the key in a preset's meta that the switches are written under, in the files that name is_builtin_tool_enabled. Open WebUI may read the switches from another key now, and then every switch a preset writes does nothing: read the lines below, then change the preset or this check.$tnSeen"; $failures++
     } elseif ($tnOn.Count -or $tnDead.Count) {
         $tnOnText = 'none'; if ($tnOn.Count) { $tnOnText = $tnOn -join ', ' }
         $tnDeadText = 'none'; if ($tnDead.Count) { $tnDeadText = $tnDead -join ', ' }
         Write-LaiLog FAIL "tool switches: the switches a preset writes are not the tool categories Open WebUI $($tn.version) asks for. Asked for and not written, so ON in every preset: $tnOnText. Written and never asked for, so a switch that does nothing: $tnDeadText. Open WebUI asks for: $($tnRead -join ', ') (in $(@($tn.files) -join ', ')). The preset writes: $($tnWritten -join ', ')."; $failures++
     } else {
-        Write-LaiLog OK "tool switches: the $($tnWritten.Count) switches a preset writes are the $($tnRead.Count) tool categories Open WebUI $($tn.version) asks for by name ($($tnRead -join ', '); $($tn.calls) calls in $(@($tn.files) -join ', '))"
+        Write-LaiLog OK "tool switches: the $($tnWritten.Count) switches a preset writes are the $($tnRead.Count) tool categories Open WebUI $($tn.version) asks for by name ($($tnRead -join ', '); $($tn.calls) calls in $(@($tn.files) -join ', ')), and the key builtinTools is named in code there: $($tnKey -join ' || '). Not judged by this check, to be read once: the lines that name builtinTools, or read from a name filled from it, without is_builtin_tool_enabled (a category asked for past the helper would be among them): $tnOtherText"
     }
 } catch {
     Write-LaiLog FAIL "tool switches: the names Open WebUI asks for could not be compared with the preset's: $($_.Exception.Message)"; $failures++

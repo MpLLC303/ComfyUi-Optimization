@@ -259,12 +259,16 @@ if ($onWindows) {
     $script:P = @{ Root = $pfRoot; Scripts = (Join-Path $pfRoot 'Scripts'); Stack = (Join-Path $pfRoot 'Stack'); Secrets = (Join-Path $pfRoot 'Secrets') }
     $script:SourceRoot = $src
     $script:CurrentUserSid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+    $pfCut = { param($p) (Test-Path -LiteralPath $p) -and (Get-Acl -LiteralPath $p).AreAccessRulesProtected }
     $pfFirst = Protect-InstallFolder
+    # Looked at here, before the second pass: -Again makes and locks Stack and Skills as well, so
+    # read after it these two lines could not fail for a first pass that does neither.
+    Assert-That ($pfFirst -eq $true -and (& $pfCut (Join-Path $pfRoot 'Stack')) -and (& $pfCut (Join-Path $pfRoot 'Skills')) -and (& $pfCut (Join-Path $pfRoot 'Logs')) -and (& $pfCut (Join-Path $pfRoot 'install-state.json'))) 'the first pass makes Stack and Skills and cuts inheritance on them, as on the folders and files that were there'
+    $pfSkillsMade = 0; if (Test-Path -LiteralPath (Join-Path $pfRoot 'Skills')) { $pfSkillsMade = @(Get-ChildItem -LiteralPath (Join-Path $pfRoot 'Skills') -Directory).Count }
+    $pfSkillsWanted = @(Get-ChildItem -LiteralPath (Join-Path $src 'skills') -Directory).Count
+    Assert-That ($pfSkillsWanted -gt 0 -and $pfSkillsMade -eq $pfSkillsWanted) "Skills is made with the starter skills in it, by the first pass ($pfSkillsMade of $pfSkillsWanted)"
     Set-Content -LiteralPath (Join-Path $pfRoot 'localai-config.json') -Value '{}'   # what a later stage writes into the root
     $pfAgain = Protect-InstallFolder -Again
-    $pfCut = { param($p) (Test-Path -LiteralPath $p) -and (Get-Acl -LiteralPath $p).AreAccessRulesProtected }
-    Assert-That ($pfFirst -eq $true -and (& $pfCut (Join-Path $pfRoot 'Stack')) -and (& $pfCut (Join-Path $pfRoot 'Skills')) -and (& $pfCut (Join-Path $pfRoot 'Logs')) -and (& $pfCut (Join-Path $pfRoot 'install-state.json'))) 'the first pass makes Stack and Skills and cuts inheritance on them, as on the folders and files that were there'
-    Assert-That (@(Get-ChildItem -LiteralPath (Join-Path $pfRoot 'Skills') -Directory).Count -eq @(Get-ChildItem -LiteralPath (Join-Path $src 'skills') -Directory).Count) 'Skills is made with the starter skills in it'
     Assert-That ((Get-Acl -LiteralPath $pfForeign).Sddl -eq $pfForeignBefore -and (Get-Acl -LiteralPath $pfRoot).Sddl -eq $pfRootBefore) 'the foreign folder, and the root it sits in, keep their permissions'
     Assert-That ($pfAgain -eq $true -and (& $pfCut (Join-Path $pfRoot 'localai-config.json'))) 'the pass after the stages reaches a file written since the first'
     # A root with nothing foreign in it: its own permissions cover what is made under it, so the
@@ -587,8 +591,24 @@ exit /b 0
         $r = Invoke-StartAgainCase 'comes-up' 60
         Assert-That ($r.Text -match 'Docker engine is running' -and $r.Text -notmatch $sdHung -and $r.Probes -eq 3) ("a probe without an answer while Docker Desktop starts does not end Start again: it goes on when the next one answers ({0} probes, {1:N0} s)" -f $r.Probes, $r.Sec)
         # 'docker desktop start' itself gets -TimeoutSec, and using all of it is not 'not responding'.
+        # The wait is measured between two lines of the run itself, by the time each begins with
+        # (whole seconds): 'Starting Docker Desktop', written right before the command, and the
+        # closing FAIL line. At least 8 s, and under 20: a 'desktop start' without -TimeoutSec would
+        # get the helper's own 30 s. The whole child run is only held to its lower end, because it
+        # also holds a PowerShell start, two module imports and the listener's answer, which a
+        # loaded runner can stretch by any amount.
         $r = Invoke-StartAgainCase 'start-waits' 8
-        Assert-That ($r.Code -ne 0 -and $r.Text -match '\[FAIL\] Local AI did not start: Docker engine did not start within 8 s\. Open Docker Desktop' -and $r.Text -notmatch $sdHung -and $r.Sec -ge 8 -and $r.Sec -lt 28) ("a 'docker desktop start' that does not come back is ended after -TimeoutSec and reported as a start that did not finish (exit {0}, {1:N0} s)" -f $r.Code, $r.Sec)
+        $sdWait = -1; $sdWaitText = 'not measured: the two lines were not found'
+        # \D between the numbers: the sign Get-Date puts there is the time separator of the culture.
+        $sdFrom = [regex]::Match($r.Text, '(\d\d)\D(\d\d)\D(\d\d) \[INFO\] Starting Docker Desktop')
+        $sdTo = [regex]::Match($r.Text, '(\d\d)\D(\d\d)\D(\d\d) \[FAIL\] Local AI did not start')
+        if ($sdFrom.Success -and $sdTo.Success) {
+            $sdWait = (3600 * [int]$sdTo.Groups[1].Value + 60 * [int]$sdTo.Groups[2].Value + [int]$sdTo.Groups[3].Value) - (3600 * [int]$sdFrom.Groups[1].Value + 60 * [int]$sdFrom.Groups[2].Value + [int]$sdFrom.Groups[3].Value)
+            # Over midnight the later line has the smaller time of day.
+            if ($sdWait -lt 0) { $sdWait += 86400 }
+            $sdWaitText = "$sdWait s"
+        }
+        Assert-That ($r.Code -ne 0 -and $r.Text -match '\[FAIL\] Local AI did not start: Docker engine did not start within 8 s\. Open Docker Desktop' -and $r.Text -notmatch $sdHung -and $r.Sec -ge 8 -and $sdWait -ge 8 -and $sdWait -lt 20) ("a 'docker desktop start' that does not come back is ended after -TimeoutSec and reported as a start that did not finish (exit {0}; from 'Starting Docker Desktop' to the FAIL line: {1}; the whole run: {2:N0} s)" -f $r.Code, $sdWaitText, $r.Sec)
     } finally { $env:Path = $sdSaved.Path; $env:LAI_SD_CASE = $sdSaved.Case; $env:LOCALAI_DOCKER_TIMEOUT = $sdSaved.Limit }
 } else { Skip 'the wait for Docker Desktop to start runs on Windows only' }
 

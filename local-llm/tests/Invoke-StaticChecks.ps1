@@ -58,6 +58,9 @@ $files = Get-ChildItem -Path $Root -Recurse -File -Include *.ps1, *.psm1, *.psd1
 #            silently until killed, a window waits without a word. The rule goes by the command's
 #            name: a timed call through Invoke-LaiTimedNative or Invoke-Capture is not looked at,
 #            and neither is another program that can wait (wsl.exe --shutdown in Stop-LocalAI.ps1).
+#            Three forms of an untimed docker call have another name and are not seen either: docker
+#            run from a variable (& $dockerCmd ps), through Start-Process, or by its full path. None
+#            of the six scripts holds one today; a new one would pass this rule.
 #   HIDDENTASK a scheduled task action that runs powershell.exe directly: on Windows 11 (Windows
 #            Terminal as console host) -WindowStyle Hidden still shows a window, and closing it kills
 #            the run. Use Get-LaiHiddenTaskLaunch (conhost --headless).
