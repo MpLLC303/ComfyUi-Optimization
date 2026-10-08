@@ -343,8 +343,9 @@ Three call sites:
 Tests: a new section `=== secret files: plain and protected form ===` after
 Invoke-WindowsUnitTests.ps1:170, before the `=== private ACLs` header. [W] = inside
 `if ($onWindows)`; [L] = in its else branch, next to `Skip 'DPAPI round trips need Windows'`;
-no mark = both jobs. For 22-28 and 31 use the harness of lines 115-141: an `HttpListener` on
-`http://127.0.0.1:<random port>/` in the test process, the code under test in a child started from
+no mark = both jobs. For 22-28 and 31 use the harness of lines 115-141: an `HttpListener` from
+`Start-TestListener` (a loopback port the system names free; never a drawn number, which can be a
+port that is taken) in the test process, the code under test in a child started from
 a small client script that writes its result to a file. For 24-28 the client script sets
 `$global:LASTEXITCODE = 0`, runs `Set-OpenWebUIPassword.ps1 -AIRoot <root> -NewPassword <text>
 -Quiet` in a try (a throw counts as exit 1) and writes the exit code and all output (`*>&1`);

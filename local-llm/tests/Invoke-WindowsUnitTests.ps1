@@ -36,6 +36,34 @@ function Assert-That([bool]$Condition, [string]$Message) {
     else { Write-Host "  ASSERT FAIL $Message" -ForegroundColor Red; $script:failures++ }
 }
 function Skip([string]$Message) { Write-Host "  SKIP        $Message" -ForegroundColor DarkGray }
+function Start-TestListener {
+    # A started HttpListener on a loopback port that is free now, and that port (Listener, Port).
+    # The port is asked of the system (a TcpListener on port 0, closed again at once), never drawn
+    # blind: a number from Get-Random can be a port that is taken. On Linux the ports a program is
+    # handed for its own connections are 32768 to 60999, and one that a connection to 127.0.0.1 used
+    # stays taken for a minute after the connection closed. The step before this suite on the Linux
+    # job (the render guard's test) makes many such connections, and one run of this suite ended
+    # in its first Start() with 'Address already in use' (which port, and who held it, the log did
+    # not say). If somebody takes the port between the asking and the listening, the next one is
+    # asked for.
+    $why = ''
+    for ($try = 1; $try -le 5; $try++) {
+        $ask = New-Object System.Net.Sockets.TcpListener([System.Net.IPAddress]::Loopback, 0)
+        $ask.Start()
+        $port = $ask.LocalEndpoint.Port
+        $ask.Stop()
+        $listener = New-Object System.Net.HttpListener
+        $listener.Prefixes.Add("http://127.0.0.1:$port/")
+        try {
+            $listener.Start()
+            return [pscustomobject]@{ Listener = $listener; Port = $port }
+        } catch {
+            $why = 'port {0}: {1}' -f $port, $_.Exception.Message
+            Write-Host ('  (try {0} of 5: no test listener on {1}; asking for another port)' -f $try, $why) -ForegroundColor DarkGray
+        }
+    }
+    throw "no test listener on 127.0.0.1 after 5 ports the system named free (last: $why)"
+}
 
 Write-Host "PowerShell $($PSVersionTable.PSVersion) ($($PSVersionTable.PSEdition)) on $(if ($onWindows) { 'Windows' } else { 'non-Windows' })"
 if (Test-Path -LiteralPath $Work) { Remove-Item -LiteralPath $Work -Recurse -Force }
@@ -77,10 +105,8 @@ Assert-That (((Get-Content -LiteralPath $statePath -Raw) | ConvertFrom-Json).mod
 Write-Host "`n=== Invoke-LaiApi UTF-8 both ways ===" -ForegroundColor Cyan
 # Both directions: the request body must be UTF-8, and a reply sent as plain 'application/json'
 # (no charset, as Open WebUI does) must be decoded as UTF-8, not ISO-8859-1 (5.1's default).
-$port = Get-Random -Minimum 20000 -Maximum 40000
-$listener = New-Object System.Net.HttpListener
-$listener.Prefixes.Add("http://127.0.0.1:$port/")
-$listener.Start()
+$started = Start-TestListener
+$listener = $started.Listener; $port = $started.Port
 $async = $listener.BeginGetContext($null, $null)
 # The client runs in its own process, exactly as the scripts do.
 $client = Join-Path $Work 'client.ps1'
@@ -115,10 +141,8 @@ $pRoot = Join-Path $Work 'pending'
 New-Item -ItemType Directory -Force -Path (Join-Path $pRoot 'Secrets') | Out-Null
 $pendingFile = Join-Path (Join-Path $pRoot 'Secrets') 'openwebui-admin.pending.json'
 Set-Content -LiteralPath $pendingFile -Value '{"email": "admin@localhost", "password": "Pending-Password-1"}' -Encoding UTF8
-$port2 = Get-Random -Minimum 20000 -Maximum 40000
-$listener2 = New-Object System.Net.HttpListener
-$listener2.Prefixes.Add("http://127.0.0.1:$port2/")
-$listener2.Start()
+$started = Start-TestListener
+$listener2 = $started.Listener; $port2 = $started.Port
 $pOut = Join-Path $Work 'pending-out.txt'
 $client2 = Join-Path $Work 'client2.ps1'
 Set-Content -LiteralPath $client2 -Value (("Import-Module '{0}' -Force`n" -f (Join-Path (Join-Path $src 'lib') 'LocalAI.psm1')) +
@@ -143,9 +167,9 @@ if (-not $proc2.WaitForExit(30000)) { $proc2.Kill() }
 $listener2.Stop()
 $res = ''; if (Test-Path -LiteralPath $pOut) { $res = (Get-Content -LiteralPath $pOut -Raw).Trim() }
 # Open WebUI's sign-in rate limit (429) is waited out, not reported as a failure.
-$listener2 = New-Object System.Net.HttpListener
-$listener2.Prefixes.Add("http://127.0.0.1:$port2/")
-$listener2.Start()
+# (A listener and a port of its own: the port the one above just gave up is not asked for again.)
+$started = Start-TestListener
+$listener2 = $started.Listener; $port2 = $started.Port
 $client3 = Join-Path $Work 'client3.ps1'
 $tOut = Join-Path $Work 'token-out.txt'
 Set-Content -LiteralPath $client3 -Value (("Import-Module '{0}' -Force`n`$env:LOCALAI_TEST_SIGNIN_WAIT = '1'`n" -f (Join-Path (Join-Path $src 'lib') 'LocalAI.psm1')) +
@@ -1402,10 +1426,8 @@ if ($missingFn.Count -eq 0) {
 }
 Import-Module (Join-Path (Join-Path $src 'lib') 'LocalAI.psm1') -Force
 # A moved endpoint: Open WebUI answers any unknown path with its web page (status 200).
-$htmlPort = Get-Random -Minimum 41000 -Maximum 49000
-$hl = New-Object System.Net.HttpListener
-$hl.Prefixes.Add("http://127.0.0.1:$htmlPort/")
-$hl.Start()
+$started = Start-TestListener
+$hl = $started.Listener; $htmlPort = $started.Port
 $hAsync = $hl.BeginGetContext($null, $null)
 $hClient = Join-Path $Work 'html-client.ps1'; $hOut = Join-Path $Work 'html-out.txt'
 Set-Content -LiteralPath $hClient -Value (("Import-Module '{0}' -Force`n" -f (Join-Path (Join-Path $src 'lib') 'LocalAI.psm1')) +
