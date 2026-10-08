@@ -52,7 +52,8 @@
       bootstrap calls, with the route given), with a stand-in for the one request to Windows that
       starts the same command line and waits: an archive swapped in the temp folder after the
       first comparison and a changed step are refused, a declined request and a window that never
-      answers are told apart, and nothing with administrator rights removes a file in the temp
+      answers are told apart, a first window that can make no signal of its own account waits
+      for none and says so, and nothing with administrator rights removes a file in the temp
       folder. The step itself is also called directly, with a wrong archive and a wrong digest.
       A real folder that Users may modify does not pass the check of its rules; a folder made with
       its rules in one call has them from the start; no run leaves anything in the temp folder or
@@ -64,11 +65,14 @@
       itself builds; the two answers are held against each other with the bootstrap's own
       functions. Each fact has its own assertion, which says what was asked, what came back and
       what an update would stop at. That is the one part that needs a network (two requests, a
-      few seconds; at most about three minutes when GitHub does not answer). GITHUB_TOKEN is
-      sent to GitHub's API when the environment holds one (its hourly limit without one is
-      small); the archive is asked for without it, as the bootstrap asks. The CI workflows pass
-      -ProbeCommit; without it this part prints SKIP.
-    Exit code = number of failed assertions. The last lines say how long the parts took.
+      few seconds; about three minutes when GitHub does not answer at all; an answer that begins
+      and then falls silent is ended by PowerShell 7.4 and later, else by .NET or by the time
+      limit of the job, as said at that part). GITHUB_TOKEN is sent to GitHub's API when the
+      environment holds one (its hourly limit without one is small); the archive is asked for
+      without it, as the bootstrap asks. The CI workflows pass -ProbeCommit; without it this part
+      prints SKIP.
+    Exit code = number of failed assertions. Each part says how long it took when it ends, and
+    the last lines say it for all of them.
 #>
 param(
     [string]$Work = (Join-Path ([System.IO.Path]::GetTempPath()) 'lai-getlocalai-test'),
@@ -82,11 +86,17 @@ if (-not (& (Join-Path $PSScriptRoot 'Assert-LaiSandbox.ps1'))) { exit 99 }
 $src = Split-Path -Parent $PSScriptRoot
 $onWindows = ($env:OS -eq 'Windows_NT')
 $failures = 0
-# How long the parts take is said at the end: the Windows job has a time limit, and its log is
-# where a part that grew shows first.
+# How long the parts take is said as each part ends, and once more at the end: the Windows job has
+# a time limit, and its log is where a part that grew shows first. A job that is cut off at that
+# limit prints no last line, so the parts that ran before must have said theirs by then.
 $suiteWatch = [System.Diagnostics.Stopwatch]::StartNew()
 $partSeconds = [ordered]@{}
 $partWatch = [System.Diagnostics.Stopwatch]::StartNew()
+function Write-PartTime([string]$Part) {
+    $script:partSeconds[$Part] = [int]$script:partWatch.Elapsed.TotalSeconds
+    Write-Host ("  Time: {0}: {1} s ({2} s since the start)" -f $Part, $script:partSeconds[$Part], [int]$script:suiteWatch.Elapsed.TotalSeconds) -ForegroundColor DarkGray
+    $script:partWatch.Restart()
+}
 function Assert-That([bool]$Condition, [string]$Message) {
     if ($Condition) { Write-Host "  ASSERT OK   $Message" -ForegroundColor Green }
     else { Write-Host "  ASSERT FAIL $Message" -ForegroundColor Red; $script:failures++ }
@@ -1072,6 +1082,14 @@ if ($haveFunctions) {
     }
     $escaped = @(Get-ChildItem -LiteralPath $fileWork -Recurse -Force -File | Where-Object { $_.Name -eq 'escaped.txt' })
     Assert-That ($notRefused.Count -eq 0 -and $escaped.Count -eq 0) "an archive with a name that would land somewhere else is refused as a whole, and none of those files is written anywhere ($($hostile.Count) kinds; not refused: $($notRefused -join ', '); written: $($escaped.Count))"
+    # A top folder is refused for one of two things, and each refusal names its own: a name of
+    # letters, digits and dots that ends in a dot is not "more than letters, digits and . _ -".
+    $topSays = [ordered]@{}
+    foreach ($topEntry in @('top./README.md', '../local-llm/escaped.txt', 'a''b;[c]/README.md')) {
+        try { $null = Get-ToolkitEntry -FullName $topEntry -Top ''; $topSays[$topEntry] = 'not refused' } catch { $topSays[$topEntry] = [string]$_.Exception.Message }
+    }
+    $dotSays = @($topSays['top./README.md'], $topSays['../local-llm/escaped.txt'])
+    Assert-That (@($dotSays | Where-Object { $_ -match 'top folder has a name Windows may store elsewhere than written \(it is ''\.\.'', or ends in a dot' -and $_ -notmatch 'more than letters' }).Count -eq 2 -and $topSays['a''b;[c]/README.md'] -match 'top folder has a name that is more than letters, digits and \. _ -' -and $topSays['a''b;[c]/README.md'] -notmatch 'store elsewhere') "a top folder that ends in a dot, or is '..', is refused for what is wrong with it (Windows would store it elsewhere than written), and one with a quote and brackets for that: neither is told the other's reason ($(@($topSays.Keys | ForEach-Object { "'$_': " + (ConvertTo-ReviewText -Text $topSays[$_] -Max 110) }) -join ' | '))"
     $tooMuch = ''
     try { $null = Expand-ToolkitArchive -Zip $goodZip -Destination (Join-Path $fileWork 'unpacked-capped') -MaxBytes 20 } catch { $tooMuch = $_.Exception.Message }
     Assert-That ($tooMuch -match 'far more than a toolkit holds') "an archive that unpacks to more than the limit is given up on ('$tooMuch')"
@@ -1102,9 +1120,9 @@ function Invoke-WebRequest {
 function Start-ElevatedWindow {
     param([string]$Zip, [string]$StageFile, [string]$ZipHash, [string]$Digest, [string]$Commit, [string]$Root, [string[]]$Extra, [int]$WaitSeconds)
     $flowState.Calls.Add("WINDOW $ZipHash $Digest $Commit")
-    if ($flowState.Window -eq 'declined') { return [pscustomobject]@{ Started = $false; Taken = $false; Why = 'stand-in: No at the prompt of Windows' } }
+    if ($flowState.Window -eq 'declined') { return [pscustomobject]@{ Started = $false; Signal = $false; Taken = $false; Why = 'stand-in: No at the prompt of Windows' } }
     [System.IO.File]::WriteAllText($StageFile, 'stand-in for the text of the step')
-    return [pscustomobject]@{ Started = $true; Taken = ($flowState.Window -eq 'taken'); Why = '' }
+    return [pscustomobject]@{ Started = $true; Signal = ($flowState.Window -ne 'no-signal'); Taken = ($flowState.Window -eq 'taken'); Why = '' }
 }
 function Invoke-ElevatedInstall {
     param([string]$Zip, [string]$ZipHash, [string]$Digest, [string]$Commit, [string]$Root, [string[]]$Extra)
@@ -1118,7 +1136,8 @@ function Invoke-ElevatedInstall {
         # -Fails: having written them, it throws this (a download that broke off part-way).
         # -Files: the commit's list of files ($null: none, and nothing is compared). -Route: as
         # Get-ElevationRoute answers. -Window: what the request for a window ends in (declined;
-        # taken: the window says that it has read the two files; silent: it never does).
+        # taken: the window says that it has read the two files; silent: it never does;
+        # no-signal: this window had no signal that window could set, and did not wait).
         # Returns what was said (Lines, Text), the stand-ins' calls in their order (Calls) and
         # what is in the temp folder afterwards (Left).
         param([byte[]]$Download, [string]$Fails = '', $Files = $null, [string]$Route = 'window', [string]$Window = 'declined')
@@ -1164,6 +1183,11 @@ function Invoke-ElevatedInstall {
     Assert-That ($flow.Calls.Count -eq 2 -and $flow.Text -match 'Administrator rights were declined; run the command again and click Yes' -and $flow.Text -match 'Nothing was installed or changed' -and $flow.Text -notmatch 'continues in the Administrator window' -and $flow.Left.Count -eq 0) "administrator rights declined: said so, and nothing is left in the temp folder (left: $($flow.Left -join ', '))"
     $flow = & $runFlow -Download $goodBytes -Files $manifest -Window 'silent'
     Assert-That (($flow.Left -join ' ') -ceq 'localai-elevated-step.txt localai-installer.zip' -and $flow.Text -match 'has not said within 7 seconds' -and $flow.Text -match 'the next run of this command removes them') "a window that was started and never says that it has read the two files keeps them: they are left, and the run says where they are (left: $($flow.Left -join ', '))"
+    # A first window that has no signal the other one can set (PowerShell 7 with administrator
+    # rights could make none of its own account) waited for nothing, so it does not say that
+    # a time has passed: it says what it could not do, and leaves the files the same way.
+    $flow = & $runFlow -Download $goodBytes -Files $manifest -Window 'no-signal'
+    Assert-That ($flow.Calls.Count -eq 2 -and ($flow.Left -join ' ') -ceq 'localai-elevated-step.txt localai-installer.zip' -and $flow.Text -match 'The installer continues in the Administrator window that opened' -and $flow.Text -match 'This window could not make the signal by which that one says that it has read the two files' -and $flow.Text -notmatch 'has not said within' -and $flow.Text -match 'the next run of this command removes them') "a window that could make no signal for the other one to set says so, and not that a time has passed that it never waited: the two files are left, and the run says where they are (left: $($flow.Left -join ', '))"
     $flow = & $runFlow -Download ($utf8.GetBytes('the first part of an archive, and then the connection broke')) -Fails 'The operation has timed out.'
     Assert-That ($flow.Calls.Count -eq 1 -and $flow.Text -match 'The download failed: The operation has timed out\.' -and $flow.Text -match 'Nothing was changed: your Local AI keeps working as it is' -and $flow.Left.Count -eq 0) "a download that broke off part-way: said so, the step is not reached, and neither the part that arrived nor the two files the run before left stay in the temp folder (calls: $($flow.Calls.Count); left: $($flow.Left -join ', '))"
     $flow = & $runFlow -Download ($utf8.GetBytes('<html>Sign in</html>')) -Files $manifest
@@ -1382,8 +1406,7 @@ $resumeFn = $installerAst.Find({ param($n) $n -is [System.Management.Automation.
 $resumeText = ''; if ($resumeFn) { $resumeText = $resumeFn.Extent.Text }
 Assert-That ($resumeText -match 'Install-LocalAI\.ps1' -and $resumeText -notmatch 'Get-LocalAI') "the installer's after-reboot task starts Install-LocalAI.ps1 itself, not this bootstrap: a resume is never held up by the question"
 
-$partSeconds['the functions and the syntax tree'] = [int]$partWatch.Elapsed.TotalSeconds
-$partWatch.Restart()
+Write-PartTime 'the functions and the syntax tree'
 
 # ---- the whole bootstrap in a child process (Windows: it starts powershell.exe) --------------------
 Write-Host "`n=== Get-LocalAI.ps1 end to end, with a stand-in for GitHub ===" -ForegroundColor Cyan
@@ -1601,9 +1624,13 @@ Invoke-Expression ([System.IO.File]::ReadAllText($StandInBootstrap))
     # which would keep that window open. Before it starts the program it can play the program of the
     # user that the step is written against: put another archive in the temp folder (-StandInSwap),
     # or change the file with the step's text (-StandInEdit). -StandInAnswer: 'declined' is 'No' at
-    # the prompt of Windows; 'silent' a window that never says it has read the files. When the
-    # window has ended, and before the first one tidies up, it writes down which of the two files
-    # are still in the temp folder (AFTER): what the window with administrator rights left alone.
+    # the prompt of Windows; 'silent' a window that never says it has read the files; 'no-signal'
+    # a first window that cannot make its signal belong to its own account, as when PowerShell 7
+    # with administrator rights could not: the bootstrap's own New-HandOverSignal is then asked
+    # for a signal of an account that is none, so that it is left with what Windows makes of it.
+    # When the window has ended, and before the first one tidies up, it writes down which of the
+    # two files are still in the temp folder (AFTER): what the window with administrator rights
+    # left alone.
     $windowHarness = Join-Path $e2e 'window-harness.ps1'
     $windowHarnessText = @'
 param([string]$StandInBootstrap, [string]$StandInZip, [string]$StandInLog, [string]$StandInTree, [string]$StandInRoot, [string]$StandInCommit, [string]$StandInTemp, [string]$StandInOptions, [string]$StandInSwap, [string]$StandInEdit, [string]$StandInAnswer, [int]$StandInWait)
@@ -1633,6 +1660,13 @@ function Invoke-WebRequest {
     if (-not $OutFile) { [System.IO.File]::AppendAllText($script:StandInLog, "OTHER $Uri`r`n"); throw 'The stand-in for GitHub sends the download only.' }
     [System.IO.File]::AppendAllText($script:StandInLog, "GET $Uri`r`n")
     Copy-Item -LiteralPath $script:StandInZip -Destination $OutFile -Force
+}
+if ($StandInAnswer -eq 'no-signal') {
+    $standInMakeSignal = ${function:New-HandOverSignal}
+    function New-HandOverSignal {
+        param([string]$Name, [string]$Owner)
+        return (& $script:standInMakeSignal -Name $Name -Owner 'no account')
+    }
 }
 $standInManifest = $null
 if ($StandInTree -ne 'NONE') { $standInManifest = (Get-TreeManifest -Tree (ConvertFrom-ReviewJson -Text ([System.IO.File]::ReadAllText($StandInTree)))).Files }
@@ -1712,7 +1746,8 @@ Install-ToolkitDownload -Url "https://codeload.github.com/example-owner/example-
         # not answer for). -Swap: an archive put in the temp folder in place of the downloaded one,
         # at the moment Windows would ask for administrator rights (NONE: none). -Edit: the file
         # with the step's text is changed at that moment (NONE: left as it is). -Answer: what
-        # Windows does with the request (yes; declined; silent: a window that never answers).
+        # Windows does with the request (yes; declined; silent: a window that never answers;
+        # no-signal: yes, to a first window that cannot make a signal of its own account).
         # -Wait: how long the bootstrap waits for the window's signal, in seconds. The stand-in
         # for the request comes back only when the window has ended, so a signal that was sent
         # is there before the wait begins and none of that time is spent. 10 seconds is the most
@@ -1840,6 +1875,13 @@ Install-ToolkitDownload -Url "https://codeload.github.com/example-owner/example-
     # and says so; the next run removes them before it downloads.
     $r = Invoke-WindowRoute -Root $rootInstalled -Answer 'silent' -Wait 1 -LeavesFiles
     Assert-That ($r.Start.Count -eq 1 -and -not $r.Ran -and ($r.Left -join ', ') -ceq 'temp folder: localai-elevated-step.txt, temp folder: localai-installer.zip' -and $r.Text -match 'has not said within 1 seconds' -and $r.Text -match 'the next run of this command removes them') "a window that never answers keeps its two files: the first window waits, leaves them and says where they are (left: $($r.Left -join ', '); $($r.Tail))"
+    # A first window that cannot make its signal belong to its own account. What Windows makes
+    # of a signal by itself can belong, for a window with administrator rights, to the group
+    # Administrators, and the step sets no signal but the asking account's: before, the first
+    # window kept such a signal and waited out its whole time for it. Now it has none, says at
+    # once what it could not do, and leaves the files; the other window installs all the same.
+    $r = Invoke-WindowRoute -Root $rootInstalled -Answer 'no-signal' -LeavesFiles
+    Assert-That ($r.Start.Count -eq 1 -and $r.Ran -eq "commit=$shaNew" -and $r.After.Count -eq 1 -and $r.After[0] -ceq $bothFiles -and ($r.Left -join ', ') -ceq 'temp folder: localai-elevated-step.txt, temp folder: localai-installer.zip' -and $r.Text -match 'This window could not make the signal by which that one says that it has read the two files' -and $r.Text -notmatch 'has not said within' -and $r.Text -match 'the next run of this command removes them') "a first window that cannot make a signal of its own account waits for none: the installer runs in the other window, and this one says at once that it leaves its two files and why, not that a time has passed (installer '$($r.Ran)'; left: $($r.Left -join ', '); $($r.Tail))"
     $r = Invoke-WindowRoute -Root $rootInstalled -Answer 'declined' -KeepTemp
     Assert-That ($r.Left.Count -eq 0 -and $r.Get.Count -eq 1) "and the next run removes what that one left, whatever becomes of it ($($r.Left -join ', '))"
 
@@ -1932,7 +1974,8 @@ Install-ToolkitDownload -Url "https://codeload.github.com/example-owner/example-
     $r = Invoke-Bootstrap -Root $rootEmpty -ApiDir $apiNone -Ref '../../../other/repo/zip/main'
     Assert-That ($r.Api.Count -eq 0 -and $r.Get.Count -eq 0 -and -not $r.Ran -and $r.Text -match 'LOCALAI_REF may hold only' -and $r.Text -match 'Nothing was downloaded or changed') "a LOCALAI_REF with '..' in it is refused before GitHub is asked anything: no lookup, no download, no installer (API $($r.Api.Count), downloads $($r.Get.Count), installer '$($r.Ran)'; $($r.Tail))"
     # Every run above, whether it installed, was refused or stopped: nothing of it stays behind.
-    Assert-That ($script:bootstrapRuns -ge 35 -and $leftBehind.Count -eq 0) "none of the $($script:bootstrapRuns) runs left anything in the temp folder or under Program Files, after a success and after a refusal alike; the one run that is meant to leave its two files is not counted (left: $($leftBehind -join '; '))"
+    Assert-That ($script:bootstrapRuns -ge 36 -and $leftBehind.Count -eq 0) "none of the $($script:bootstrapRuns) runs left anything in the temp folder or under Program Files, after a success and after a refusal alike; the two runs that are meant to leave their two files are not counted (left: $($leftBehind -join '; '))"
+    Write-PartTime "the bootstrap in $($script:bootstrapRuns) child processes"
 
     # The step with administrator rights, called directly (this test has the rights, and the step's
     # functions are the bootstrap's own): what it does with an archive that is not the one that
@@ -1991,6 +2034,29 @@ Install-ToolkitDownload -Url "https://codeload.github.com/example-owner/example-
             } finally { $signal.Dispose() }
         }
         Assert-That ($null -ne $signal -and -not $setBefore -and -not $setByOthers -and -not $setForOthers -and $setAfter -and $signalOwner -eq $asker -and $administratorsMaySet) "the first window's signal belongs to the account that made it, and is set by its name together with that account and by nothing else: no name, a name that is none, a signal that does not exist, another account or no account are no error and set nothing; Administrators may set it and read whom it belongs to, for the case that the rights are another account's (before: $setBefore, by other names: $setByOthers, for other accounts: $setForOthers, after: $setAfter, rule for Administrators: $administratorsMaySet)"
+        # A signal the step would not set is not handed to the first window at all: it would wait
+        # its whole time for it. Asked for the signal of no account, of text that is no account,
+        # or of an account this one may not give anything to (S-1-0-0, nobody), the making with
+        # owner and rules fails, and what is left is the signal as Windows makes it by itself,
+        # which belongs to this account or to Administrators. Before, that signal was handed
+        # back. Now its owner is read, and it is closed again: nothing comes back, and the name
+        # stands for nothing afterwards.
+        $signalKept = New-Object System.Collections.Generic.List[string]
+        foreach ($nobody in @('', 'not a SID', 'S-1-0-0')) {
+            $nobodyName = 'LocalAI-Update-' + [guid]::NewGuid().ToString('N')
+            $nobodySignal = New-HandOverSignal -Name $nobodyName -Owner $nobody
+            $nobodyOwner = ''
+            if ($nobodySignal) {
+                try { $nobodyOwner = [string]$nobodySignal.GetAccessControl().GetOwner([System.Security.Principal.SecurityIdentifier]).Value } finally { $nobodySignal.Dispose() }
+            }
+            $nobodyOpened = $null
+            $nobodyThere = [System.Threading.EventWaitHandle]::TryOpenExisting($nobodyName, [ref]$nobodyOpened)
+            if ($nobodyOpened) { $nobodyOpened.Dispose() }
+            # Only a signal that does belong to the account asked for may come back (a machine
+            # that lets this test give a signal to nobody: then it is nobody's, as asked).
+            if (($null -ne $nobodySignal -and ($nobody -notmatch '^S-1-' -or $nobodyOwner -cne $nobody)) -or $nobodyThere) { $signalKept.Add("'$nobody': handed back $($null -ne $nobodySignal), owner '$nobodyOwner', still there $nobodyThere") }
+        }
+        Assert-That ($signalKept.Count -eq 0) "asked for a signal that would belong to no account, the first window gets none and leaves none behind, instead of one the step will not set and a wait for it that runs its whole time (kept: $($signalKept -join '; '))"
         # What the review found: once the first window is gone, a program of the user can make
         # the signal's name stand for a signal of somebody else, one that only administrators may
         # set, and the step, which has those rights, would set it. Here the name is a signal that
@@ -2077,7 +2143,7 @@ Install-ToolkitDownload -Url "https://codeload.github.com/example-owner/example-
     Remove-ToolkitTree -Path $linkRoot
     Assert-That ($linkError -match 'is a link in the unpacked archive' -and -not (Test-Path -LiteralPath $linkRoot) -and (Test-Path -LiteralPath (Join-Path $linkTarget 'keep.txt'))) "a junction among unpacked files is an error, not a way to more files; and a folder is removed without walking into a junction in it: what the junction points at is still there ('$linkError')"
     if ($failures -eq 0) { Remove-Item -LiteralPath $Work -Recurse -Force -ErrorAction SilentlyContinue }
-    $partSeconds["the bootstrap in $($script:bootstrapRuns) child processes, the step called directly and real folders"] = [int]$partWatch.Elapsed.TotalSeconds
+    Write-PartTime 'the step called directly, its signal and real folders'
 } else {
     # The message is the one the Linux job declares (LAI_DECLARED_SKIPS in the workflow file): under
     # CI a skip with any other wording fails that job. What does not run here is all of the block
@@ -2102,7 +2168,11 @@ $partWatch.Restart()
 # for without a token, because that is how every PC asks for it. Each is asked once, and a second
 # time after 3 seconds only when no answer came at all or GitHub's servers failed: an answer that
 # refuses is an answer. No answer within 30 seconds (the list) or 60 (the archive) counts as none,
-# so this part takes a few seconds, and about three minutes at the very most.
+# so this part takes a few seconds, and about three minutes when GitHub does not answer at all.
+# Those seconds are the time to reach GitHub and for its answer to begin. An answer that begins
+# and then falls silent is another matter: PowerShell 7.4 and later is told to give up on it after
+# the same time (-OperationTimeoutSeconds); Windows PowerShell 5.1 cannot be told, there .NET's own
+# five minutes for a silent answer apply, and behind both stands the time limit of the job.
 # Each fact has its own assertion, which says what was asked and what came back, and when the fact
 # does not hold, what an update from an installed copy then stops at.
 # The CI workflows pass -ProbeCommit. Without it this part prints SKIP, and under CI a skip the job
@@ -2142,17 +2212,22 @@ if (-not $ProbeCommit) {
         if (Test-Path -LiteralPath $githubWork) { Remove-Item -LiteralPath $githubWork -Recurse -Force }
         New-Item -ItemType Directory -Force -Path $githubWork | Out-Null
         $githubZip = Join-Path $githubWork 'commit.zip'
+        # -TimeoutSec ends a request GitHub does not begin to answer. One that begins and then
+        # falls silent is ended only where the cmdlet has a setting for that.
+        $silenceIsEnded = (Get-Command -Name Invoke-WebRequest -CommandType Cmdlet).Parameters.ContainsKey('OperationTimeoutSeconds')
         $askGitHub = {
             # One request. Content: the answer's body (none with -OutFile, which takes it). Why:
             # empty when GitHub answered, else what went wrong; Status then holds the number of a
             # refusal (0: no answer at all). Asked: how many times it took.
             param([string]$Uri, [hashtable]$Headers, [string]$OutFile, [int]$TimeoutSec)
             $answer = [pscustomobject]@{ Content = $null; Status = 0; Why = ''; Asked = 0 }
+            $whenSilent = @{}
+            if ($silenceIsEnded) { $whenSilent['OperationTimeoutSeconds'] = $TimeoutSec }
             for ($asking = 1; $asking -le 2; $asking++) {
                 $answer.Asked = $asking
                 try {
-                    if ($OutFile) { Invoke-WebRequest -Uri $Uri -OutFile $OutFile -UseBasicParsing -Headers $Headers -TimeoutSec $TimeoutSec }
-                    else { $answer.Content = (Invoke-WebRequest -Uri $Uri -UseBasicParsing -Headers $Headers -TimeoutSec $TimeoutSec).Content }
+                    if ($OutFile) { Invoke-WebRequest -Uri $Uri -OutFile $OutFile -UseBasicParsing -Headers $Headers -TimeoutSec $TimeoutSec @whenSilent }
+                    else { $answer.Content = (Invoke-WebRequest -Uri $Uri -UseBasicParsing -Headers $Headers -TimeoutSec $TimeoutSec @whenSilent).Content }
                     $answer.Status = 200
                     $answer.Why = ''
                     return $answer
@@ -2240,7 +2315,7 @@ if (-not $ProbeCommit) {
         }
         if ($failures -eq 0) { Remove-Item -LiteralPath $Work -Recurse -Force -ErrorAction SilentlyContinue }
     }
-    $partSeconds['GitHub itself'] = [int]$partWatch.Elapsed.TotalSeconds
+    Write-PartTime 'GitHub itself'
 }
 
 # How long it took, part by part: the first place to look when the job this suite runs in comes

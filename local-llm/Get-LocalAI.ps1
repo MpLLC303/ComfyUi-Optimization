@@ -578,6 +578,11 @@
     #   - What Windows PowerShell itself reads from the user's folders when it starts with
     #     administrator rights (it looks for modules in the user's Documents folder before the
     #     system's), and what the installer reads from the AI folder, which the user owns.
+    #   - Attacker B asking Windows for administrator rights itself. The prompt of Windows names
+    #     the program that is to get them (Windows PowerShell); the command that program is started
+    #     with it shows only on request. A program of the user sees this script run and can raise
+    #     the same prompt for a command of its own at the moment this script's is expected: a Yes
+    #     then gives the rights to that command. No code here can stop it.
     #   - GitHub itself: the list of files and the archive both come from it, over TLS.
     #
     # What is compared (Compare-ToolkitTree, Get-ToolkitDigest):
@@ -835,7 +840,10 @@
             # from local-llm down). GitHub makes it of the repository's name, a '-' and the commit
             # or the ref: letters, digits and . _ - are all it ever holds. A quote, a bracket, a
             # ';' or a space has no business in that path.
-            if ($Top -cnotmatch '^[A-Za-z0-9._-]+\z' -or -not (Test-PlainRepoPath -Path $Top)) { throw "the archive's top folder has a name that is more than letters, digits and . _ - (GitHub names it after the repository and the commit): $(ConvertTo-ReviewText -Text $FullName -Max 120)" }
+            if ($Top -cnotmatch '^[A-Za-z0-9._-]+\z') { throw "the archive's top folder has a name that is more than letters, digits and . _ - (GitHub names it after the repository and the commit): $(ConvertTo-ReviewText -Text $FullName -Max 120)" }
+            # Of such names Windows keeps all but one kind as written: a dot at the end it drops,
+            # and '..' is the folder above.
+            if (-not (Test-PlainRepoPath -Path $Top)) { throw "the archive's top folder has a name Windows may store elsewhere than written (it is '..', or ends in a dot, which Windows drops): $(ConvertTo-ReviewText -Text $FullName -Max 120)" }
         }
         if ($parts[0] -cne $Top -or ($parts.Count -eq 1 -and -not $isFolder)) { throw 'the archive does not hold one top folder with everything in it' }
         $other = [pscustomobject]@{ Top = $Top; Path = ''; Name = '' }
@@ -1159,9 +1167,18 @@
         # owner on it, and left to itself Windows hands what an administrator's window makes to
         # the group Administrators on some systems. That account and Administrators may set it and
         # read whom it belongs to: the administrator rights may be those of another account (a
-        # standard user who types an administrator's password at the prompt of Windows). $null when
-        # it cannot be made; the files then stay until the next run.
+        # standard user who types an administrator's password at the prompt of Windows).
+        # Windows PowerShell makes the signal with its owner and rules in one call. PowerShell 7 has
+        # no such call on the signal itself: its .NET keeps the same making under another name,
+        # which is asked for by that name, so that Windows PowerShell is not asked for a type it
+        # does not have. Where neither can be had, the signal is what Windows makes of it.
+        # Whichever way it was made, whom it belongs to is then read from the signal itself, and it
+        # is handed back only when that is -Owner. $null in every other case, and when no signal can
+        # be made: one the other window will not set is one this window would wait its whole time
+        # for, and without one it can say at once that the files stay until the next run.
         param([string]$Name, [string]$Owner)
+        $manual = [System.Threading.EventResetMode]::ManualReset
+        $signal = $null
         try {
             $account = New-Object System.Security.Principal.SecurityIdentifier($Owner)
             $security = New-Object System.Security.AccessControl.EventWaitHandleSecurity
@@ -1171,12 +1188,21 @@
                 $security.AddAccessRule((New-Object System.Security.AccessControl.EventWaitHandleAccessRule($who, $rights, [System.Security.AccessControl.AccessControlType]::Allow)))
             }
             $madeNew = $false
-            return (New-Object System.Threading.EventWaitHandle($false, [System.Threading.EventResetMode]::ManualReset, $Name, [ref]$madeNew, $security))
+            $maker = 'System.Threading.EventWaitHandleAcl' -as [type]
+            if ($maker) { $signal = $maker::Create($false, $manual, $Name, [ref]$madeNew, $security) }
+            else { $signal = New-Object System.Threading.EventWaitHandle($false, $manual, $Name, [ref]$madeNew, $security) }
+        } catch { $signal = $null }
+        try {
+            if (-not $signal) { $signal = New-Object System.Threading.EventWaitHandle($false, $manual, $Name) }
+            # PowerShell 7 reads a signal's owner through a type of its own as well, Windows
+            # PowerShell from the signal.
+            $reader = 'System.Threading.ThreadingAclExtensions' -as [type]
+            if ($reader) { $found = $reader::GetAccessControl($signal) } else { $found = $signal.GetAccessControl() }
+            $belongsTo = $found.GetOwner([System.Security.Principal.SecurityIdentifier])
+            if ($null -ne $belongsTo -and ([string]$belongsTo.Value) -ceq $Owner) { return $signal }
         } catch { $null = $_ }
-        # Without an owner and rules of its own (PowerShell 7 has no such constructor): it is what
-        # Windows makes of it. Where that is not this account's, the other window leaves it alone,
-        # and the files stay until the next run.
-        try { return (New-Object System.Threading.EventWaitHandle($false, [System.Threading.EventResetMode]::ManualReset, $Name)) } catch { return $null }
+        if ($signal) { $signal.Dispose() }
+        return $null
     }
 
     function Send-HandOverSignal {
@@ -1319,12 +1345,15 @@
         # file must have (Get-ElevatedStage, Get-ElevatedLauncher). Windows PowerShell by its full
         # path: no folder on the PATH decides what gets the administrator rights.
         # Returns Started ($false: there is no such window, Why says what Windows answered: 'No' at
-        # its prompt lands here) and Taken (the window has read both files: they can go).
+        # its prompt lands here), Signal (this window had a signal that window can set: without
+        # one it did not wait) and Taken (the window has read both files: they can go).
         param([string]$Zip, [string]$StageFile, [string]$ZipHash, [string]$Digest, [string]$Commit, [string]$Root, [string[]]$Extra, [int]$WaitSeconds = 120)
         $signalName = 'LocalAI-Update-' + [guid]::NewGuid().ToString('N')
         # The account that asks, by its SID: the signal is made to belong to it, and the other
-        # window is told so in the step's text and on its command line. Without it the other
-        # window sets nothing, and the files stay until the next run.
+        # window is told so in the step's text and on its command line. Without that account, or
+        # without a signal that is its own, the other window sets nothing: there is then no
+        # signal here either (New-HandOverSignal), nothing is waited for, and the files stay until
+        # the next run.
         $asker = ''
         try { $asker = [string][System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value } catch { $asker = '' }
         $signal = New-HandOverSignal -Name $signalName -Owner $asker
@@ -1337,12 +1366,12 @@
             $shell = [System.IO.Path]::Combine([Environment]::GetFolderPath('System'), 'WindowsPowerShell', 'v1.0', 'powershell.exe')
             # -NoExit: the window stays open with the installer's messages, as the installer's own does.
             try { Start-Process -FilePath $shell -Verb RunAs -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-NoExit', '-Command', $launcher) -ErrorAction Stop }
-            catch { return [pscustomobject]@{ Started = $false; Taken = $false; Why = [string]$_.Exception.Message } }
+            catch { return [pscustomobject]@{ Started = $false; Signal = $false; Taken = $false; Why = [string]$_.Exception.Message } }
             # Windows has started the window (the click on Yes is behind us): it reads the step's
             # text at once and copies the archive a moment later.
             $taken = $false
             if ($signal) { try { $taken = [bool]$signal.WaitOne($WaitSeconds * 1000) } catch { $taken = $false } }
-            return [pscustomobject]@{ Started = $true; Taken = $taken; Why = '' }
+            return [pscustomobject]@{ Started = $true; Signal = ($null -ne $signal); Taken = $taken; Why = '' }
         } finally { if ($signal) { $signal.Dispose() } }
     }
 
@@ -1361,7 +1390,8 @@
         # Whatever happens, nothing of this run stays behind in the temp folder: the two files are
         # removed here, with the rights this window has. One exception, and it is said: a window
         # with administrator rights that was started and has not said in time that it has read
-        # them. They are then left for it, and the next run removes them first thing.
+        # them, or could not be given a signal to say it by. They are then left for it, and the
+        # next run removes them first thing.
         param([string]$Url, [string]$Ref, [string]$Commit, $Manifest, [bool]$Compare, [string]$Zip, [string]$StageFile, [string]$OldFolder, [string]$Root, [string[]]$Extra, [string]$Route, [int]$WaitSeconds = 120)
         $leave = $false
         $removeOwn = {
@@ -1435,7 +1465,8 @@
             Write-Host 'The installer continues in the Administrator window that opened.' -ForegroundColor Cyan
             if (-not $handOver.Taken) {
                 $leave = $true
-                Write-Host "That window has not said within $WaitSeconds seconds that it has read the two files this one put in the temp folder for it. They are left there ($Zip and $StageFile); the next run of this command removes them." -ForegroundColor Yellow
+                if ($handOver.Signal) { Write-Host "That window has not said within $WaitSeconds seconds that it has read the two files this one put in the temp folder for it. They are left there ($Zip and $StageFile); the next run of this command removes them." -ForegroundColor Yellow }
+                else { Write-Host "This window could not make the signal by which that one says that it has read the two files this one put in the temp folder for it, so it cannot tell when they are needed no longer. They are left there ($Zip and $StageFile); the next run of this command removes them." -ForegroundColor Yellow }
             }
         } finally {
             if (-not $leave) { & $removeOwn }
