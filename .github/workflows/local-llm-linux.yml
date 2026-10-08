@@ -57,10 +57,11 @@ jobs:
       # declares no skip at all) runs it. One line per skip, exactly the message the suite prints
       # after SKIP. A new skip, or a reworded one, fails this job until it is added here: leaving a
       # block out on Linux is then a decision, not an accident.
-      # The first eleven are from Invoke-WindowsUnitTests.ps1, the next three from
-      # Invoke-GetLocalAITest.ps1. The last three are for checks in Invoke-WindowsUnitTests.ps1
-      # that Linux leaves out without a word today (no New-NetFirewallRule, no COMPUTERNAME, no
-      # USERPROFILE): declared ahead, so that the SKIP lines they are to print do not fail this job.
+      # Eighteen lines. The first eleven are from Invoke-WindowsUnitTests.ps1, the next three from
+      # Invoke-GetLocalAITest.ps1, and the last four from Invoke-WindowsUnitTests.ps1 again: three
+      # checks that Linux used to leave out without a word and now prints as SKIP (no
+      # New-NetFirewallRule, no COMPUTERNAME, no USERPROFILE), and the readers of the PC security
+      # check, which ask Windows itself.
       LAI_DECLARED_SKIPS: |
         ACL test runs on Windows only
         mutex ACL exists only on Windows PowerShell
@@ -79,6 +80,7 @@ jobs:
         Windows Firewall block ranges need New-NetFirewallRule
         computer name redaction needs COMPUTERNAME
         profile path check needs USERPROFILE
+        device-open, firewall, Security Center, cloud-sync and session readers: Windows only (the judges above ran on canned input)
     steps:
       - uses: actions/checkout@v5
 

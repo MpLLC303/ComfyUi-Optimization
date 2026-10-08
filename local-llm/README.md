@@ -464,6 +464,7 @@ differs.
 | Chat is suddenly slow (CPU speed) | ComfyUI has a job queued or finished less than 60 s ago, so the render guard runs chats on the CPU. Afterwards the guard unloads the CPU copy, so the next chat after that loads onto the GPU again | Expected. `docker logs render-guard` shows why ("runs on the CPU", then "unloaded the CPU copy"). Wait for the render, or re-run the installer with `-RenderGuard off`. Still slow a minute after the render: run `C:\AI\Scripts\Release-GPU.ps1` and send the message again |
 | A chat answers "image omitted", or fails with "does not support multimodal requests" | The chat has an image from Uncensored Vision and you switched it to Main, Fast or Code. The render guard drops such images (without it, every message in that chat fails) | Switch that chat back to Uncensored Vision, or start a new chat |
 | Open WebUI: "render-guard: Ollama ... is not reachable" | Ollama isn't running (the guard only relays the error) | Start Ollama from the Start menu, then send the message again. `-RenderGuard off` does not help here: it only stops the CPU routing, and chats still go through the guard (changing the URL by hand in Admin Settings is undone by the next installer run) |
+| Open WebUI: "render-guard: this request is larger than 256 MiB" (HTTP 413) | The chat has grown past the size the render guard takes for one request. A chat sends all its pictures again at every turn, so a long chat with many or large pictures gets there | Start a new chat, or attach fewer or smaller pictures. The size is the setting `RENDER_GUARD_MAX_BODY_MIB`; see *The containers are locked down* under Security model before you raise it |
 | Installer interrupted | Power loss, closed window | Run it again. It's idempotent, and tuning results are reused. |
 | "Another Local AI installer run or model update is already running" | An installer window (often the Administrator one) or `Update-Models.ps1` is still open | Let it finish or close that window, then try again |
 | "Open WebUI is kept stopped after a failed restore" | A restore and its automatic rollback both failed | Run the recovery command shown in the message (also in `C:\AI\open-webui-hold.json`), then Start again |
@@ -473,9 +474,17 @@ differs.
 The stack itself is locked down (next section), but it is only as safe as the PC under it. Start menu →
 Local AI → *Security check* (`C:\AI\Scripts\Test-PCSecurity.ps1`) looks at the PC and, for every problem,
 names one next step you can do yourself (a Settings path or a download page). It **only reads**: no
-setting is changed, nothing is started, stopped or uninstalled, and nothing is sent anywhere. It checks:
+setting is changed, nothing is started, stopped or uninstalled, and nothing is sent anywhere. One
+check goes a step further and still changes nothing: for a hardware-access driver on its list that
+is loaded, it opens the driver's device without asking for read or write access and closes it at
+once, to see whether any program may. It checks:
 
-- antivirus on and current (Microsoft Defender, or the product Windows Security knows), Tamper Protection;
+- antivirus on and current (Microsoft Defender, or the product Windows Security knows), Tamper
+  Protection. An antivirus that Windows still lists but that is snoozed, expired or switched off
+  counts as none: when Microsoft Defender stands back for it (passive mode) or has its real-time
+  protection off, nothing is protecting the PC, and that is a failure. When Defender is doing the
+  protecting, such a leftover, or one whose definitions are out of date, is named on the same
+  line with what to do about it;
 - Windows Update installed something in the last 35 days, and no restart is pending;
 - the firewall is on for every network type; User Account Control is on and asks;
 - Core isolation's memory integrity, the Microsoft vulnerable driver blocklist, Local Security Authority
@@ -487,18 +496,32 @@ setting is changed, nothing is started, stopped or uninstalled, and nothing is s
   RGB tools; Microsoft Defender flags it since 2025), RTCore64 (MSI Afterburner), CorsairLLAccess64
   (iCUE before 3.25.60), ASUS AsIO2/AsIO3 and GIGABYTE gdrv; each with the app it usually comes with
   and whether updating or uninstalling that app fixes it;
+- hardware-access drivers of fan, lighting and tuning tools that are on no such list but hand out
+  direct access to the hardware (ASUS AsIO and GLCKIo, ENE EneIo, MsIo): a warning when any
+  program on the PC can open one, not only the tool it came with, because every program you run,
+  a malicious one too, could then use it to take over Windows;
 - Remote Desktop and SMBv1, and programs listening beyond this PC; Ollama, Open WebUI, SearXNG,
   ComfyUI (8188/8000) or Docker (2375) reachable from the network is a failure;
+- firewall rules that let other computers connect to a program that runs any script it is given
+  (python, node, PowerShell, wscript, cscript, java). Windows writes such a rule when you answer
+  *Allow* to its firewall question while a script is listening, and the opening then holds for
+  every script started with that program, not for one app;
 - Docker Desktop at 4.44.3 or newer (CVE-2025-9074) and its *Expose daemon on tcp://localhost:2375
   without TLS* setting off;
 - ComfyUI: the custom nodes you have (they run with your full user rights; one called
   ComfyUI_LLMVISION stole browser passwords in 2024) and model files in the pickle format
   (`.ckpt`, `.pt`, `.pth`, `.bin`), which can run code when loaded: prefer `.safetensors`;
 - `C:\AI\Secrets` readable only by you, Administrators and SYSTEM;
+- OneDrive, when the backups (or the second copy you set up for them) lie in its folder: a warning
+  when it is set to start with Windows but is not running, because nothing uploads the backups
+  then and they exist on this PC only;
 - whether you use an administrator account day to day (a standard account is safer).
 
 It works in a normal window; the TPM, drive encryption and SMBv1 checks need *Run as administrator*
-and say so. The report in `C:\AI\Logs\pc-security-<time>.md` leaves out your user name, the computer
+and say so. The hardware-access driver test is the other way round: it runs in a normal window
+only (an administrator may open every device, so the answer would say nothing) and says so in an
+elevated one. What the antivirus, driver, firewall-rule and OneDrive checks cannot read, or do not
+know how to judge, is shown as not checked (SKIP), never as fine. The report in `C:\AI\Logs\pc-security-<time>.md` leaves out your user name, the computer
 name and e-mail addresses, so it can be shared when asking for help. The exit code is the number of
 failures.
 
@@ -526,10 +549,19 @@ failures.
   read-only filesystem; SearXNG reads its settings from a folder it cannot write to, and gets two
   small temporary folders it can write to but cannot run programs from. Open WebUI still runs as
   root inside its container, with no capabilities and a writable filesystem, because it rewrites some
-  of its own files at every start. The render guard keeps each request in memory while it passes
-  it on, so a very large one (a model file sent through it, or a chat carrying hundreds of
-  megabytes of pictures) can outgrow its 2 GB limit and end it; Docker restarts it and the chats
-  running through it are cut off. An existing install gets
+  of its own files at every start. The render guard keeps only chats in memory (it may have to
+  rewrite them), and only up to a size cap: one chat request may be 256 MiB at most, because the
+  guard holds it up to six times over while it reads and rewrites it (1536 MiB of its 2 GB). A
+  larger one is refused with a message that says so (HTTP 413, see Troubleshooting) instead of
+  ending the guard. Everything else, a model file sent through it for one, passes through in
+  small pieces whatever its size. The cap is the setting `RENDER_GUARD_MAX_BODY_MIB`; to change
+  it, add a line such as `RENDER_GUARD_MAX_BODY_MIB=128` to `C:\AI\Stack\.env` and use Start menu >
+  Local AI > *Start again*. A lower number is safe. A higher one uses up the room that is left,
+  and from about 340 on a single chat can outgrow the 2 GB and end the guard. It must be a whole
+  number above 0: with anything else the guard does not work. What the cap does not cover:
+  several chats near it at the same moment, and a request built to be expensive to read (only a
+  program inside one of the containers can send one); Docker then restarts the guard and the
+  chats running through it are cut off. An existing install gets
   all of this the next time you run the installer or Update toolkit, which copies the new compose
   file and recreates the containers whose settings changed. The reasons for each choice, and what
   is still open, are in `docs/CONTAINER-HARDENING-PLAN.md`.

@@ -309,7 +309,7 @@ if ($onWindows -and (Get-Command New-NetFirewallRule -ErrorAction SilentlyContin
         Assert-That (@($filter.RemoteAddress).Count -eq $blockedList.Count) "Windows Firewall accepts the block ranges ($(@($filter.RemoteAddress) -join ', '))"
     } catch { Assert-That $false "Windows Firewall rejected the block ranges: $($_.Exception.Message)" }
     finally { Get-NetFirewallRule -DisplayName $ruleName -ErrorAction SilentlyContinue | Remove-NetFirewallRule -ErrorAction SilentlyContinue }
-}
+} else { Skip 'Windows Firewall block ranges need New-NetFirewallRule' }
 
 Write-Host "`n=== image pull policy ===" -ForegroundColor Cyan
 foreach ($c in @(
@@ -551,7 +551,7 @@ if ($zipFile) {
     Assert-That ($all -notmatch 'someone@example\.org') 'admin e-mail redacted'
     Assert-That ($all -notmatch 'eyJhbGci') 'bearer token redacted'
     Assert-That ($all -notmatch 'other\.person@family') 'any other e-mail address redacted'
-    if ($env:COMPUTERNAME) { Assert-That ($all -notmatch [regex]::Escape($env:COMPUTERNAME)) 'computer name redacted' }
+    if ($env:COMPUTERNAME) { Assert-That ($all -notmatch [regex]::Escape($env:COMPUTERNAME)) 'computer name redacted' } else { Skip 'computer name redaction needs COMPUTERNAME' }
     Assert-That ($all -match '\[REDACTED\]') 'redaction markers present'
     Assert-That ((Test-Path -LiteralPath (Join-Path $x 'shortcut-Start-LocalAI.log')) -and ($all -match 'shortcut marker 7731')) 'the last Start-menu shortcut run is in the bundle (redacted with the rest)'
 }
@@ -2352,7 +2352,7 @@ Assert-That ($pcsText -match 'PC SECURITY CHECK COMPLETE' -and $pcsText -match '
 $names = @(@($env:USERNAME, [Environment]::UserName, $env:COMPUTERNAME, [Environment]::MachineName) | Where-Object { $_ -and $_.Length -ge 2 } | Select-Object -Unique)
 $leaks = @($names | Where-Object { $pcsText -match ('(?i)(?<![\p{L}\p{N}])' + [regex]::Escape($_) + '(?![\p{L}\p{N}])') })
 Assert-That ($names.Count -ge 1 -and $leaks.Count -eq 0) "the report names neither the user nor the computer ($($names.Count) name(s) checked, $($leaks.Count) found)"
-if ($env:USERPROFILE) { Assert-That (-not $pcsText.ToLowerInvariant().Contains($env:USERPROFILE.ToLowerInvariant())) 'and shows no profile path' }
+if ($env:USERPROFILE) { Assert-That (-not $pcsText.ToLowerInvariant().Contains($env:USERPROFILE.ToLowerInvariant())) 'and shows no profile path' } else { Skip 'profile path check needs USERPROFILE' }
 if ($onWindows) {
     Assert-That (@($checkLines | Where-Object { $_ -notmatch '\] SKIP ' }).Count -ge 8) "on Windows the checks really run ($(@($checkLines | Where-Object { $_ -notmatch '\] SKIP ' }).Count) not skipped)"
 } else {
