@@ -60,7 +60,7 @@ try {
     Invoke-DockerText @('rm', '-f', 'open-webui') | Out-Null
     Invoke-DockerText @('create', '--name', 'open-webui', 'alpine:3.20', 'sleep', '3600') | Out-Null
     $holdScript = Join-Path $Work 'hold-lock.ps1'
-    Set-Content -LiteralPath $holdScript -Value ("Import-Module '{0}' -Force; `$l = Enter-LaiVolumeLock; Start-Sleep -Seconds 120; Exit-LaiVolumeLock `$l" -f (Join-Path (Join-Path $src 'lib') 'LocalAI.psm1'))
+    Set-Content -LiteralPath $holdScript -Value ("Import-Module '{0}' -Force; `$l = Enter-LaiVolumeLock; Start-Sleep -Seconds 180; Exit-LaiVolumeLock `$l" -f (Join-Path (Join-Path $src 'lib') 'LocalAI.psm1'))
     $holder = Start-Process -FilePath 'pwsh' -ArgumentList @('-NoProfile', '-File', $holdScript) -PassThru
     $deadline = (Get-Date).AddSeconds(30)
     while (-not (Test-LaiVolumeLockBusy) -and (Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 300 }
@@ -81,6 +81,19 @@ try {
     Assert-That ((& $webuiBack) -eq $back3 -and @((Read-LaiState -Path $state3)['notified']) -contains 'Open WebUI') "an Open WebUI that was reported and is now left alone for a backup or restore is not announced as recovered, and stays reported ($((& $webuiBack) - $back3) notice(s); reported: $(@((Read-LaiState -Path $state3)['notified']) -join ', '))"
     Assert-That ((Get-State 'open-webui') -eq 'created') 'Open WebUI is not started mid-backup/restore'
     Assert-That ((Get-WatchLog) -match 'left alone') 'watch.log says it was left alone on purpose'
+    # Two were reported. SearXNG answers again while Open WebUI is still left alone: that is not 'back
+    # to normal', which would be the last word although Open WebUI has not been looked at. The notice
+    # says what recovered and what was not checked. (A fresh backup and no disk limit, so that nothing
+    # else is expected to fail; the assertion holds either way.)
+    $fresh3 = Join-Path (Join-Path $aiRoot 'Backups') ('open-webui-{0}.tar.gz' -f (Get-Date -Format 'yyyyMMdd-HHmmss'))
+    Set-Content -LiteralPath $fresh3 -Value 'x'
+    Save-LaiState -State @{ failed = @('Open WebUI', 'SearXNG'); notified = @('Open WebUI', 'SearXNG'); notifiedAt = (Get-Date).ToString('s') } -Path $state3
+    $normal3 = { @((Get-WatchLog) -split "`n" | Where-Object { $_ -match ' NOTIFY Local AI: back to normal' }).Count }
+    $normalBefore = & $normal3
+    Invoke-Watch @('-MinFreeGB', '0') | Out-Null
+    $part3 = [string]@((Get-WatchLog) -split "`n" | Where-Object { $_ -match ' NOTIFY ' })[-1]
+    Remove-Item -LiteralPath $fresh3 -Force
+    Assert-That ((& $normal3) -eq $normalBefore -and $part3 -match 'NOTIFY Local AI: partly recovered: recovered SearXNG\.[^\n]* Not checked on this run: Open WebUI\.' -and @((Read-LaiState -Path $state3)['notified']) -contains 'Open WebUI') "one of two reported recovers while the other is left alone: 'partly recovered' naming what was not checked, no 'back to normal', and Open WebUI stays reported ($((& $normal3) - $normalBefore) 'back to normal'; $part3)"
 
     Write-Host "`n=== 3b. deep research paused by a backup: left alone under the lock, woken after ===" -ForegroundColor Cyan
     # A stand-in answering on its health URL, under deep research's container name: Python's http.server
@@ -168,7 +181,7 @@ services:
     $future = Join-Path $bdir ('open-webui-{0}.tar.gz' -f (Get-Date -Format 'yyyyMMdd-HHmmss'))
     Set-Content -LiteralPath $future -Value 'x'; (Get-Item -LiteralPath $future).LastWriteTime = (Get-Date).AddDays(365)
     Invoke-Watch @('-NoHeal') | Out-Null
-    Assert-That ((& $lastFail) -match 'Backups \(open-webui-\S+ is dated \S+, in the future .*: delete it\)') "a backup dated in the future fails the check and says to delete it ($(& $lastFail))"
+    Assert-That ((& $lastFail) -match 'Backups \(no nightly backup in the last 50 h; open-webui-\S+ is dated \S+, in the future .*: delete it\)') "a backup dated in the future fails the check and says to delete it, next to the plain reason that no other backup is there ($(& $lastFail))"
     # ...also next to a fresh one (clock fixed since): it would otherwise block pruning and restores for a year.
     Set-Content -LiteralPath (Join-Path $bdir ('open-webui-{0}.tar.gz' -f (Get-Date).AddHours(-1).ToString('yyyyMMdd-HHmmss'))) -Value 'x'
     Invoke-Watch @('-NoHeal') | Out-Null
@@ -253,10 +266,15 @@ services:
     Save-LaiState -State @{ researchError = $researchError; researchOkAt = (Get-Date).AddHours(-1).ToString('s') } -Path $bstatePath
     Invoke-Watch $w5 | Out-Null
     Assert-That ((& $lastFail) -notmatch 'Backups') "a failure an hour after a good backup does not fail the check ($(& $lastFail))"
+    $drReported = @((Read-LaiState -Path $statePath)['notified']) -contains 'Deep research'
     $c5 = Read-LaiState -Path $cfgFile; $c5.Remove('DeepResearchPort'); Save-LaiState -State $c5 -Path $cfgFile
     Save-LaiState -State @{ researchError = $researchError } -Path $bstatePath
     Invoke-Watch $w5 | Out-Null
     Assert-That ((& $lastFail) -notmatch 'Backups') "and an old record does not either once deep research is not installed ($(& $lastFail))"
+    # Deep research was reported (its port answered nothing on three runs) and is now removed. That is
+    # not 'not checked': kept as reported it would stand in every later notice as left unchecked, and
+    # none could say 'back to normal' again.
+    Assert-That ($drReported -and @((Read-LaiState -Path $statePath)['notified']) -notcontains 'Deep research') "a reported check that is no longer part of the install is dropped, not carried as not checked (reported before: $drReported; now: $(@((Read-LaiState -Path $statePath)['notified']) -join ', '))"
     # (f) The nightly backup found Open WebUI without chats and recorded it ('emptied'). From a state
     # with no failures the very first run tells: the date, the last backup with chats, the command that
     # puts it back, and that nothing is deleted. Once: the second run sends nothing.
@@ -264,6 +282,8 @@ services:
     # had notifications off (and record that for the health check); alone it changes nothing now.
     $emAt = (Get-Date).AddDays(-1)
     $emGood = 'open-webui-20260101-030000.tar.gz'
+    # The restore command is only given for a file that is in the backup folder: this one is.
+    Set-Content -LiteralPath (Join-Path $bdir $emGood) -Value 'x'
     $emNotices = { @((Get-WatchLog) -split "`n" | Where-Object { $_ -match ' NOTIFY Local AI: problem detected: [^\n]*Open WebUI had no chats' }) }
     Save-LaiState -State @{ emptied = @{ at = $emAt.ToString('s'); archive = 'open-webui-emptied.tar.gz'; lastGood = $emGood; users = 1; chats = 0; hadUsers = 1; hadChats = 12 } } -Path $bstatePath
     Save-LaiState -State @{ failed = @() } -Path $statePath
@@ -283,13 +303,34 @@ services:
     # Emptied once more on a later night (this record names the last good backup by its full path),
     # and the notification fails: not counted as told, so the next run tells.
     $emGood2 = Join-Path $bdir 'open-webui-20260102-030000.tar.gz'
+    Set-Content -LiteralPath $emGood2 -Value 'x'
     Save-LaiState -State @{ emptied = @{ at = (Get-Date).ToString('s'); lastGood = $emGood2; chats = 0; hadChats = 3 } } -Path $bstatePath
     Invoke-Watch ($w5 + @('-TestToastFail')) | Out-Null
     $emTried = @((Get-WatchLog) -split "`n" | Where-Object { $_ -match 'NOTIFY \(toast failed\) Local AI: problem detected: [^\n]*Open WebUI had no chats' }).Count
     Assert-That ($emTried -eq 1 -and [string](Read-LaiState -Path $statePath)['emptiedTold'] -eq $emTold) "a new emptying is announced although Backups was reported already; that notification failed, so it is not recorded as told ($emTried tried)"
-    Invoke-Watch $w5 | Out-Null
+    # OS is set for this run as Windows sets it. The watch took that variable for 'this is Windows':
+    # here it then tried a real toast (which fails on Linux), and on a PC any other value in the
+    # owner's own variables sent every notice to watch.log only. It asks .NET for the platform now.
+    $savedOS = $env:OS
+    $env:OS = 'Windows_NT'
+    try { Invoke-Watch $w5 | Out-Null } finally { $env:OS = $savedOS }
     $em = @(& $emNotices)
-    Assert-That ($em.Count -eq $em0 + 2 -and [string]$em[-1] -match (' -Archive ' + [regex]::Escape("'" + $emGood2 + "'")) -and [string](Read-LaiState -Path $statePath)['emptiedTold'] -ne $emTold) "and the next run sends it, with a full path taken as it stands ($([string]$em[-1]))"
+    Assert-That ($em.Count -eq $em0 + 2 -and [string]$em[-1] -match (' -Archive ' + [regex]::Escape("'" + $emGood2 + "'")) -and [string](Read-LaiState -Path $statePath)['emptiedTold'] -ne $emTold) "and the next run sends it, with the full path of a file in the backup folder ($([string]$em[-1]))"
+    $osNotice = [string]@((Get-WatchLog) -split "`n" | Where-Object { $_ -match ' NOTIFY' })[-1]
+    Assert-That ($osNotice -match ' NOTIFY Local AI: problem detected: ' -and $osNotice -notmatch 'toast failed') "with OS set to Windows_NT alone it is still the plain notice of a run off Windows: the platform is not read from that variable ($osNotice)"
+    # The record names a file that exists, but outside the backup folder (as one on another drive or a
+    # share would be), and the nightly backups stopped three days ago. No restore command for a file
+    # that is not in the backup folder, and the missing nightly backup is named next to the emptying:
+    # Backups is reported already, so nothing else would say that no backup is being made.
+    $emElsewhere = Join-Path $Work 'open-webui-20260103-030000.tar.gz'
+    Set-Content -LiteralPath $emElsewhere -Value 'x'
+    Get-ChildItem -LiteralPath $bdir -File | ForEach-Object { $_.LastWriteTime = (Get-Date).AddDays(-3) }
+    Save-LaiState -State @{ emptied = @{ at = (Get-Date).AddHours(-2).ToString('s'); lastGood = $emElsewhere; chats = 0; hadChats = 3 } } -Path $bstatePath
+    Invoke-Watch $w5 | Out-Null
+    $emFail = & $lastFail
+    Assert-That ($emFail -match ('Open WebUI had no chats; the backup on record as the last one with chats, ' + [regex]::Escape($emElsewhere) + ', is not in ' + [regex]::Escape($bdir) + ' ') -and $emFail -notmatch 'Restore-OpenWebUI|-Archive ') "a recorded backup outside the backup folder is named as not being there, with no restore command ($emFail)"
+    Assert-That ($emFail -match 'Backups \([^\n]*Open WebUI had no chats[^\n]*; no nightly backup in the last 50 h') "and nightly backups that stopped meanwhile are named next to the emptying ($emFail)"
+    Remove-Item -LiteralPath $emElsewhere -Force
     Remove-Item -LiteralPath $bstatePath -Force
     Get-ChildItem -LiteralPath $bdir -File | Remove-Item -Force
 
@@ -364,20 +405,23 @@ services:
     & chmod +x (Join-Path $hangDir 'docker')
     $savedPATH = $env:PATH
     $env:PATH = $hangDir + [System.IO.Path]::PathSeparator + $savedPATH
-    $env:LOCALAI_DOCKER_TIMEOUT = '3'
+    # The 3 s limit is a parameter for the watch, which reads no hook from the environment. The backup
+    # script still takes it from LOCALAI_DOCKER_TIMEOUT, set below for its run only.
+    $w7 = @('-NoHeal', '-TestDockerTimeout', '3')
     try {
         Save-LaiState -State @{ failed = @() } -Path $statePath
         $sw = [Diagnostics.Stopwatch]::StartNew()
-        Invoke-Watch @('-NoHeal') | Out-Null
+        Invoke-Watch $w7 | Out-Null
         $watchSec = $sw.Elapsed.TotalSeconds
         $hangLine = & $lastFail
-        Assert-That ($watchSec -lt 90 -and $hangLine -match 'FAIL .*Docker \(not responding' -and @((Read-LaiState -Path $statePath)['failed']) -contains 'Docker') ("the watch reports Docker as not responding, and logs and saves its state instead of hanging ({0:N0} s: {1})" -f $watchSec, $hangLine)
+        Assert-That ($watchSec -lt 90 -and $hangLine -match 'FAIL .*Docker \(not responding \(no answer within 3 s\)' -and @((Read-LaiState -Path $statePath)['failed']) -contains 'Docker') ("the watch reports Docker as not responding, and logs and saves its state instead of hanging ({0:N0} s: {1})" -f $watchSec, $hangLine)
         # Seen on a second run it is announced, and the next step leads with restarting Docker
         # Desktop: Start again gets no answer from a Docker that does not answer. Case matters here:
         # the detail in the parentheses says 'restart Docker Desktop' too, in lower case.
-        Invoke-Watch @('-NoHeal') | Out-Null
+        Invoke-Watch $w7 | Out-Null
         $hungNotice = [string]@((Get-WatchLog) -split "`n" | Where-Object { $_ -match ' NOTIFY Local AI: problem detected: ' })[-1]
         Assert-That ($hungNotice -cmatch 'Docker \(not responding[^\n]*\. Restart Docker Desktop \(whale icon > Restart\)\. ' -and $hungNotice -cnotmatch '\. Use Start menu > Local AI - Start again\. ') "for a Docker Desktop that does not answer, the notice's next step starts with restarting it, not with Start again ($hungNotice)"
+        $env:LOCALAI_DOCKER_TIMEOUT = '3'
         $sw = [Diagnostics.Stopwatch]::StartNew()
         $prev = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
         & pwsh -NoProfile -File (Join-Path $src 'Backup-OpenWebUI.ps1') -AIRoot $aiRoot -EngineWaitSec 20 2>&1 | Out-Null
@@ -404,7 +448,14 @@ services:
     $up = $false
     for ($i = 0; $i -lt 30 -and -not $up; $i++) { try { Invoke-LaiApi -Uri 'http://127.0.0.1:3998/health' -TimeoutSec 2 | Out-Null; $up = $true } catch { Start-Sleep -Seconds 1 } }
     Assert-That $up "setup: the stand-in Open WebUI answers on port 3998 ($(Get-State 'open-webui'))"
-    Invoke-Watch @('-NoHeal') | Out-Null
+    # LOCALAI_DOCKER_TIMEOUT holds something that is no number for this run. The watch read it on every
+    # run and stopped on the cast, before any check, log line or notification: one variable among the
+    # owner's own, and no scheduled run did anything from then on. It does not read it any more.
+    $ranCount = { @((Get-WatchLog) -split "`n" | Where-Object { $_ -match ' (FAIL|OK)( |$)' -and $_ -notmatch ' NOTIFY' }).Count }
+    $ran0 = & $ranCount
+    $env:LOCALAI_DOCKER_TIMEOUT = 'x'
+    try { $out7 = Invoke-Watch @('-NoHeal') } finally { $env:LOCALAI_DOCKER_TIMEOUT = '' }
+    Assert-That ((& $ranCount) -eq $ran0 + 1) "with LOCALAI_DOCKER_TIMEOUT set to 'x' alone the run still does its checks and writes its line: that variable ends no run ($((& $ranCount) - $ran0) line(s); $(($out7 -split "`n")[0]))"
     $l7 = & $lastFail
     Assert-That ($l7 -match 'Chats reach Ollama \(Open WebUI cannot reach Ollama at http://127\.0\.0\.1:9 ') "Open WebUI answering but unable to reach Ollama is a failed check that names the URL ($l7)"
     $c7['WebUIOllamaUrl'] = 'http://127.0.0.1:11434'; Save-LaiState -State $c7 -Path $cfgFile
@@ -447,6 +498,20 @@ services:
     $ws8 = Read-LaiState -Path $statePath
     Assert-That ($back.Count -eq $back0 + 1 -and $backLine -match 'recovered [^\n]*Docker' -and $backLine -match 'recovered [^\n]*Open WebUI') "Docker back and everything healthy: exactly one 'back to normal', naming Docker and Open WebUI ($($back.Count - $back0) notice(s): $backLine / $(& $lastFail))"
     Assert-That (@(@($ws8['notified']) | Where-Object { $_ }).Count -eq 0) "and nothing is left as reported ($(@($ws8['notified']) -join ', '))"
+    # Everything is healthy here, so a disk without room and an emptied Open WebUI are the only two
+    # problems and the next step is the one for the disk. It must not offer the old backups for
+    # deletion in the very notice that says one of them holds the chats. The recorded backup is not
+    # in the folder (pruned or moved since): the notice says so, with no restore command for it.
+    $gone8 = 'open-webui-20251231-030000.tar.gz'
+    $hadState8 = Test-Path -LiteralPath $bstatePath
+    $bs8 = Read-LaiState -Path $bstatePath
+    $bs8['emptied'] = @{ at = (Get-Date).ToString('s'); lastGood = $gone8; chats = 0; hadChats = 5 }
+    Save-LaiState -State $bs8 -Path $bstatePath
+    Invoke-Watch @('-NoHeal', '-MinFreeGB', '1000000') | Out-Null
+    $full8 = [string]@(& $notices8 'Local AI: problem detected: [^\n]*Open WebUI had no chats')[-1]
+    if ($hadState8) { $bs8.Remove('emptied'); Save-LaiState -State $bs8 -Path $bstatePath } else { Remove-Item -LiteralPath $bstatePath -Force }
+    Assert-That ($full8 -match 'Disk space \([^\n]*\. Free some disk space \(unused models\)\. Keep every backup in ' -and $full8 -notmatch 'old backups') "a disk without room next to an emptied Open WebUI: the next step frees space elsewhere and says to keep every backup ($full8)"
+    Assert-That ($full8 -match ([regex]::Escape($gone8) + ', is not in ') -and $full8 -notmatch 'Restore-OpenWebUI|-Archive ') "and a recorded backup that is no longer in the backup folder gets no restore command ($full8)"
     Get-ChildItem -LiteralPath $bdir -File | Remove-Item -Force
 
     Write-Host "`n=== 9. a lasting problem is also a banner in Open WebUI; Windows' notification switch off ===" -ForegroundColor Cyan

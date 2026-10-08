@@ -62,14 +62,17 @@ param(
     # Record the installed scripts, the Stack folder, the LocalAI-* tasks and the listeners as they
     # are now as the integrity baseline (after changes you made yourself), then exit.
     [switch]$AcceptBaseline,
-    # Test only (tests/Invoke-WatchTest.ps1; the scheduled task passes none of the three): act as if
+    # Test only (tests/Invoke-WatchTest.ps1; the scheduled task passes none of the four): act as if
     # Windows' notification switch for PowerShell had this value, e.g. DisabledForUser.
     [string]$TestToastSetting = '',
     # Test only: every notification fails, as with a broken notification service.
     [switch]$TestToastFail,
     # Test only: end the run where the comparison with the integrity baseline starts, with its mark
     # written and nothing compared.
-    [switch]$TestIntegrityEnd
+    [switch]$TestIntegrityEnd,
+    # Test only: seconds a docker command may take before Docker Desktop counts as not responding
+    # (0 = the 30 s of every scheduled run).
+    [int]$TestDockerTimeout = 0
 )
 $ErrorActionPreference = 'Stop'
 Import-Module (Join-Path (Join-Path $PSScriptRoot 'lib') 'LocalAI.psm1') -Force
@@ -84,7 +87,9 @@ $logDir = Join-Path $AIRoot 'Logs'
 if (-not (Test-Path -LiteralPath $logDir)) { New-Item -ItemType Directory -Force -Path $logDir | Out-Null }
 $logFile = Join-Path $logDir 'watch.log'
 $statePath = Join-Path $AIRoot 'watch-state.json'
-$onWindows = ($env:OS -eq 'Windows_NT')
+# Asked of .NET, not of the OS variable: a per-user variable of that name replaces the system's one
+# in this user's processes, and every notification would then go to watch.log only.
+$onWindows = ([System.Environment]::OSVersion.Platform -eq [System.PlatformID]::Win32NT)
 $notify = $onWindows -and -not $NoNotify
 # The test hooks, as Send-Notification and the integrity comparison read them. They are parameters of
 # this run and nothing else. None is read from the environment: a variable there can be set for good
@@ -125,7 +130,10 @@ function Get-WatchStamp($Value) {
 
 # Every docker call has a time limit: a Docker Desktop that stopped answering (it can after sleep)
 # would otherwise hang this run until Task Scheduler ends it, with no log line and no notification.
-$dockerLimit = Get-LaiDockerTimeout
+# The limit is a constant here, or the test's parameter: the library's Get-LaiDockerTimeout reads
+# LOCALAI_DOCKER_TIMEOUT and casts it to a number, so a value that is none ended every run on this
+# line, before any check, log line or notification.
+$dockerLimit = 30; if ($TestDockerTimeout -gt 0) { $dockerLimit = $TestDockerTimeout }
 
 function Get-FreeSpaceProblem {
     # Returns '' when every relevant drive has room, else e.g. 'C:\ 7.2 GB free'.
@@ -363,7 +371,10 @@ $soon = (Get-Date).AddHours(1)
 $futureDaily = @($all | Where-Object { $_.Name -match '^open-webui-\d{8}-\d{6}\.tar\.gz$' -and $_.LastWriteTime -gt $soon })
 $all = @($all | Where-Object { $_.LastWriteTime -le $soon })
 $daily = @($all | Where-Object { $_.Name -match '^open-webui-\d{8}-\d{6}\.tar\.gz$' })
-$results['Backups'] = ($all.Count -gt 0) -and ($all[0].Name -notlike '*-CORRUPT.tar.gz') -and ($daily.Count -gt 0) -and (((Get-Date) - $daily[0].LastWriteTime).TotalHours -le 50)
+$backupBase = @()
+if ($all.Count -gt 0 -and $all[0].Name -like '*-CORRUPT.tar.gz') { $backupBase += 'the newest backup failed its database check' }
+if ($daily.Count -eq 0 -or ((Get-Date) - $daily[0].LastWriteTime).TotalHours -gt 50) { $backupBase += 'no nightly backup in the last 50 h' }
+$results['Backups'] = ($backupBase.Count -eq 0)
 $bstate = Read-LaiState -Path (Join-Path $AIRoot 'backup-state.json')
 $backupLog = Join-Path $logDir 'backup.log'
 # What else makes the backups something not to rely on, the gravest first. Any one fails the check.
@@ -379,15 +390,31 @@ if ($bstate['emptied'] -is [hashtable]) {
     $emptiedAt = ConvertTo-WatchDate $emptied['at']
     $onDate = 'at the last backup'; if ($emptiedAt) { $onDate = 'on ' + $emptiedAt.ToString('yyyy-MM-dd') }
     $lastGood = ([string]$emptied['lastGood'] -replace '\s+', ' ').Trim()
-    if ($lastGood) {
-        # A bare name is a file in the backup folder; anything with a folder in it is taken as it stands.
-        $lastGoodPath = $lastGood; if ($lastGood -notmatch '[\\/]') { $lastGoodPath = Join-Path $backupDir $lastGood }
+    # The record is a file any program of this user can write, and a backup can have been moved or
+    # removed since: a restore command is given only for a file that is in the backup folder now (by
+    # its name or its full path), never for one in another folder, on another drive or on a share.
+    $lastGoodPath = ''
+    if ($lastGood.Length -gt 300) { $lastGood = $lastGood.Substring(0, 300) + '...' }
+    elseif ($lastGood) {
+        try {
+            $lastGoodFull = [System.IO.Path]::GetFullPath([System.IO.Path]::Combine($backupDir, $lastGood))
+            $inBackupDir = Join-Path $backupDir ([System.IO.Path]::GetFileName($lastGoodFull))
+            if ($lastGoodFull -eq [System.IO.Path]::GetFullPath($inBackupDir) -and (Test-Path -LiteralPath $inBackupDir -PathType Leaf)) { $lastGoodPath = $inBackupDir }
+        } catch { Write-Verbose "the recorded last good backup is no usable path: $($_.Exception.Message)" }
+    }
+    if ($lastGoodPath) {
         $restoreCmd = '& {0} -AIRoot {1} -Archive {2}' -f (ConvertTo-LaiPsQuoted (Join-Path $PSScriptRoot 'Restore-OpenWebUI.ps1')), (ConvertTo-LaiPsQuoted $AIRoot), (ConvertTo-LaiPsQuoted $lastGoodPath)
         $backupWhy += "$onDate Open WebUI had no chats; the last backup with chats is $lastGood, put back with: $restoreCmd (nothing is deleted meanwhile)"
+    } elseif ($lastGood) {
+        $backupWhy += "$onDate Open WebUI had no chats; the backup on record as the last one with chats, $lastGood, is not in $backupDir (nothing is deleted meanwhile)"
     } else {
         $backupWhy += "$onDate Open WebUI had no chats, and no earlier backup with chats is on record (nothing is deleted meanwhile)"
     }
 }
+# The plain reasons from above (no nightly backup, the newest one damaged) come next. Alone they stay
+# the bare 'Backups' whose hint is backup.log. Next to another reason they are named too: Backups is
+# reported already then, so nothing else would ever say that no backup is being made any more.
+$backupWhy += $backupBase
 if ($futureDaily.Count) {
     $backupWhy += "$($futureDaily[0].Name) is dated $($futureDaily[0].LastWriteTime.ToString('s')), in the future (the PC clock was wrong when it was made): delete it"
 }
@@ -408,7 +435,7 @@ if ($researchPort -gt 0 -and $bstate['researchError']) {
         $backupWhy += "deep research's backup fails (last good one: $lastOk): $researchWhy (see $backupLog)"
     }
 }
-if ($backupWhy.Count) {
+if ($backupWhy.Count -gt $backupBase.Count) {
     $results['Backups'] = $false
     $details['Backups'] = $backupWhy -join '; '
 }
@@ -784,7 +811,12 @@ if ($previous.ContainsKey('pendingRecovered') -and $previous['pendingRecovered']
 # is left alone, and the chat path is not tried without Open WebUI. Counting those as recovered sent
 # 'recovered Open WebUI' the moment Docker stopped. What was reported and did not run stays reported,
 # with no notification, until its check runs again.
-$owed = @(@($prevNotified) + @($pendingRecovered | Where-Object { $prevNotified -notcontains $_ }))
+# What is no longer part of this install is owed nothing: deep research removed, or a mirror no longer
+# configured, would stay 'not checked' for good, and no later notice could say 'back to normal'.
+$retired = @()
+if ($researchPort -le 0) { $retired += 'Deep research' }
+if (-not $mirrorTarget) { $retired += 'Backup mirror' }
+$owed = @(@(@($prevNotified) + @($pendingRecovered | Where-Object { $prevNotified -notcontains $_ })) | Where-Object { $retired -notcontains $_ })
 $recovered = @($owed | Where-Object { $results.Contains($_) -and $results[$_] })
 $notChecked = @($owed | Where-Object { -not $results.Contains($_) })
 $notified = @(@($failed | Where-Object { ($prevNotified -contains $_) -or ($toNotify -contains $_) }) + $notChecked)
@@ -810,7 +842,10 @@ function Get-WatchHint([string[]]$Failed) {
     } elseif ($failed -contains 'Docker' -or $failed -contains 'Open WebUI' -or $failed -contains 'SearXNG' -or $failed -contains 'Render guard' -or $failed -contains 'Ollama' -or $failed -contains 'Chats reach Ollama') {
         $hint = 'Use Start menu > Local AI - Start again. If that does not help, restart Docker Desktop (whale icon > Restart) and use Start again once more.'
     } elseif ($failed -contains 'Disk space') {
-        $hint = 'Free some disk space (old backups in ' + (Join-Path $AIRoot 'Backups') + ', unused models).'
+        $hint = 'Free some disk space (old backups in ' + $backupDir + ', unused models).'
+        # With an emptied Open WebUI on record an old backup is the only copy of the chats, and this
+        # hint stands in the notice that says so: it must not offer the backups for deletion.
+        if ($emptiedKey) { $hint = 'Free some disk space (unused models). Keep every backup in ' + $backupDir + ' until the chats are back.' }
     } elseif ($failed -contains 'Backups') {
         $hint = 'The reason is at the end of ' + $backupLog + '.'
     } elseif ($failed -contains 'Backup mirror') {
@@ -836,8 +871,13 @@ if ($toNotify.Count -gt 0) {
     if ($healed.Count -gt 0) { $parts += 'restarted ' + ($healed -join ', ') }
     $other = @($recovered | Where-Object { $healed -notcontains $_ })
     if ($other.Count -gt 0) { $parts += 'recovered ' + ($other -join ', ') }
-    if ($failed.Count -eq 0) { $sent = Send-Notification 'Local AI: back to normal' (($parts -join '; ') + '.') }
-    else { $sent = Send-Notification 'Local AI: partly recovered' ((($parts -join '; ') + '. Still not working: ' + $failedText + '.')) }
+    # 'Back to normal' only when nothing reported is left: neither failing nor left unchecked on this
+    # run (an Open WebUI stopped for a backup may be as broken afterwards as it was reported before).
+    $title = 'Local AI: back to normal'; if ($failed.Count -or $notChecked.Count) { $title = 'Local AI: partly recovered' }
+    $text = ($parts -join '; ') + '.'
+    if ($failed.Count) { $text += ' Still not working: ' + $failedText + '.' }
+    if ($notChecked.Count) { $text += ' Not checked on this run: ' + ($notChecked -join ', ') + '.' }
+    $sent = Send-Notification $title $text
     if (-not $sent -and $recovered.Count) { $recoveryFailed = $true }
 }
 
