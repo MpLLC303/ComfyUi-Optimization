@@ -12,15 +12,18 @@
       2. Takes a verified safety backup of the current volume (tag "pre-restore"; never pruned or
          mirrored during the restore).
       3. Stops every container using the volume, extracts the archive into a staging folder *inside*
-         the volume, and only after webui.db is confirmed there swaps it in.
+         the volume, and only after webui.db is confirmed there swaps it in. An archive that does
+         not unpack touches none of the old data: Open WebUI is started again on it as it was.
       4. If anything fails after the old data was touched, it puts the safety backup back. If even that
-         fails, the container is left stopped and the exact recovery command is printed.
+         fails, the container is left stopped and the exact recovery command is printed. The same
+         when the restore is stopped (Ctrl+C) while it replaces the old data: Open WebUI stays
+         stopped, and the command that finishes the restore is printed.
     A machine-wide lock stops the scheduled backup from running at the same time.
 
     A backup leaves out the document-search and speech models Open WebUI downloaded (about 7 GB).
     The ones in the volume are kept through the swap, so Open WebUI does not fetch them again; only
     a volume that had none (a new PC, a wiped volume) downloads them at the first start, which can
-    take longer than the 5 minutes this script waits for an answer.
+    take longer than the 5 minutes this script waits for an answer (-WebUIWaitSec sets another wait).
 
     A backup carries the settings of its day, so once Open WebUI is back this install's own are
     applied again: its Ollama connection, sign-up off, and on the toolkit's presets no past-chat
@@ -56,11 +59,28 @@ param(
     # Deep research's volume (tests use throwaway ones).
     [string]$ResearchVolume = 'localai-deep-research',
     # Deep research's container; stopped during its restore.
-    [string]$ResearchContainer = 'deep-research'
+    [string]$ResearchContainer = 'deep-research',
+    # The models catalog whose presets get this install's safety settings back after the restore.
+    # Defaults to config\models.psd1 next to this script.
+    [string]$CatalogPath = '',
+    # How many seconds Open WebUI gets to answer after the restore (5 minutes unless given).
+    [ValidateRange(1, [int]::MaxValue)][int]$WebUIWaitSec = 300,
+    # Test only (tests/Invoke-UpdateWebUITest.ps1; no shortcut and no scheduled task passes it):
+    # setting this install's Ollama connection after the restore counts as failed, the way an
+    # error from Open WebUI ends it.
+    [switch]$TestFailOllamaUrl
 )
 $ErrorActionPreference = 'Stop'
 Import-Module (Join-Path (Join-Path $PSScriptRoot 'lib') 'LocalAI.psm1') -Force
 $img = $HelperImage
+# -CatalogPath is looked at before anything is asked or changed (the step that reads the catalog
+# runs minutes later, once the data is swapped) and kept as a full path. $catalogGiven: said in
+# that step, so the log of a restore names a catalog that was not the toolkit's own.
+$catalogGiven = [bool]$CatalogPath
+if ($catalogGiven) {
+    if (-not (Test-Path -LiteralPath $CatalogPath -PathType Leaf)) { throw "The models catalog given with -CatalogPath was not found: $CatalogPath. Nothing was changed." }
+    $CatalogPath = (Resolve-Path -LiteralPath $CatalogPath).ProviderPath
+} else { $CatalogPath = Join-Path (Join-Path $PSScriptRoot 'config') 'models.psd1' }
 
 function Invoke-Docker {
     param([string[]]$Arguments, [switch]$AllowFail)
@@ -73,37 +93,59 @@ function Invoke-Docker {
 }
 
 # The archive is always mounted as /restore.tar.gz, so its file name never reaches the shell.
-# No double quotes anywhere in this script: Windows PowerShell 5.1 mangles them in native arguments.
-# The second 'for' line: a backup leaves out the document-search and speech models Open WebUI
-# downloaded (cache/embedding/models and cache/whisper/models, about 7 GB), and the delete after it
-# takes all the volume holds. So the two folders move into the staging tree first and come back
-# with it, unless the archive brings its own. Every restore, and every rollback to a safety backup,
-# used to end with Open WebUI downloading them again.
-# The first 'for' line: a swap that failed or was cut off after that move left the two folders in
-# the staging tree, and this swap (the rollback to the safety backup, or the restore run again)
-# starts by clearing that tree. They go back to their place first, where the second line finds
-# them. Best effort (|| true): it only saves a download, and must never stop a restore.
+# No double quotes anywhere in these scripts: Windows PowerShell 5.1 mangles them in native arguments.
+# The swap is two runs of the helper (Invoke-Swap). The first ($extractScript) unpacks the archive
+# next to the old data and checks it: it deletes nothing of that data, so when it fails Open WebUI
+# goes back on the data it had, with no rollback. The second ($moveScript) deletes the old data and
+# moves the unpacked tree into its place: only from there on can the volume be half replaced.
+# The 'for' line of the second run: a backup leaves out the document-search and speech models Open
+# WebUI downloaded (cache/embedding/models and cache/whisper/models, about 7 GB), and the delete
+# after it takes all the volume holds. So the two folders move into the staging tree first and come
+# back with it, unless the archive brings its own. Every restore, and every rollback to a safety
+# backup, used to end with Open WebUI downloading them again.
+# The 'for' line of the first run: a swap that failed or was cut off after that move left the two
+# folders in the staging tree, and this swap (the rollback to the safety backup, or the restore run
+# again) starts by clearing that tree. They go back to their place first, where the second run
+# finds them. Best effort (|| true): it only saves a download, and must never stop a restore.
 # The archive is unpacked next to the staging tree (.restore-partial) and renamed, so the staging
 # tree only ever holds a complete one: a models folder taken back from it is whole, never the
 # first part of one from an older archive (those still carry the models) whose unpacking was cut off.
-$swapScript = 'set -e; ' +
+# $sweepScript is how the first run begins (the models back to their place, both trees gone). It is
+# also run by itself after an unpacking that failed or was cut off, so that what it left in the
+# volume does not stay there.
+# The second run begins with a check of its own that the staging tree is there: without one, its
+# delete would take the old data and leave nothing to move in.
+$sweepScript = 'set -e; ' +
     'for m in cache/embedding/models cache/whisper/models; do if [ -d /data/.restore-staging/$m ]; then if [ ! -e /data/$m ]; then ' +
     'mkdir -p /data/${m%/*} && mv /data/.restore-staging/$m /data/$m || true; fi; fi; done; ' +
-    'rm -rf /data/.restore-staging /data/.restore-partial; mkdir /data/.restore-partial; ' +
+    'rm -rf /data/.restore-staging /data/.restore-partial'
+$extractScript = $sweepScript + '; mkdir /data/.restore-partial; ' +
     'tar xzf /restore.tar.gz -C /data/.restore-partial; mv /data/.restore-partial /data/.restore-staging; ' +
-    'test -f /data/.restore-staging/webui.db; ' +
+    'test -f /data/.restore-staging/webui.db'
+$moveScript = 'set -e; test -d /data/.restore-staging; ' +
     'for m in cache/embedding/models cache/whisper/models; do if [ -d /data/$m ]; then if [ ! -e /data/.restore-staging/$m ]; then ' +
     'mkdir -p /data/.restore-staging/${m%/*}; mv /data/$m /data/.restore-staging/$m; fi; fi; done; ' +
     'find /data -mindepth 1 -maxdepth 1 ! -name .restore-staging -exec rm -rf {} +; ' +
     'cd /data/.restore-staging; find . -mindepth 1 -maxdepth 1 -exec mv {} /data/ \; ; ' +
     'cd /; rmdir /data/.restore-staging'
+# Both in one run, for deep research (one container, no hold): its branch below swaps the check
+# 'test -f /data/.restore-staging/webui.db' in this text for its own.
+$swapScript = $extractScript + '; ' + $moveScript
 
 function Invoke-Swap {
+    # extractOpen: the first run was started and the second was not, so what it unpacked may sit in
+    # the volume ('finally' removes it). volumeTouched and swapOpen: set right before the second
+    # run, never before the first (an archive that does not unpack sets off no rollback). swapOpen
+    # is cleared once the second run is through: while it is set, the volume may be half replaced,
+    # and 'finally' starts nothing on it.
     param([string]$ArchivePath)
-    if ($env:LOCALAI_TEST_FAIL_SWAP) { throw 'Test hook: swap failed' }
-    if ($env:LOCALAI_TEST_KILL_IN_SWAP) { [Environment]::Exit(9) }   # test hook: killed mid-swap (no catch/finally)
-    if ($env:LOCALAI_TEST_FAIL_SWAP_ONCE) { $env:LOCALAI_TEST_FAIL_SWAP_ONCE = ''; throw 'Test hook: first swap failed' }
-    Invoke-Docker -Arguments @('run', '--rm', '-v', "${Volume}:/data", '-v', "${ArchivePath}:/restore.tar.gz:ro", $img, 'sh', '-c', $swapScript) | Out-Null
+    $script:extractOpen = $true
+    Invoke-Docker -Arguments @('run', '--rm', '-v', "${Volume}:/data", '-v', "${ArchivePath}:/restore.tar.gz:ro", $img, 'sh', '-c', $extractScript) | Out-Null
+    $script:volumeTouched = $true
+    $script:swapOpen = $true
+    $script:extractOpen = $false
+    Invoke-Docker -Arguments @('run', '--rm', '-v', "${Volume}:/data", $img, 'sh', '-c', $moveScript) | Out-Null
+    $script:swapOpen = $false
 }
 
 function Test-Archive {
@@ -116,7 +158,10 @@ $backupDir = Join-Path $AIRoot 'Backups'
 $stagingDir = Join-Path $backupDir 'restore-staging'
 $lock = $null
 $stoppedContainers = @()
+# What Invoke-Swap sets (see there).
 $volumeTouched = $false
+$script:swapOpen = $false
+$script:extractOpen = $false
 $safety = $null
 $holdPath = Join-Path $AIRoot 'open-webui-hold.json'
 $script:holdArchive = ''
@@ -206,7 +251,6 @@ if ($DeepResearch) {
         }
         $rTouched = $true
         Invoke-Docker -Arguments @('run', '--rm', '-v', "${ResearchVolume}:/data", '-v', "${staged}:/restore.tar.gz:ro", $img, 'sh', '-c', $rSwap) | Out-Null
-        if ($env:LOCALAI_TEST_FAIL_RESEARCH_SWAP) { throw 'Test hook: deep research swap failed' }
         Write-LaiLog OK "Deep research data restored from $($source.Name)"
     } catch {
         $code = 1
@@ -341,11 +385,13 @@ try {
         $toStop += [pscustomobject]@{ Id = $id; Policy = $policy }
     }
     # Recorded BEFORE any container is touched: if this window is closed or the PC loses power from
-    # here on, no catch or finally runs. Once the swap has started the volume may be half replaced;
-    # even before it, a container may be left with its restart policy off (it would then stay down
-    # after every reboot, with nothing saying why). The hold keeps the watch, Start again and the
-    # installer from starting Open WebUI, says how to finish, and holds the original policies the
-    # recovery puts back. Cleared on success, and on a failure before the swap.
+    # here on, no catch or finally runs. Once the swap's second run has started the volume may be
+    # half replaced; even before it, a container may be left with its restart policy off (it would
+    # then stay down after every reboot, with nothing saying why). The hold keeps the watch, Start
+    # again and the installer from starting Open WebUI, says how to finish, and holds the original
+    # policies the recovery puts back. Cleared on success, after a rollback that worked, and on a
+    # failure before the old data was touched (that includes an archive that did not unpack). It
+    # stays when the swap's second run failed without a rollback or was stopped (Ctrl+C).
     $priorHold = Test-Path -LiteralPath $holdPath
     if (-not $priorHold) {
         $script:recoverCmd = "& $(ConvertTo-LaiPsQuoted (Join-Path $PSScriptRoot 'Restore-OpenWebUI.ps1')) -AIRoot $(ConvertTo-LaiPsQuoted $AIRoot) -Archive $(ConvertTo-LaiPsQuoted (Get-Item -LiteralPath $Archive).FullName) -SkipSafetyBackup"
@@ -364,7 +410,6 @@ try {
     if ($back.Count -gt 0) {
         throw "Something restarted a container on volume '$Volume' ($($back -join '; ')); aborting before any change."
     }
-    $volumeTouched = $true
     Invoke-Swap $staged
     Write-LaiLog OK "Volume '$Volume' now holds $($source.Name)"
     # Recovering from an earlier failed restore: its containers are already stopped (so not listed
@@ -429,15 +474,54 @@ try {
     }
     $script:restoreFailed = $true
 } finally {
-    foreach ($c in $stoppedContainers) {
-        try {
-            Invoke-Docker -Arguments @('update', '--restart', $c.Policy, $c.Id) -AllowFail | Out-Null
-            Invoke-Docker -Arguments @('start', $c.Id) | Out-Null
-        } catch { Write-LaiLog WARN "Could not restart container $($c.Id): $($_.Exception.Message)" }
+    # The archive did not unpack, or its unpacking was stopped (Ctrl+C): what it had unpacked by
+    # then sits in the volume. None of the old data was deleted for it, but it can be GBs, Open
+    # WebUI would start next to it, and every backup from then on would carry it. Best effort,
+    # before anything is started. Not while the swap is open: the tree is the data moving in then.
+    if ($script:extractOpen -and -not $script:swapOpen) {
+        $swept = $false
+        try { $swept = ((Invoke-Docker -Arguments @('run', '--rm', '-v', "${Volume}:/data", $img, 'sh', '-c', $sweepScript) -AllowFail).ExitCode -eq 0) }
+        catch { Write-Verbose "the helper did not run: $($_.Exception.Message)" }
+        if (-not $swept) { Write-LaiLog WARN "Could not remove what the unpacking left in volume '$Volume' (the folder .restore-partial or .restore-staging); the next restore removes it." }
+        if (-not $volumeTouched) { Write-LaiLog INFO "The restore ended before the old data was touched: nothing in volume '$Volume' was deleted or replaced by this run." }
     }
-    # Stopped before the swap (an error, or Ctrl+C, which skips 'catch' but not 'finally'): the data
-    # was never touched and the containers are back, so drop the in-progress hold this run wrote.
-    # After a good restore it is already gone; after a failed swap volumeTouched keeps it.
+    if ($script:swapOpen) {
+        # The swap's second run was started and neither came through nor was rolled back: the volume
+        # may be half replaced, so nothing is started on it and the hold stays. 'catch' has said so
+        # and recorded the hold with the way out, unless it never ran or never came to its end
+        # (Ctrl+C skips 'catch', but not 'finally'; it used to start Open WebUI on that volume).
+        # Then both are done here, with this run's containers and their original restart policies.
+        if (-not $script:restoreFailed) {
+            # Hold the list first, clear it, then record (as in 'catch').
+            $held = $stoppedContainers
+            $stoppedContainers = @()
+            # The way out an earlier hold names still applies when this run has none of its own (a
+            # recovery run, which writes no hold before its swap). With neither: this archive again.
+            $holdNow = $null
+            try { $holdNow = Get-LaiWebUIHold -AIRoot $AIRoot } catch { Write-Verbose "the hold was not read: $($_.Exception.Message)" }
+            if ($holdNow) {
+                if (-not $script:recoverCmd) { $script:recoverCmd = [string]$holdNow['Recover'] }
+                if (-not $script:holdArchive) { $script:holdArchive = [string]$holdNow['Archive'] }
+            }
+            if (-not $script:recoverCmd) { $script:recoverCmd = "& $(ConvertTo-LaiPsQuoted (Join-Path $PSScriptRoot 'Restore-OpenWebUI.ps1')) -AIRoot $(ConvertTo-LaiPsQuoted $AIRoot) -Archive $(ConvertTo-LaiPsQuoted $source.FullName) -SkipSafetyBackup" }
+            # The watch is named only once the hold is on record: without one it would start Open WebUI.
+            $watchNote = ''
+            try { Set-Hold 'a restore was stopped while it replaced the data' $held; $watchNote = ' (the health watch will not start it)' }
+            catch { Write-LaiLog FAIL "Could not record the hold ($($_.Exception.Message)): do NOT start Open WebUI until the restore succeeds." }
+            Write-LaiLog FAIL "The restore was stopped while it replaced the data in volume '$Volume', which may be half replaced. Open WebUI is left STOPPED${watchNote}. Recover with: $script:recoverCmd"
+        }
+    } else {
+        foreach ($c in $stoppedContainers) {
+            try {
+                Invoke-Docker -Arguments @('update', '--restart', $c.Policy, $c.Id) -AllowFail | Out-Null
+                Invoke-Docker -Arguments @('start', $c.Id) | Out-Null
+            } catch { Write-LaiLog WARN "Could not restart container $($c.Id): $($_.Exception.Message)" }
+        }
+    }
+    # Stopped before the old data was touched (an error, an archive that did not unpack, or Ctrl+C,
+    # which skips 'catch' but not 'finally'): the containers are back, so drop the in-progress hold
+    # this run wrote. After a good restore it is already gone, and after a rollback that worked
+    # 'catch' has dropped it; a swap that is still open keeps it (volumeTouched is set with it).
     if ($script:holdWritten -and -not $volumeTouched) { Clear-Hold '' }
     if ($staged -and (Test-Path -LiteralPath $staged)) { Remove-Item -LiteralPath $staged -Force -ErrorAction SilentlyContinue }
     Exit-LaiVolumeLock $lock
@@ -455,15 +539,12 @@ if ($stoppedContainers.Count -gt 0) {
     $port = 3000
     if ($config.ContainsKey('WebUIPort')) { $port = [int]$config['WebUIPort'] }
     $up = $false
-    # LOCALAI_TEST_WEBUI_WAIT_SEC: test hook, a shorter wait. It counts only as a positive whole
-    # number: anything else keeps the 5 minutes.
-    $waitSec = 300; $askedWait = 0
-    if ($env:LOCALAI_TEST_WEBUI_WAIT_SEC -and [int]::TryParse([string]$env:LOCALAI_TEST_WEBUI_WAIT_SEC, [ref]$askedWait) -and $askedWait -gt 0) { $waitSec = $askedWait }
-    try { Wait-LaiWebUI -BaseUrl "http://127.0.0.1:$port" -TimeoutSec $waitSec; Write-LaiLog OK "Open WebUI is back on http://localhost:$port"; $up = $true }
+    # -WebUIWaitSec: 5 minutes unless given.
+    try { Wait-LaiWebUI -BaseUrl "http://127.0.0.1:$port" -TimeoutSec $WebUIWaitSec; Write-LaiLog OK "Open WebUI is back on http://localhost:$port"; $up = $true }
     catch {
         # The models a backup leaves out came along in the swap if the volume had them. A volume that
         # had none (a new one, or the models were deleted) makes Open WebUI download them at this start.
-        Write-LaiLog WARN "Data restored, but Open WebUI did not answer within $([math]::Round($waitSec / 60, 1)) minutes. It may still be fetching its document-search models (several GB, when the volume had none): give it some minutes, and check 'docker logs --tail 100 $Container'."
+        Write-LaiLog WARN "Data restored, but Open WebUI did not answer within $([math]::Round($WebUIWaitSec / 60, 1)) minutes. It may still be fetching its document-search models (several GB, when the volume had none): give it some minutes, and check 'docker logs --tail 100 $Container'."
         if ($safety) {
             # That copy fits the version that ran before this restore. Update-OpenWebUI.ps1 -Rollback
             # switches the version right before it calls this script: put back by itself there, the
@@ -502,7 +583,10 @@ if ($stoppedContainers.Count -gt 0) {
             # A try of its own: an error here is not a failed sign-in, and must not keep the safety
             # settings below from being put back.
             try {
-                if ($env:LOCALAI_TEST_FAIL_OLLAMA_URL) { throw 'Test hook: the Ollama connection could not be set' }
+                # Test only (-TestFailOllamaUrl, which only tests/Invoke-UpdateWebUITest.ps1 passes): the
+                # connection counts as not set, the way an error from Open WebUI ends this step, with
+                # the parameter named in the warning below.
+                if ($TestFailOllamaUrl) { throw 'the test parameter -TestFailOllamaUrl was passed, which makes this step fail (no shortcut and no scheduled task passes it, so something else started this run)' }
                 if (Set-LaiWebUIOllamaUrl -BaseUrl "http://127.0.0.1:$port" -Token $token -OllamaUrl $expected) {
                     Write-LaiLog OK "Re-applied this install's Ollama connection ($expected) to the restored settings"
                 }
@@ -517,11 +601,11 @@ if ($stoppedContainers.Count -gt 0) {
                 $base = "http://127.0.0.1:$port"
                 Set-LaiWebUIAdminConfig -BaseUrl $base -Token $token -Changes @{ ENABLE_SIGNUP = $false } | Out-Null
                 if ((Invoke-LaiApi -Uri "$base/api/v1/auths/admin/config" -Token $token).ENABLE_SIGNUP -ne $false) { throw "Open WebUI did not keep 'sign-up off'" }
-                $catalogPath = Join-Path (Join-Path $PSScriptRoot 'config') 'models.psd1'
-                if ($env:LOCALAI_TEST_CATALOG) { $catalogPath = $env:LOCALAI_TEST_CATALOG }
+                # $CatalogPath: config\models.psd1 next to this script, unless -CatalogPath named another.
+                if ($catalogGiven) { Write-LaiLog INFO "The presets to look at are those of the catalog given with -CatalogPath: $CatalogPath" }
                 $changed = @()
                 $found = 0
-                foreach ($m in (Get-LaiCatalog -Path $catalogPath -IncludeTrials).Models) {
+                foreach ($m in (Get-LaiCatalog -Path $CatalogPath -IncludeTrials).Models) {
                     $existing = Get-LaiWebUIModel -BaseUrl $base -Token $token -Id $m.Preset
                     # Not in the restored data (never set up, or deleted): nothing to make safe, and
                     # Set-LaiWebUIModel would create it.

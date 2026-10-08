@@ -42,9 +42,33 @@ function Invoke-WithPath([string]$Dir, [scriptblock]$Body) {
     $env:PATH = $Dir + [System.IO.Path]::PathSeparator + $saved
     try { return (& $Body) } finally { $env:PATH = $saved }
 }
+function New-RunShim([string]$Name, [string]$Match, [string]$Then, [switch]$AfterRealRun) {
+    # A docker (New-DockerShim) that is the real one for every call but those with $Match among
+    # their arguments: for these it does $Then (sh), with -AfterRealRun once the real docker has
+    # run the call. $Match is a piece of the sh text Restore-OpenWebUI.ps1 hands its helper, so one
+    # run of the helper can be made to fail, or to end the restore, and no other. This is what the
+    # restore's test variables in the environment used to do; the script reads none any more.
+    $first = ''; if ($AfterRealRun) { $first = "'REALDOCKER' `"`$@`"" }
+    $body = @'
+#!/bin/sh
+case " $* " in *'SHIM_MATCH'*)
+SHIM_FIRST
+SHIM_THEN
+;; esac
+exec 'REALDOCKER' "$@"
+'@
+    return (New-DockerShim $Name ($body.Replace('SHIM_MATCH', $Match).Replace('SHIM_FIRST', $first).Replace('SHIM_THEN', $Then)))
+}
+# The two runs of the restore's swap, by a piece of sh only that run has: the first unpacks the
+# archive next to the old data, the second deletes the old data and moves the unpacked tree in.
+$extractRun = 'tar xzf /restore.tar.gz'
+$moveRun = 'rmdir /data/.restore-staging'
 function Invoke-Update([string[]]$Arguments) {
+    # -CatalogPath: the health check that ends an update, and the restore of a rollback, read the
+    # stand-in catalog. $script:waitArgs: the wait for Open WebUI a part has set (-WebUIWaitSec).
+    $all = @('-CatalogPath', $testCatalog) + @($script:waitArgs) + @($Arguments)
     $prev = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
-    $out = & pwsh -NoProfile -File (Join-Path $src 'Update-OpenWebUI.ps1') -AIRoot $aiRoot @Arguments 2>&1 | ForEach-Object { "$_" }
+    $out = & pwsh -NoProfile -File (Join-Path $src 'Update-OpenWebUI.ps1') -AIRoot $aiRoot @all 2>&1 | ForEach-Object { "$_" }
     $code = $LASTEXITCODE
     $ErrorActionPreference = $prev
     $out | Where-Object { $_ -match 'OK|WARN|FAIL|roll|pull' } | Select-Object -Last 3 | ForEach-Object { Write-Host "    | $_" }
@@ -100,7 +124,10 @@ Invoke-DockerText @('volume', 'rm', 'open-webui') | Out-Null
 Invoke-DockerText @('compose', '--project-directory', $stack, '-f', (Join-Path $stack 'docker-compose.yml'), 'up', '-d') | Out-Null
 Invoke-DockerText @('run', '--rm', '-v', 'open-webui:/d', 'alpine:3.20', 'sh', '-c', 'head -c 4096 /dev/urandom > /d/webui.db') | Out-Null
 Set-Marker 'DATA-v1'
-if (-not $env:LOCALAI_TEST_CATALOG) { $env:LOCALAI_TEST_CATALOG = Join-Path $PSScriptRoot 'models.test.psd1' }
+# The stand-in catalog and the wait for Open WebUI go to the update and the restore as parameters
+# (Invoke-Update, $runScript): neither script reads them, or anything else, from the environment.
+$testCatalog = Join-Path $PSScriptRoot 'models.test.psd1'
+$script:waitArgs = @()
 
 try {
     Write-Host "`n=== 1. update 3.19 -> 3.20 ===" -ForegroundColor Cyan
@@ -289,8 +316,9 @@ exec 'REALDOCKER' "$@"
     # @{} for a marker that is not there: a missing key is then a failed assertion, not an error.
     $pendingNow = { $p = (Read-LaiState -Path $cfgFile)['UpdatePending']; if ($p -is [hashtable]) { $p } else { @{} } }
     # Open WebUI 'does not answer' (a dead port, waits of seconds) or answers (the sandbox's real one).
-    $noAnswer = { Set-WebUIPort 3999; $env:LOCALAI_TEST_WEBUI_WAIT_SEC = '6' }
-    $answersNow = { $env:LOCALAI_TEST_WEBUI_WAIT_SEC = ''; Set-WebUIPort 3000 }
+    # The wait is the scripts' own -WebUIWaitSec; an update hands it on to the restore of a rollback.
+    $noAnswer = { Set-WebUIPort 3999; $script:waitArgs = @('-WebUIWaitSec', '6') }
+    $answersNow = { $script:waitArgs = @(); Set-WebUIPort 3000 }
     $containerState = { Invoke-DockerText @('inspect', '-f', '{{.State.Status}}', 'open-webui') }
     & $noAnswer
     try {
@@ -393,19 +421,26 @@ exec 'REALDOCKER' "$@"
     $holdFile = Join-Path $aiRoot 'open-webui-hold.json'
     $runScript = {
         param([string]$Name, [string[]]$Arguments)
+        # The restore and the update get the stand-in catalog (unless the call names one itself) and
+        # the wait for Open WebUI a part has set, as their own parameters.
+        $more = @()
+        if (@('Restore-OpenWebUI.ps1', 'Update-OpenWebUI.ps1') -contains $Name) {
+            if (@($Arguments) -notcontains '-CatalogPath') { $more += @('-CatalogPath', $testCatalog) }
+            $more += @($script:waitArgs)
+        }
         $prevPref = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
-        $o = & pwsh -NoProfile -File (Join-Path $src $Name) -AIRoot $aiRoot @Arguments 2>&1 | ForEach-Object { "$_" }
+        $o = & pwsh -NoProfile -File (Join-Path $src $Name) -AIRoot $aiRoot @Arguments @more 2>&1 | ForEach-Object { "$_" }
         $c = $LASTEXITCODE; $ErrorActionPreference = $prevPref
         return [pscustomobject]@{ Code = $c; Text = ($o -join "`n") }
     }
-    # The swap fails, and so does the rollback to the safety backup (same hook): the worst case.
-    $env:LOCALAI_TEST_FAIL_SWAP = '1'
-    $r = & $runScript 'Restore-OpenWebUI.ps1' @('-Archive', $good.FullName, '-Force')
+    # The swap's second run fails (the one that deletes the old data and moves the backup in), and
+    # so does that of the rollback to the safety backup (the same stand-in docker): the worst case.
+    $failMoveDir = New-RunShim -Name 'fail-move' -Match $moveRun -Then 'echo stand-in docker: this run of the helper fails >&2; exit 1'
+    $r = Invoke-WithPath $failMoveDir { & $runScript 'Restore-OpenWebUI.ps1' @('-Archive', $good.FullName, '-Force') }
     $h1 = Read-LaiState -Path $holdFile
     Assert-That ($r.Code -ne 0 -and [string]$h1['Archive'] -like '*pre-restore*') "failed restore and rollback record a hold naming the safety backup (exit $($r.Code))"
     # Following the recovery command fails again (no safety backup of its own): the pointer must survive.
-    $r = & $runScript 'Restore-OpenWebUI.ps1' @('-Archive', [string]$h1['Archive'], '-Force', '-SkipSafetyBackup')
-    $env:LOCALAI_TEST_FAIL_SWAP = ''
+    $r = Invoke-WithPath $failMoveDir { & $runScript 'Restore-OpenWebUI.ps1' @('-Archive', [string]$h1['Archive'], '-Force', '-SkipSafetyBackup') }
     $h2 = Read-LaiState -Path $holdFile
     Assert-That ($r.Code -ne 0 -and $h2['Archive'] -eq $h1['Archive'] -and $r.Text -match 'earlier recovery command still applies') 'a failed recovery keeps the pointer to the newest safety backup'
     Assert-That ((Invoke-DockerText @('inspect', '-f', '{{.State.Status}} {{.HostConfig.RestartPolicy.Name}}', 'open-webui')) -eq 'exited no') 'container left stopped, restart policy off'
@@ -435,11 +470,12 @@ exec 'REALDOCKER' "$@"
     Assert-That ((Invoke-DockerText @('inspect', '-f', '{{.State.Status}} {{.HostConfig.RestartPolicy.Name}}', 'open-webui')) -eq 'running always') 'container running again with its original restart policy'
 
     Write-Host "`n=== 5b. a restore killed mid-swap (window closed, power cut) ===" -ForegroundColor Cyan
-    $env:LOCALAI_TEST_KILL_IN_SWAP = '1'
-    $r = & $runScript 'Restore-OpenWebUI.ps1' @('-Archive', $good.FullName, '-Force', '-SkipSafetyBackup')
-    $env:LOCALAI_TEST_KILL_IN_SWAP = ''
+    # This docker kills the restore's own process as the swap's second run starts: no catch or
+    # finally runs.
+    $killMoveDir = New-RunShim -Name 'kill-in-move' -Match $moveRun -Then 'kill -9 $PPID; exit 1'
+    $r = Invoke-WithPath $killMoveDir { & $runScript 'Restore-OpenWebUI.ps1' @('-Archive', $good.FullName, '-Force', '-SkipSafetyBackup') }
     $hk = Read-LaiState -Path $holdFile
-    Assert-That ($r.Code -eq 9 -and [string]$hk['Reason'] -match 'interrupted') "killed with no catch/finally: the hold was already there (exit $($r.Code))"
+    Assert-That ($r.Code -ne 0 -and [string]$hk['Reason'] -match 'interrupted') "killed with no catch/finally: the hold was already there (exit $($r.Code))"
     Assert-That ((Invoke-DockerText @('inspect', '-f', '{{.State.Status}} {{.HostConfig.RestartPolicy.Name}}', 'open-webui')) -eq 'exited no') 'Open WebUI stays down with auto-restart off'
     $cfgTmp = Read-LaiState -Path $cfgPath; $cfgTmp['WebUIPort'] = 3999; Save-LaiState -State $cfgTmp -Path $cfgPath
     & $runScript 'Watch-LocalAI.ps1' @() | Out-Null
@@ -449,9 +485,11 @@ exec 'REALDOCKER' "$@"
     Assert-That ($r.Code -eq 0 -and -not (Test-Path -LiteralPath $holdFile) -and (Invoke-DockerText @('inspect', '-f', '{{.State.Status}} {{.HostConfig.RestartPolicy.Name}}', 'open-webui')) -eq 'running always') 'running the restore again finishes it: hold cleared, auto-restart back'
 
     Write-Host "`n=== 5c. a failed swap rolled back from the safety backup leaves no hold ===" -ForegroundColor Cyan
-    $env:LOCALAI_TEST_FAIL_SWAP_ONCE = '1'
-    $r = & $runScript 'Restore-OpenWebUI.ps1' @('-Archive', $good.FullName, '-Force')
-    $env:LOCALAI_TEST_FAIL_SWAP_ONCE = ''
+    # This docker fails the swap's second run once (until its marker file is there): the restore's
+    # fails, the rollback's goes through.
+    $onceMarker = Join-Path $Work 'fail-move-once.marker'
+    $onceDir = New-RunShim -Name 'fail-move-once' -Match $moveRun -Then ("if [ ! -e 'ONCE_MARKER' ]; then : > 'ONCE_MARKER'; echo stand-in docker: this run of the helper fails once >&2; exit 1; fi".Replace('ONCE_MARKER', $onceMarker))
+    $r = Invoke-WithPath $onceDir { & $runScript 'Restore-OpenWebUI.ps1' @('-Archive', $good.FullName, '-Force') }
     Assert-That ($r.Code -ne 0 -and $r.Text -match 'Rollback complete' -and -not (Test-Path -LiteralPath $holdFile)) "failed swap, good rollback: no hold left behind (exit $($r.Code))"
     Assert-That ((Invoke-DockerText @('inspect', '-f', '{{.State.Status}} {{.HostConfig.RestartPolicy.Name}}', 'open-webui')) -eq 'running always') 'and Open WebUI runs again as before'
 
@@ -459,9 +497,7 @@ exec 'REALDOCKER' "$@"
     $bdir5 = Join-Path $aiRoot 'Backups'
     $future5 = Join-Path $bdir5 ('open-webui-{0}.tar.gz' -f (Get-Date).AddDays(400).ToString('yyyyMMdd-HHmmss'))
     Copy-Item -LiteralPath $good.FullName -Destination $future5; (Get-Item -LiteralPath $future5).LastWriteTime = (Get-Date).AddDays(400)
-    $env:LOCALAI_TEST_FAIL_SWAP = '1'
-    $r = & $runScript 'Restore-OpenWebUI.ps1' @('-Archive', $good.FullName, '-Force', '-SkipSafetyBackup')
-    $env:LOCALAI_TEST_FAIL_SWAP = ''
+    $r = Invoke-WithPath $failMoveDir { & $runScript 'Restore-OpenWebUI.ps1' @('-Archive', $good.FullName, '-Force', '-SkipSafetyBackup') }
     $h5 = Read-LaiState -Path $holdFile
     $rec5 = [string]$h5['Recover']
     Assert-That ($r.Code -ne 0 -and $rec5 -match '-Archive ' -and $rec5 -notmatch 'YYYYMMDD' -and $rec5 -notmatch [regex]::Escape($good.Name) -and $rec5 -notmatch [regex]::Escape((Split-Path -Leaf $future5))) "the recovery command names another real nightly backup ($rec5)"
@@ -505,10 +541,75 @@ exec 'REALDOCKER' "$@"
     $pol = Invoke-DockerText @('inspect', '-f', '{{.State.Status}} {{.HostConfig.RestartPolicy.Name}}', 'open-webui')
     Assert-That ($r.Code -ne 0 -and -not (Test-Path -LiteralPath $holdFile) -and $pol -eq 'running always') "failed stop: exit $($r.Code), container '$pol', hold left: $(Test-Path -LiteralPath $holdFile)"
 
+    Write-Host "`n=== 5i. an archive that does not unpack touches nothing: no rollback, no hold, Open WebUI back on its data ===" -ForegroundColor Cyan
+    # The swap's first run fails, the way a cut-off unpacking does: this docker puts half a tree
+    # into the volume (.restore-partial) and then fails the run. Nothing of the old data was deleted
+    # for it, so no rollback to the safety backup may start. It used to, and when that failed as
+    # well (a full disk fails both), Open WebUI stayed stopped on data nothing had touched.
+    $halfMarker = Join-Path $Work 'fail-extract.planted'
+    $halfTree = @'
+'REALDOCKER' run --rm -v open-webui:/data alpine:3.20 sh -c 'mkdir -p /data/.restore-partial/cache && echo half > /data/.restore-partial/webui.db' >/dev/null 2>&1 && : > 'PLANT_MARKER'
+echo stand-in docker: the archive does not unpack >&2; exit 1
+'@
+    $failExtractDir = New-RunShim -Name 'fail-extract' -Match $extractRun -Then ($halfTree.Replace('PLANT_MARKER', $halfMarker))
+    Set-Marker 'DATA-5i'
+    $r = Invoke-WithPath $failExtractDir { & $runScript 'Restore-OpenWebUI.ps1' @('-Archive', $good.FullName, '-Force') }
+    $pol = Invoke-DockerText @('inspect', '-f', '{{.State.Status}} {{.HostConfig.RestartPolicy.Name}}', 'open-webui')
+    Assert-That ((Test-Path -LiteralPath $halfMarker) -and $r.Code -ne 0) "setup: the unpacking failed and left half a tree in the volume (exit $($r.Code))"
+    Assert-That ($r.Text -notmatch 'Rolling back' -and $r.Text -notmatch 'left STOPPED' -and $r.Text -match "nothing in volume 'open-webui' was deleted or replaced") 'an archive that does not unpack sets off no rollback to the safety backup, and the restore says that nothing in the volume was deleted or replaced'
+    Assert-That (-not (Test-Path -LiteralPath $holdFile) -and $pol -eq 'running always') "no hold is left and Open WebUI runs again with its restart policy (container '$pol', hold left: $(Test-Path -LiteralPath $holdFile))"
+    Assert-That ((Get-Marker) -eq 'DATA-5i') "the data is unchanged ($(Get-Marker))"
+    $inVolumeNow = Invoke-DockerText @('run', '--rm', '-v', 'open-webui:/d', 'alpine:3.20', 'ls', '-a', '/d')
+    Assert-That ($inVolumeNow -match 'webui\.db' -and $inVolumeNow -notmatch '\.restore-') "and what the unpacking left is gone from the volume: Open WebUI does not start next to it, and no backup carries it ($($inVolumeNow -replace '\s+', ' '))"
+    # The same without a safety backup. That used to end on 'No safety backup exists; Open WebUI is
+    # left STOPPED so it cannot start on a damaged volume', with a hold, for data nothing had touched.
+    $r = Invoke-WithPath $failExtractDir { & $runScript 'Restore-OpenWebUI.ps1' @('-Archive', $good.FullName, '-Force', '-SkipSafetyBackup') }
+    $pol = Invoke-DockerText @('inspect', '-f', '{{.State.Status}} {{.HostConfig.RestartPolicy.Name}}', 'open-webui')
+    Assert-That ($r.Code -ne 0 -and $r.Text -notmatch 'left STOPPED' -and -not (Test-Path -LiteralPath $holdFile) -and $pol -eq 'running always' -and (Get-Marker) -eq 'DATA-5i') "without a safety backup as well: no 'damaged volume' message and no hold for data that was never touched (exit $($r.Code), container '$pol', hold left: $(Test-Path -LiteralPath $holdFile), data $(Get-Marker))"
+
+    Write-Host "`n=== 5j. a restore stopped (Ctrl+C) while it replaces the data leaves Open WebUI stopped, with the way to finish ===" -ForegroundColor Cyan
+    # This docker sends the restore's own process the signal of Ctrl+C as the swap's second run
+    # starts, and then stays the way the helper would: 'catch' is skipped, 'finally' runs. In real
+    # life the old data may be half replaced by then (here that run never starts, so it is whole).
+    # 'finally' used to start Open WebUI on that volume.
+    $stopMoveDir = New-RunShim -Name 'stop-in-move' -Match $moveRun -Then 'kill -INT $PPID; exec sleep 30'
+    $stagedCopy = Join-Path (Join-Path (Join-Path $aiRoot 'Backups') 'restore-staging') 'restore.tar.gz'
+    $r = Invoke-WithPath $stopMoveDir { & $runScript 'Restore-OpenWebUI.ps1' @('-Archive', $good.FullName, '-Force', '-SkipSafetyBackup') }
+    $hs = Read-LaiState -Path $holdFile
+    $pol = Invoke-DockerText @('inspect', '-f', '{{.State.Status}} {{.HostConfig.RestartPolicy.Name}}', 'open-webui')
+    Assert-That (-not (Test-Path -LiteralPath $stagedCopy)) "stopped as the swap's second run started (exit $($r.Code)): 'finally' ran, the staged copy of the archive is gone"
+    Assert-That ($pol -eq 'exited no') "and it started nothing on the volume: Open WebUI stays down with auto-restart off ($pol)"
+    $keptPolicy = @(@($hs['Containers']) | Where-Object { $_ -and $_['Policy'] -eq 'always' }).Count -gt 0
+    Assert-That ([string]$hs['Recover'] -match [regex]::Escape((Join-Path $src 'Restore-OpenWebUI.ps1')) -and $keptPolicy) "the hold says how to finish (its recovery command names the script) and keeps the original restart policy (recover: $($hs['Recover']))"
+    Assert-That ([string]$hs['Reason'] -match 'stopped while it replaced the data') "the hold is the one 'finally' records for a stopped swap, not one a failed run left ($($hs['Reason']))"
+    $r = & $runScript 'Restore-OpenWebUI.ps1' @('-Archive', $good.FullName, '-Force', '-SkipSafetyBackup')
+    Assert-That ($r.Code -eq 0 -and -not (Test-Path -LiteralPath $holdFile) -and (Invoke-DockerText @('inspect', '-f', '{{.State.Status}} {{.HostConfig.RestartPolicy.Name}}', 'open-webui')) -eq 'running always') "running the restore again finishes it: hold cleared, auto-restart back (exit $($r.Code))"
+
     Write-Host "`n=== 5g. a restore puts this install's safety settings back on the restored data ===" -ForegroundColor Cyan
     # An old backup brings back the presets and admin settings of its day. The stand-in for that: the
     # sandbox's Open WebUI (the one step 5 of the restore talks to) has them switched on first.
     # One sign-in for the whole step: Open WebUI rate-limits them.
+    # First, what the rest of this part leans on. Neither script takes a test hook from the
+    # environment any more: any program running as the owner can set a variable there for good (one
+    # made every update end on 'did not come up', one made the step below skip a preset and still
+    # say OK). Comments count as well: a name left in one is a hook someone puts back.
+    $stillNamed = @('Restore-OpenWebUI.ps1', 'Update-OpenWebUI.ps1' | Where-Object { (Get-Content -Encoding UTF8 -Raw -LiteralPath (Join-Path $src $_)).Contains('LOCALAI_TEST_') })
+    Assert-That ($stillNamed.Count -eq 0) "neither Restore-OpenWebUI.ps1 nor Update-OpenWebUI.ps1 holds the name of a test variable, in code or in a comment (found in: $($stillNamed -join ', '))"
+    # The two parameters that took the variables' place are the owner's as well, so both scripts
+    # look at them before they ask or change anything: a catalog that is not there, a wait of no
+    # seconds. (All white space is taken as one blank: an error that ends a script is broken at
+    # the window width.)
+    $noCatalog = Join-Path $aiRoot 'no-such-catalog.psd1'
+    $imageWas = Get-Image
+    $oneLine = { param([string]$Text) (Join-Wrapped $Text) -replace '\s+', ' ' }
+    $r = & $runScript 'Restore-OpenWebUI.ps1' @('-Archive', $good.FullName, '-Force', '-SkipSafetyBackup', '-CatalogPath', $noCatalog)
+    Assert-That ($r.Code -ne 0 -and (& $oneLine $r.Text) -match 'given with -CatalogPath was not found' -and $r.Text -notmatch 'Restoring open-webui-') "a restore with a -CatalogPath that is not there ends before it changes anything (exit $($r.Code))"
+    $r = & $runScript 'Update-OpenWebUI.ps1' @('-Version', '3.20', '-SkipBackup', '-CatalogPath', $noCatalog)
+    Assert-That ($r.Code -ne 0 -and (& $oneLine $r.Text) -match 'given with -CatalogPath was not found' -and (Get-Image) -eq $imageWas) "an update with a -CatalogPath that is not there ends before it changes anything (exit $($r.Code), $(Get-Image) runs)"
+    $r = & $runScript 'Restore-OpenWebUI.ps1' @('-Archive', $good.FullName, '-Force', '-SkipSafetyBackup', '-WebUIWaitSec', '0')
+    Assert-That ($r.Code -ne 0 -and (& $oneLine $r.Text) -match "Cannot validate argument on parameter 'WebUIWaitSec'" -and $r.Text -notmatch 'Restoring open-webui-') "a wait of 0 seconds for Open WebUI is refused before anything is changed (exit $($r.Code))"
+    $pol = Invoke-DockerText @('inspect', '-f', '{{.State.Status}} {{.HostConfig.RestartPolicy.Name}}', 'open-webui')
+    Assert-That (-not (Test-Path -LiteralPath $holdFile) -and $pol -eq 'running always') "and none of the three left a hold or stopped Open WebUI (container '$pol')"
     $sb = 'http://127.0.0.1:3000'
     $tok = Connect-LaiWebUI -BaseUrl $sb -Email 'admin@localhost' -Password 'Test-Password-123'
     $presetRaw = Get-LaiWebUIModel -BaseUrl $sb -Token $tok -Id 'local-main'
@@ -533,24 +634,31 @@ exec 'REALDOCKER' "$@"
             Assert-That ($pm.builtinTools.chats -eq $true -and $pm.builtinTools.code_interpreter -eq $true -and $pm.capabilities.code_interpreter -eq $true -and @($pm.defaultFeatureIds) -contains 'web_search' -and (& $getSignup) -eq $true) 'setup: as in an old backup, the preset has past-chat search, code execution and unasked web search on, and sign-up is on'
             # On this run the Ollama connection cannot be set (in real life: an error from Open WebUI
             # after a good sign-in). That is no reason to leave the safety settings as they came.
-            $env:LOCALAI_TEST_FAIL_OLLAMA_URL = '1'
-            try { $r = & $runScript 'Restore-OpenWebUI.ps1' @('-Archive', $good.FullName, '-Force', '-SkipSafetyBackup') } finally { $env:LOCALAI_TEST_FAIL_OLLAMA_URL = '' }
+            # -TestFailOllamaUrl stands in for that error: it comes from the sandbox's Open WebUI, where
+            # no stand-in docker reaches and no parameter of the owner's makes one.
+            # And for this one run the seven names the two scripts used to read from the environment
+            # are set. They must change nothing. Read, they failed the swap or ended the run in it,
+            # named another catalog for the step below and cut the wait for Open WebUI to a second.
+            $oldHooks = @('LOCALAI_TEST_FAIL_SWAP', 'LOCALAI_TEST_KILL_IN_SWAP', 'LOCALAI_TEST_FAIL_SWAP_ONCE', 'LOCALAI_TEST_FAIL_RESEARCH_SWAP', 'LOCALAI_TEST_FAIL_OLLAMA_URL', 'LOCALAI_TEST_WEBUI_WAIT_SEC', 'LOCALAI_TEST_CATALOG')
+            foreach ($hookVar in $oldHooks) { Set-LaiProcessEnv -Name $hookVar -Value '1' }
+            try { $r = & $runScript 'Restore-OpenWebUI.ps1' @('-Archive', $good.FullName, '-Force', '-SkipSafetyBackup', '-TestFailOllamaUrl') }
+            finally { foreach ($hookVar in $oldHooks) { Set-LaiProcessEnv -Name $hookVar -Value $null } }
             $after = & $getPreset
             $pm = $after.meta
+            Assert-That ($r.Code -eq 0 -and $r.Text -match "now holds $([regex]::Escape($good.Name))" -and $r.Text -match 'Open WebUI is back on' -and $r.Text -notmatch 'Test hook') "the names the restore used to read from the environment are set and change nothing: the swap goes through and Open WebUI is waited for as ever (exit $($r.Code))"
             Assert-That ($r.Code -eq 0 -and $pm.builtinTools.chats -eq $false) "after a restore the preset's model can no longer search and read past chats (exit $($r.Code), chats '$($pm.builtinTools.chats)')"
             Assert-That ($pm.builtinTools.code_interpreter -eq $false -and $pm.capabilities.code_interpreter -eq $false) "code execution is off again on the preset (tool '$($pm.builtinTools.code_interpreter)', capability '$($pm.capabilities.code_interpreter)')"
             Assert-That (@($pm.defaultFeatureIds | Where-Object { $_ }).Count -eq 0) "an uncensored preset searches the web only when asked again (on by default: '$(@($pm.defaultFeatureIds) -join ',')')"
             Assert-That ((& $getSignup) -eq $false) 'sign-up is off again'
             Assert-That ($r.Text -match "Re-applied this install's safety settings.*sign-up off; \d+ toolkit preset\(s\) checked.*Local Main \(past-chat search, code execution, on by default: web_search\)" -and $r.Text -notmatch 'were not put back') 'the restore says what it re-applied, preset by preset, and how many presets it checked'
-            Assert-That ($r.Text -match "Could not re-apply this install's Ollama connection .*Test hook" -and $r.Text -notmatch 'Could not sign in') 'an Ollama connection that could not be set is reported as that, not as a failed sign-in (and the safety settings above were still put back)'
+            Assert-That ($r.Text -match "Could not re-apply this install's Ollama connection .*-TestFailOllamaUrl" -and $r.Text -notmatch 'Could not sign in') 'an Ollama connection that could not be set is reported as that, not as a failed sign-in (and the safety settings above were still put back); the warning names the test parameter that made it fail'
             Assert-That ([string]$after.name -eq [string]$presetWas['name'] -and [string]$pm.description -eq [string]$presetWas['meta']['description'] -and [string]$after.params.system -eq [string]$presetWas['params']['system']) 'everything else on the preset is kept (name, description, system prompt)'
             Assert-That ([bool](Get-LaiWebUIModel -BaseUrl $sb -Token $tok -Id 'official-standin') -eq $otherWas) 'a catalog preset the restored data does not have is not created'
             # None of the toolkit's presets in the restored data (here: a catalog of one preset this
             # Open WebUI does not have). No preset was looked at, so nothing may say they are fine.
             $goneCatalog = Join-Path $aiRoot 'gone-catalog.psd1'
             Set-Content -LiteralPath $goneCatalog -Encoding UTF8 -Value "@{ DefaultPreset = 'lai-gone'; ContextCandidates = @(8192); Models = @(@{ Key = 'gone'; Display = 'Gone'; Preset = 'lai-gone' }) }"
-            $catalogWas = $env:LOCALAI_TEST_CATALOG; $env:LOCALAI_TEST_CATALOG = $goneCatalog
-            try { $r = & $runScript 'Restore-OpenWebUI.ps1' @('-Archive', $good.FullName, '-Force', '-SkipSafetyBackup') } finally { $env:LOCALAI_TEST_CATALOG = $catalogWas; Remove-Item -LiteralPath $goneCatalog -Force -ErrorAction SilentlyContinue }
+            try { $r = & $runScript 'Restore-OpenWebUI.ps1' @('-Archive', $good.FullName, '-Force', '-SkipSafetyBackup', '-CatalogPath', $goneCatalog) } finally { Remove-Item -LiteralPath $goneCatalog -Force -ErrorAction SilentlyContinue }
             Assert-That ($r.Code -eq 0 -and $r.Text -match "were not put back: sign-up is off again, but none of the toolkit's presets is in the restored data.*run Start menu > Local AI - Update toolkit" -and $r.Text -notmatch "Re-applied this install's safety settings") "restored data with none of the toolkit's presets: the restore says no preset was checked and how to set them up, not that all is well (exit $($r.Code))"
         } finally {
             # Never leave the shared sandbox Open WebUI with these on.
@@ -570,8 +678,9 @@ exec 'REALDOCKER' "$@"
     Assert-That ((& $modelFiles) -eq 'm w') "setup: the volume holds a document-search model and a speech model ($(& $modelFiles))"
     # The swap fails and the safety backup goes back in. That archive has neither folder: without
     # the move in the swap, the rollback 'to how it was' came back without the models.
-    $env:LOCALAI_TEST_FAIL_SWAP_ONCE = '1'
-    try { $r = & $runScript 'Restore-OpenWebUI.ps1' @('-Archive', $good.FullName, '-Force') } finally { $env:LOCALAI_TEST_FAIL_SWAP_ONCE = '' }
+    # (The docker of part 5c again, its marker file gone: the swap's second run fails once.)
+    Remove-Item -LiteralPath $onceMarker -Force -ErrorAction SilentlyContinue
+    $r = Invoke-WithPath $onceDir { & $runScript 'Restore-OpenWebUI.ps1' @('-Archive', $good.FullName, '-Force') }
     Assert-That ($r.Code -ne 0 -and $r.Text -match 'Rollback complete' -and (& $modelFiles) -eq 'm w') "a failed restore that is rolled back keeps both model folders (exit $($r.Code); found: $(& $modelFiles))"
     # A restore that works, of an archive from before there was any cache folder. Open WebUI is
     # looked for on a dead port, for a few seconds: it 'does not answer' (as in part 4b).
@@ -907,13 +1016,15 @@ exec 'REALDOCKER' "$@"
         Assert-That ((Invoke-DockerText @('inspect', '-f', '{{.State.Status}}', 'lai-research-ct')) -eq 'running') 'the research container runs again after the restore'
         Assert-That ((Invoke-DockerText @('inspect', '-f', '{{.HostConfig.RestartPolicy.Name}}', 'lai-research-ct')) -eq 'always') 'its restart policy is back after the restore (off during it)'
         # The swap fails after the old data was replaced: the safety copy goes back.
+        # This docker runs deep research's swap for real (the one helper run with its check for the
+        # encrypted_databases folder; the run that puts the safety copy back has none) and then
+        # reports it as failed.
         Invoke-DockerText @('run', '--rm', '-v', 'lai-research-test:/d', 'alpine:3.20', 'sh', '-c', 'echo v3 > /d/encrypted_databases/u.db') | Out-Null
-        $env:LOCALAI_TEST_FAIL_RESEARCH_SWAP = '1'
-        try { $r = & $runScript 'Restore-OpenWebUI.ps1' ($rr + @('-Archive', $made[0].FullName)) } finally { $env:LOCALAI_TEST_FAIL_RESEARCH_SWAP = '' }
+        $failResearchDir = New-RunShim -Name 'fail-research-swap' -Match 'test -d /data/.restore-staging/encrypted_databases' -Then 'echo stand-in docker: the swap ran and is reported as failed >&2; exit 1' -AfterRealRun
+        $r = Invoke-WithPath $failResearchDir { & $runScript 'Restore-OpenWebUI.ps1' ($rr + @('-Archive', $made[0].FullName)) }
         Assert-That ($r.Code -ne 0 -and $r.Text -match 'put back' -and (& $rData) -eq 'v3' -and (Invoke-DockerText @('inspect', '-f', '{{.State.Status}}', 'lai-research-ct')) -eq 'running') "a failed swap puts the earlier data back and starts deep research again (exit $($r.Code), data $(& $rData))"
         # Without a safety copy there is nothing to go back to: deep research is kept stopped.
-        $env:LOCALAI_TEST_FAIL_RESEARCH_SWAP = '1'
-        try { $r = & $runScript 'Restore-OpenWebUI.ps1' ($rr + @('-Archive', $made[0].FullName, '-SkipSafetyBackup')) } finally { $env:LOCALAI_TEST_FAIL_RESEARCH_SWAP = '' }
+        $r = Invoke-WithPath $failResearchDir { & $runScript 'Restore-OpenWebUI.ps1' ($rr + @('-Archive', $made[0].FullName, '-SkipSafetyBackup')) }
         Assert-That ($r.Code -ne 0 -and $r.Text -match 'kept stopped' -and (Invoke-DockerText @('inspect', '-f', '{{.State.Status}}', 'lai-research-ct')) -eq 'exited') "with no safety copy a failed swap keeps deep research stopped and says how to finish (exit $($r.Code))"
         Invoke-DockerText @('update', '--restart', 'always', 'lai-research-ct') | Out-Null
         Invoke-DockerText @('start', 'lai-research-ct') | Out-Null
