@@ -95,6 +95,24 @@ $files = Get-ChildItem -Path $Root -Recurse -File -Include *.ps1, *.psm1, *.psd1
 #            mem_limit or a pids_limit, with a published port not bound to 127.0.0.1, or with a line
 #            that hands it all back or that this check cannot read (privileged, ALL under cap_add,
 #            a '<<' merge or 'extends' at the service's own level, a key not written plainly).
+#   TESTHOOK a script outside tests (.ps1, .psm1) that takes something from a test and is not on the
+#            pinned list ($testHookPins: what main held when this rule came, one entry per file and
+#            name). Two things count. A read of a test variable from the environment: a name that
+#            begins LOCALAI_TEST_, or LOCALAI_DOCKER_TIMEOUT, or LOCALAI_TS_TIMEOUT, read as
+#            $env:NAME, as [Environment]::GetEnvironmentVariable('NAME'), or through Get-Item,
+#            Get-Content, Get-ChildItem or Test-Path (or an alias of one) on Env:NAME. And a
+#            parameter in the script's own param block whose name begins Test. A variable can be
+#            set for good by any program running as the user, and every later run then takes it
+#            for a test's. Use a stand-in the test puts on PATH, a real parameter, or a -Test
+#            parameter the run announces. Setting such a variable is not a read. A pinned entry
+#            that matches nothing any more fails too, so the list only shrinks, and no marker
+#            comment silences the rule. What it cannot see: a name put together at run time
+#            ('LOCALAI_' + 'TEST_X', or a variable that holds the name, as in
+#            GetEnvironmentVariable($n)); a read under another .NET call (the table that
+#            GetEnvironmentVariables() returns, ExpandEnvironmentVariables); 'Get-ChildItem Env:'
+#            with the names picked out afterwards; a read in code that a script holds as text for
+#            another PowerShell or for cmd; and a second read of a pinned name in its file, which
+#            passes with the first.
 function Find-Pitfall([System.Management.Automation.Language.Ast]$Ast, [string[]]$Lines, [string]$FileName = '', [switch]$UserFacing) {
     $found = New-Object System.Collections.Generic.List[object]
     $add = { param($Rule, $Node, $Msg) $found.Add([pscustomobject]@{ Rule = $Rule; Line = $Node.Extent.StartLineNumber; Message = $Msg }) }
@@ -545,6 +563,128 @@ function Find-ComposeSecGap([string]$Text) {
     return , $gaps.ToArray()
 }
 
+function Find-TestHook([System.Management.Automation.Language.Ast]$Ast, [string]$File = '') {
+    # Rule TESTHOOK, the finding half: every place where the script $Ast takes something from a
+    # test. One object per place: File (as given), Kind ('env' for a read of a test variable from
+    # the environment, 'param' for a script parameter that begins Test), Name, Line, and Seen (the
+    # form, for the message). The syntax tree only, never the text: comments and messages name
+    # these variables (Watch-LocalAI.ps1 says why it reads none of them).
+    $found = New-Object System.Collections.Generic.List[object]
+    $nameRx = [regex]'(?i)^(?:LOCALAI_TEST_.*|LOCALAI_DOCKER_TIMEOUT|LOCALAI_TS_TIMEOUT)$'
+    $add = { param($Kind, $Name, $Node, $Seen) $found.Add([pscustomobject]@{ File = $File; Kind = $Kind; Name = $Name; Line = $Node.Extent.StartLineNumber; Seen = $Seen }) }
+
+    # $env:NAME, also inside a double-quoted string.
+    foreach ($v in $Ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.VariableExpressionAst] }, $true)) {
+        $path = [string]$v.VariablePath.UserPath
+        if ($path -notmatch '^env:' -or -not $nameRx.IsMatch($path.Substring(4))) { continue }
+        # '$env:NAME = value' sets it (a cast in front changes nothing): not a read. '+=' and the
+        # like read it first, and so does the same name in the condition of the line that sets it
+        # (Restore-OpenWebUI.ps1: if ($env:NAME) { $env:NAME = '' }).
+        $left = $v
+        while ($left.Parent -is [System.Management.Automation.Language.AttributedExpressionAst]) { $left = $left.Parent }
+        $asg = $left.Parent
+        if ($asg -is [System.Management.Automation.Language.AssignmentStatementAst] -and [object]::ReferenceEquals($asg.Left, $left) -and [string]$asg.Operator -eq 'Equals') { continue }
+        & $add 'env' $path.Substring(4) $v ('$env:' + $path.Substring(4))
+    }
+
+    # [Environment]::GetEnvironmentVariable('NAME'), with or without a target. By the method's name,
+    # as ENVRESTORE goes by SetEnvironmentVariable; a name that is not written out is not seen.
+    foreach ($im in $Ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.InvokeMemberExpressionAst] -and [string]$n.Member.Value -eq 'GetEnvironmentVariable' }, $true)) {
+        $first = @($im.Arguments)[0]
+        if ($first -is [System.Management.Automation.Language.StringConstantExpressionAst] -and $nameRx.IsMatch([string]$first.Value)) {
+            & $add 'env' ([string]$first.Value) $im ("GetEnvironmentVariable('{0}')" -f $first.Value)
+        }
+    }
+
+    # Get-Item, Get-Content, Get-ChildItem and Test-Path on the Env: drive (Env:NAME, Env:\NAME,
+    # Env:/NAME), by position, behind -Path or -LiteralPath, or as one of several paths.
+    $readers = @('Get-Item', 'gi', 'Get-Content', 'gc', 'cat', 'type', 'Get-ChildItem', 'gci', 'dir', 'ls', 'Test-Path')
+    foreach ($c in $Ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] }, $true)) {
+        $cmd = $c.GetCommandName()
+        if (-not $cmd -or $readers -notcontains $cmd) { continue }
+        foreach ($s in $c.FindAll({ param($n) $n -is [System.Management.Automation.Language.StringConstantExpressionAst] }, $false)) {
+            $word = [string]$s.Value
+            if ($word -notmatch '^env:[\\/]?') { continue }
+            $name = $word -replace '^env:[\\/]?', ''
+            if ($nameRx.IsMatch($name)) { & $add 'env' $name $s ('{0} Env:{1}' -f $cmd, $name) }
+        }
+    }
+
+    # A parameter of the script itself. Not FindAll: a function's own parameter is that
+    # function's business (lib\LocalAI.psm1 has a $Tested, an Ollama version).
+    if ($Ast -is [System.Management.Automation.Language.ScriptBlockAst] -and $Ast.ParamBlock) {
+        foreach ($prm in $Ast.ParamBlock.Parameters) {
+            $pn = [string]$prm.Name.VariablePath.UserPath
+            if ($pn -match '^Test') { & $add 'param' $pn $prm ('-' + $pn) }
+        }
+    }
+    return $found.ToArray()
+}
+
+function Find-TestHookProblem($Hits, [string[]]$Pins = @()) {
+    # Rule TESTHOOK, the judging half: one sentence per place in $Hits (from Find-TestHook) that
+    # $Pins does not allow, and one per entry of $Pins that allows nothing any more. An entry is
+    # '<file> <kind> <name>', the file as its path below the toolkit folder with '/', and stands
+    # for itself only: no wildcard, no pattern. The list is handed in, so the canaries judge with
+    # their own and the real one is read in one place. Nothing in a script can switch this off.
+    $out = New-Object System.Collections.Generic.List[string]
+    $used = @{}; $said = @{}
+    foreach ($h in $Hits) {
+        $key = '{0} {1} {2}' -f $h.File, $h.Kind, $h.Name
+        if ($Pins -contains $key) { $used[$key] = $true; continue }
+        # Two reads of one name on one line are one sentence.
+        $at = '{0}:{1}' -f $h.File, $h.Line
+        if ($said.ContainsKey("$at $key")) { continue }
+        $said["$at $key"] = $true
+        if ($h.Kind -eq 'param') {
+            $out.Add("$at test parameter $($h.Seen) is not on the pinned list: use a stand-in the test puts on PATH or a real parameter; a -Test parameter the run announces needs its own entry in `$testHookPins (tests/Invoke-StaticChecks.ps1)")
+        } else {
+            $out.Add("$at test variable $($h.Name) is read from the environment ($($h.Seen)): any program running as the user can set it for good; use a stand-in the test puts on PATH, a real parameter, or a -Test parameter the run announces")
+        }
+    }
+    foreach ($p in $Pins) {
+        if (-not $used.ContainsKey($p)) { $out.Add("pinned entry '$p' matches nothing any more: take it out of `$testHookPins in tests/Invoke-StaticChecks.ps1 (the list only shrinks)") }
+    }
+    return $out.ToArray()
+}
+
+# Rule TESTHOOK: what main held when the rule came. One entry per file, kind and name, each
+# written out (Find-TestHookProblem compares whole entries). Nothing is added here for a new read
+# from the environment; an entry whose read or parameter is gone must go too.
+$testHookPins = @(
+    'Backup-OpenWebUI.ps1 env LOCALAI_TEST_CHAT_POLL_SEC'
+    'Enable-TailscaleAccess.ps1 env LOCALAI_TS_TIMEOUT'
+    'Install-LocalAI.ps1 env LOCALAI_TEST_ALLOW_CPU'
+    'Install-LocalAI.ps1 env LOCALAI_TEST_CATALOG'
+    'Install-LocalAI.ps1 env LOCALAI_TEST_FAIL_STAGE'
+    'Install-LocalAI.ps1 env LOCALAI_TEST_WEBUI_OLLAMA_URL'
+    'Restore-OpenWebUI.ps1 env LOCALAI_TEST_CATALOG'
+    'Restore-OpenWebUI.ps1 env LOCALAI_TEST_FAIL_OLLAMA_URL'
+    'Restore-OpenWebUI.ps1 env LOCALAI_TEST_FAIL_RESEARCH_SWAP'
+    'Restore-OpenWebUI.ps1 env LOCALAI_TEST_FAIL_SWAP'
+    'Restore-OpenWebUI.ps1 env LOCALAI_TEST_FAIL_SWAP_ONCE'
+    'Restore-OpenWebUI.ps1 env LOCALAI_TEST_KILL_IN_SWAP'
+    'Restore-OpenWebUI.ps1 env LOCALAI_TEST_WEBUI_WAIT_SEC'
+    'Test-LocalAI.ps1 env LOCALAI_TEST_CATALOG'
+    'Update-Models.ps1 env LOCALAI_TEST_ALLOW_CPU'
+    'Update-Models.ps1 env LOCALAI_TEST_CATALOG'
+    'Update-Models.ps1 env LOCALAI_TEST_PULL_FROM'
+    'Update-Models.ps1 env LOCALAI_TEST_REGISTRY_URL'
+    'Update-Models.ps1 param TestGpuStaysBusy'
+    'Update-OpenWebUI.ps1 env LOCALAI_TEST_WEBUI_WAIT_SEC'
+    'Watch-LocalAI.ps1 param TestDockerTimeout'
+    'Watch-LocalAI.ps1 param TestIntegrityEnd'
+    'Watch-LocalAI.ps1 param TestToastFail'
+    'Watch-LocalAI.ps1 param TestToastSetting'
+    'lib/LocalAI.psm1 env LOCALAI_DOCKER_TIMEOUT'
+    'lib/LocalAI.psm1 env LOCALAI_TEST_CHATS_IN_FLIGHT'
+    'lib/LocalAI.psm1 env LOCALAI_TEST_GPU_BUSY'
+    'lib/LocalAI.psm1 env LOCALAI_TEST_KNOWLEDGE_FAIL'
+    'lib/LocalAI.psm1 env LOCALAI_TEST_LOAD_FAIL'
+    'lib/LocalAI.psm1 env LOCALAI_TEST_SIGNIN_WAIT'
+    'lib/LocalAI.psm1 env LOCALAI_TEST_SPEED_FAIL'
+)
+
 # ---- canaries: every rule must fire on its bad snippet and stay quiet on the fixed one ---------
 $canaries = @(
     @{ Rule = 'PS51'; Fire = $true; Code = '$h | Measure-Object -Property Size -Sum' }
@@ -729,6 +869,58 @@ $mdCanaries = @(
     @{ Fire = $true; Text = "| A | B |`n|---|---|`n| a1 | b1 | | a2 | b2 |" }
     @{ Fire = $false; Text = "| A | B |`n|---|---|`n| a1 | b1 |`n| a2 | b2 |" }
     @{ Fire = $false; Text = "| A | B |`n|---|---|`n| ``a || b`` | x \| y |`n`ntext`n`n| C |`n|---|`n| c |" })
+# TESTHOOK: Code is the script 'Canary.ps1', judged with the pinned list Pins (none unless given).
+# A canary that fires must say what it found (Says) in exactly one sentence (Gaps, when more): the
+# forms of a read first, then the parameter, then the pinned list, then what must stay quiet.
+$testHookCanaries = @(
+    @{ Fire = $true; Says = '^Canary\.ps1:1 test variable LOCALAI_TEST_X is read from the environment \(\$env:LOCALAI_TEST_X\).* use a stand-in the test puts on PATH, a real parameter, or a -Test parameter the run announces$'; Code = 'if ($env:LOCALAI_TEST_X) { throw ''Test hook: stage failed'' }' }
+    # Read twice on one line, as the scripts do: one sentence.
+    @{ Fire = $true; Says = '^Canary\.ps1:1 test variable LOCALAI_DOCKER_TIMEOUT is read'; Code = '$s = 30; if ($env:LOCALAI_DOCKER_TIMEOUT) { $s = [int]$env:LOCALAI_DOCKER_TIMEOUT }' }
+    @{ Fire = $true; Says = '^Canary\.ps1:1 test variable LOCALAI_TS_TIMEOUT is read'; Code = '$limit = 30; if ($env:LOCALAI_TS_TIMEOUT) { $limit = [int]$env:LOCALAI_TS_TIMEOUT }' }
+    @{ Fire = $true; Says = '^Canary\.ps1:1 test variable LOCALAI_TEST_X is read'; Code = '$x = $env:LOCALAI_TEST_X' }
+    @{ Fire = $true; Says = '^Canary\.ps1:2 test variable LOCALAI_TEST_X is read'; Code = "`$a = 1`n`$b = `$env:LOCALAI_TEST_X" }
+    # Read and set on one line (Restore-OpenWebUI.ps1's hook that fails once): the read counts, once.
+    @{ Fire = $true; Says = '^Canary\.ps1:1 test variable LOCALAI_TEST_X is read'; Code = 'if ($env:LOCALAI_TEST_X) { $env:LOCALAI_TEST_X = ''''; throw ''Test hook: first swap failed'' }' }
+    @{ Fire = $true; Says = '^Canary\.ps1:1 test variable LOCALAI_TEST_X is read'; Code = '$env:LOCALAI_TEST_X += ''a''' }
+    @{ Fire = $true; Says = 'test variable LOCALAI_TEST_CATALOG is read'; Code = 'Write-Host "catalog: $env:LOCALAI_TEST_CATALOG"' }
+    @{ Fire = $true; Says = 'test variable localai_test_x is read'; Code = '$x = $env:localai_test_x' }
+    @{ Fire = $true; Says = 'test variable LOCALAI_TEST_X is read from the environment \(GetEnvironmentVariable\(''LOCALAI_TEST_X''\)\)'; Code = '$v = [Environment]::GetEnvironmentVariable(''LOCALAI_TEST_X'')' }
+    @{ Fire = $true; Says = 'test variable LOCALAI_TS_TIMEOUT is read from the environment \(GetEnvironmentVariable\(''LOCALAI_TS_TIMEOUT''\)\)'; Code = '$v = [System.Environment]::GetEnvironmentVariable("LOCALAI_TS_TIMEOUT", ''User'')' }
+    @{ Fire = $true; Says = 'test variable LOCALAI_TEST_X is read from the environment \(Get-Item Env:LOCALAI_TEST_X\)'; Code = '$i = Get-Item Env:LOCALAI_TEST_X' }
+    @{ Fire = $true; Says = 'test variable LOCALAI_TEST_X is read from the environment \(Get-Content Env:LOCALAI_TEST_X\)'; Code = '$t = Get-Content Env:LOCALAI_TEST_X' }
+    @{ Fire = $true; Says = 'test variable LOCALAI_TEST_X is read from the environment \(Get-ChildItem Env:LOCALAI_TEST_X\)'; Code = '$all = Get-ChildItem Env:LOCALAI_TEST_X' }
+    @{ Fire = $true; Says = 'test variable LOCALAI_TEST_X is read from the environment \(Test-Path Env:LOCALAI_TEST_X\)'; Code = 'if (Test-Path Env:LOCALAI_TEST_X) { 1 }' }
+    @{ Fire = $true; Says = '\(Get-Item Env:LOCALAI_DOCKER_TIMEOUT\)'; Code = '$i = Get-Item -LiteralPath ''Env:\LOCALAI_DOCKER_TIMEOUT'' -ErrorAction SilentlyContinue' }
+    @{ Fire = $true; Says = '\(Test-Path Env:LOCALAI_TEST_X\)'; Code = '$both = Test-Path Env:OLLAMA_HOST, Env:/LOCALAI_TEST_X' }
+    @{ Fire = $true; Says = 'test variable LOCALAI_TEST_\* is read from the environment \(gci Env:LOCALAI_TEST_\*\)'; Code = 'foreach ($i in (gci Env:LOCALAI_TEST_*)) { $i.Value }' }
+    @{ Fire = $true; Says = '^Canary\.ps1:3 test parameter -TestX is not on the pinned list: use a stand-in the test puts on PATH or a real parameter'; Code = "param(`n    [int]`$Port = 3000,`n    [switch]`$TestX`n)`n`$hook = [bool]`$TestX" }
+    # The pinned list: an entry is one file and one name, written out; one that allows nothing is a problem.
+    @{ Fire = $true; Gaps = 2; Says = '^Canary\.ps1:1 test variable LOCALAI_TEST_X is read.* \| pinned entry ''Other\.ps1 env LOCALAI_TEST_X'' matches nothing any more'; Pins = @('Other.ps1 env LOCALAI_TEST_X'); Code = '$x = $env:LOCALAI_TEST_X' }
+    @{ Fire = $true; Gaps = 2; Says = '^Canary\.ps1:1 test variable LOCALAI_TEST_Y is read.* \| pinned entry ''Canary\.ps1 env LOCALAI_TEST_X'' matches nothing any more'; Pins = @('Canary.ps1 env LOCALAI_TEST_X'); Code = '$y = $env:LOCALAI_TEST_Y' }
+    @{ Fire = $true; Gaps = 2; Says = '^Canary\.ps1:1 test variable LOCALAI_TEST_X is read.* \| pinned entry ''Canary\.ps1 env LOCALAI_TEST_\*'' matches nothing any more'; Pins = @('Canary.ps1 env LOCALAI_TEST_*'); Code = '$x = $env:LOCALAI_TEST_X' }
+    @{ Fire = $true; Says = '^pinned entry ''Canary\.ps1 env LOCALAI_TEST_X'' matches nothing any more: take it out of \$testHookPins .*the list only shrinks'; Pins = @('Canary.ps1 env LOCALAI_TEST_X'); Code = '$a = 1' }
+    @{ Fire = $true; Says = '^pinned entry ''Canary\.ps1 param TestX'' matches nothing any more'; Pins = @('Canary.ps1 env LOCALAI_TEST_X', 'Canary.ps1 param TestX'); Code = "param([switch]`$Force)`n`$x = `$env:LOCALAI_TEST_X" }
+    @{ Fire = $false; Pins = @('Canary.ps1 env LOCALAI_TEST_X'); Code = 'if ($env:LOCALAI_TEST_X) { $p = $env:LOCALAI_TEST_X }' }
+    @{ Fire = $false; Pins = @('lib/Canary.psm1 env LOCALAI_DOCKER_TIMEOUT'); File = 'lib/Canary.psm1'; Code = 'if ($env:LOCALAI_DOCKER_TIMEOUT) { 1 }' }
+    @{ Fire = $false; Pins = @('Canary.ps1 param TestX'); Code = "param(`n    [switch]`$TestX`n)`n`$hook = [bool]`$TestX" }
+    # The owner's own options of Get-LocalAI.ps1, as it reads them.
+    @{ Fire = $false; Code = '$ref = $env:LOCALAI_REF' }
+    @{ Fire = $false; Code = '$root = $env:LOCALAI_ROOT' }
+    @{ Fire = $false; Code = 'if ($env:LOCALAI_ARGS) { $extra = @($env:LOCALAI_ARGS -split ''\s+'' | Where-Object { $_ }) }' }
+    @{ Fire = $false; Code = '$review = Get-UpdateReview -Ref $ref -ReviewedCommit $env:LOCALAI_REVIEWED_COMMIT' }
+    # Setting is not reading.
+    @{ Fire = $false; Code = '$env:LOCALAI_TEST_X = ''''' }
+    @{ Fire = $false; Code = '[string]$env:LOCALAI_TEST_X = 1' }
+    @{ Fire = $false; Code = '[Environment]::SetEnvironmentVariable(''LOCALAI_TEST_X'', ''1'', ''Process'')' }
+    @{ Fire = $false; Code = 'Set-Item Env:LOCALAI_TEST_X 1; Remove-Item Env:LOCALAI_TEST_X' }
+    # A function's own parameter, a name that only looks like one, a variable that is not the environment's.
+    @{ Fire = $false; Code = 'function Test-Known { param([string]$Version, [string]$Tested = ''0.11.4'') return ([version]$Version -le [version]$Tested) }' }
+    @{ Fire = $false; Code = '$a = $env:LOCALAI_TESTING; $b = $env:MY_LOCALAI_TEST_X; $c = $env:LOCALAI_TS_TIMEOUT_SEC; $d = $script:LOCALAI_TEST_X; $e = $LOCALAI_DOCKER_TIMEOUT' }
+    # Comments and messages name the variables; the commands read other things.
+    @{ Fire = $false; Code = "# LOCALAI_DOCKER_TIMEOUT: test hook.`nWrite-Host 'Not wanted? First `$env:LOCALAI_TEST_X = 1, or set LOCALAI_TS_TIMEOUT.'" }
+    @{ Fire = $false; Code = 'if (Test-Path -LiteralPath $p) { $t = Get-Content -LiteralPath $p -Encoding UTF8 }; $r = Get-Item Env:LOCALAI_ROOT; $n = @(Get-ChildItem Env:).Count' }
+    # A name that is not written out is not seen (the header says so); it must not stop the check either.
+    @{ Fire = $false; Code = 'foreach ($n in @(''OPEN_WEBUI_VERSION'', ''SEARXNG_VERSION'')) { $saved[$n] = [Environment]::GetEnvironmentVariable($n, ''Process'') }' })
 foreach ($k in $mdCanaries) {
     if (((Find-MdTableGap $k.Text).Count -gt 0) -ne $k.Fire) {
         $canaryFail++; $problems++
@@ -750,6 +942,20 @@ foreach ($k in $composeSecCanaries) {
         Write-Host ("CANARY   rule COMPOSESEC wanted {0} gap(s) [{1}], found {2} [{3}] on: {4}" -f $want, $says, $got.Count, ($got -join ' | '), ($k.Text -replace "`n", ' / ')) -ForegroundColor Red
     }
 }
+foreach ($k in $testHookCanaries) {
+    $t = $null; $e = $null
+    $cast = [System.Management.Automation.Language.Parser]::ParseInput($k.Code, [ref]$t, [ref]$e)
+    $fn = 'Canary.ps1'; if ($k.ContainsKey('File')) { $fn = $k.File }
+    $pins = @(); if ($k.ContainsKey('Pins')) { $pins = @($k.Pins) }
+    $got = @(Find-TestHookProblem -Hits @(Find-TestHook -Ast $cast -File $fn) -Pins $pins)
+    $want = 0; $says = ''
+    if ($k.Fire) { $want = 1; $says = $k.Says; if ($k.ContainsKey('Gaps')) { $want = $k.Gaps } }
+    # A snippet that does not parse proves nothing, whatever it finds.
+    if (@($e).Count -or $got.Count -ne $want -or ($says -and ($got -join ' | ') -notmatch $says)) {
+        $canaryFail++; $problems++
+        Write-Host ("CANARY   rule TESTHOOK wanted {0} problem(s) [{1}], found {2} [{3}] on: {4}" -f $want, $says, $got.Count, ($got -join ' | '), ($k.Code -replace "`n", ' / ')) -ForegroundColor Red
+    }
+}
 foreach ($k in $docCanaries) {
     $hit = (Find-DocParam -Text $k.Text -ParamsByScript @{ 'Update-OpenWebUI.ps1' = @('Latest', 'Rollback'); 'Install-LocalAI.ps1' = @('RenderGuard'); 'Uninstall-LocalAI.ps1' = @('Force'); 'Update-Models.ps1' = @('Rollback') } `
         -ValueParamsByScript @{ 'Install-LocalAI.ps1' = @('RenderGuard'); 'Update-Models.ps1' = @('Rollback') }).Count -gt 0
@@ -768,7 +974,7 @@ foreach ($k in $canaries) {
         Write-Host ("CANARY   rule {0} {1} on: {2}" -f $k.Rule, $(if ($k.Fire) { 'did not fire' } else { 'fired wrongly' }), $k.Code) -ForegroundColor Red
     }
 }
-$canaryCount = $canaries.Count + $docCanaries.Count + $composeCanaries.Count + $composeSecCanaries.Count + $mdCanaries.Count
+$canaryCount = $canaries.Count + $docCanaries.Count + $composeCanaries.Count + $composeSecCanaries.Count + $mdCanaries.Count + $testHookCanaries.Count
 Write-Host ("Pitfall-rule canaries: {0}/{1} OK" -f ($canaryCount - $canaryFail), $canaryCount) -ForegroundColor $(if ($canaryFail) { 'Red' } else { 'Green' })
 
 foreach ($f in $files) {
@@ -790,6 +996,21 @@ foreach ($f in $files) {
         $problems++
         Write-Host ("{0,-8} {1}:{2} {3}" -f $p.Rule, $f.Name, $p.Line, $p.Message) -ForegroundColor Red
     }
+}
+
+# TESTHOOK: every script outside tests against the pinned list. All of them are read first and
+# judged once: an entry is stale only when no script holds its read or parameter any more.
+$testHookHits = @()
+foreach ($f in ($files | Where-Object { $_.Extension -in '.ps1', '.psm1' })) {
+    # The path below $Root with '/', on Windows as on Linux: the entries are written that way.
+    $rel = $f.FullName.Substring($Root.Length).TrimStart([char]'/', [char]'\').Replace('\', '/')
+    if ($rel -like 'tests/*') { continue }
+    $ast = [System.Management.Automation.Language.Parser]::ParseFile($f.FullName, [ref]$null, [ref]$null)
+    $testHookHits += @(Find-TestHook -Ast $ast -File $rel)
+}
+foreach ($msg in @(Find-TestHookProblem -Hits $testHookHits -Pins $testHookPins)) {
+    $problems++
+    Write-Host ('{0,-8} {1}' -f 'TESTHOOK', $msg) -ForegroundColor Red
 }
 
 # The README's commands against the scripts' real parameters.
