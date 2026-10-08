@@ -199,6 +199,336 @@ Set-Content -LiteralPath $pendingFile -Value '{"email": "adm'
 $rv = Resolve-LaiPendingPassword -AIRoot $pRoot -BaseUrl 'http://127.0.0.1:1'
 Assert-That ($rv -eq 'dropped' -and -not (Test-Path -LiteralPath $pendingFile)) 'a pending file cut off mid-write is dropped instead of blocking every run'
 
+Write-Host "`n=== secret files: plain and protected form ===" -ForegroundColor Cyan
+# The two forms of a stored password file (Read-LaiSecretFile, Save-LaiSecretFile) and the two
+# places that write the admin file through them: a pending password that is promoted, and a
+# rotation. Nothing in the toolkit writes the protected form yet: only this section passes
+# -Form Protected, and only the Windows job can open one.
+$sfDir = Join-Path $Work 'secretfiles'
+New-Item -ItemType Directory -Force -Path $sfDir | Out-Null
+# What a call was refused with: the text of its error, '' when it went through. Every assertion on
+# a refusal matches part of the message: a call to a function that is not there is refused too,
+# and so is one whose .NET error got through.
+$sfRefusal = { param([scriptblock]$Call) try { & $Call | Out-Null; return '' } catch { return [string]$_.Exception.Message } }
+# What a call returned. When it threw: nothing, and a line that says what (the assertion on what
+# it should have returned or written then fails, and the suite goes on).
+$sfDo = { param([scriptblock]$Call) try { & $Call } catch { Write-Host ('  (threw: {0})' -f ([string]$_.Exception.Message -replace '\s+', ' ')) -ForegroundColor DarkGray } }
+# A file as the one-line reader of the other scripts gives it ($null when it gives nothing), the
+# names of an object's fields, a file's text, and a file's bytes as text (to hold two reads
+# against each other).
+$sfOnDisk = { param([string]$File) if (-not (Test-Path -LiteralPath $File)) { return $null }; try { return (Get-Content -Encoding UTF8 -LiteralPath $File -Raw | ConvertFrom-Json) } catch { return $null } }
+$sfNames = { param($Object) if ($null -eq $Object) { return @() }; return @($Object.PSObject.Properties | ForEach-Object { $_.Name }) }
+$sfTextOf = { param([string]$File) if (Test-Path -LiteralPath $File) { return [System.IO.File]::ReadAllText($File, [System.Text.Encoding]::UTF8) }; return '' }
+$sfHex = { param([string]$File) if (Test-Path -LiteralPath $File) { return [System.BitConverter]::ToString([System.IO.File]::ReadAllBytes($File)) }; return 'no file' }
+
+# Written without a byte order mark, as PowerShell 7 and other programs write it (the files below
+# come from Set-Content -Encoding UTF8, which puts one in on Windows PowerShell 5.1).
+$sfPlain = Join-Path $sfDir 'plain.json'
+[System.IO.File]::WriteAllText($sfPlain, '{"email": "admin@localhost", "password": "Stored-Password-01"}')
+$sfRead = & $sfDo { Read-LaiSecretFile -Path $sfPlain }
+Assert-That ($sfRead.password -ceq 'Stored-Password-01' -and $sfRead.email -eq 'admin@localhost') 'a plain secret file reads with its password and e-mail'
+& $sfDo { Save-LaiSecretFile -Path $sfPlain -Value @{ email = 'admin@localhost'; password = 'Saved-Password-02' } }
+$sfOld = & $sfOnDisk $sfPlain
+Assert-That ($sfOld.password -ceq 'Saved-Password-02' -and $sfOld.email -eq 'admin@localhost' -and (& $sfNames $sfOld) -notcontains 'protected' -and (& $sfNames $sfOld) -notcontains 'passwordProtected') 'saving with no -Form keeps a plain file plain, and the old one-line reader still finds the password'
+$sfNew = Join-Path $sfDir 'new.json'
+& $sfDo { Save-LaiSecretFile -Path $sfNew -Value @{ email = 'admin@localhost'; password = 'Fresh-Password-03' } }
+$sfOld = & $sfOnDisk $sfNew
+Assert-That ($sfOld.password -ceq 'Fresh-Password-03' -and (& $sfNames $sfOld) -notcontains 'protected') 'a file that does not exist yet is written plain'
+# The value as an object, the way Resolve-LaiPendingPassword hands over the pending file it read
+# (the saves above took a hashtable, as Set-OpenWebUIPassword.ps1 does). 'rotated' is looked for
+# in the file's text: PowerShell 7 reads such a value back as a date, 5.1 as text.
+& $sfDo { Save-LaiSecretFile -Path $sfNew -Value (ConvertFrom-Json -InputObject '{"email": "admin@localhost", "password": "Fresh-Password-04", "url": "http://localhost:3000", "rotated": "2026-01-02T03:04:05"}') }
+$sfRead = & $sfDo { Read-LaiSecretFile -Path $sfNew }
+Assert-That ($sfRead.url -eq 'http://localhost:3000' -and (& $sfTextOf $sfNew) -match '"rotated":\s*"2026-01-02T03:04:05' -and $sfRead.password -ceq 'Fresh-Password-04' -and $sfRead.email -eq 'admin@localhost') 'other fields (url, rotated) survive a save'
+
+# A marker this version does not know, and one that is there but empty: the form goes by the
+# marker being there, so neither is a plain file. 'QUJD' is Base64 of three letters, nothing that
+# was ever protected: whatever tries to open it fails.
+$sfUnknown = Join-Path $sfDir 'unknown.json'
+Set-Content -LiteralPath $sfUnknown -Value '{"email": "admin@localhost", "protected": "dpapi-user-9", "passwordProtected": "QUJD"}' -Encoding UTF8
+$sfEmptyMarker = Join-Path $sfDir 'emptymarker.json'
+Set-Content -LiteralPath $sfEmptyMarker -Value '{"email": "admin@localhost", "protected": "", "password": "Stored-Password-05"}' -Encoding UTF8
+$sfM3 = 'is protected in a form this toolkit version does not know'
+$sfWhy = & $sfRefusal { Read-LaiSecretFile -Path $sfUnknown }
+$sfWhy2 = & $sfRefusal { Read-LaiSecretFile -Path $sfUnknown -NoPassword }
+$sfWhy3 = & $sfRefusal { Read-LaiSecretFile -Path $sfEmptyMarker }
+Assert-That ($sfWhy -match ($sfM3 + " \('dpapi-user-9'\)") -and $sfWhy2 -match $sfM3 -and $sfWhy3 -match ($sfM3 + " \(''\)")) 'a marker this version does not know is refused, not read as an empty password'
+$sfMarked = Join-Path $sfDir 'marked.json'
+Set-Content -LiteralPath $sfMarked -Value '{"email": "admin@localhost", "protected": "dpapi-user-1", "passwordProtected": "QUJD"}' -Encoding UTF8
+$sfRead = & $sfDo { Read-LaiSecretFile -Path $sfMarked -NoPassword }
+Assert-That ($sfRead.email -eq 'admin@localhost' -and (& $sfNames $sfRead) -contains 'password' -and [string]$sfRead.password -eq '') '-NoPassword returns the e-mail of a protected file without opening it'
+$sfBefore = & $sfHex $sfNew
+$sfWhy = & $sfRefusal { Save-LaiSecretFile -Path $sfNew -Value @{ email = 'admin@localhost' } }
+$sfWhy2 = & $sfRefusal { Save-LaiSecretFile -Path $sfNew -Value @{ email = 'admin@localhost'; password = '' } }
+Assert-That ($sfWhy -match 'Nothing to store in .+: the value has no password' -and $sfWhy2 -match 'the value has no password' -and (& $sfHex $sfNew) -eq $sfBefore) 'a value without a password is refused'
+# A file with nothing in it, one cut off mid-write, and JSON that is no object: refused in words of
+# their own (an empty file reads as no text at all, which 5.1 and 7 hand to ConvertFrom-Json
+# differently).
+$sfEmpty = Join-Path $sfDir 'empty.json'
+[System.IO.File]::WriteAllBytes($sfEmpty, [byte[]]@())
+$sfCut = Join-Path $sfDir 'cut.json'
+Set-Content -LiteralPath $sfCut -Value '{"email": "admin@localhost", "passw' -Encoding UTF8
+$sfNoObject = Join-Path $sfDir 'noobject.json'
+Set-Content -LiteralPath $sfNoObject -Value '["admin@localhost", "Stored-Password-0a"]' -Encoding UTF8
+$sfM7 = 'is empty or was cut off: it holds no stored password'
+$sfWhy = & $sfRefusal { Read-LaiSecretFile -Path $sfEmpty }
+$sfWhy2 = & $sfRefusal { Read-LaiSecretFile -Path $sfCut }
+$sfWhy3 = & $sfRefusal { Read-LaiSecretFile -Path $sfNoObject }
+$sfWhy4 = & $sfRefusal { Read-LaiSecretFile -Path $sfEmpty -NoPassword }
+Assert-That ($sfWhy -match $sfM7 -and $sfWhy2 -match $sfM7 -and $sfWhy3 -match $sfM7 -and $sfWhy4 -match $sfM7) 'a secret file that is empty, was cut off or holds no JSON object is refused with a message of its own, with -NoPassword too'
+$sfBefore = & $sfHex $sfUnknown
+$sfWhy = & $sfRefusal { Save-LaiSecretFile -Path $sfUnknown -Value @{ email = 'admin@localhost'; password = 'Other-Password-0b' } }
+$sfWhy2 = & $sfRefusal { Save-LaiSecretFile -Path $sfUnknown -Value @{ email = 'admin@localhost'; password = 'Other-Password-0b' } -Form Plain }
+Assert-That ($sfWhy -match ($sfM3 + " \('dpapi-user-9'\)") -and $sfWhy2 -match $sfM3 -and (& $sfHex $sfUnknown) -eq $sfBefore) 'a save over a file with a marker this version does not know is refused, with -Form Plain too, and leaves it byte for byte'
+# Marked as protected, the value missing or empty: said as that on every system (before anything
+# is opened, so not as "works on Windows only").
+$sfNoValue = Join-Path $sfDir 'novalue.json'
+Set-Content -LiteralPath $sfNoValue -Value '{"email": "admin@localhost", "protected": "dpapi-user-1"}' -Encoding UTF8
+$sfBlankValue = Join-Path $sfDir 'blankvalue.json'
+Set-Content -LiteralPath $sfBlankValue -Value '{"email": "admin@localhost", "protected": "dpapi-user-1", "passwordProtected": ""}' -Encoding UTF8
+$sfM4 = 'is marked as protected but holds no protected password'
+$sfWhy = & $sfRefusal { Read-LaiSecretFile -Path $sfNoValue }
+$sfWhy2 = & $sfRefusal { Read-LaiSecretFile -Path $sfBlankValue }
+Assert-That ($sfWhy -match $sfM4 -and $sfWhy2 -match $sfM4) 'a file marked as protected without its value is refused with a message of its own, on every system'
+
+# The two writers of the admin file, each in a child process as it runs, against a listener in
+# this process that stands in for Open WebUI.
+$sfSignIn = '{"role":"admin","token":"tok-123"}'
+$sfQuote = { param([string]$Text) "'" + $Text.Replace("'", "''") + "'" }
+$sfAdminOf = { param([string]$Root) Join-Path (Join-Path $Root 'Secrets') 'openwebui-admin.json' }
+$sfPendingOf = { param([string]$Root) Join-Path (Join-Path $Root 'Secrets') 'openwebui-admin.pending.json' }
+$sfNewRoot = { param([string]$Name) $made = Join-Path $sfDir $Name; New-Item -ItemType Directory -Force -Path (Join-Path $made 'Secrets') | Out-Null; return $made }
+function Invoke-SecretFileClient {
+    # Runs a client script in a child process while this process answers its requests from a
+    # listener of its own: each with 200, 'application/json' and the next of -Replies. In the
+    # client's text {PORT} becomes the listener's port and {OUT} the quoted path of the file the
+    # client writes its result to. The wait is on the child, not on the listener: a client that
+    # stops before it asks anything ends it at once. Returns Lines (the result file; none when the
+    # client did not get to write it) and Bodies (the request bodies that arrived, as text).
+    param([string]$Name, [string]$ClientText, [string[]]$Replies)
+    $started = Start-TestListener
+    $outFile = Join-Path $sfDir ($Name + '-out.txt')
+    $clientFile = Join-Path $sfDir ($Name + '-client.ps1')
+    Remove-Item -LiteralPath $outFile -Force -ErrorAction SilentlyContinue
+    Set-Content -LiteralPath $clientFile -Value ($ClientText.Replace('{PORT}', [string]$started.Port).Replace('{OUT}', (& $sfQuote $outFile)))
+    $bodies = @()
+    try {
+        $spArgs = @{ FilePath = $childExe; ArgumentList = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $clientFile); PassThru = $true }
+        if ($onWindows) { $spArgs['WindowStyle'] = 'Hidden' }
+        $proc = Start-Process @spArgs
+        $until = (Get-Date).AddSeconds(120)
+        foreach ($reply in $Replies) {
+            $as = $started.Listener.BeginGetContext($null, $null)
+            $arrived = $false
+            while (-not $arrived) {
+                $arrived = $as.AsyncWaitHandle.WaitOne(200)
+                # A client answers nothing after it has ended: no request is on its way then.
+                if (-not $arrived -and ($proc.HasExited -or (Get-Date) -gt $until)) { break }
+            }
+            if (-not $arrived) { break }
+            $ctx = $started.Listener.EndGetContext($as)
+            $ms = New-Object System.IO.MemoryStream
+            $ctx.Request.InputStream.CopyTo($ms)
+            $bodies += [System.Text.Encoding]::UTF8.GetString($ms.ToArray())
+            $msg = [System.Text.Encoding]::UTF8.GetBytes($reply)
+            $ctx.Response.StatusCode = 200
+            $ctx.Response.ContentType = 'application/json'
+            $ctx.Response.OutputStream.Write($msg, 0, $msg.Length)
+            $ctx.Response.Close()
+        }
+        if (-not $proc.WaitForExit(60000)) { $proc.Kill() }
+    } finally { $started.Listener.Stop() }
+    $lines = @()
+    if (Test-Path -LiteralPath $outFile) { $lines = @(Get-Content -LiteralPath $outFile -Encoding UTF8) }
+    return [pscustomobject]@{ Lines = $lines; Bodies = $bodies }
+}
+function Invoke-SecretFileRotation {
+    # Set-OpenWebUIPassword.ps1 against an install folder that holds Secrets\openwebui-admin.json
+    # and nothing else, with the three answers of a rotation that goes through: sign-in, change,
+    # sign-in. Returns Code (its exit code; a throw counts as 1), Text (all it printed, then what
+    # it threw) and Sent (the password of the first request, the one it signed in with; '' when it
+    # asked nothing).
+    param([string]$Name, [string]$Root, [string]$Arguments)
+    $client = @(
+        ('$root = ' + (& $sfQuote $Root)),
+        'Set-Content -LiteralPath (Join-Path $root ''localai-config.json'') -Value ''{"WebUIPort": {PORT}}'' -Encoding UTF8',
+        '$said = New-Object System.Collections.Generic.List[string]',
+        '$global:LASTEXITCODE = 0',
+        '$code = 0',
+        ('try { & ' + (& $sfQuote (Join-Path $src 'Set-OpenWebUIPassword.ps1')) + ' -AIRoot $root ' + $Arguments + ' *>&1 | ForEach-Object { $said.Add("$_") }; $code = $LASTEXITCODE }'),
+        'catch { $code = 1; $said.Add(''THROWN '' + $_.Exception.Message) }',
+        'Set-Content -LiteralPath {OUT} -Value (@("exit=$code") + $said.ToArray()) -Encoding UTF8'
+    ) -join "`n"
+    $ran = Invoke-SecretFileClient -Name $Name -ClientText $client -Replies @($sfSignIn, 'true', $sfSignIn)
+    $code = -1
+    if ($ran.Lines.Count -gt 0 -and $ran.Lines[0] -match '^exit=(-?\d+)$') { $code = [int]$Matches[1] }
+    $sent = ''
+    if ($ran.Bodies.Count -gt 0) { try { $sent = [string](ConvertFrom-Json -InputObject $ran.Bodies[0]).password } catch { $sent = '' } }
+    return [pscustomobject]@{ Code = $code; Text = (@($ran.Lines | Select-Object -Skip 1) -join "`n"); Sent = $sent; Asked = $ran.Bodies.Count }
+}
+function Invoke-SecretFilePending {
+    # Resolve-LaiPendingPassword with no try around it, as Set-OpenWebUIPassword.ps1 calls it,
+    # against a sign-in that accepts the pending password. Returns Result (what it returned; ''
+    # when it threw, which ends the client before its result line) and Asked (how many requests
+    # arrived: 1 when it got as far as the sign-in).
+    param([string]$Name, [string]$Root)
+    $client = @(
+        ('Import-Module ' + (& $sfQuote (Join-Path (Join-Path $src 'lib') 'LocalAI.psm1')) + ' -Force'),
+        ('$a = Resolve-LaiPendingPassword -AIRoot ' + (& $sfQuote $Root) + ' -BaseUrl ''http://127.0.0.1:{PORT}'''),
+        'Set-Content -LiteralPath {OUT} -Value $a -Encoding UTF8'
+    ) -join "`n"
+    $ran = Invoke-SecretFileClient -Name $Name -ClientText $client -Replies @($sfSignIn)
+    return [pscustomobject]@{ Result = ($ran.Lines -join ','); Asked = $ran.Bodies.Count }
+}
+# What a rotation said, on one line, when it did not end as the test expects.
+$sfSay = { param($Run, [bool]$AsExpected) if (-not $AsExpected) { Write-Host ('  (the script said: {0})' -f ($Run.Text -replace '\s*\r?\n\s*', ' | ')) -ForegroundColor DarkGray } }
+
+$sfRoot = & $sfNewRoot 'pending-plain'
+Set-Content -LiteralPath (& $sfAdminOf $sfRoot) -Value '{"email": "admin@localhost", "password": "Stored-Password-22"}' -Encoding UTF8
+Set-Content -LiteralPath (& $sfPendingOf $sfRoot) -Value '{"email": "admin@localhost", "password": "Pending-Password-22", "url": "http://localhost:3000"}' -Encoding UTF8
+$sfGot = Invoke-SecretFilePending -Name 'pending-plain' -Root $sfRoot
+$sfOld = & $sfOnDisk (& $sfAdminOf $sfRoot)
+Assert-That ($sfGot.Result -eq 'promoted' -and $sfOld.password -ceq 'Pending-Password-22' -and $sfOld.url -eq 'http://localhost:3000' -and (& $sfNames $sfOld) -notcontains 'protected' -and -not (Test-Path -LiteralPath (& $sfPendingOf $sfRoot))) "a promoted pending password is stored plain in a plain file (got '$($sfGot.Result)')"
+# The admin file has a marker this version does not know: the save refuses, the call ends there,
+# and the pending file, which may be the only copy of the live password, is still there.
+$sfRoot = & $sfNewRoot 'pending-unknown'
+Set-Content -LiteralPath (& $sfAdminOf $sfRoot) -Value '{"email": "admin@localhost", "protected": "dpapi-user-9", "passwordProtected": "QUJD"}' -Encoding UTF8
+Set-Content -LiteralPath (& $sfPendingOf $sfRoot) -Value '{"email": "admin@localhost", "password": "Pending-Password-0c"}' -Encoding UTF8
+$sfBefore = & $sfHex (& $sfAdminOf $sfRoot)
+# Off Windows the child writes to this output, and its error shows here.
+if (-not $onWindows) { Write-Host '  (the error printed next is the child process being refused, which is what this test is for)' -ForegroundColor DarkGray }
+$sfGot = Invoke-SecretFilePending -Name 'pending-unknown' -Root $sfRoot
+Assert-That ($sfGot.Asked -eq 1 -and $sfGot.Result -eq '' -and (& $sfOnDisk (& $sfPendingOf $sfRoot)).password -ceq 'Pending-Password-0c' -and (& $sfHex (& $sfAdminOf $sfRoot)) -eq $sfBefore) "a pending password stays in the pending file when the admin file has a marker this version does not know, and the admin file is unchanged (got '$($sfGot.Result)', sign-ins: $($sfGot.Asked))"
+
+$sfRoot = & $sfNewRoot 'rotate-plain'
+Set-Content -LiteralPath (& $sfAdminOf $sfRoot) -Value '{"email": "admin@localhost", "password": "Stored-Password-24"}' -Encoding UTF8
+$sfRun = Invoke-SecretFileRotation -Name 'rotate-plain' -Root $sfRoot -Arguments "-NewPassword 'Typed-Password-24' -Quiet"
+& $sfSay $sfRun ($sfRun.Code -eq 0)
+$sfOld = & $sfOnDisk (& $sfAdminOf $sfRoot)
+Assert-That ($sfRun.Code -eq 0 -and $sfRun.Sent -ceq 'Stored-Password-24' -and $sfOld.password -ceq 'Typed-Password-24' -and (& $sfNames $sfOld) -notcontains 'protected' -and -not (Test-Path -LiteralPath (& $sfPendingOf $sfRoot))) "rotation over a plain file: exit 0, still plain with the new password, no pending file (exit $($sfRun.Code))"
+# The same without -Quiet. A password that was given is not put on the screen again: the script
+# says where it is stored. One that the script made is shown, once.
+$sfRun = Invoke-SecretFileRotation -Name 'rotate-given' -Root $sfRoot -Arguments "-NewPassword 'Typed-Password-0f'"
+& $sfSay $sfRun ($sfRun.Code -eq 0)
+Assert-That ($sfRun.Code -eq 0 -and (& $sfOnDisk (& $sfAdminOf $sfRoot)).password -ceq 'Typed-Password-0f' -and -not $sfRun.Text.Contains('Typed-Password-0f') -and $sfRun.Text.Contains((& $sfAdminOf $sfRoot))) "a password that was given is not printed back: the output names the file it is stored in (exit $($sfRun.Code))"
+$sfRun = Invoke-SecretFileRotation -Name 'rotate-made' -Root $sfRoot -Arguments ''
+& $sfSay $sfRun ($sfRun.Code -eq 0)
+$sfMade = [string](& $sfOnDisk (& $sfAdminOf $sfRoot)).password
+$sfShown = @($sfRun.Text -split "`n" | Where-Object { $sfMade -and $_.Contains($sfMade) })
+Assert-That ($sfRun.Code -eq 0 -and $sfMade -like 'Lai-*' -and $sfShown.Count -eq 1 -and $sfShown[0] -like 'New password: *') "a password the script made is shown once, and it is the stored one (exit $($sfRun.Code), lines with it: $($sfShown.Count))"
+# The comparison of the two typed entries, taken from the script itself and run on a pair: -ne
+# ignores upper and lower case and would take these two for the same.
+$sfAst = [System.Management.Automation.Language.Parser]::ParseFile((Join-Path $src 'Set-OpenWebUIPassword.ps1'), [ref]$null, [ref]$null)
+$sfIf = @($sfAst.FindAll({ param($n) $n -is [System.Management.Automation.Language.IfStatementAst] -and $n.Extent.Text -match 'do not match' }, $true) | Sort-Object { $_.Extent.Text.Length })[0]
+$sfPair = [scriptblock]::Create('param($pa, $pb) ' + [string]$sfIf.Extent.Text)
+$sfWhy = & $sfRefusal { & $sfPair 'Typed-Password-0e' 'typed-password-0e' }
+$sfWhy2 = & $sfRefusal { & $sfPair 'Typed-Password-0e' 'Typed-Password-0e' }
+Assert-That ([string]$sfIf.Extent.Text -match '\$pa\b.+\$pb\b' -and $sfWhy -match 'The two passwords do not match' -and $sfWhy2 -eq '') "-Prompt: two entries that differ only in upper and lower case do not match, the same entry twice does ('$sfWhy')"
+
+if ($onWindows) {
+    $sfSecret = 'P' + [char]0x00E9 + 'ssword-Text-10'
+    $sfTail = 'ssword-Text-10'
+    $sfBlob = [string](& $sfDo { Protect-LaiSecretText -Text $sfSecret })
+    $sfBack = & $sfDo { Unprotect-LaiSecretText -Blob $sfBlob }
+    Assert-That ($sfBack -ceq $sfSecret) 'protect then unprotect returns the same text, with a non-ASCII character'
+    $sfRaw = [byte[]]@()
+    try { $sfRaw = [Convert]::FromBase64String($sfBlob) } catch { $sfRaw = [byte[]]@() }
+    Assert-That ($sfRaw.Length -gt 0 -and -not $sfBlob.Contains($sfTail) -and -not ([System.Text.Encoding]::UTF8.GetString($sfRaw).Contains($sfTail)) -and -not ([System.Text.Encoding]::Unicode.GetString($sfRaw).Contains($sfTail))) 'the protected text is Base64 and does not contain the password'
+    $sfBlob2 = [string](& $sfDo { Protect-LaiSecretText -Text $sfSecret })
+    $sfBack2 = & $sfDo { Unprotect-LaiSecretText -Blob $sfBlob2 }
+    Assert-That ($sfBlob -ne '' -and $sfBlob2 -ne '' -and $sfBlob -cne $sfBlob2 -and $sfBack -ceq $sfSecret -and $sfBack2 -ceq $sfSecret) 'protecting the same text twice gives two different texts that both open'
+    # CI has one account, so nothing here was protected by somebody else. A value this account
+    # cannot open is made by changing the last byte of one it can.
+    $sfBad = ''
+    if ($sfRaw.Length -gt 0) {
+        $sfFlip = [byte[]]$sfRaw.Clone()
+        $sfFlip[$sfFlip.Length - 1] = [byte]($sfFlip[$sfFlip.Length - 1] -bxor 0xFF)
+        $sfBad = [Convert]::ToBase64String($sfFlip)
+    }
+    $sfM2 = 'This Windows account cannot open the protected password'
+    $sfWhy = & $sfRefusal { Unprotect-LaiSecretText -Blob $sfBad }
+    Assert-That ($sfWhy -match $sfM2) 'a protected text with one byte changed is refused: cannot open'
+    $sfWhy = & $sfRefusal { Unprotect-LaiSecretText -Blob 'this is not Base64 !' }
+    Assert-That ($sfWhy -match $sfM2) 'text that is not Base64 is refused the same way'
+
+    $sfProt = Join-Path $sfDir 'protected.json'
+    & $sfDo { Save-LaiSecretFile -Path $sfProt -Value @{ email = 'admin@localhost'; password = $sfSecret; url = 'http://localhost:3000' } -Form Protected }
+    $sfOld = & $sfOnDisk $sfProt
+    Assert-That ($sfOld.protected -ceq 'dpapi-user-1' -and [string]$sfOld.passwordProtected -ne '' -and (& $sfNames $sfOld) -notcontains 'password') '-Form Protected writes the marker dpapi-user-1 and passwordProtected, and no password field'
+    $sfFile = [string](& $sfTextOf $sfProt)
+    Assert-That ($sfFile -match 'passwordProtected' -and -not $sfFile.Contains($sfSecret) -and -not $sfFile.Contains($sfTail)) 'the password appears nowhere in the protected file'
+    $sfRead = & $sfDo { Read-LaiSecretFile -Path $sfProt }
+    Assert-That ($sfRead.password -ceq $sfSecret -and $sfRead.email -eq 'admin@localhost') 'a protected file reads back with the same password and e-mail'
+    & $sfDo { Save-LaiSecretFile -Path $sfProt -Value @{ email = 'admin@localhost'; password = 'Kept-Password-18' } }
+    $sfOld = & $sfOnDisk $sfProt
+    $sfRead = & $sfDo { Read-LaiSecretFile -Path $sfProt }
+    Assert-That ($sfOld.protected -ceq 'dpapi-user-1' -and (& $sfNames $sfOld) -notcontains 'password' -and $sfRead.password -ceq 'Kept-Password-18') 'saving with no -Form keeps a protected file protected, with the new password'
+    & $sfDo { Save-LaiSecretFile -Path $sfProt -Value @{ email = 'admin@localhost'; password = 'Plain-Password-19' } -Form Plain }
+    $sfOld = & $sfOnDisk $sfProt
+    Assert-That ($sfOld.password -ceq 'Plain-Password-19' -and (& $sfNames $sfOld) -notcontains 'protected' -and (& $sfNames $sfOld) -notcontains 'passwordProtected') '-Form Plain turns a protected file back into the plain form'
+    $sfLocked = Join-Path $sfDir 'locked.json'
+    $sfLockedText = '{"email": "admin@localhost", "protected": "dpapi-user-1", "passwordProtected": "' + $sfBad + '"}'
+    Set-Content -LiteralPath $sfLocked -Value $sfLockedText -Encoding UTF8
+    $sfWhy = & $sfRefusal { Read-LaiSecretFile -Path $sfLocked }
+    Assert-That ($sfWhy -match ('Cannot read the password in .+' + $sfM2)) 'a protected file with a changed blob makes the read throw, it does not return an empty password'
+    & $sfDo { Save-LaiSecretFile -Path $sfLocked -Value @{ email = 'admin@localhost'; password = 'Again-Password-21' } }
+    $sfOld = & $sfOnDisk $sfLocked
+    $sfRead = & $sfDo { Read-LaiSecretFile -Path $sfLocked }
+    Assert-That ($sfOld.protected -ceq 'dpapi-user-1' -and (& $sfNames $sfOld) -notcontains 'password' -and $sfRead.password -ceq 'Again-Password-21') 'saving with no -Form over a protected file this account cannot open writes one that opens'
+
+    $sfRoot = & $sfNewRoot 'pending-protected'
+    & $sfDo { Save-LaiSecretFile -Path (& $sfAdminOf $sfRoot) -Value @{ email = 'admin@localhost'; password = 'Stored-Password-23' } -Form Protected }
+    Set-Content -LiteralPath (& $sfPendingOf $sfRoot) -Value '{"email": "admin@localhost", "password": "Pending-Password-23"}' -Encoding UTF8
+    $sfGot = Invoke-SecretFilePending -Name 'pending-protected' -Root $sfRoot
+    $sfOld = & $sfOnDisk (& $sfAdminOf $sfRoot)
+    $sfRead = & $sfDo { Read-LaiSecretFile -Path (& $sfAdminOf $sfRoot) }
+    Assert-That ($sfGot.Result -eq 'promoted' -and $sfOld.protected -ceq 'dpapi-user-1' -and (& $sfNames $sfOld) -notcontains 'password' -and $sfRead.password -ceq 'Pending-Password-23' -and -not (Test-Path -LiteralPath (& $sfPendingOf $sfRoot))) "a promoted pending password keeps a protected file protected (got '$($sfGot.Result)')"
+
+    $sfRoot = & $sfNewRoot 'rotate-protected'
+    & $sfDo { Save-LaiSecretFile -Path (& $sfAdminOf $sfRoot) -Value @{ email = 'admin@localhost'; password = 'Stored-Password-25' } -Form Protected }
+    $sfRun = Invoke-SecretFileRotation -Name 'rotate-protected' -Root $sfRoot -Arguments "-NewPassword 'Typed-Password-26' -Quiet"
+    & $sfSay $sfRun ($sfRun.Code -eq 0)
+    Assert-That ($sfRun.Sent -ceq 'Stored-Password-25') 'rotation over a protected file signs in with the opened password'
+    $sfOld = & $sfOnDisk (& $sfAdminOf $sfRoot)
+    $sfRead = & $sfDo { Read-LaiSecretFile -Path (& $sfAdminOf $sfRoot) }
+    Assert-That ($sfRun.Code -eq 0 -and $sfOld.protected -ceq 'dpapi-user-1' -and (& $sfNames $sfOld) -notcontains 'password' -and $sfRead.password -ceq 'Typed-Password-26' -and -not (Test-Path -LiteralPath (& $sfPendingOf $sfRoot))) "rotation over a protected file leaves it protected, with the new password (exit $($sfRun.Code))"
+
+    $sfRoot = & $sfNewRoot 'rotate-locked'
+    Set-Content -LiteralPath (& $sfAdminOf $sfRoot) -Value $sfLockedText -Encoding UTF8
+    $sfBefore = & $sfHex (& $sfAdminOf $sfRoot)
+    $sfRun = Invoke-SecretFileRotation -Name 'rotate-locked' -Root $sfRoot -Arguments "-NewPassword 'Typed-Password-27' -Quiet"
+    & $sfSay $sfRun ($sfRun.Code -eq 1)
+    Assert-That ($sfRun.Code -eq 1 -and $sfRun.Text -match $sfM2 -and $sfRun.Text -match '-PromptCurrent' -and $sfRun.Asked -eq 0 -and (& $sfHex (& $sfAdminOf $sfRoot)) -eq $sfBefore -and -not (Test-Path -LiteralPath (& $sfPendingOf $sfRoot))) "a protected file this account cannot open stops the rotation, names -PromptCurrent and changes nothing (exit $($sfRun.Code))"
+    $sfRun = Invoke-SecretFileRotation -Name 'rotate-current' -Root $sfRoot -Arguments "-NewPassword 'Typed-Password-28' -CurrentPassword 'Live-Password-0028' -Quiet"
+    & $sfSay $sfRun ($sfRun.Code -eq 0)
+    $sfOld = & $sfOnDisk (& $sfAdminOf $sfRoot)
+    $sfRead = & $sfDo { Read-LaiSecretFile -Path (& $sfAdminOf $sfRoot) }
+    Assert-That ($sfRun.Code -eq 0 -and $sfRun.Sent -ceq 'Live-Password-0028' -and $sfOld.protected -ceq 'dpapi-user-1' -and (& $sfNames $sfOld) -notcontains 'password' -and $sfRead.password -ceq 'Typed-Password-28') "with -CurrentPassword the same file is rotated and protected again (exit $($sfRun.Code))"
+} else {
+    Skip 'DPAPI round trips need Windows'
+    # Off Windows nothing can be protected or opened. What can be shown here: every such call
+    # says so, and a save that cannot protect throws before it writes.
+    $sfM1 = 'works on Windows only'
+    $sfWhy = & $sfRefusal { Protect-LaiSecretText -Text 'Any-Password-08' }
+    $sfWhy2 = & $sfRefusal { Unprotect-LaiSecretText -Blob 'QUJD' }
+    Assert-That ($sfWhy -match $sfM1 -and $sfWhy2 -match $sfM1) 'off Windows, protecting says it works on Windows only'
+    $sfWhy = & $sfRefusal { Read-LaiSecretFile -Path $sfMarked }
+    Assert-That ($sfWhy -match ('Cannot read the password in .+' + $sfM1)) 'off Windows, a protected file is refused with that message, not read as empty'
+    $sfBefore = & $sfHex $sfPlain
+    $sfWhy = & $sfRefusal { Save-LaiSecretFile -Path $sfPlain -Value @{ email = 'admin@localhost'; password = 'Other-Password-29' } -Form Protected }
+    Assert-That ($sfWhy -match ('Cannot store the password in .+' + $sfM1) -and (& $sfHex $sfPlain) -eq $sfBefore) 'off Windows, -Form Protected over a plain file is refused with that message and leaves the file byte for byte'
+    $sfBefore = & $sfHex $sfMarked
+    $sfWhy = & $sfRefusal { Save-LaiSecretFile -Path $sfMarked -Value @{ email = 'admin@localhost'; password = 'Other-Password-30' } }
+    Assert-That ($sfWhy -match ('Cannot store the password in .+' + $sfM1) -and (& $sfHex $sfMarked) -eq $sfBefore) 'off Windows, saving with no -Form over a file marked protected is refused the same way and leaves it byte for byte'
+    $sfRoot = & $sfNewRoot 'pending-marked'
+    Set-Content -LiteralPath (& $sfAdminOf $sfRoot) -Value '{"email": "admin@localhost", "protected": "dpapi-user-1", "passwordProtected": "QUJD"}' -Encoding UTF8
+    Set-Content -LiteralPath (& $sfPendingOf $sfRoot) -Value '{"email": "admin@localhost", "password": "Pending-Password-31"}' -Encoding UTF8
+    $sfBefore = & $sfHex (& $sfAdminOf $sfRoot)
+    Write-Host '  (the error printed next is the child process being refused, which is what this test is for)' -ForegroundColor DarkGray
+    $sfGot = Invoke-SecretFilePending -Name 'pending-marked' -Root $sfRoot
+    Assert-That ($sfGot.Asked -eq 1 -and $sfGot.Result -eq '' -and (& $sfOnDisk (& $sfPendingOf $sfRoot)).password -ceq 'Pending-Password-31' -and (& $sfHex (& $sfAdminOf $sfRoot)) -eq $sfBefore) 'a pending password that cannot be stored protected stays in the pending file, and the admin file is unchanged'
+}
+
 Write-Host "`n=== private ACLs (AI folder, read-only Scripts) ===" -ForegroundColor Cyan
 if ($onWindows) {
     $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
@@ -216,6 +546,19 @@ if ($onWindows) {
     $userOnScript = @($scriptRules | Where-Object { $_.Sid -eq $sid })
     Assert-That ($r2.ExitCode -eq 0 -and $userOnScript.Count -ge 1 -and @($userOnScript | Where-Object { $_.Rights -match 'Write|Modify|FullControl' }).Count -eq 0) "Scripts: the user can read and run but not change files ($(($userOnScript | ForEach-Object { $_.Rights }) -join '; '))"
     Assert-That (@($scriptRules | Where-Object { $_.Sid -eq 'S-1-5-32-544' -and $_.Rights -match 'FullControl' }).Count -ge 1) 'Scripts: Administrators keep full control (elevated updates still work)'
+    # An entry another account was given by name on the folder itself, not handed down from the
+    # folder above: cutting inheritance leaves it, and so does setting the entries of three other
+    # names. Users (S-1-5-32-545) get such an entry here, and it has to be gone afterwards.
+    $aclOther = Join-Path $Work 'aclother'
+    New-Item -ItemType Directory -Force -Path $aclOther | Out-Null
+    & icacls.exe $aclOther '/grant' '*S-1-5-32-545:(OI)(CI)M' | Out-Null
+    $aclOtherGranted = $LASTEXITCODE
+    $aclOtherBefore = @(& $rules $aclOther)
+    Assert-That ($aclOtherGranted -eq 0 -and @($aclOtherBefore | Where-Object { $_.Sid -eq 'S-1-5-32-545' -and -not $_.Inherited }).Count -ge 1) "setup: a folder holds an entry of its own for a fourth name, Users (icacls exit $aclOtherGranted; $(($aclOtherBefore | ForEach-Object { '{0} {1}' -f $_.Sid, @('own', 'handed down')[[int][bool]$_.Inherited] }) -join ', '))"
+    $aclOtherRun = Set-LaiPrivateAcl -Path $aclOther -UserSid $sid
+    $aclOtherAfter = @(& $rules $aclOther)
+    $aclOtherSids = @($aclOtherAfter | ForEach-Object { $_.Sid } | Sort-Object)
+    Assert-That ($aclOtherRun.ExitCode -eq 0 -and $aclOtherAfter.Count -eq 3 -and ($aclOtherSids -join ' ') -eq ((@($sid, 'S-1-5-18', 'S-1-5-32-544') | Sort-Object) -join ' ')) "a folder with an entry for a fourth name ends with exactly three: the user, SYSTEM and Administrators (exit $($aclOtherRun.ExitCode); $($aclOtherAfter.Count) rules, for: $($aclOtherSids -join ' '))"
 } else { Skip 'ACL test runs on Windows only' }
 
 # ---- the installer's own functions on real Windows ---------------------------------------------
