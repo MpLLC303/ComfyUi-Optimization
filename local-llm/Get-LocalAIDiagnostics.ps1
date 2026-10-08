@@ -131,6 +131,27 @@ function Invoke-Capture([string]$File, [string[]]$Arguments) {
     }
     return $r.Text
 }
+function Get-LogByTime([string]$Text) {
+    # A container's log, asked for with --timestamps, in the order it was written. 'docker logs' hands
+    # over what the container wrote to stdout and to stderr separately, and Invoke-Capture returns all
+    # of the first followed by all of the second: a request and the error it led to would be far
+    # apart, with nothing to tell that from. Every line starts with its time
+    # (2026-01-02T03:04:05.123456789Z ...): sorted by that, and by where it stood for the same time.
+    # A line without one (docker's own 'No such container') keeps its place behind the line before it.
+    $lines = @($Text -split "`r?`n")
+    $keys = New-Object string[] $lines.Count
+    $last = ''
+    for ($i = 0; $i -lt $lines.Count; $i++) {
+        $m = [regex]::Match($lines[$i], '^(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)(?:\.(\d{1,9}))?(?:Z|[+-]\d\d:\d\d)(?: |$)')
+        # The fraction padded to nine digits: compared as text, .5 must not come after .25.
+        if ($m.Success) { $last = $m.Groups[1].Value + '.' + $m.Groups[2].Value.PadRight(9, '0') }
+        $keys[$i] = $last + ' ' + $i.ToString('D6')
+    }
+    # Only the keys are sorted, and each one ends in the place of its line. (Sorting the lines along
+    # with them, [Array]::Sort($keys, $lines), sorts a copy of the lines and leaves these as they were.)
+    [Array]::Sort($keys, [System.StringComparer]::Ordinal)
+    return (@($keys | ForEach-Object { $lines[[int]$_.Substring($_.LastIndexOf(' ') + 1)] }) -join "`n")
+}
 function Get-Tail([string]$Path, [int]$Lines = 200) {
     if (-not (Test-Path -LiteralPath $Path)) { return "(missing: $Path)" }
     # Ollama's and the toolkit's logs are UTF-8 (5.1 would read them as ANSI and garble names).
@@ -184,7 +205,7 @@ Add-Summary "Docker engine: $(($dockerVer -split "`n")[0])"
 $states = Invoke-Capture 'docker' @('ps', '-a', '--filter', 'label=com.docker.compose.project=localai', '--format', '{{.Names}}: {{.Status}} ({{.Image}})')
 Add-Summary "Containers: $(($states -split "`n" | Where-Object { $_ }) -join '; ')"
 Save-Part 'docker.txt' (@("engine: $dockerVer", '', $states, '', (Invoke-Capture 'docker' @('volume', 'ls'))) -join "`n")
-foreach ($c in @('open-webui', 'searxng', 'render-guard', 'deep-research')) { Save-Part "logs-$c.txt" (Invoke-Capture 'docker' @('logs', '--tail', '200', $c)) }
+foreach ($c in @('open-webui', 'searxng', 'render-guard', 'deep-research')) { Save-Part "logs-$c.txt" (Get-LogByTime (Invoke-Capture 'docker' @('logs', '--timestamps', '--tail', '200', $c))) }
 $guard = Invoke-Capture 'docker' @('exec', 'render-guard', 'python3', '-c', "import urllib.request;print(urllib.request.urlopen('http://127.0.0.1:11434/render-guard/status',timeout=5).read().decode())")
 Save-Part 'render-guard-status.json' $guard
 $health = Invoke-Safely { (Invoke-LaiApi -Uri "http://127.0.0.1:$webPort/health" -TimeoutSec 10) | ConvertTo-Json -Compress }

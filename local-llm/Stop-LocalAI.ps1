@@ -15,10 +15,15 @@
     Before any of that Docker Desktop is asked whether it answers. If it does not (it can stop
     answering after sleep), nothing is paused or stopped: the models are unloaded, and the run ends
     with what to do about Docker Desktop.
+    If the containers could not be stopped (Docker Desktop stopped answering meanwhile, or docker
+    compose stop failed), the health watch is switched on again and the run ends as failed: it is
+    never left paused over containers that still run.
     Optional, for the most free RAM:
       -QuitOllama   quit the Ollama tray app and server.
       -QuitDocker   quit Docker Desktop and its WSL VM (gives back up to the 16 GB the VM may hold).
-                    This also stops any other containers and WSL distributions you run.
+                    This also stops any other containers and WSL distributions you run. A Docker
+                    Desktop that does not answer the request to quit is ended (its process is
+                    stopped and WSL shut down), with a warning.
     Containers use restart: always, so after a reboot they come back on their own.
 
 .EXAMPLE
@@ -46,6 +51,9 @@ $compose = Join-Path $stackDir 'docker-compose.yml'
 # Every docker call has a time limit. After sleep Docker Desktop can stop answering while its
 # commands still start: without a limit this window would wait on the first of them without a word.
 $dockerLimit = Get-LaiDockerTimeout
+# The two calls that have work to do (stopping the containers, quitting Docker Desktop) get ten times
+# the limit of a quick one: 300 s.
+$slowLimit = 10 * $dockerLimit
 $hungMsg = 'Docker Desktop is not responding. Restart it (whale icon > Restart), wait for Engine running, then run this again.'
 
 function Invoke-Docker {
@@ -53,8 +61,9 @@ function Invoke-Docker {
     return (Invoke-LaiTimedNative -File 'docker' -Arguments $Arguments -TimeoutSec $TimeoutSec)
 }
 function Resume-Watch {
-    # For a docker call that got no answer after the watch was paused: back on, so that it reports a
-    # Docker Desktop that does not answer. Left paused it would say nothing for hours.
+    # For containers that could not be stopped after the watch was paused: back on. Left paused it
+    # would say nothing for hours, neither about a Docker Desktop that does not answer nor about an
+    # outage of the containers that still run.
     & (Join-Path $PSScriptRoot 'Watch-LocalAI.ps1') -AIRoot $AIRoot -Unpause | Out-Null
 }
 
@@ -78,12 +87,15 @@ if (-not $hung) {
         $lock = $null
         try { $lock = Enter-LaiVolumeLock -TimeoutSec 1800 } catch { $failed = $_.Exception.Message }
         if ($lock) {
-            try { $r = Invoke-Docker @('compose', '--project-directory', $stackDir, '-f', $compose, 'stop') -TimeoutSec 300 }
+            try { $r = Invoke-Docker @('compose', '--project-directory', $stackDir, '-f', $compose, 'stop') -TimeoutSec $slowLimit }
             finally { Exit-LaiVolumeLock $lock }
-            if ($r.TimedOut) { $hung = $true; Resume-Watch }
+            if ($r.TimedOut) { $hung = $true }
             elseif ($r.ExitCode -ne 0) { $failed = "docker compose stop failed: $($r.Text)" }
             else { Write-LaiLog OK 'Containers stopped (data kept)' }
         }
+        # Not stopped, for whichever of the three reasons (the lock was not free in time, no answer,
+        # an error from docker compose): the pause made above is taken back.
+        if ($hung -or $failed) { Resume-Watch }
     } elseif ($engine -ne 'ok') {
         Write-LaiLog INFO 'Docker is not running; no containers to stop'
     }
@@ -124,18 +136,20 @@ if ($QuitOllama -and $onWindows -and $goOn) {
 
 # 6. Optional: Docker Desktop and its WSL VM.
 if ($QuitDocker -and $onWindows -and $engine -eq 'ok' -and $goOn) {
-    $r = Invoke-Docker @('desktop', 'stop') -TimeoutSec 300
-    if ($r.TimedOut) { $hung = $true; Resume-Watch }
-    else {
-        if ($r.ExitCode -ne 0) {
-            # Older Docker Desktop without the 'docker desktop' CLI plugin.
-            Get-Process -Name 'Docker Desktop' -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
-            Start-Sleep -Seconds 5
-            $prev = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
-            try { & wsl.exe --shutdown 2>&1 | Out-Null } finally { $ErrorActionPreference = $prev }
-        }
-        Write-LaiLog OK 'Docker Desktop quit (WSL VM memory released)'
+    $r = Invoke-Docker @('desktop', 'stop') -TimeoutSec $slowLimit
+    if ($r.TimedOut -or $r.ExitCode -ne 0) {
+        # An older Docker Desktop without the 'docker desktop' CLI plugin, or one that gave no answer
+        # to the request: ended the other way. Quitting it is what was asked for, the containers are
+        # stopped already, and the watch stays paused: switched on over containers that were stopped
+        # on purpose, it would start them again or raise an alarm about Docker in the middle of a game.
+        # Said before it is done, so the window is not silent while this takes its time.
+        if ($r.TimedOut) { Write-LaiLog WARN "Docker Desktop did not answer within $slowLimit s when asked to quit: ending it instead (its process is stopped and WSL shut down)" }
+        Get-Process -Name 'Docker Desktop' -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+        Start-Sleep -Seconds 5
+        $prev = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
+        try { & wsl.exe --shutdown 2>&1 | Out-Null } finally { $ErrorActionPreference = $prev }
     }
+    Write-LaiLog OK 'Docker Desktop quit (WSL VM memory released)'
 }
 
 $after = Get-LaiGpuInfo
@@ -146,10 +160,10 @@ if ($after) {
     $level = 'OK'; if ($stillLoaded.Count -gt 0) { $level = 'WARN' }
     Write-LaiLog $level $msg
 }
-if ($hung) {
+$why = $failed; if ($hung) { $why = $hungMsg }
+if ($why) {
     # Printed as a line of its own (an error's text can be wrapped), then the run ends as failed.
-    Write-LaiLog FAIL "Gaming mode did not finish, and the health watch stays on: $hungMsg"
-    throw $hungMsg
+    Write-LaiLog FAIL "Gaming mode did not finish, and the health watch stays on: $why"
+    throw $why
 }
-if ($failed) { throw $failed }
 Write-LaiLog INFO ("Health watch paused for {0} h. Bring everything back with: {1}" -f $PauseHours, (Join-Path $PSScriptRoot 'Start-LocalAI.ps1'))

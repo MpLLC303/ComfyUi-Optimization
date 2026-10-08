@@ -39,9 +39,11 @@ $hungMsg = 'Docker Desktop is not responding. Restart it (whale icon > Restart),
 $restartStep = 'Restart Docker Desktop (whale icon in the taskbar > Restart), wait until it says Engine running, then use Start menu > Local AI - Start again.'
 
 function Invoke-Docker {
-    # No answer within the limit ends the run with the one message for that, whichever call it was.
-    param([string[]]$Arguments, [int]$TimeoutSec = $dockerLimit)
-    $r = Invoke-LaiTimedNative -File 'docker' -Arguments $Arguments -TimeoutSec $TimeoutSec
+    # For the quick calls (inspect, the probe run with exec): no answer within the limit ends the run
+    # with the one message for that. Not for 'desktop start' and 'compose up' below, which have work
+    # to do: one of those taking long is not a Docker Desktop that stopped answering.
+    param([string[]]$Arguments)
+    $r = Invoke-LaiTimedNative -File 'docker' -Arguments $Arguments -TimeoutSec $dockerLimit
     if ($r.TimedOut) { throw $hungMsg }
     return $r
 }
@@ -79,15 +81,21 @@ try {
     if ($engine -ne 'ok') {
         if (-not $onWindows) { throw 'Docker engine is not running.' }
         Write-LaiLog INFO 'Starting Docker Desktop (takes a minute or two)'
-        $r = Invoke-Docker @('desktop', 'start') -TimeoutSec $TimeoutSec
-        if ($r.ExitCode -ne 0) {
+        # 'docker desktop start' can wait until Docker Desktop is up, so it gets the whole wait. Using
+        # all of it is not 'stuck' either (a first start after an update, a dialog that waits for an
+        # answer): the command is ended, and the engine is asked below like after any other start.
+        $r = Invoke-LaiTimedNative -File 'docker' -Arguments @('desktop', 'start') -TimeoutSec $TimeoutSec
+        # While it starts, Docker may give no answer for a while: that is not yet 'stuck'. Only the
+        # deadline ends the wait, and what was seen last picks the message.
+        $deadline = (Get-Date).AddSeconds($TimeoutSec)
+        if ($r.TimedOut) {
+            # The wait is used up already: one look at the engine, and that look picks the message.
+            $deadline = Get-Date
+        } elseif ($r.ExitCode -ne 0) {
             $exe = Find-LaiDockerDesktopExe
             if (-not $exe) { throw 'Docker Desktop.exe was not found (not in its registered install folder, next to the docker command or in Program Files). Start Docker Desktop from the Start menu, then use Start menu > Local AI - Start again.' }
             Start-Process -FilePath $exe
         }
-        # While it starts, Docker may give no answer for a while: that is not yet 'stuck'. Only the
-        # deadline ends the wait, and what was seen last picks the message.
-        $deadline = (Get-Date).AddSeconds($TimeoutSec)
         while ($true) {
             $engine = Test-LaiDockerEngine -TimeoutSec $dockerLimit
             if ($engine -eq 'ok') { break }
@@ -111,7 +119,11 @@ try {
         # Again under the lock: a restore that held it while this waited may have failed meanwhile.
         $hold = Get-LaiWebUIHold -AIRoot $AIRoot
         if ($hold) { throw "Open WebUI is kept stopped after a failed restore ($($hold['Reason'])). Recover first: $($hold['Recover'])" }
-        $r = Invoke-Docker @('compose', '--project-directory', $stackDir, '-f', $compose, 'up', '-d') -TimeoutSec ([Math]::Max(600, $TimeoutSec))
+        # Twenty times the limit of a quick call (600 s), or -TimeoutSec when that is more: it may
+        # have images to download. Running out of it is said as that, not as 'not responding'.
+        $upLimit = [Math]::Max(20 * $dockerLimit, $TimeoutSec)
+        $r = Invoke-LaiTimedNative -File 'docker' -Arguments @('compose', '--project-directory', $stackDir, '-f', $compose, 'up', '-d') -TimeoutSec $upLimit
+        if ($r.TimedOut) { throw "docker compose up did not finish within $upLimit s. $restartStep" }
         if ($r.ExitCode -ne 0) { throw "docker compose up failed: $($r.Text)" }
     } finally { Exit-LaiVolumeLock $lock }
     try { Wait-LaiWebUI -BaseUrl "http://127.0.0.1:$webPort" -TimeoutSec $TimeoutSec }

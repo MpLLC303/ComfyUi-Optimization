@@ -225,6 +225,22 @@ services:
         while ((Test-LaiVolumeLockBusy) -and (Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 300 }
         Remove-Item -LiteralPath $holdFile -Force -ErrorAction SilentlyContinue
     }
+    # Gaming mode with containers it cannot stop: docker compose rejects the compose file, and the
+    # container of 4. goes on running. The run used to end on that error with the watch left paused
+    # for 12 hours over containers that still ran, and no line said so. The pause is now taken back,
+    # and the last line before the error says that the watch stays on.
+    $composeFile = Join-Path $stack 'docker-compose.yml'
+    $composeText = Get-Content -Raw -LiteralPath $composeFile
+    Set-Content -LiteralPath $composeFile -Value 'services: not-a-mapping'
+    try {
+        $stopF = Invoke-Script 'Stop-LocalAI.ps1'
+        $pausedF = (Read-LaiState -Path $state3).ContainsKey('pausedUntil')
+        $failF = Get-LastLine $stopF.Text '\[FAIL\] '
+        Assert-That ($stopF.Code -ne 0 -and $failF -match 'Gaming mode did not finish, and the health watch stays on: docker compose stop failed: ' -and -not $pausedF -and (Get-State 'lai-stopstart-probe') -eq 'running') ("Gaming mode that cannot stop the containers ends as failed, says that the health watch stays on, and has taken its pause back (exit {0}, paused: {1}, the container is {2}: {3})" -f $stopF.Code, $pausedF, (Get-State 'lai-stopstart-probe'), $failF)
+    } finally {
+        Set-Content -LiteralPath $composeFile -Value $composeText -NoNewline
+        Invoke-Watch @('-Unpause') | Out-Null
+    }
     # Gaming mode against an Ollama that keeps its model listed whatever it is told (a stand-in:
     # /api/ps always names one model, an unload is answered and changes nothing). After the second
     # unload the model is named in a warning, and no line says it was unloaded.
@@ -263,6 +279,33 @@ ThreadingHTTPServer(('127.0.0.1', $fakePort), H).serve_forever()
         Invoke-Watch @('-Unpause') | Out-Null
         $cfg4['OllamaUrl'] = $realOllama; $cfg4['WebUIPort'] = 3000; Save-LaiState -State $cfg4 -Path $cfgPath
     }
+
+    Write-Host "`n=== 4c. the diagnostics keep a container's log in the order it was written ===" -ForegroundColor Cyan
+    # A stand-in under deep research's container name that writes to stdout and to stderr in turn, a
+    # second apart. 'docker logs' hands the two over separately, and the bundle held all of the first
+    # followed by all of the second: which request led to which error could not be read from it. The
+    # diagnostics now ask for the time of every line and put the lines back in that order.
+    $said4c = 'first-on-stdout second-on-stderr third-on-stdout fourth-on-stderr'
+    Invoke-DockerText @('rm', '-f', 'deep-research') | Out-Null
+    Invoke-DockerText @('run', '-d', '--name', 'deep-research', '--label', 'lai-test=1', 'alpine:3.20', 'sh', '-c',
+        'echo first-on-stdout; sleep 1; echo second-on-stderr >&2; sleep 1; echo third-on-stdout; sleep 1; echo fourth-on-stderr >&2') | Out-Null
+    try {
+        $deadline = (Get-Date).AddSeconds(60)
+        while ((Get-State 'deep-research') -ne 'exited' -and (Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 500 }
+        Assert-That ((Get-State 'deep-research') -eq 'exited') "setup: the stand-in has written its four lines and ended ($(Get-State 'deep-research'))"
+        $diagOut4 = Join-Path $Work 'diag-out-4c'
+        $diag4 = Invoke-Script 'Get-LocalAIDiagnostics.ps1' @('-OutDir', $diagOut4)
+        $zip4 = @(Get-ChildItem -LiteralPath $diagOut4 -Filter 'diagnostics-*.zip' -ErrorAction SilentlyContinue)
+        $logTxt = ''
+        if ($zip4.Count -eq 1) {
+            Expand-Archive -LiteralPath $zip4[0].FullName -DestinationPath (Join-Path $Work 'diag-x-4c') -Force
+            $logPart = Join-Path (Join-Path $Work 'diag-x-4c') 'logs-deep-research.txt'
+            if (Test-Path -LiteralPath $logPart) { $logTxt = Get-Content -Raw -LiteralPath $logPart }
+        }
+        # Each of the four lines with its time in front, in the order they come in the file.
+        $order4c = @([regex]::Matches($logTxt, '(?m)^\d{4}-\d\d-\d\dT[0-9:.]+Z (first-on-stdout|second-on-stderr|third-on-stdout|fourth-on-stderr)\s*$') | ForEach-Object { $_.Groups[1].Value }) -join ' '
+        Assert-That ($diag4.Code -eq 0 -and $order4c -eq $said4c) ("the bundle's container log has stdout and stderr in the order they were written, each line with its time (exit {0}, {1} zip(s): '{2}')" -f $diag4.Code, $zip4.Count, $order4c)
+    } finally { Invoke-DockerText @('rm', '-f', 'deep-research') | Out-Null }
 
     Write-Host "`n=== 5. long-term: reminders, clock skew, backup mirror, disk hysteresis ===" -ForegroundColor Cyan
     $cfgFile = Join-Path $aiRoot 'localai-config.json'
@@ -609,6 +652,34 @@ ThreadingHTTPServer(('127.0.0.1', $fakePort), H).serve_forever()
     # Still running = /proc entry that is not a zombie.
     $alive = @($pids | Where-Object { (Test-Path -LiteralPath "/proc/$_/stat") -and ((Get-Content -Raw -LiteralPath "/proc/$_/stat" -ErrorAction SilentlyContinue) -notmatch '^\d+ \(.*\) Z') })
     Assert-That ($pids.Count -ge 6 -and $alive.Count -eq 0) "every docker call that hung was stopped, those of Start again, Gaming mode, the health check and the diagnostics among them ($($pids.Count) started, $($alive.Count) still running)"
+
+    Write-Host "`n=== 7b. Docker answers the first question and nothing after it: the command with work to do runs out of its time ===" -ForegroundColor Cyan
+    # A docker CLI that answers the engine probe and never anything else. With LOCALAI_DOCKER_TIMEOUT
+    # at 2, a quick call has 2 s, 'compose stop' ten times that and 'compose up' twenty times.
+    $halfDir = Join-Path $Work 'half-shim'
+    New-Item -ItemType Directory -Force -Path $halfDir | Out-Null
+    $halfPids = Join-Path $halfDir 'pids.txt'
+    Set-Content -LiteralPath (Join-Path $halfDir 'docker') -Value ("#!/bin/sh`nif [ `"`$1`" = version ]; then echo 27.0.0; exit 0; fi`necho `$`$ >> '{0}'`nexec sleep 617" -f $halfPids)
+    & chmod +x (Join-Path $halfDir 'docker')
+    $savedPATH = $env:PATH
+    $env:PATH = $halfDir + [System.IO.Path]::PathSeparator + $savedPATH
+    $env:LOCALAI_DOCKER_TIMEOUT = '2'
+    try {
+        # Gaming mode has paused the watch by the time 'compose stop' gets no answer: the pause is
+        # taken back, or the watch would say nothing about this Docker for 12 hours.
+        $stop7b = Invoke-Script 'Stop-LocalAI.ps1'
+        $paused7b = (Read-LaiState -Path $statePath).ContainsKey('pausedUntil')
+        Invoke-Watch @('-Unpause') | Out-Null
+        Assert-That ($stop7b.Code -ne 0 -and $stop7b.Sec -lt 120 -and $stop7b.Text -match ('\[FAIL\] Gaming mode did not finish, and the health watch stays on: ' + $hungSaid) -and -not $paused7b) ("Gaming mode whose 'compose stop' gets no answer ends as failed with the step for Docker Desktop, and has taken its pause of the health watch back (exit {0}, {1:N0} s, paused: {2})" -f $stop7b.Code, $stop7b.Sec, $paused7b)
+        # Start again: 'compose up' may be downloading images, so running out of its time is said as
+        # that, with the next step, and not as a Docker Desktop that does not answer.
+        $start7b = Invoke-Script 'Start-LocalAI.ps1' @('-TimeoutSec', '5')
+        $fail7b = Get-LastLine $start7b.Text '\[FAIL\] '
+        Assert-That ($start7b.Code -ne 0 -and $start7b.Sec -lt 150 -and $fail7b -match 'Local AI did not start: docker compose up did not finish within 40 s\. Restart Docker Desktop ' -and $start7b.Text -notmatch $hungSaid) ("Start again whose 'compose up' does not finish says so with its time limit and the next step, not that Docker Desktop is not responding (exit {0}, {1:N0} s: {2})" -f $start7b.Code, $start7b.Sec, $fail7b)
+    } finally { $env:PATH = $savedPATH; $env:LOCALAI_DOCKER_TIMEOUT = '' }
+    $pids7b = @(Get-Content -LiteralPath $halfPids -ErrorAction SilentlyContinue | Where-Object { $_ -match '^\d+$' })
+    $alive7b = @($pids7b | Where-Object { (Test-Path -LiteralPath "/proc/$_/stat") -and ((Get-Content -Raw -LiteralPath "/proc/$_/stat" -ErrorAction SilentlyContinue) -notmatch '^\d+ \(.*\) Z') })
+    Assert-That ($pids7b.Count -ge 2 -and $alive7b.Count -eq 0) "both commands that got no answer were stopped ($($pids7b.Count) started, $($alive7b.Count) still running)"
 
     Write-Host "`n=== 8. Open WebUI up, but unable to reach Ollama (the path chats take) ===" -ForegroundColor Cyan
     # A stand-in Open WebUI on the host network that answers /health on port 3998 and has python3
