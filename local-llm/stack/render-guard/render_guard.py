@@ -28,6 +28,8 @@ queries), which go straight to Ollama. Any error inside the guard passes the req
 unchanged: the guard must never break a chat. Only a chat or generate request is held in memory,
 up to RENDER_GUARD_MAX_BODY_MIB (a larger one is refused with HTTP 413); every other request
 body, a model file sent to /api/blobs for one, is passed on piece by piece as it arrives.
+When Ollama cannot be reached or gives no answer, the client gets HTTP 502 with a sentence written
+for the chat window (OLLAMA_DOWN, OLLAMA_SILENT); Ollama's address and the error are in the log.
 
 Standard library only. Configuration via environment variables (see CONFIG below).
 Status page: GET /render-guard/status
@@ -50,6 +52,29 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 def _env_bool(name, default):
     return os.environ.get(name, default).strip().lower() not in ('0', 'false', 'no', 'off', '')
+
+
+_STARTUP_NOTES = []          # what reading the settings has to tell the log; main() writes it (log() comes later)
+
+
+def _env_mib(name, default):
+    """A size setting in MiB: a whole number above 0. Any other value counts as the default, and
+    a note says so in the log at start. The compose file passes the value on from Stack/.env as
+    it stands there, so a typing mistake reaches the guard. Read with a bare int(), a value that
+    is no number stopped the guard at its start, and 0 or less made it refuse every chat as too
+    large: either way one wrong character ended all chats."""
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        n = int(raw)
+    except ValueError:
+        n = 0
+    if n >= 1:
+        return n
+    # %a: the value as it was typed, on one line and in ASCII whatever it holds.
+    _STARTUP_NOTES.append('%s=%a is not a whole number above 0: %d MiB is used instead' % (name, raw[:80], default))
+    return default
 
 
 CONFIG = {
@@ -85,7 +110,8 @@ CONFIG = {
     # program in one of the stack's containers) can write one below this limit, and the guard
     # is ended as it was before there was a limit. The limit is also per request: it does not
     # add up the chats that arrive at the same moment.
-    'max_body_bytes': int(os.environ.get('RENDER_GUARD_MAX_BODY_MIB', '256')) * 1048576,
+    # A value that is no whole number above 0 counts as 256, with a line in the log (_env_mib).
+    'max_body_bytes': _env_mib('RENDER_GUARD_MAX_BODY_MIB', 256) * 1048576,
     # Longest the guard goes on reading from a client that is still sending a request it has
     # already answered itself (a 413 or a 502), see Handler._drain.
     'drain_sec': float(os.environ.get('DRAIN_SEC', '30')),
@@ -96,6 +122,13 @@ BODY_LINE_MAX = 4096         # longest chunk-size or trailer line taken from a c
 BODY_TRAILER_MAX = 64        # most trailer lines taken after a chunked request body
 MODEL_CHANGE_PATHS = ('/api/pull', '/api/create', '/api/delete', '/api/copy')
 IMAGE_NOTE = '[image omitted: this model cannot see images; switch this chat to a preset that sees images (Uncensored Vision, or an Official one if installed) or start a new chat]'
+# The guard's two HTTP 502 answers. Open WebUI shows the text in the chat, to the person waiting
+# for an answer there: a sentence to act on, the same every time. Ollama's address and the error
+# are for whoever reads the guard's log, and go only there.
+# OLLAMA_DOWN: no connection to Ollama could be made. OLLAMA_SILENT: there was one, and no answer
+# came over it (it broke, or Ollama said nothing for as long as the guard waits).
+OLLAMA_DOWN = 'render-guard: Ollama is not running, so this chat cannot be answered. Start it (Start menu > Local AI - Start again), then send the message again.'
+OLLAMA_SILENT = 'render-guard: Ollama gave no answer. A long answer on the CPU can take many minutes: ask for a shorter one or wait for the render to end, then send the message again.'
 HOP_BY_HOP = {'connection', 'keep-alive', 'proxy-authenticate', 'proxy-authorization', 'te',
               'trailer', 'trailers', 'transfer-encoding', 'upgrade', 'content-length', 'host'}
 
@@ -607,11 +640,13 @@ class Handler(BaseHTTPRequestHandler):
         kept for hours. Instead every pass is one read of the socket, with the time that is left
         as its timeout: until the Content-Length is used up or, for a chunked body (self._unread
         is None), until the client closes the connection. A client does that once it has read
-        the answer, which says 'Connection: close'."""
-        deadline = time.time() + CONFIG['drain_sec']
+        the answer, which says 'Connection: close'.
+        The wait is counted on the monotonic clock: counted on the wall clock, it would be that
+        much longer whenever the clock is set back while it runs (a time sync does that)."""
+        deadline = time.monotonic() + CONFIG['drain_sec']
         try:
             while self._unread is None or self._unread > 0:
-                left = deadline - time.time()
+                left = deadline - time.monotonic()
                 if left <= 0:
                     break
                 self.connection.settimeout(left)
@@ -659,6 +694,9 @@ class Handler(BaseHTTPRequestHandler):
             except (OSError, ValueError):
                 break
         if not done.is_set():
+            # Said before the connection to Ollama is shut: _proxy then knows that the error it
+            # gets there is this hang-up, not Ollama failing.
+            self._client_gone = True
             try:
                 if upstream_conn.sock is not None:
                     upstream_conn.sock.shutdown(socket.SHUT_RDWR)
@@ -685,6 +723,8 @@ class Handler(BaseHTTPRequestHandler):
         # or None for a chunked body, which says only at its end that it is over. _body_pieces
         # counts it down as it reads. 0 until the length is known: there is nothing to go by.
         self._unread = 0
+        # True once _watch_client has ended the request to Ollama for a client that hung up.
+        self._client_gone = False
         try:
             length = 0 if chunked else max(int(self.headers.get('Content-Length') or 0), 0)
         except ValueError:
@@ -776,8 +816,10 @@ class Handler(BaseHTTPRequestHandler):
                 headers['Transfer-Encoding'] = 'chunked'
             elif size > 0 or self.command in ('POST', 'PUT', 'DELETE'):
                 headers['Content-Length'] = str(size)
+            connected = False
             try:
                 conn.connect()
+                connected = True
                 conn.sock.settimeout(900)
                 conn.request(self.command, self.path, body=send, headers=headers, encode_chunked=relay_chunked)
             except BodyError as e:
@@ -787,7 +829,14 @@ class Handler(BaseHTTPRequestHandler):
                 log('%s %s: %s' % (self.command, path_only, e))
                 raise
             except Exception as e:
-                self._send_json(502, {'error': 'render-guard: Ollama at %s is not reachable: %s' % (CONFIG['upstream'], e)})
+                # Only a connection that could not be made says that Ollama is not running. One
+                # that was made and then broke while the request went out (Ollama ended it in the
+                # middle of an upload, say) does not: Ollama was there to take it.
+                if connected:
+                    log('%s %s could not be sent on to Ollama at %s: %s' % (self.command, path_only, CONFIG['upstream'], e))
+                else:
+                    log('Ollama at %s is not reachable: %s' % (CONFIG['upstream'], e))
+                self._send_json(502, {'error': OLLAMA_SILENT if connected else OLLAMA_DOWN})
                 self._drain()   # a client still sending its body would not get to read the 502
                 return
             threading.Thread(target=self._watch_client, args=(conn, done), daemon=True).start()
@@ -795,8 +844,14 @@ class Handler(BaseHTTPRequestHandler):
                 resp = conn.getresponse()
             except Exception as e:
                 if not done.is_set():
+                    # A Stop press ends here as well: _watch_client has shut the connection to
+                    # Ollama for a client that hung up. That is no fault of Ollama's, so the log
+                    # says nothing of it; the 502 goes out all the same, for a client that closed
+                    # only its sending side and still reads.
+                    if not self._client_gone:
+                        log('no answer from Ollama at %s: %s' % (CONFIG['upstream'], e))
                     try:
-                        self._send_json(502, {'error': 'render-guard: no answer from Ollama: %s' % e})
+                        self._send_json(502, {'error': OLLAMA_SILENT})
                     except OSError:
                         pass
                 return
@@ -852,6 +907,9 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main():
+    # First of all, so that it is in the log even when the port below cannot be taken.
+    for note in _STARTUP_NOTES:
+        log(note)
     ThreadingHTTPServer.daemon_threads = True
     srv = ThreadingHTTPServer(('0.0.0.0', CONFIG['listen_port']), Handler)
     threading.Thread(target=_render_watcher, daemon=True).start()
