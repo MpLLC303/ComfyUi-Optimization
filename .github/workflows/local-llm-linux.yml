@@ -502,9 +502,12 @@ jobs:
   stack:
     name: Production stack (docker compose, the real images)
     runs-on: ubuntu-latest
-    # Expected run time is well under 30 minutes. The smoke step is capped lower than the job so a
-    # stuck pull or start fails that step (and the log step below still runs) instead of the runner
-    # ending the whole job with the container logs unread.
+    # Expected run time is well under 30 minutes: about 5 for the stack and its checks, and about 3
+    # more (an estimate, not yet measured) for the backup, wipe and restore of a chat, which ends
+    # with Open WebUI starting a second time and fetching its document-search models again. The
+    # smoke step is capped lower than the job so a stuck pull or start fails that step (and the log
+    # step below still runs) instead of the runner ending the whole job with the container logs
+    # unread.
     timeout-minutes: 40
     steps:
       - uses: actions/checkout@v5
@@ -522,12 +525,15 @@ jobs:
             ollama/ollama:0.35.1
           for i in $(seq 1 60); do curl -sf localhost:11434/api/version && break; sleep 2; done
           curl -sf localhost:11434/api/version
+          # The small image Backup-OpenWebUI.ps1 and Restore-OpenWebUI.ps1 run tar in.
+          docker pull -q alpine:3.20
 
-      - name: Stack smoke test (compose up on stack/docker-compose.yml, with deep research)
+      - name: Stack smoke test (compose up on stack/docker-compose.yml, with deep research, backup and restore)
         shell: pwsh
         timeout-minutes: 25
         run: |
-          & ./local-llm/tests/Invoke-AllTests.ps1 -Step ./local-llm/tests/Invoke-StackSmokeTest.ps1 -StepArgs '-DeepResearch'
+          # Ports other than the compose file's fallbacks (3000, 8888, 5055), so a variable it misnames shows.
+          & ./local-llm/tests/Invoke-AllTests.ps1 -Step ./local-llm/tests/Invoke-StackSmokeTest.ps1 -StepArgs '-DeepResearch','-WebUIPort','3111','-SearxngPort','8899','-ResearchPort','5066'
           exit $LASTEXITCODE
 
       - name: Nothing left behind (containers, volumes, helper processes, models)
