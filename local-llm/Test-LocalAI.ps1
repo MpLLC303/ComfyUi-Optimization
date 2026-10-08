@@ -82,8 +82,10 @@ function Warn([string]$d) { @{ Status = 'WARN'; Detail = $d } }
 function Skip([string]$d) { @{ Status = 'SKIP'; Detail = $d } }
 # What a preset lets the assistant do that the installer switches off, from the preset's meta as Open
 # WebUI returns it (pure: reads only its argument; unit-tested in tests\Invoke-WindowsUnitTests.ps1).
-# Open WebUI offers the past-chat tools unless builtinTools.chats is false, so a missing key (a preset
-# restored from an older backup) counts as on. Code execution is on when either of its switches is.
+# Open WebUI treats a missing tool category as on, so a switch counts as off only when it is false: a
+# missing one (a preset restored from an older backup, or written by hand) counts as on, and the row
+# never says 'off' for a switch it did not read as off. Code execution has two switches and counts as
+# on when either of them does.
 function Get-PresetToolRisk($Meta) {
     $tools = $null; $caps = $null
     if ($null -ne $Meta) { $tools = $Meta.builtinTools; $caps = $Meta.capabilities }
@@ -92,7 +94,7 @@ function Get-PresetToolRisk($Meta) {
     if ($null -ne $caps) { $capCode = $caps.code_interpreter }
     $risks = @()
     if (-not ($chats -is [bool] -and -not $chats)) { $risks += 'read past chats' }
-    if ($toolCode -eq $true -or $capCode -eq $true) { $risks += 'run code' }
+    if (-not ($toolCode -is [bool] -and -not $toolCode -and $capCode -is [bool] -and -not $capCode)) { $risks += 'run code' }
     return $risks
 }
 
