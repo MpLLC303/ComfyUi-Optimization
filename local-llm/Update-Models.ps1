@@ -17,8 +17,9 @@
     worse. That costs the old model's size on disk until the next update or -DropPrevious.
 
     -Rollback also pins the model: later runs download nothing for it until -Unpin. They still rebuild
-    its preset when the alias is missing, when it was built from other content than the tag holds now
-    (a rollback whose re-tune did not finish: the GPU stayed busy, the load failed) or with -Retune.
+    its preset when the alias is missing, when it was last measured on other content than the tag
+    holds now (a rollback whose re-tune was not completed: the GPU stayed busy, a load or the
+    measurement failed) or with -Retune.
 
     -RecheckOnly downloads nothing. It loads, on the Ollama installed now, only the presets measured
     on another Ollama version (the Ollama app updates itself) or left partly on the CPU by an earlier
@@ -60,7 +61,10 @@ param(
     # No downloads: only re-check the presets measured on another Ollama version (see above).
     [switch]$RecheckOnly,
     # For the nightly task: -RecheckOnly -SkipTests that never waits and skips while the PC is in use.
-    [switch]$Scheduled
+    [switch]$Scheduled,
+    # Test only (tests/Invoke-ModelUpdateTest.ps1; no shortcut and no scheduled task passes it): the
+    # wait for a quiet GPU ends at once, the way it ends when the card stays busy.
+    [switch]$TestGpuStaysBusy
 )
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
@@ -151,6 +155,9 @@ $system = (Get-Content -Encoding UTF8 -LiteralPath (Join-Path (Join-Path $PSScri
 $minFree = 768; if ($config.ContainsKey('MinFreeVramMiB')) { $minFree = [int]$config['MinFreeVramMiB'] }
 $maxBusy = 3500; if ($config.ContainsKey('MaxBusyVramMiB')) { $maxBusy = [int]$config['MaxBusyVramMiB'] }
 $allowCpu = ($env:LOCALAI_TEST_ALLOW_CPU -eq '1')
+# The test hook of the wait for a quiet GPU, as Wait-GpuIdle reads it. A parameter of this run and
+# nothing else, like the health watch's: no new variable is read from the environment for it.
+$hookGpuStaysBusy = [bool]$TestGpuStaysBusy
 
 if ($UpdateOllama) {
     $winget = Get-Command winget -ErrorAction SilentlyContinue
@@ -331,11 +338,16 @@ function Write-RollbackResult {
     # The last word of a -Rollback run on one model. Its tag is back and pinned either way; "back to
     # the previous version" is only true once the preset (the alias Open WebUI chats with) was rebuilt
     # on it, so the OK is printed after the re-tune and never before.
+    # Without -Rebuilt the line claims only what holds wherever the rebuild stopped. Before the alias
+    # was touched (the GPU stayed busy, the restored version does not load) it is still built on the
+    # newer upload. After that (the new alias did not load, its speed could not be measured) it is
+    # already built on the restored one, at a context install-state.json does not record. Hence
+    # "may still get", and the same way out for both: the next plain run.
     param([object]$Model, [switch]$Rebuilt)
     if ($Rebuilt) {
         Write-LaiLog OK "$($Model.Display): back to the previous version ($((Get-LaiOllamaDigest -BaseUrl $ollamaUrl -Name $Model.Source).Substring(0, 12))); pinned so the next update leaves it alone (Update-Models.ps1 -Unpin $($Model.Key) to undo)"
     } else {
-        Write-LaiLog WARN "$($Model.Display): its tag is back on the previous version and pinned, but its preset is not rebuilt yet, so chats still get the version you rolled back from. Once the cause above is fixed, run Update-Models.ps1 without the rollback option: it downloads nothing for a pinned model and rebuilds the preset."
+        Write-LaiLog WARN "$($Model.Display): its tag is back on the previous version and pinned, but the rebuild of its preset was not completed (the reason is above), so chats may still get the version you rolled back from. Once that cause is fixed, run Update-Models.ps1 without the rollback option: it downloads nothing for a pinned model and rebuilds the preset."
     }
 }
 function Wait-GpuIdle {
@@ -343,8 +355,12 @@ function Wait-GpuIdle {
     # message instead of an error trace. -RolledBack: the models a -Rollback run just put back; their
     # presets are not rebuilt when the run ends here, and the run says so.
     param([object[]]$RolledBack = @())
-    try { return (Wait-LaiGpuIdle -MaxUsedMiB $maxBusy -TimeoutSec 600) }
-    catch {
+    try {
+        # Test hook (-TestGpuStaysBusy, which only tests/Invoke-ModelUpdateTest.ps1 passes): the wait
+        # ends here the way Wait-LaiGpuIdle ends it for a card that stays busy, with the reason named.
+        if ($hookGpuStaysBusy) { throw 'The GPU counts as busy for this run: the test parameter -TestGpuStaysBusy was passed. No shortcut and no scheduled task passes it, so something else started this run.' }
+        return (Wait-LaiGpuIdle -MaxUsedMiB $maxBusy -TimeoutSec 600)
+    } catch {
         Write-LaiLog FAIL $_.Exception.Message
         foreach ($rb in $RolledBack) { Write-RollbackResult -Model $rb }
         Stop-Run 1

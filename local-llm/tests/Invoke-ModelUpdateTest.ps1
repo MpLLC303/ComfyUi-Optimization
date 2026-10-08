@@ -219,6 +219,10 @@ try {
     Assert-That ($r.Code -eq 0 -and [string]$rec['result'] -eq 'ok' -and (& $tunedVer) -eq $ollamaVer) "the Start-menu re-check fixes it once the cause is gone (exit $($r.Code))"
 
     Write-Host "`n=== 3. -Rollback main ===" -ForegroundColor Cyan
+    # The words of the WARN a rollback ends with when its preset was not rebuilt to the end.
+    $notRebuilt = 'rebuild of its preset was not completed'
+    $tunedOn = { [string](Read-LaiState -Path $stPath)['tuning']['main']['Digest'] }
+    $pinnedNow = { $f = (Read-LaiState -Path $stPath)['flags']; if ($f -is [hashtable]) { @($f['pinnedModels']) } else { @() } }
     $r = Invoke-Update @('-Rollback', 'main') ''
     Assert-That ($r.Code -eq 0) "rollback exits 0 (got $($r.Code))"
     Assert-That ((Get-Digest $tag) -eq $original) 'tag is back to the original content'
@@ -228,7 +232,7 @@ try {
     $tuneAt = $r.Text.IndexOf('Tuning Update test', [StringComparison]::Ordinal)
     $okAt = $r.Text.IndexOf('pinned so the next update', [StringComparison]::Ordinal)
     Assert-That ($tuneAt -ge 0 -and $okAt -gt $tuneAt) "the rollback's OK line is printed after the re-tune, not before it (re-tune at $tuneAt, OK at $okAt)"
-    Assert-That ($r.Text -match 'Re-tuned:' -and $r.Text -notmatch 'preset is not rebuilt yet' -and [string](Read-LaiState -Path $stPath)['tuning']['main']['Digest'] -eq $original) 'and the preset was rebuilt on the restored version'
+    Assert-That ($r.Text -match 'Re-tuned:' -and $r.Text -notmatch $notRebuilt -and (& $tunedOn) -eq $original) 'and the preset was rebuilt on the restored version'
     $r = Invoke-Update @('-Rollback', 'main') ''
     Assert-That ($r.Code -ne 0 -and $r.Text -match 'Nothing to roll back') 'second rollback refuses clearly'
     $r = Invoke-Update @() $variant
@@ -237,9 +241,9 @@ try {
     $r = Invoke-Update @('-Unpin', 'main') ''
     Assert-That ($r.Code -eq 0) 'unpin'
 
-    # A rollback whose re-tune fails (here the restored version does not load; a GPU that stays busy
-    # ends the same way). The tag is back and pinned, the preset is not rebuilt, and the run says
-    # exactly that instead of OK.
+    # A rollback whose re-tune fails, three ways (the other two follow below). Here the restored
+    # version does not load: the tag is back and pinned, the preset is not rebuilt, and the run says
+    # that instead of OK.
     $r = Invoke-Update @() $variant
     $variantDigest = Get-Digest $variant
     Assert-That ($r.Code -eq 0 -and (Get-Digest $tag) -eq $variantDigest -and (Get-Digest $prev) -eq $original) "setup: re-published once more, the original kept as -prev (exit $($r.Code))"
@@ -247,7 +251,7 @@ try {
     try { $r = Invoke-Update @('-Rollback', 'main') '' } finally { $env:LOCALAI_TEST_LOAD_FAIL = '' }
     Assert-That ($r.Code -ne 0) "a rollback whose re-tune fails exits non-zero (exit $($r.Code))"
     Assert-That ((Get-Digest $tag) -eq $original -and -not (Test-LaiOllamaModel -BaseUrl $OllamaUrl -Name $prev)) 'its tag is back on the original all the same, and -prev is used up'
-    Assert-That ($r.Text -match 'preset is not rebuilt yet' -and $r.Text -notmatch 'pinned so the next update') 'it says the tag is back but the preset is not rebuilt yet, and prints no OK for the rollback'
+    Assert-That ($r.Text -match $notRebuilt -and $r.Text -notmatch 'pinned so the next update') 'it says the tag is back but the rebuild of the preset was not completed, and prints no OK for the rollback'
     Assert-That ($r.Text -match "cannot load Update test's files" -and $r.Text -notmatch 'the new download') 'and it does not call the restored version a new download'
     Assert-That ([string](Read-LaiState -Path $stPath)['tuning']['main']['Digest'] -eq $variantDigest) 'install-state still records the upload the preset was really built on'
     $r = Invoke-Update @('-Rollback', 'main') ''
@@ -263,6 +267,47 @@ try {
     Assert-That ($r.Text -match 'Re-tuned:' -and $tunedNow -eq $original) "but it finishes the rollback: the preset is rebuilt on the restored version ($tunedNow)"
     $r = Invoke-Update @() $variant
     Assert-That ($r.Code -eq 0 -and $r.Text -notmatch 'Re-tuned:' -and (Get-Digest $tag) -eq $original) "and the run after that has nothing left to rebuild (exit $($r.Code))"
+
+    # The other two ways start from the same state: unpinned and re-published once more, so the tag
+    # is on the variant, the original is kept as -prev and the preset was measured on the variant.
+    $republish = {
+        param([string]$Before)
+        $u = Invoke-Update @('-Unpin', 'main') ''
+        $p = Invoke-Update @() $variant
+        Assert-That ($u.Code -eq 0 -and $p.Code -eq 0 -and (Get-Digest $tag) -eq $variantDigest -and (Get-Digest $prev) -eq $original -and (& $tunedOn) -eq $variantDigest) "setup ($Before): unpinned and re-published, the original kept as -prev, the preset measured on the new upload (exit $($u.Code), $($p.Code))"
+    }
+    # The plain run after a rollback that could not finish: nothing is downloaded for the pinned
+    # model, and the preset is rebuilt and measured on the restored version.
+    $finish = {
+        param([string]$After)
+        $p = Invoke-Update @() $variant
+        Assert-That ($p.Code -eq 0 -and $p.Text -match 'pinned after a rollback' -and (Get-Digest $tag) -eq $original) "the plain run after $After downloads nothing for the pinned model (exit $($p.Code))"
+        Assert-That ($p.Text -match 'Re-tuned:' -and (& $tunedOn) -eq $original) "and finishes the rollback: the preset is measured on the restored version ($(& $tunedOn))"
+    }
+
+    # The GPU stays busy: the run ends at the wait for a quiet card, before anything is tuned. The
+    # tag is back and pinned by then, so the run must say that the preset is not, and not only why
+    # it stopped. (-TestGpuStaysBusy ends the wait the way ten minutes of a busy card end it.)
+    & $republish 'the GPU stays busy'
+    $r = Invoke-Update @('-Rollback', 'main', '-TestGpuStaysBusy') ''
+    Assert-That ($r.Code -eq 1 -and $r.Text -match 'The GPU counts as busy' -and $r.Text -notmatch 'Tuning Update test') "a rollback that finds the GPU busy ends there with the reason and exit 1, before any tuning (exit $($r.Code))"
+    Assert-That ($r.Text -match $notRebuilt -and $r.Text -notmatch 'pinned so the next update') 'it says the tag is back but the rebuild of the preset was not completed, and prints no OK for the rollback'
+    Assert-That ((Get-Digest $tag) -eq $original -and -not (Test-LaiOllamaModel -BaseUrl $OllamaUrl -Name $prev)) 'its tag is back on the original, and -prev is used up'
+    Assert-That (@(& $pinnedNow) -contains 'main' -and (& $tunedOn) -eq $variantDigest) "install-state.json has the model pinned and still records the upload the preset was built on (pinned: $(@(& $pinnedNow) -join ', '))"
+    & $finish 'a busy GPU'
+
+    # The failure comes after the alias was rebuilt: the search on the restored tag finds a context,
+    # the alias is created from it, and then its speed cannot be measured. Chats get the restored
+    # version from then on, so "chats still get the version you rolled back from" would be false
+    # here; the run says only what holds in every case, and the same plain run finishes it.
+    & $republish 'the measurement fails'
+    $env:LOCALAI_TEST_SPEED_FAIL = $alias
+    try { $r = Invoke-Update @('-Rollback', 'main') '' } finally { $env:LOCALAI_TEST_SPEED_FAIL = '' }
+    Assert-That ($r.Code -ne 0 -and $r.Text -match 'ctx\s+8192:' -and $r.Text -match 'speed measurement failed') "a rollback whose re-tune fails after the alias was rebuilt exits non-zero (exit $($r.Code))"
+    Assert-That ($r.Text -match $notRebuilt -and $r.Text -notmatch 'pinned so the next update') 'it says the rebuild of the preset was not completed, and prints no OK for the rollback'
+    Assert-That ($r.Text -match 'chats may still get' -and $r.Text -notmatch 'chats still get') 'it does not claim that chats still get the newer upload: this alias was already rebuilt on the restored one'
+    Assert-That ((Get-Digest $tag) -eq $original -and @(& $pinnedNow) -contains 'main' -and (& $tunedOn) -eq $variantDigest) 'the tag is back on the original and pinned, and install-state.json does not record a measurement that did not finish'
+    & $finish 'a failed measurement'
     # Pinned means no download, not no upkeep: -Retune and a deleted alias are still handled.
     $r = Invoke-Update @('-Retune') $variant
     Assert-That ($r.Code -eq 0 -and $r.Text -match 'Re-tuned:' -and (Get-Digest $tag) -eq $original) "-Retune measures a pinned model again without downloading it (exit $($r.Code))"
