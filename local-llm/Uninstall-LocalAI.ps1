@@ -29,7 +29,11 @@
     Exit code 0: finished. 1: stopped before anything was removed. 2: a step failed, or something
     could not be removed because Docker Desktop (the containers) or Ollama (the models, with
     -RemoveModels) was not running; the last lines name it. Start that program and run the
-    uninstaller again: it removes only what is still there.
+    uninstaller again: it removes only what is still there. Tuned aliases alone, left because
+    Ollama was not running, are listed as kept and do not make it 2. While a run asks for another
+    one that changes Ollama's settings or models, -RemoveData keeps install-state.json and
+    localai-config.json for it (your own Ollama settings from before the install are read from
+    there); that run deletes them.
 
 .EXAMPLE
     .\Uninstall-LocalAI.ps1 -WhatIf        # show what would happen
@@ -115,15 +119,20 @@ if ($dockerDown) { $left += 'containers open-webui, searxng, render-guard (Docke
 $ollamaUp = $true
 try { $names = @(Get-LaiOllamaModelNames -BaseUrl $OllamaUrl) } catch { $ollamaUp = $false; $names = @() }
 $modelsNow = ($RemoveModels -and $ollamaUp)
-if ($RemoveModels -and -not $ollamaUp) { $left += "downloaded models from the catalog (Ollama is not answering at $OllamaUrl)"; $startFirst += 'Ollama' }
+$aliases = 'tuned Ollama aliases localai-*'
+if ($RemoveModels -and -not $ollamaUp) { $left += "$aliases and downloaded models from the catalog (Ollama is not answering at $OllamaUrl)"; $startFirst += 'Ollama' }
 
 # ---- plan + confirmation ------------------------------------------------------------------------
 $plan = @('scheduled tasks (backup, health watch, install resume)', 'Tailscale mapping to Open WebUI (if any)')
 if (-not $dockerDown) { $plan += 'containers open-webui, searxng, render-guard' }
-$plan += 'tuned Ollama aliases localai-*', 'shortcuts (desktop ComfyUI, Start-menu Local AI folder)'
+if ($ollamaUp) { $plan += $aliases }
+$plan += 'shortcuts (desktop ComfyUI, Start-menu Local AI folder)'
 $kept = @()
 if ($RemoveData) { $plan += 'Open WebUI data volume (chats, memories, knowledge) and C:\AI stack/scripts/secrets/logs' } else { $kept += 'Open WebUI data volume (re-run Install-LocalAI.ps1 and everything comes back)' }
 if ($modelsNow) { $plan += 'downloaded models from the catalog' } elseif (-not $RemoveModels) { $kept += 'downloaded models' }
+# The aliases alone (about 0 GB) are named as kept and do not make the run 'Not finished': a PC
+# whose Ollama was uninstalled first could then never finish.
+if (-not $ollamaUp -and -not $RemoveModels) { $kept += "$aliases (Ollama is not answering at $OllamaUrl; to remove them, start Ollama and run the uninstaller again)" }
 if ($ResetOllamaSettings) { $plan += 'OLLAMA_* user variables set by the installer (+ OLLAMA_HOST firewall rule)' } else { $kept += 'Ollama settings' }
 $kept += "backups in $(Join-Path $AIRoot 'Backups')"
 # The rules file for an AI coding agent (written by the installer, edited by the owner) is not in the list of what -RemoveData deletes.
@@ -267,12 +276,24 @@ if ($onWindows -and ($ResetOllamaSettings -or $modelsNow)) {
 # address it started with until it is restarted, and without the rule every device on the network
 # could reach it.
 $blockRule = 'LocalAI - Block Ollama from LAN'
+$ruleKept = $false
 if ($ResetOllamaSettings -and (Get-Command Get-NetFirewallRule -ErrorAction SilentlyContinue)) {
     if (Get-NetFirewallRule -DisplayName $blockRule -ErrorAction SilentlyContinue) {
-        $rows = @(Get-NetTCPConnection -State Listen -LocalPort 11434 -ErrorAction SilentlyContinue)
-        $set = ConvertTo-LaiListenerSet -Connections $rows
-        if (@($set | Where-Object { $_['Network'] }).Count -gt 0) {
-            Write-LaiLog WARN "The firewall rule '$blockRule' stays for now: port 11434 is still open beyond this PC (the running Ollama keeps listening there until it is restarted), and without the rule other devices on your network could use it. Quit Ollama from its tray icon, start it again, then run this once more."
+        # 'Could not be read' is not 'nothing listens': the rule goes only when the list was read and
+        # shows nothing on 11434 beyond loopback. All listeners are asked for and filtered here (asking
+        # for the one port is an error when nothing listens on it); a missing cmdlet is caught as well.
+        $why = ''; $after = ''
+        try {
+            $rows = @(Get-NetTCPConnection -State Listen -ErrorAction Stop | Where-Object { $_ -and $_.LocalPort -eq 11434 })
+            $set = ConvertTo-LaiListenerSet -Connections $rows
+            if (@($set | Where-Object { $_['Network'] }).Count -gt 0) { $why = 'port 11434 is still open beyond this PC (the running Ollama keeps listening there until it is restarted)' }
+        } catch {
+            $why = "this PC's list of listening ports could not be read ($($_.Exception.Message)), so it is not known whether Ollama still listens on the network"
+            $after = ' If this message comes back after that, the rule can stay: all it does is keep other devices away from port 11434.'
+        }
+        if ($why) {
+            $ruleKept = $true
+            Write-LaiLog WARN "The firewall rule '$blockRule' stays for now: $why, and without the rule other devices on your network could use it. Quit Ollama from its tray icon, start it again, then run this once more.$after"
             $kept += "firewall rule '$blockRule' (until Ollama is restarted; then run this once more)"
         } else {
             Invoke-Step 'firewall rule' { Remove-NetFirewallRule -DisplayName $blockRule; Write-LaiLog OK 'Removed firewall rule' }
@@ -301,9 +322,19 @@ if ($env:ProgramData) {
 
 if ($RemoveData) {
     $here = (Resolve-Path -LiteralPath $PSScriptRoot).Path
+    # This run asks for another one (Ollama did not answer, or the firewall rule waits for Ollama's
+    # restart). When that run changes Ollama's settings or models it reads two files: your own
+    # Ollama settings from before the install, and Ollama's address. Deleted now, it would remove
+    # the settings this run has just put back. So they stay, and that run deletes them.
+    $again = ($left.Count -gt 0 -or -not $ollamaUp -or $ruleKept)
+    $forNextRun = @()
+    if ($again -and ($ResetOllamaSettings -or $RemoveModels)) { foreach ($j in 'install-state.json', 'localai-config.json') { $forNextRun += @($j, "$j.bak") } }
+    $stay = @($forNextRun | Where-Object { Test-Path -LiteralPath (Join-Path $AIRoot $_) })
+    if ($stay.Count -gt 0) { $kept += "$($stay -join ', ') in $AIRoot (the next run reads them, then deletes them)" }
     $stateFiles = @()
     foreach ($j in 'install-state.json', 'localai-config.json', 'watch-state.json', 'backup-state.json', 'model-recheck.json', 'integrity-baseline.json') { $stateFiles += @($j, "$j.bak", "$j.bad", "$j.tmp") }
     foreach ($item in (@('Stack', 'Secrets', 'Logs', 'Downloads', 'install-report.md', 'open-webui-hold.json') + $stateFiles)) {
+        if ($forNextRun -contains $item) { continue }
         $path = Join-Path $AIRoot $item
         if (-not (Test-Path -LiteralPath $path)) { continue }
         # Never Remove-Item -Recurse here: this runs as administrator in a folder the user controls,
@@ -329,8 +360,9 @@ if ($problems.Count -gt 0) {
 }
 # Under -WhatIf nothing was attempted: the plan above already names what a real run would leave.
 $unfinished = ($left.Count -gt 0 -and -not $WhatIfPreference)
+if ($problems.Count -eq 0 -and $left.Count -eq 0) { Write-LaiLog OK 'Uninstall finished.' }
+# Also before a 'Not finished': the files kept for the run it asks for are named here.
+foreach ($k in $kept) { Write-LaiLog INFO "kept: $k" }
 if ($unfinished) { Write-LaiLog WARN "Not finished: $($left -join '; '). Start $($startFirst -join ' and '), then run the uninstaller again with the same options." }
 if ($problems.Count -gt 0 -or $unfinished) { exit 2 }
-if ($left.Count -eq 0) { Write-LaiLog OK 'Uninstall finished.' }
-foreach ($k in $kept) { Write-LaiLog INFO "kept: $k" }
 exit 0
