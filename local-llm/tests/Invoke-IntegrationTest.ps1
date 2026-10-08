@@ -360,6 +360,95 @@ asyncio.run(main())
     & pwsh -NoProfile -File (Join-Path $PSScriptRoot 'Reset-Sandbox.ps1') -SkillsOnly -WebUIUrl $WebUIUrl -Email $Email -Password $Password | Out-Null
 }
 
+# The tool switches a preset writes, against the names the installed Open WebUI itself asks for.
+# Its code asks for each tool category by name, is_builtin_tool_enabled('<name>'), and takes a name
+# it does not find among a preset's switches for ON. So a name the preset spells another way is a
+# switch that does nothing while its tools stay on, and a category Open WebUI has that the preset
+# does not write is on as well: the two lists must be the same in both directions. The names are
+# read from the source text of the open_webui package this job installed (the version the toolkit
+# pins), found with Open WebUI's own Python; nothing of the package is imported or run. A package
+# this check cannot read the names from (no such call, or a call that hands the name over another
+# way) is a FAIL that shows the lines it found: never a pass, never a skip.
+$tnDir = Join-Path ([System.IO.Path]::GetTempPath()) ('lai-toolnames-' + [guid]::NewGuid().ToString('N'))
+try {
+    New-Item -ItemType Directory -Path $tnDir | Out-Null
+    $tnDrv = Join-Path $tnDir 'tool_names.py'
+    Set-Content -LiteralPath $tnDrv -Encoding ascii -Value @'
+import importlib.util, json, os, re
+from importlib import metadata
+helper = "is_builtin_tool_enabled"
+out = {"version": "unknown", "base": "", "error": "", "names": [], "calls": 0, "literal": 0, "files": [], "lines": []}
+try:
+    try:
+        out["version"] = metadata.version("open-webui")
+    except Exception:
+        pass
+    base = list(importlib.util.find_spec("open_webui").submodule_search_locations)[0]
+    out["base"] = base
+    names = set()
+    for folder, _dirs, files in os.walk(base):
+        for name in sorted(files):
+            if not name.endswith(".py"):
+                continue
+            path = os.path.join(folder, name)
+            with open(path, encoding="utf-8", errors="replace") as f:
+                src = f.read()
+            if helper not in src and "builtinTools" not in src:
+                continue
+            rel = os.path.relpath(path, base)
+            found = re.findall(helper + r"\s*\(\s*[\"']([^\"']*)[\"']", src)
+            calls = len(re.findall(r"(?<!def )" + helper + r"\s*\(", src))
+            if calls:
+                out["files"].append(rel)
+            names.update(found)
+            out["literal"] += len(found)
+            out["calls"] += calls
+            for line in src.splitlines():
+                if helper in line or "builtinTools" in line:
+                    out["lines"].append(rel + ": " + line.strip()[:140])
+    out["names"] = sorted(names)
+    out["lines"] = out["lines"][:40]
+except Exception as e:
+    out["error"] = type(e).__name__ + ": " + str(e)
+print(json.dumps(out))
+'@
+    $tnPid = @(& pgrep -f 'open-webui serve' | Where-Object { $_ }) | Select-Object -First 1
+    # The interpreter as started (its venv path), as the skill notebook check above finds it.
+    $tnPy = @([System.IO.File]::ReadAllText("/proc/$tnPid/cmdline") -split [char]0)[0]
+    $prevEap = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
+    try { $tnOut = @(& $tnPy $tnDrv 2>&1 | ForEach-Object { "$_" }) } finally { $ErrorActionPreference = $prevEap }
+    $tn = $null; try { $tn = ($tnOut | Where-Object { $_ -like '{*' } | Select-Object -Last 1) | ConvertFrom-Json } catch { $tn = $null }
+    $tnEntry = @($catalog.Models)[0]
+    $tnWritten = @((New-LaiPresetForm -Entry $tnEntry -NativeTools $true -SystemPrompt 'x')['meta']['builtinTools'].Keys | ForEach-Object { [string]$_ } | Sort-Object)
+    $tnRead = @(); $tnSeen = ''
+    if ($tn) {
+        $tnRead = @($tn.names | Where-Object { $null -ne $_ } | ForEach-Object { [string]$_ })
+        $tnSeen = " Open WebUI $($tn.version), $($tn.base). Lines found: $(@($tn.lines) -join ' || ')"
+    }
+    # Asked for by Open WebUI and not written by the preset: ON. Written and never asked for: does nothing.
+    $tnOn = @($tnRead | Where-Object { $tnWritten -cnotcontains $_ })
+    $tnDead = @($tnWritten | Where-Object { $tnRead -cnotcontains $_ })
+    if (-not $tn) {
+        Write-LaiLog FAIL "tool switches: Open WebUI's Python gave no result, so the names of its tool categories could not be read (the check failed, the presets are unchecked): $($tnOut -join ' ')"; $failures++
+    } elseif ($tn.error) {
+        Write-LaiLog FAIL "tool switches: the open_webui package could not be read, so the names of its tool categories are unchecked: $($tn.error).$tnSeen"; $failures++
+    } elseif ($tnRead.Count -eq 0) {
+        Write-LaiLog FAIL "tool switches: no call is_builtin_tool_enabled('<name>') was found in the open_webui package, so the names of its tool categories could not be read. Open WebUI may ask for them another way now: change this check to read that.$tnSeen"; $failures++
+    } elseif ([int]$tn.calls -ne [int]$tn.literal) {
+        Write-LaiLog FAIL "tool switches: $($tn.literal) of the $($tn.calls) calls of is_builtin_tool_enabled have the name written out in quotes. The others hand it over another way, so the list read here ($($tnRead -join ', ')) may be short: change this check to read them.$tnSeen"; $failures++
+    } elseif ($tnOn.Count -or $tnDead.Count) {
+        $tnOnText = 'none'; if ($tnOn.Count) { $tnOnText = $tnOn -join ', ' }
+        $tnDeadText = 'none'; if ($tnDead.Count) { $tnDeadText = $tnDead -join ', ' }
+        Write-LaiLog FAIL "tool switches: the switches a preset writes are not the tool categories Open WebUI $($tn.version) asks for. Asked for and not written, so ON in every preset: $tnOnText. Written and never asked for, so a switch that does nothing: $tnDeadText. Open WebUI asks for: $($tnRead -join ', ') (in $(@($tn.files) -join ', ')). The preset writes: $($tnWritten -join ', ')."; $failures++
+    } else {
+        Write-LaiLog OK "tool switches: the $($tnWritten.Count) switches a preset writes are the $($tnRead.Count) tool categories Open WebUI $($tn.version) asks for by name ($($tnRead -join ', '); $($tn.calls) calls in $(@($tn.files) -join ', '))"
+    }
+} catch {
+    Write-LaiLog FAIL "tool switches: the names Open WebUI asks for could not be compared with the preset's: $($_.Exception.Message)"; $failures++
+} finally {
+    Remove-Item -LiteralPath $tnDir -Recurse -Force -ErrorAction SilentlyContinue
+}
+
 # The optional research agent (-DeepResearch): the real Local Deep Research image against the
 # sandbox's Ollama, through the module functions the installer and Test-LocalAI use. A research run
 # itself takes minutes on this CPU and is left to Test-LocalAI on the real PC.

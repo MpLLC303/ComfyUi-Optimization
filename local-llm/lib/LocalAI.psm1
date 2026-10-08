@@ -3922,12 +3922,11 @@ function New-LaiPresetForm {
         # asking, in a turn that holds a web page's text too. The 16 names are those of Open WebUI
         # v0.11.4, the version the toolkit pins (its model editor, BuiltinTools.svelte, and
         # get_builtin_tools in backend/open_webui/utils/tools.py, as read from its source on
-        # 2026-10-08). Nothing asks Open WebUI itself for them yet: no test compares this list with
-        # the names its code reads, so a name spelt differently there would be a switch that does
-        # nothing, and its tools would stay on. (tests/Invoke-IntegrationTest.ps1 already runs
-        # Python inside the real Open WebUI on the Linux job; that is where such a check belongs.)
+        # 2026-10-08). tests/Invoke-IntegrationTest.ps1 compares this list, in both directions, with
+        # the names the installed Open WebUI's own code asks for (on the Linux job): a name spelt
+        # differently there would be a switch that does nothing, and its tools would stay on.
         # A category a newer Open WebUI adds is not in this list and is on there until it is added
-        # here.
+        # here; that comparison fails when the pinned version has one.
         #   on   time, user_input (the model asks you a question), knowledge and files (it reads
         #        attached collections and the files of the chat), web_search (search_web, fetch_url)
         #        and memory, which reads AND writes: add_memory, update_memory,
