@@ -157,7 +157,10 @@ function Get-LaiDockerTimeout {
     # Seconds a quick docker command (version, inspect, start, exec of a probe) may take before
     # Docker Desktop counts as not responding. LOCALAI_DOCKER_TIMEOUT: test hook.
     $s = 30
-    if ($env:LOCALAI_DOCKER_TIMEOUT) { $s = [int]$env:LOCALAI_DOCKER_TIMEOUT }
+    # Only a positive whole number counts. The nightly backup and the model update ask for this at
+    # their start: a value that is no number, left in the owner's variables, must not end them.
+    $asked = 0
+    if ($env:LOCALAI_DOCKER_TIMEOUT -and [int]::TryParse([string]$env:LOCALAI_DOCKER_TIMEOUT, [ref]$asked) -and $asked -gt 0) { $s = $asked }
     return $s
 }
 
@@ -2127,7 +2130,10 @@ function Connect-LaiWebUI {
         catch {
             if ([int](Get-LaiHttpStatus $_) -ne 429 -or $try -eq 8) { throw }
             if ($try -eq 1) { Write-LaiLog WARN 'Open WebUI is rate-limiting sign-ins (15 per 3 minutes); waiting for the limit to clear.' }
-            $wait = 45; if ($env:LOCALAI_TEST_SIGNIN_WAIT) { $wait = [int]$env:LOCALAI_TEST_SIGNIN_WAIT }
+            # The test hook counts only as a positive whole number: anything else keeps the 45 s
+            # instead of ending the sign-in with a cast error.
+            $wait = 45; $askedWait = 0
+            if ($env:LOCALAI_TEST_SIGNIN_WAIT -and [int]::TryParse([string]$env:LOCALAI_TEST_SIGNIN_WAIT, [ref]$askedWait) -and $askedWait -gt 0) { $wait = $askedWait }
             Start-Sleep -Seconds $wait
         }
     }

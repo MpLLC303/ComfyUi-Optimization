@@ -313,6 +313,10 @@ if ($env:ProgramFiles) {
     $elevated = Join-Path $env:ProgramFiles 'LocalAI'
     $dlDir = Join-Path $env:ProgramFiles 'LocalAI-Downloads'
     if (Test-Path -LiteralPath $dlDir) { Invoke-Step $dlDir { Remove-LaiTree -Path $dlDir; Write-LaiLog OK "Deleted $dlDir" } }
+    # The folder an update unpacks into before it starts the installer (Get-LocalAI.ps1). The update
+    # removes it itself; an Administrator window closed mid-run leaves it until the next update.
+    $updDir = Join-Path $env:ProgramFiles 'LocalAI-Update'
+    if (Test-Path -LiteralPath $updDir) { Invoke-Step $updDir { Remove-LaiTree -Path $updDir; Write-LaiLog OK "Deleted $updDir" } }
     if (Test-Path -LiteralPath $elevated) { Invoke-Step $elevated { Remove-LaiTree -Path $elevated; Write-LaiLog OK "Deleted $elevated" } }
 }
 if ($env:ProgramData) {

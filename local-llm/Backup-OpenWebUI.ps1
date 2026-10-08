@@ -38,7 +38,7 @@ param(
     [int]$RetentionDays = 0,
     # Optional second copy (another drive, NAS share). '' = take it from localai-config.json.
     [string]$Mirror = '',
-    # Suffix for the archive name (pre-uninstall, before-<version>, ...). Tagged archives are not daily ones.
+    # Suffix for the archive name (pre-uninstall, before-toolkit-<version>-<commit or day>, ...). Tagged archives are not daily ones.
     [string]$Tag = '',
     # Archive the running container instead of stopping it (used before replacing a manual install).
     [switch]$NoStop,
@@ -515,7 +515,8 @@ try {
     }
 
     # Retention: daily (untagged) archives older than N days go, but the newest three daily ones always
-    # stay. Tagged archives (pre-compose, pre-restore, before-<version>) never count toward those three.
+    # stay. Tagged archives (pre-compose, pre-restore, before-toolkit-<version>-<commit or day>) never
+    # count toward those three.
     # The final backup of an uninstall (-pre-uninstall) is never pruned: after a reinstall it is the
     # only copy of the old chats, and the new install's first backup would otherwise delete it.
     # The archive Update-OpenWebUI.ps1 -Rollback would use stays no matter how old it is. Applied to

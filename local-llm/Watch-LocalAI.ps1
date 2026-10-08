@@ -371,11 +371,15 @@ $soon = (Get-Date).AddHours(1)
 $futureDaily = @($all | Where-Object { $_.Name -match '^open-webui-\d{8}-\d{6}\.tar\.gz$' -and $_.LastWriteTime -gt $soon })
 $all = @($all | Where-Object { $_.LastWriteTime -le $soon })
 $daily = @($all | Where-Object { $_.Name -match '^open-webui-\d{8}-\d{6}\.tar\.gz$' })
+$bstate = Read-LaiState -Path (Join-Path $AIRoot 'backup-state.json')
 $backupBase = @()
 if ($all.Count -gt 0 -and $all[0].Name -like '*-CORRUPT.tar.gz') { $backupBase += 'the newest backup failed its database check' }
+# An -EMPTY archive (the nightly backup found Open WebUI without its users or chats) is no good
+# newest backup either. Its record in backup-state.json says more and is told below; this line is
+# for a newest -EMPTY archive whose record is gone.
+if ($all.Count -gt 0 -and $all[0].Name -like '*-EMPTY.tar.gz' -and -not ($bstate['emptied'] -is [hashtable])) { $backupBase += 'the newest backup is of an Open WebUI without its users or chats' }
 if ($daily.Count -eq 0 -or ((Get-Date) - $daily[0].LastWriteTime).TotalHours -gt 50) { $backupBase += 'no nightly backup in the last 50 h' }
 $results['Backups'] = ($backupBase.Count -eq 0)
-$bstate = Read-LaiState -Path (Join-Path $AIRoot 'backup-state.json')
 $backupLog = Join-Path $logDir 'backup.log'
 # What else makes the backups something not to rely on, the gravest first. Any one fails the check.
 $backupWhy = @()
@@ -402,13 +406,16 @@ if ($bstate['emptied'] -is [hashtable]) {
             if ($lastGoodFull -eq [System.IO.Path]::GetFullPath($inBackupDir) -and (Test-Path -LiteralPath $inBackupDir -PathType Leaf)) { $lastGoodPath = $inBackupDir }
         } catch { Write-Verbose "the recorded last good backup is no usable path: $($_.Exception.Message)" }
     }
+    # The second way out, for an owner who emptied it on purpose: one backup run that takes the data
+    # as it is now for this install's own. The backup's own log names both ways as well.
+    $ifMeant = 'if you emptied it yourself, run once: & {0} -AIRoot {1} -AcceptEmpty' -f (ConvertTo-LaiPsQuoted (Join-Path $PSScriptRoot 'Backup-OpenWebUI.ps1')), (ConvertTo-LaiPsQuoted $AIRoot)
     if ($lastGoodPath) {
         $restoreCmd = '& {0} -AIRoot {1} -Archive {2}' -f (ConvertTo-LaiPsQuoted (Join-Path $PSScriptRoot 'Restore-OpenWebUI.ps1')), (ConvertTo-LaiPsQuoted $AIRoot), (ConvertTo-LaiPsQuoted $lastGoodPath)
-        $backupWhy += "$onDate Open WebUI had no chats; the last backup with chats is $lastGood, put back with: $restoreCmd (no older backup is deleted meanwhile)"
+        $backupWhy += "$onDate Open WebUI had no chats; the last backup with chats is $lastGood, put back with: $restoreCmd (no older backup is deleted meanwhile); $ifMeant"
     } elseif ($lastGood) {
-        $backupWhy += "$onDate Open WebUI had no chats; the backup on record as the last one with chats, $lastGood, is not in $backupDir (no older backup is deleted meanwhile)"
+        $backupWhy += "$onDate Open WebUI had no chats; the backup on record as the last one with chats, $lastGood, is not in $backupDir (no older backup is deleted meanwhile); $ifMeant"
     } else {
-        $backupWhy += "$onDate Open WebUI had no chats, and no earlier backup with chats is on record (no older backup is deleted meanwhile)"
+        $backupWhy += "$onDate Open WebUI had no chats, and no earlier backup with chats is on record (no older backup is deleted meanwhile); $ifMeant"
     }
 }
 # The plain reasons from above (no nightly backup, the newest one damaged) come next. Alone they stay

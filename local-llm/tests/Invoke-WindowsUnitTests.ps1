@@ -705,6 +705,21 @@ if ($onWindows) {
     Assert-That ($ihStale -match 'WARN Integrity watch: .*on its next run\. That install or update carried on 1 thing\(s\) already accepted by hand \(-AcceptBaseline\), which still count as normal: "Scripts\\extra\.ps1" is new\. It also kept 1 thing\(s\) it did not install, which now count as normal: "Stack\\planted\.yml" is new\. That is 2 in all\. If that acceptance was not yours, or you did not add what was kept, do not repair this with Update toolkit' -and [regex]::Matches($ihStale, 'do not repair this with Update toolkit').Count -eq 1 -and $ihStale -notmatch 'first remove what was added|Start menu > Local AI - Update toolkit' -and [regex]::Matches($ihStale, 'this goes away with: ').Count -eq 1 -and $ihStale -match 'If both were you, this goes away with: .*-AcceptBaseline' -and $ihStale -notmatch 'the comparison is not running|did not finish') "a settled script and a kept Stack file: one advice, which names no shortcut, the number in all, and no reason from the record of another baseline ($ihStale)"
     Assert-That ($ihOwn -match 'WARN Integrity watch: .*has not compared the PC with it yet: the comparison is not running \(the comparison started at 09:00 did not finish\)\. That install or update carried on 1 thing\(s\) already accepted by hand' -and $ihOwn -match 'If that acceptance was not yours, do not repair this with Update toolkit.*If it was, this goes away with: .*-AcceptBaseline' -and $ihOwn -notmatch 'on its next run|kept \d+ thing\(s\) it did not install') "the watch's record under this baseline's id: its reason is shown, and an all-settled list still ends in the command ($ihOwn)"
     Assert-That ($ihPlain -match 'WARN Integrity watch: .*on its next run\. That install or update kept 1 thing\(s\) it did not install, which now count as normal: "Stack\\planted\.yml" is new\. If you did not add them, first remove what was added.*If you did, this goes away with: .*-AcceptBaseline' -and $ihPlain -notmatch 'carried on|in all') "only kept things: the line reads as before ($ihPlain)"
+    # The Backups row of such a run, in the same root: the nightly backup found Open WebUI without its
+    # users or chats and recorded it (backup-state.json, 'emptied'), and the newest archive is the
+    # -EMPTY one of that night. The row fails with the counts, the last good backup and both ways out,
+    # and does not name the -EMPTY archive as a backup.
+    $ihBk = Join-Path $ihRoot 'Backups'
+    New-Item -ItemType Directory -Force -Path $ihBk | Out-Null
+    $ihGood = Join-Path $ihBk 'open-webui-20260101-030000.tar.gz'
+    $ihEmpty = Join-Path $ihBk 'open-webui-20260102-030000-EMPTY.tar.gz'
+    Set-Content -LiteralPath $ihGood -Value 'x'
+    (Get-Item -LiteralPath $ihGood).LastWriteTime = (Get-Date).AddHours(-30)
+    Set-Content -LiteralPath $ihEmpty -Value 'x'
+    Save-LaiState -Path (Join-Path $ihRoot 'backup-state.json') -State @{ emptied = @{ at = '2026-01-02T03:00:00'; archive = $ihEmpty; lastGood = $ihGood; users = 0; chats = 0; hadUsers = 3; hadChats = 40 } }
+    $ihRes = Invoke-Child 'Test-LocalAI.ps1' @('-AIRoot', $ihRoot, '-NoContainers', '-Quick')
+    $ihBackups = @($ihRes.Text -split "`n" | Where-Object { $_ -match ' Backups: ' }) -join ' '
+    Assert-That ($ihBackups -match 'FAIL Backups: ' -and $ihBackups -match 'looked wiped' -and $ihBackups -match '0 users and 0 chats, 3 and 40 at the last good backup' -and $ihBackups -match [regex]::Escape($ihGood) -and $ihBackups -match 'Restore-OpenWebUI\.ps1' -and $ihBackups -match '-AcceptEmpty' -and $ihBackups -notmatch 'EMPTY\.tar\.gz') "an Open WebUI the nightly backup found wiped fails the Backups row with the counts now and before, the last good backup and both ways out, and its -EMPTY archive is not named as a backup ($ihBackups)"
 } else { Skip 'the Integrity watch line of the health check runs on Windows only' }
 
 Write-Host "`n=== diagnostics bundle: redaction ===" -ForegroundColor Cyan
@@ -811,6 +826,17 @@ $tn = Invoke-LaiTimedNative -File $childExe -Arguments @('-NoProfile', '-Command
 Assert-That ($tn.TimedOut -and $tn.ExitCode -eq -1 -and $sw.Elapsed.TotalSeconds -lt 30) ("a program that never answers is stopped after the limit ({0:N0} s)" -f $sw.Elapsed.TotalSeconds)
 $tn = Invoke-LaiTimedNative -File $childExe -Arguments @('-NoProfile', '-Command', "Write-Output 'a b|c'; exit 7") -TimeoutSec 120
 Assert-That (-not $tn.TimedOut -and $tn.ExitCode -eq 7 -and ([string]$tn.Out).Trim() -eq 'a b|c') "arguments with spaces arrive intact; output and exit code come back (exit $($tn.ExitCode): $($tn.Out))"
+# The limit itself. LOCALAI_DOCKER_TIMEOUT is a test hook; the nightly backup and the model update
+# ask for the limit at their start, so a value left in the owner's own variables that is no positive
+# whole number must not end them (it was cast with [int], which fails on 'x').
+$dtSaved = $env:LOCALAI_DOCKER_TIMEOUT
+$dtGot = @()
+try { foreach ($dtValue in 'x', '0', '-5', '7', '') { $env:LOCALAI_DOCKER_TIMEOUT = $dtValue; $dtGot += [string](Get-LaiDockerTimeout) } }
+catch { $dtGot += "stopped: $($_.Exception.Message)" }
+finally { $env:LOCALAI_DOCKER_TIMEOUT = $dtSaved }
+Assert-That (($dtGot -join ',') -eq '30,30,30,7,30') "the docker time limit takes LOCALAI_DOCKER_TIMEOUT only as a positive whole number: 'x', 0 and -5 keep 30 s, 7 is 7, unset is 30 ($($dtGot -join ','))"
+$libTextDt = Get-Content -LiteralPath (Join-Path (Join-Path $src 'lib') 'LocalAI.psm1') -Raw -Encoding UTF8
+Assert-That ($libTextDt -notmatch '\[int\]\$env:LOCALAI_DOCKER_TIMEOUT' -and $libTextDt -notmatch '\[int\]\$env:LOCALAI_TEST_SIGNIN_WAIT' -and $libTextDt -match 'TryParse\(\[string\]\$env:LOCALAI_TEST_SIGNIN_WAIT') 'the library casts neither that variable nor the sign-in wait of the tests to a number unchecked (text of lib\LocalAI.psm1)'
 
 Write-Host "`n=== context search (Find-LaiMaxContext) with a mocked Ollama and nvidia-smi ===" -ForegroundColor Cyan
 # The integration test runs the tuner on a CPU box with -AllowCpu, so the search itself (step-down,
@@ -2025,6 +2051,22 @@ if ($onWindows) {
 # Keep-awake for long installs: takes on Windows (Windows CI), a no-op elsewhere.
 if ($env:OS -eq 'Windows_NT') { Assert-That (Enable-LaiKeepAwake) 'Windows does not sleep while the installer runs (SetThreadExecutionState took)' }
 else { Assert-That (-not (Enable-LaiKeepAwake)) 'keep-awake is a no-op off Windows' }
+# Stop-Install takes the request back (the -NoExit window and its thread outlive the installer).
+# Its own 'LaiPower' statement is run here, taken from the function, not a copy of it. The call
+# hands back the state before it: 0x80000001 after Enable-LaiKeepAwake, and 0x80000000
+# (ES_CONTINUOUS alone) only when that statement really ran and took.
+if ($env:OS -eq 'Windows_NT') {
+    $kaAst = [System.Management.Automation.Language.Parser]::ParseFile((Join-Path $src 'Install-LocalAI.ps1'), [ref]$null, [ref]$null)
+    $kaStop = $kaAst.Find({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Stop-Install' }, $true)
+    $kaIf = $null; if ($kaStop) { $kaIf = $kaStop.Find({ param($n) $n -is [System.Management.Automation.Language.IfStatementAst] -and $n.Extent.Text -match 'LaiPower' }, $true) }
+    Assert-That ($null -ne $kaIf) 'Stop-Install has a statement that clears the keep-awake request'
+    if ($kaIf) {
+        Enable-LaiKeepAwake | Out-Null
+        . ([scriptblock]::Create($kaIf.Extent.Text))
+        $kaAfter = [LaiPower]::SetThreadExecutionState([uint32]2147483648)
+        Assert-That ($kaAfter -eq [uint32]2147483648) ("after Stop-Install's clear the thread asks for ES_CONTINUOUS alone (the state before the next call: 0x{0:X8})" -f $kaAfter)
+    }
+}
 Write-Host "`n=== other hardware: GPU size, several GPUs, no NVIDIA GPU, RAM ===" -ForegroundColor Cyan
 Import-Module (Join-Path (Join-Path $src 'lib') 'LocalAI.psm1') -Force
 # The owner's card must keep passing: every model of the real catalog fits a 24 GB RTX 3090.
@@ -2166,6 +2208,8 @@ $instText = Get-Content -LiteralPath (Join-Path $src 'Install-LocalAI.ps1') -Raw
 Assert-That ($instText -match "-InstallerSetBefore:\(\[bool\]\`$State\.stages\['Ollama'\]\)") 'the installer records only before its Ollama stage first completed'
 $ustText = Get-Content -LiteralPath (Join-Path $src 'Uninstall-LocalAI.ps1') -Raw -Encoding UTF8
 Assert-That ($ustText -match 'Get-LaiEnvResetPlan' -and $ustText -match 'prevOllamaEnv') 'Uninstall-LocalAI.ps1 restores from the recorded values instead of only deleting'
+# An update whose Administrator window was closed mid-run leaves its folder under Program Files.
+Assert-That ($ustText -match "Join-Path \`$env:ProgramFiles 'LocalAI-Update'" -and $ustText -match 'Remove-LaiTree -Path \$updDir') 'Uninstall-LocalAI.ps1 also removes LocalAI-Update under Program Files, the folder an update unpacks into (text of the script)'
 
 Write-Host "`n=== installer port choice: a port Docker holds for another project is not this stack's ===" -ForegroundColor Cyan
 $instAst4 = [System.Management.Automation.Language.Parser]::ParseFile((Join-Path $src 'Install-LocalAI.ps1'), [ref]$null, [ref]$null)

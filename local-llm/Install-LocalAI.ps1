@@ -174,8 +174,8 @@ if (-not (Test-IsAdmin)) {
         }
         exit 1223   # ERROR_CANCELLED
     }
-    # Exit code 10 tells the wrappers (Install-LocalAI.cmd, Get-LocalAI.ps1) that the install goes on
-    # in the new Administrator window.
+    # Exit code 10 tells the wrapper (Install-LocalAI.cmd) that the install goes on in the new
+    # Administrator window. Get-LocalAI.ps1 does not read it any more.
     Write-Host 'The installer continues in the Administrator window that just opened; you can close this one.' -ForegroundColor Cyan
     exit 10
 }

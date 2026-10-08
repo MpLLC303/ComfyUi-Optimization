@@ -65,7 +65,7 @@ function Write-Missing([string]$What) {
 
 # Compose projects and volumes only the tests create; container names the tests give alpine stand-ins.
 $testProjects = @('lai-update-test', 'lai-uninstall-test', 'lai-stopstart-test')
-$testVolumes = @('owui-old', 'owui-empty', 'lai-deep-test', 'lai-empty-test', 'lai-ok-test')
+$testVolumes = @('owui-old', 'owui-empty', 'lai-deep-test', 'lai-empty-test', 'lai-ok-test', 'lai-wipe-test')
 $standInNames = @('open-webui', 'render-guard', 'lai-stopstart-probe')
 
 if ((Invoke-DockerCli @('info', '--format', '{{.ServerVersion}}')).Code -ne 0) {

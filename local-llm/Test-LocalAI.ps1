@@ -486,11 +486,25 @@ if ($script:token) {
 Add-Check 'Backups' {
     $dir = Join-Path $AIRoot 'Backups'
     $all = @(Get-ChildItem -LiteralPath $dir -Filter 'open-webui-*.tar.gz' -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending)  # lai-ok: objects
-    $newest = $all | Where-Object { $_.Name -notlike '*-CORRUPT.tar.gz' } | Select-Object -First 1
+    # An -EMPTY archive (made on a night Open WebUI had lost its users or chats) is no backup to name
+    # as the newest good one, or to restore from, any more than a -CORRUPT one.
+    $newest = $all | Where-Object { $_.Name -notlike '*-CORRUPT.tar.gz' -and $_.Name -notlike '*-EMPTY.tar.gz' } | Select-Object -First 1
     # Age is judged on the nightly archives only, so a tagged one cannot hide a broken nightly task.
     $daily = $all | Where-Object { $_.Name -match '^open-webui-\d{8}-\d{6}\.tar\.gz$' } | Select-Object -First 1
     if ($all.Count -gt 0 -and $all[0].Name -like '*-CORRUPT.tar.gz') {
         return (Fail "the newest backup $($all[0].Name) failed its database check; the live Open WebUI data may be damaged (restore the last good one with Restore-OpenWebUI.ps1 -Archive $(if ($newest) { "'$($newest.FullName)'" } else { '<an older archive>' }), see the README's Maintain section)")
+    }
+    # The nightly backup found Open WebUI without its users or chats and recorded it (backup-state.json,
+    # 'emptied': at, lastGood, users, chats, hadUsers, hadChats). It stands until the data is back or
+    # the owner accepts it; the watch reports the same. 'at' is text under Windows PowerShell 5.1 and
+    # a date under PowerShell 7.
+    $wiped = (Read-LaiState -Path (Join-Path $AIRoot 'backup-state.json'))['emptied']
+    if ($wiped -is [hashtable]) {
+        $since = $wiped['at']; if ($since -is [datetime]) { $since = $since.ToString('s') }
+        $good = ([string]$wiped['lastGood'] -replace '\s+', ' ').Trim()
+        if ($good.Length -gt 300) { $good = $good.Substring(0, 300) + '...' }
+        if (-not $good) { $good = 'none on record' }
+        return (Fail ("Open WebUI's data looked wiped at the nightly backup of {0}: {1} users and {2} chats, {3} and {4} at the last good backup ({5}). Nightly archives are kept as -EMPTY and no older backup is deleted until this is settled: run Restore-OpenWebUI.ps1 to get the data back (it takes that last good backup), or, if you emptied it yourself, Backup-OpenWebUI.ps1 -AcceptEmpty once" -f $since, $wiped['users'], $wiped['chats'], $wiped['hadUsers'], $wiped['hadChats'], $good))
     }
     if (-not $newest) { return (Fail "no archive in $dir") }
     if (-not $daily) { return (Warn "no nightly archive yet (newest: $($newest.Name)); the nightly backup task has not run yet; if this stays, run Start menu > Local AI - Update toolkit to set it up again") }
