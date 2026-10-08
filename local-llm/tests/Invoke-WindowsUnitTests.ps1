@@ -1347,9 +1347,22 @@ $mFast = Merge-LaiPresetForm -Managed $fastForm -Existing $userFast
 Assert-That ($mFast.params['think'] -eq $true -and $mFast.params['system'] -eq 'sys') "Think turned on in the preset survives a re-run (think=$($mFast.params['think'])), the system prompt is still refreshed"
 Assert-That ($mFast.meta.capabilities['image_generation'] -eq $true -and $mFast.meta.builtinTools['image_generation'] -eq $true) 'image generation the user switched on (ComfyUI hookup) survives a re-run'
 Assert-That ($mFast.meta.capabilities['code_interpreter'] -eq $false -and $mFast.meta.builtinTools['code_interpreter'] -eq $false) 'code execution is still forced off'
+# The same switched on the way Open WebUI's own editor stores it: a box that is ticked again is a
+# switch that is deleted (a missing switch counts as on), not one set to true. The update took the
+# missing switch for 'never set' and wrote the installer's false over it, so the picture tool was
+# off again after every update although it is the owner's to set.
+$tickedFast = [pscustomobject]@{ id = 'local-fast'; name = 'Local Fast'; base_model_id = 'localai-fast:latest'; params = [pscustomobject]@{ think = $false }
+    meta = [pscustomobject]@{ capabilities = [pscustomobject]@{ image_generation = $true }; builtinTools = [pscustomobject]@{ time = $true; chats = $false; code_interpreter = $false; notes = $false } } }
+$mTicked = Merge-LaiPresetForm -Managed $fastForm -Existing $tickedFast
+Assert-That ($mTicked.meta.builtinTools.ContainsKey('image_generation') -and $mTicked.meta.builtinTools['image_generation'] -is [bool] -and $mTicked.meta.builtinTools['image_generation'] -eq $true -and $mTicked.meta.capabilities['image_generation'] -eq $true) "the picture tool ticked in Open WebUI's editor (stored as a switch that is no longer there) stays on after a re-run, and is written out as on (after: '$($mTicked.meta.builtinTools['image_generation'])'; nothing shown = still missing)"
+Assert-That ($mTicked.meta.builtinTools['notes'] -eq $false -and $mTicked.meta.builtinTools['calendar'] -is [bool] -and $mTicked.meta.builtinTools['calendar'] -eq $false -and $mTicked.meta.builtinTools['code_interpreter'] -eq $false -and $mTicked.meta.builtinTools['chats'] -eq $false) 'that goes for the three switches that are the owner''s only: a writing tool whose switch is missing is still switched off'
+$mImgOff = Merge-LaiPresetForm -Managed $fastForm -Existing ([pscustomobject]@{ id = 'local-fast'; name = 'Local Fast'; params = [pscustomobject]@{}; meta = [pscustomobject]@{ builtinTools = [pscustomobject]@{ image_generation = $false } } })
+$mImgNull = Merge-LaiPresetForm -Managed $fastForm -Existing ([pscustomobject]@{ id = 'local-fast'; name = 'Local Fast'; params = [pscustomobject]@{}; meta = [pscustomobject]@{ builtinTools = [pscustomobject]@{ image_generation = $null } } })
+Assert-That ($mImgOff.meta.builtinTools['image_generation'] -is [bool] -and $mImgOff.meta.builtinTools['image_generation'] -eq $false -and $mImgNull.meta.builtinTools['image_generation'] -is [bool] -and $mImgNull.meta.builtinTools['image_generation'] -eq $false) 'a picture tool that is switched off stays off, and one that is null (which Open WebUI itself reads as off) is written out as off'
 $resetFast = [pscustomobject]@{ id = 'local-fast'; name = 'Local Fast'; params = [pscustomobject]@{ think = $null }; meta = [pscustomobject]@{} }
 $mReset = Merge-LaiPresetForm -Managed $fastForm -Existing $resetFast
 Assert-That ($mReset.params['think'] -eq $false) 'a preset whose Think was set back to Default gets the catalog value again'
+Assert-That ($mReset.meta.builtinTools['image_generation'] -is [bool] -and $mReset.meta.builtinTools['image_generation'] -eq $false -and @($mReset.meta.builtinTools.Keys).Count -eq 16) 'and a preset that has no tool switches at all gets the whole set as a new preset does, the picture tool off'
 $catData = Import-PowerShellDataFile -Path (Join-Path (Join-Path $src 'config') 'models.psd1')
 $promise = @($catData.Models | Where-Object { $_.Think -eq $false -and $_.Description -match '(?i)chat controls' -and $_.Description -notmatch '(?i)cannot' } | ForEach-Object { $_.Key })
 Assert-That ($promise.Count -eq 0) "no catalog entry with Think = `$false promises a Chat Controls switch that the preset overrides ($($promise -join ', '))"
@@ -1550,47 +1563,67 @@ if ($onWindows) {
     # path, the entry is an ordinary file or folder (the path now leads into the other folder), and
     # the walk hashed or listed what lies there. Done in a loop while the installer records its
     # baseline as administrator, that put the names and SHA-256 of files the user may not read into
-    # a file the user can read. On Windows the walk asks the entry's handle where the entry really
-    # is and holds that against where the folder above really was when it was listed from its own
-    # handle (-ParentFinal): anywhere else is a link, and nothing is listed or hashed.
+    # a file the user can read. And a walk that only opens the entry by its path and then refuses it
+    # still tells which of the user's names exist in that other folder: one that exists there is a
+    # 'link', one that does not leaves no entry. So the walk keeps the folder open and opens each
+    # entry by its name in that open folder: what the folder's path leads to by now decides nothing.
     $igRaceRoot = Join-Path $Work 'integrity-race'; $igRacePar = Join-Path $igRaceRoot 'par'; $igRaceOut = Join-Path $Work 'integrity-race-outside'
+    $igRaceMoved = Join-Path $igRaceRoot 'par-moved'
     foreach ($d in (Join-Path $igRacePar 'sub'), (Join-Path $igRaceOut 'sub')) { New-Item -ItemType Directory -Force -Path $d | Out-Null }
     Set-Content -LiteralPath (Join-Path $igRacePar 'same.txt') -Value 'inside the install'
+    Set-Content -LiteralPath (Join-Path $igRacePar 'only-here.txt') -Value 'inside the install; the other folder has no file of this name'
     Set-Content -LiteralPath (Join-Path (Join-Path $igRacePar 'sub') 'inner.txt') -Value 'inside the install'
     $igRaceOutFile = Join-Path $igRaceOut 'same.txt'; $igRaceOutInner = Join-Path (Join-Path $igRaceOut 'sub') 'inner.txt'
     Set-Content -LiteralPath $igRaceOutFile -Value 'outside: for administrators only'
     Set-Content -LiteralPath $igRaceOutInner -Value 'outside: for administrators only, one folder down'
     $igRaceOutHashes = @($igRaceOutFile, $igRaceOutInner | ForEach-Object { [string](Get-FileHash -LiteralPath $_ -Algorithm SHA256).Hash })
-    # What the walk holds once it has listed 'par' from its handle: where par really is, and what
-    # the listing said about its two entries.
-    $igRaceErr = ''; $igRaceParFinal = ''; $igRaceOutFinal = ''
-    try { $igRaceParFinal = [string](Get-LaiIntegrityFinalPath -Path $igRacePar); $igRaceOutFinal = [string](Get-LaiIntegrityFinalPath -Path $igRaceOut) } catch { $igRaceErr = $_.Exception.Message }
-    $igStaleFile = Get-Item -LiteralPath (Join-Path $igRacePar 'same.txt') -Force
-    $igStaleDir = Get-Item -LiteralPath (Join-Path $igRacePar 'sub') -Force
-    Remove-Item -LiteralPath $igRacePar -Recurse -Force
-    $prev = $ErrorActionPreference; $ErrorActionPreference = 'Continue'; & cmd.exe /c mklink /J $igRacePar $igRaceOut 2>&1 | Out-Null; $ErrorActionPreference = $prev
-    # Asked again by their paths, as the walk by path did: both are there, neither is a link.
-    $igStaleFile.Refresh(); $igStaleDir.Refresh()
-    $igRacePlain = ($igStaleFile.Exists -and $igStaleDir.Exists -and -not ($igStaleFile.Attributes -band [IO.FileAttributes]::ReparsePoint) -and -not ($igStaleDir.Attributes -band [IO.FileAttributes]::ReparsePoint))
-    $igRaceReached = [string](Get-Content -Encoding UTF8 -LiteralPath $igStaleFile.FullName -Raw)
-    Assert-That (-not $igRaceErr -and $igRaceParFinal -like '\Device\*\integrity-race\par' -and $igRaceOutFinal -like '\Device\*\integrity-race-outside' -and $igRacePlain -and $igRaceReached -like 'outside:*') "setup: the folder above a listed file and a listed folder became a link to a folder with the same names; by their paths both still look ordinary, and the file's path now reads the other folder's file ($igRaceParFinal; $igRaceErr)"
-    $igRaceFileMap = @{}; $igRaceDirMap = @{}
+    $igRaceErr = ''; $igRaceHeld = @{ State = 'not opened' }; $igTrueHeld = @{ State = 'not opened' }
+    $igRaceMap = @{}; $igRaceOsMap = @{}; $igTrueMap = @{}; $igRacePathName = ''; $igRaceParFinal = ''; $igRaceSetup = $false
     try {
-        Add-LaiIntegrityEntry -Map $igRaceFileMap -Item $igStaleFile -Relative 'Stack\par\same.txt' -ParentFinal $igRaceParFinal
-        Add-LaiIntegrityEntry -Map $igRaceDirMap -Item $igStaleDir -Relative 'Stack\par\sub' -ParentFinal $igRaceParFinal
+        # What the walk holds once it has listed 'par': the open folder, and where it really is.
+        $igRaceHeld = Open-LaiIntegrityHandle -Path $igRacePar
+        $igRaceParFinal = [string]$igRaceHeld['Final']
+        # The swap, while the walk holds the folder open (it lets others rename the folder
+        # meanwhile): the folder is renamed away, and a link of its name to the other folder takes
+        # its place.
+        Rename-Item -LiteralPath $igRacePar -NewName 'par-moved' -ErrorAction Stop
+        $prev = $ErrorActionPreference; $ErrorActionPreference = 'Continue'; & cmd.exe /c mklink /J $igRacePar $igRaceOut 2>&1 | Out-Null; $ErrorActionPreference = $prev
+        # By their paths: same.txt and sub lead into the other folder and look ordinary there, and
+        # only-here.txt is not to be found.
+        $igRaceReached = [string](Get-Content -Encoding UTF8 -LiteralPath (Join-Path $igRacePar 'same.txt') -Raw)
+        $igRaceSetup = ([string]$igRaceHeld['State'] -eq 'ok' -and [bool]$igRaceHeld['Folder'] -and $igRaceParFinal -like '\Device\*\integrity-race\par' -and $igRaceReached -like 'outside:*' -and
+            (Test-Path -LiteralPath (Join-Path $igRacePar 'sub') -PathType Container) -and -not (Test-Path -LiteralPath (Join-Path $igRacePar 'only-here.txt')) -and (Test-Path -LiteralPath (Join-Path $igRaceMoved 'only-here.txt')))
+        foreach ($n in 'same.txt', 'only-here.txt') { Add-LaiIntegrityEntry -Map $igRaceMap -Relative ('Stack\par\' + $n) -Parent $igRaceHeld['Handle'] -ParentFinal $igRaceParFinal -Name $n }
+        Add-LaiIntegrityEntry -Map $igRaceMap -Relative 'Stack\par\sub' -Parent $igRaceHeld['Handle'] -ParentFinal $igRaceParFinal -Name 'sub' -Folder
+        # The same once more with another value in the OS variable. Any program of the user can put
+        # one into the user's own variables (no administrator rights needed), and the elevated
+        # installer starts with it. Read from that variable, 'this is Windows' was no longer true,
+        # and the walk went by path again, which is the walk that can be raced.
+        $savedOS = $env:OS
+        $env:OS = 'not what Windows sets'
+        try {
+            foreach ($n in 'same.txt', 'only-here.txt') { Add-LaiIntegrityEntry -Map $igRaceOsMap -Relative ('Stack\par\' + $n) -Parent $igRaceHeld['Handle'] -ParentFinal $igRaceParFinal -Name $n }
+            Add-LaiIntegrityEntry -Map $igRaceOsMap -Relative 'Stack\par\sub' -Parent $igRaceHeld['Handle'] -ParentFinal $igRaceParFinal -Name 'sub' -Folder
+        } finally { $env:OS = $savedOS }
+        # A name that is a path is no entry of the open folder: it is not handed to Windows.
+        $igRacePathName = [string](Open-LaiIntegrityHandle -Parent $igRaceHeld['Handle'] -ParentFinal $igRaceParFinal -Name 'sub\inner.txt')['State'] + ' / ' + [string](Open-LaiIntegrityHandle -Parent $igRaceHeld['Handle'] -ParentFinal $igRaceParFinal -Name '..')['State']
+        # Entries of a folder that is where it was when the walk opened it are read from their
+        # handles: a file by its SHA-256, a folder entry by entry. (That folder's path is written
+        # with the temp folder's short name on some machines; where it really is, is not, and only
+        # that is compared.)
+        $igTrueHeld = Open-LaiIntegrityHandle -Path $igRaceOut
+        Add-LaiIntegrityEntry -Map $igTrueMap -Relative 'Stack\out\same.txt' -Parent $igTrueHeld['Handle'] -ParentFinal ([string]$igTrueHeld['Final']) -Name 'same.txt'
+        Add-LaiIntegrityEntry -Map $igTrueMap -Relative 'Stack\out\sub' -Parent $igTrueHeld['Handle'] -ParentFinal ([string]$igTrueHeld['Final']) -Name 'sub' -Folder
     } catch { $igRaceErr = $_.Exception.Message }
-    $igRaceLeaked = @(@($igRaceFileMap.Values) + @($igRaceDirMap.Values) | Where-Object { $igRaceOutHashes -contains [string]$_ })
-    Assert-That (-not $igRaceErr -and @($igRaceFileMap.Keys).Count -eq 1 -and [string]$igRaceFileMap['Stack\par\same.txt'] -eq 'link' -and $igRaceLeaked.Count -eq 0) "a listed file whose folder became a link is not read: its handle is somewhere else than below where that folder really was, so it is a link, and the other folder's file is not hashed ($(@($igRaceFileMap.Keys | Sort-Object | ForEach-Object { '{0} = {1}' -f $_, $igRaceFileMap[$_] }) -join ', ')) $igRaceErr"
-    Assert-That (-not $igRaceErr -and @($igRaceDirMap.Keys).Count -eq 1 -and [string]$igRaceDirMap['Stack\par\sub'] -eq 'link' -and @($igRaceDirMap.Keys | Where-Object { $_ -like '*inner*' }).Count -eq 0 -and $igRaceLeaked.Count -eq 0) "a listed folder whose folder above became a link is not entered: a link, and nothing in the other folder is named or hashed ($(@($igRaceDirMap.Keys | Sort-Object | ForEach-Object { '{0} = {1}' -f $_, $igRaceDirMap[$_] }) -join ', ')) $igRaceErr"
-    # The same two entries held against the folder they really are in are read: a file by its
-    # SHA-256, a folder entry by entry. (This folder's path is written with the temp folder's short
-    # name on some machines; where it really is, is not, and only that is compared.)
-    $igTrueFileMap = @{}; $igTrueDirMap = @{}; $igTrueErr = ''
-    try {
-        Add-LaiIntegrityEntry -Map $igTrueFileMap -Item (Get-Item -LiteralPath $igRaceOutFile -Force) -Relative 'Stack\out\same.txt' -ParentFinal $igRaceOutFinal
-        Add-LaiIntegrityEntry -Map $igTrueDirMap -Item (Get-Item -LiteralPath (Join-Path $igRaceOut 'sub') -Force) -Relative 'Stack\out\sub' -ParentFinal $igRaceOutFinal
-    } catch { $igTrueErr = $_.Exception.Message }
-    Assert-That (-not $igTrueErr -and @($igTrueFileMap.Keys).Count -eq 1 -and [string]$igTrueFileMap['Stack\out\same.txt'] -eq $igRaceOutHashes[0] -and @($igTrueDirMap.Keys).Count -eq 1 -and [string]$igTrueDirMap['Stack\out\sub\inner.txt'] -eq $igRaceOutHashes[1]) "held against the folder they really are in, the same file and folder are read from their handles: the file's SHA-256, and the folder's one file ($(@($igTrueFileMap.Values) -join ', '); $(@($igTrueDirMap.Keys) -join ', ')) $igTrueErr"
+    finally { foreach ($h in $igRaceHeld, $igTrueHeld) { if ($h['Handle']) { $h['Handle'].Dispose() } } }
+    $igRaceShow = { param($Map) (@($Map.Keys | Sort-Object | ForEach-Object { '{0} = {1}' -f $_, $Map[$_] }) -join ', ') }
+    $igRaceLeaked = @(@($igRaceMap.Values) + @($igRaceOsMap.Values) | Where-Object { $igRaceOutHashes -contains [string]$_ })
+    Assert-That ($igRaceSetup -and -not $igRaceErr) "setup: a folder the walk holds open was renamed away and a link to a folder with the same names put in its place; by their paths a file and a folder now lead into that other folder, and a third name is not found there ($([string]$igRaceHeld['State']); $igRaceParFinal) $igRaceErr"
+    Assert-That (-not $igRaceErr -and @($igRaceMap.Keys).Count -eq 3 -and [string]$igRaceMap['Stack\par\same.txt'] -eq 'link' -and [string]$igRaceMap['Stack\par\sub'] -eq 'link' -and $igRaceLeaked.Count -eq 0) "a listed file and a listed folder whose folder was swapped for a link are not read: each is opened in the folder the walk holds, is no longer where that folder was, so it is a link, and nothing of the other folder is named or hashed ($(& $igRaceShow $igRaceMap)) $igRaceErr"
+    Assert-That (-not $igRaceErr -and [string]$igRaceMap['Stack\par\only-here.txt'] -eq 'link' -and [string]$igRaceMap['Stack\par\only-here.txt'] -eq [string]$igRaceMap['Stack\par\same.txt']) "and a name the other folder does not have is recorded the same as one it has: the baseline does not tell which of the user's names exist behind the link ($(& $igRaceShow $igRaceMap)) $igRaceErr"
+    Assert-That (-not $igRaceErr -and @($igRaceOsMap.Keys).Count -eq 3 -and (& $igRaceShow $igRaceOsMap) -eq (& $igRaceShow $igRaceMap)) "with another value in the OS variable it is the same walk and the same three links: whether this is Windows is not read from that variable ($(& $igRaceShow $igRaceOsMap)) $igRaceErr"
+    Assert-That ($igRacePathName -eq 'unreadable / unreadable') "a name with a backslash in it, or '..', is not opened as an entry of the open folder ($igRacePathName)"
+    Assert-That (-not $igRaceErr -and @($igTrueMap.Keys).Count -eq 2 -and [string]$igTrueMap['Stack\out\same.txt'] -eq $igRaceOutHashes[0] -and [string]$igTrueMap['Stack\out\sub\inner.txt'] -eq $igRaceOutHashes[1]) "entries of a folder that is where it was are read from their handles: the file's SHA-256, and the folder's one file ($(& $igRaceShow $igTrueMap)) $igRaceErr"
     # File names that are also words of the list the walk keeps a folder's entries in: all are read.
     $igWords = Join-Path $Work 'integrity-words'
     New-Item -ItemType Directory -Force -Path $igWords | Out-Null
@@ -1599,6 +1632,14 @@ if ($onWindows) {
     Add-LaiIntegrityEntry -Map $igWordsMap -Item (Get-Item -LiteralPath $igWords -Force) -Relative 'Stack\words'
     $igWordsRead = @($igWordsMap.GetEnumerator() | Where-Object { ([string]$_.Value).Length -eq 64 } | ForEach-Object { [string]$_.Key } | Sort-Object)
     Assert-That (($igWordsRead -join ', ') -eq 'Stack\words\Count, Stack\words\Keys, Stack\words\Values, Stack\words\z.txt' -and @($igWordsMap.Keys).Count -eq 4) "files called Count, Keys and Values hide nothing in their folder: each of them and the file next to them is hashed ($(@($igWordsMap.Keys | Sort-Object | ForEach-Object { '{0} = {1}' -f $_, $igWordsMap[$_] }) -join ', '))"
+} else {
+    # The OS variable the other way round: set as Windows sets it, on a machine that is not Windows.
+    # Read from that variable, the walk took this for Windows, could call none of Windows' own
+    # functions, and recorded Scripts and Stack as unreadable without reading a file.
+    $savedOS = $env:OS
+    $env:OS = 'Windows_NT'
+    try { $igOsFiles = Get-LaiIntegrityFiles -AIRoot $igRoot } finally { $env:OS = $savedOS }
+    Assert-That (@($igOsFiles.Keys).Count -eq 4 -and [string]$igOsFiles['Scripts\tool.ps1'] -eq [string](Get-FileHash -LiteralPath $igTool -Algorithm SHA256).Hash -and [string]$igOsFiles['Stack\linked'] -eq 'link') "with OS set to Windows_NT on a machine that is not Windows the walk still goes by path and hashes the files: the platform is not read from that variable ($(@($igOsFiles.Keys | Sort-Object | ForEach-Object { '{0} = {1}' -f $_, $igOsFiles[$_] }) -join ', '))"
 }
 Assert-That ([string](Get-LaiIntegrityFiles -AIRoot $igRoot -MaxHashBytes 3)['Scripts\tool.ps1'] -like 'size *') 'a file above the size limit is recorded by its size instead of being hashed'
 
@@ -1623,6 +1664,55 @@ $igByTime = Get-LaiIntegritySnapshot -AIRoot $igRoot -TaskPattern 'LaiNoSuchTask
 Assert-That ([string]$igByBytes['filesStopped'] -eq 'Scripts\tool.ps1' -and @($igByBytes['files'].Keys).Count -eq 1 -and [string]$igByTime['filesStopped'] -eq 'Scripts' -and @($igByTime['files'].Keys).Count -eq 0) "the walk also has a limit on the bytes it hashes and on its time ($([string]$igByBytes['filesStopped']) / $([string]$igByTime['filesStopped']))"
 Assert-That ((Get-LaiIntegritySummary -Baseline $igPart) -match '^2 files \(not all of them') 'and a baseline that could not read everything says so in its summary'
 
+# Scripts or Stack not read at all: the walk reads nothing through a link, and nothing by its path
+# when Windows' own calls are not there. All the list then holds of the folder is the folder's own
+# name as 'link' or 'unreadable'. That used to read as '"Scripts" is new' plus one 'is gone' for
+# every file, and once it was accepted as nothing at all: two such states are equal, the summary
+# said '2 files', and no file in the folder was watched any more without a word about it.
+$igUnBase = @{ files = @{ 'Scripts\a.ps1' = 'H1'; 'Scripts\lib\b.psm1' = 'H2'; 'Stack\c.yml' = 'H3' } }
+$igUnNow = @{ files = @{ 'Scripts' = 'unreadable'; 'Stack' = 'link' } }
+$igUnread = Get-LaiIntegrityUnread -Files @{ 'Scripts' = ('A' * 64); 'Stack' = 'link'; 'Stack\sub' = 'link'; 'Scripts\x' = 'unreadable' }
+Assert-That ($igUnread -is [hashtable] -and @($igUnread.Keys).Count -eq 1 -and [string]$igUnread['Stack'] -eq 'link' -and @((Get-LaiIntegrityUnread -Files $igUnBase['files']).Keys).Count -eq 0 -and @((Get-LaiIntegrityUnread -Files $null).Keys).Count -eq 0) "a folder that was not read is Scripts or Stack itself recorded as a link or as unreadable, nothing below them and no file of that name ($(@($igUnread.Keys) -join ', '))"
+$igUnDiff = @(Compare-LaiIntegrity -Baseline $igUnBase -Current $igUnNow)
+$igUnText = @($igUnDiff | ForEach-Object { [string]$_.Text })
+Assert-That ($igUnDiff.Count -eq 2 -and ((@($igUnDiff | ForEach-Object { [string]$_.Id }) | Sort-Object) -join ', ') -eq 'walk|Scripts, walk|Stack' -and $igUnText -contains '"Scripts" could not be read, so the files in it were not compared' -and $igUnText -contains '"Stack" is a link to another place, or lies in an install folder that is one, so the files in it were not compared') "a folder that was not read is one difference that says its files were not compared: not 'is new', and no file in it is called gone ($($igUnText -join '; '))"
+$igUnHalf = @(Compare-LaiIntegrity -Baseline $igUnBase -Current @{ files = @{ 'Scripts' = 'link'; 'Stack\c.yml' = 'H9' } } | ForEach-Object { [string]$_.Id } | Sort-Object)
+Assert-That (($igUnHalf -join ', ') -eq 'file|Stack\c.yml, walk|Scripts') "the other folder is still compared file by file ($($igUnHalf -join ', '))"
+$igUnSummary = Get-LaiIntegritySummary -Baseline $igUnNow
+Assert-That (@(Compare-LaiIntegrity -Baseline $igUnNow -Current $igUnNow).Count -eq 0 -and $igUnSummary -eq '0 files (none in Scripts, which could not be read: changes there are NOT noticed; none in Stack, which is a link to another place, or lies in an install folder that is one: changes there are NOT noticed), scheduled tasks not read, listeners not read') "a baseline recorded that way raises nothing by itself, so its summary says that no file of the folder is watched, and counts none ($igUnSummary)"
+Assert-That ((Get-LaiIntegritySummary -Baseline @{ files = @{ 'Scripts' = 'link'; 'Stack\c.yml' = 'H3'; 'Stack\linked' = 'link' } }) -match '^2 files \(none in Scripts, which is a link ') 'next to a folder that was read, the folder that was not is no file of the count'
+Assert-That ((Test-LaiIntegrityStill -Id 'file+|Stack\z.yml' -Snapshot @{ files = @{ 'Stack' = 'unreadable'; 'Scripts\a.ps1' = 'H1' }; filesStopped = '' }) -and -not (Test-LaiIntegrityStill -Id 'file+|Scripts\z.ps1' -Snapshot @{ files = @{ 'Stack' = 'unreadable'; 'Scripts\a.ps1' = 'H1' }; filesStopped = '' })) 'a file that is not found in a folder that was not read counts as still there (it could not be told); one missing from the folder that was read does not'
+if ($onWindows) {
+    # The install folder itself is a link (the folder was moved and a junction left in its place).
+    # Nothing is read through it: Scripts and Stack are each a link, whatever lies behind it.
+    $igJRoot = Join-Path $Work 'integrity-linked-root'
+    $prev = $ErrorActionPreference; $ErrorActionPreference = 'Continue'; & cmd.exe /c mklink /J $igJRoot $igRoot 2>&1 | Out-Null; $ErrorActionPreference = $prev
+    $igJSnap = Get-LaiIntegritySnapshot -AIRoot $igJRoot -TaskPattern 'LaiNoSuchTask-*'
+    $igJSnap['listeners'] = $null
+    $igJShow = (@($igJSnap['files'].Keys | Sort-Object | ForEach-Object { '{0} = {1}' -f $_, $igJSnap['files'][$_] }) -join ', ')
+    Assert-That ((Test-Path -LiteralPath (Join-Path (Join-Path $igJRoot 'Scripts') 'tool.ps1')) -and $igJShow -eq 'Scripts = link, Stack = link' -and [string]$igJSnap['filesStopped'] -eq '') "an install folder that is a link itself is not read through: Scripts and Stack are each recorded as a link and no file behind it is listed or hashed ($igJShow)"
+    $igJDiff = @(Compare-LaiIntegrity -Baseline $igFull -Current $igJSnap)
+    $igJSummary = Get-LaiIntegritySummary -Baseline $igJSnap
+    Assert-That ($igJDiff.Count -eq 2 -and @($igJDiff | Where-Object { [string]$_.Id -like 'walk|*' -and [string]$_.Text -like '*is a link to another place, or lies in an install folder that is one, so the files in it were not compared' }).Count -eq 2 -and $igJSummary -match '^0 files \(none in Scripts, which is a link to another place, or lies in an install folder that is one: changes there are NOT noticed; none in Stack, ') "the comparison says that the files of both folders were not compared, and the summary of such a baseline that none of them is watched ($(@($igJDiff | ForEach-Object { [string]$_.Text }) -join '; ') / $igJSummary)"
+    # With another value in the OS variable (see above) the same: a walk by path went through the link.
+    $savedOS = $env:OS
+    $env:OS = 'not what Windows sets'
+    try { $igJOsFiles = Get-LaiIntegrityFiles -AIRoot $igJRoot } finally { $env:OS = $savedOS }
+    Assert-That (@($igJOsFiles.Keys).Count -eq 2 -and [string]$igJOsFiles['Scripts'] -eq 'link' -and [string]$igJOsFiles['Stack'] -eq 'link') "and with another value in the OS variable the linked install folder is still not read through ($(@($igJOsFiles.Keys | Sort-Object) -join ', '))"
+    # Windows' own calls not there (the helper could not be compiled): nothing is read by its path
+    # instead, and that is said the same way.
+    & (Get-Module LocalAI) { function script:Initialize-LaiIntegrityNative { return $false } }
+    try {
+        $igBlindSnap = Get-LaiIntegritySnapshot -AIRoot $igRoot -TaskPattern 'LaiNoSuchTask-*'
+    } finally { Import-Module (Join-Path (Join-Path $src 'lib') 'LocalAI.psm1') -Force }
+    $igBlindSnap['listeners'] = $null
+    $igBlindShow = (@($igBlindSnap['files'].Keys | Sort-Object | ForEach-Object { '{0} = {1}' -f $_, $igBlindSnap['files'][$_] }) -join ', ')
+    $igBlindDiff = @(Compare-LaiIntegrity -Baseline $igFull -Current $igBlindSnap)
+    $igBlindSummary = Get-LaiIntegritySummary -Baseline $igBlindSnap
+    Assert-That ($igBlindShow -eq 'Scripts = unreadable, Stack = unreadable' -and $null -eq $igBlindSnap['env']) "without Windows' own calls the walk reads nothing, not by path either: Scripts, Stack and the settings of .env are not read ($igBlindShow)"
+    Assert-That ($igBlindDiff.Count -eq 2 -and @($igBlindDiff | Where-Object { [string]$_.Id -like 'walk|*' -and [string]$_.Text -like '*could not be read, so the files in it were not compared' }).Count -eq 2 -and $igBlindSummary -match '^0 files \(none in Scripts, which could not be read: changes there are NOT noticed; none in Stack, which could not be read: ') "and that is two differences that say so, with no file called gone, and a summary that counts no file ($(@($igBlindDiff | ForEach-Object { [string]$_.Text }) -join '; ') / $igBlindSummary)"
+}
+
 # Where chats and searches are sent is a line in Stack\.env: those settings are compared by name, as
 # a fingerprint. Their values, and every other line (versions, ports, keys), are not kept.
 $igEnvMap = ConvertTo-LaiIntegrityEnv -Lines @('# a comment', 'OPEN_WEBUI_VERSION=v1', 'OLLAMA_BASE_URL=http://render-guard:11434', ' OLLAMA_UPSTREAM = http://host.docker.internal:11434 ', 'COMFYUI_URLS=http://host.docker.internal:8188', 'DEEP_RESEARCH_OLLAMA_URL=http://render-guard:11434', 'WEBUI_SECRET_KEY=never-shown', 'WEBUI_EXTRA_ORIGINS=;https://pc.tail.ts.net', 'WEBUI_PORT=3000')
@@ -1630,6 +1720,28 @@ Assert-That (((@($igEnvMap.Keys) | Sort-Object) -join ',') -eq 'COMFYUI_URLS,DEE
 Assert-That ([string]$igEnvMap['OLLAMA_BASE_URL'] -match '^[0-9A-F]{12}$' -and [string]$igEnvMap['OLLAMA_BASE_URL'] -eq [string]$igEnvMap['DEEP_RESEARCH_OLLAMA_URL'] -and [string]$igEnvMap['OLLAMA_BASE_URL'] -ne [string]$igEnvMap['OLLAMA_UPSTREAM'] -and @($igEnvMap.Values | Where-Object { $_ -match 'http|render' }).Count -eq 0) 'each as a short fingerprint of its value: the same address reads the same, another one differs, and no value is kept'
 $igEnvNow = Get-LaiIntegrityEnv -AIRoot $igRoot
 Assert-That ($igEnvNow -is [hashtable] -and @($igEnvNow.Keys).Count -eq 1 -and [string]$igEnvNow['OLLAMA_BASE_URL'] -eq [string]$igEnvMap['OLLAMA_BASE_URL'] -and (Get-LaiIntegrityEnv -AIRoot $igOutside) -is [hashtable] -and @((Get-LaiIntegrityEnv -AIRoot $igOutside).Keys).Count -eq 0) 'read from the real file; no .env at all is an empty answer'
+if ($onWindows) {
+    # Stack\.env is reached like every file of the walk, not by its path: behind a Stack that is a
+    # link (or an install folder that is one) it is not read, and what it holds does not reach the
+    # baseline. Read by its path, the settings of another folder's .env were named there, each with
+    # a fingerprint of its value.
+    $igEnvRoot = Join-Path $Work 'integrity-env-link'; $igEnvOut = Join-Path $Work 'integrity-env-outside'
+    foreach ($d in $igEnvRoot, $igEnvOut) { New-Item -ItemType Directory -Force -Path $d | Out-Null }
+    Set-Content -LiteralPath (Join-Path $igEnvOut '.env') -Value @('ELSEWHERE_UPSTREAM=http://not-this-install:1', 'OLLAMA_BASE_URL=http://elsewhere:11434')
+    $prev = $ErrorActionPreference; $ErrorActionPreference = 'Continue'; & cmd.exe /c mklink /J (Join-Path $igEnvRoot 'Stack') $igEnvOut 2>&1 | Out-Null; $ErrorActionPreference = $prev
+    $igEnvByPath = [string](Get-Content -Encoding UTF8 -Raw -LiteralPath (Join-Path (Join-Path $igEnvRoot 'Stack') '.env'))
+    $igEnvLinked = Get-LaiIntegrityEnv -AIRoot $igEnvRoot
+    $igEnvLinkedRoot = Get-LaiIntegrityEnv -AIRoot $igJRoot
+    $igEnvNamed = @(@($igEnvLinked, $igEnvLinkedRoot) | Where-Object { $_ -is [hashtable] } | ForEach-Object { @($_.Keys) }) -join ', '
+    Assert-That ($igEnvByPath -like 'ELSEWHERE_UPSTREAM=*' -and $null -eq $igEnvLinked -and $null -eq $igEnvLinkedRoot) "a .env behind a Stack that is a link, or behind an install folder that is one, is not read: it cannot be told, and no setting of that file is named (named: $igEnvNamed)"
+    # Read from its handle it is the same file as before: a byte order mark is no part of the first
+    # name (Windows PowerShell writes one with -Encoding UTF8), and a folder called .env is no file.
+    $igEnvBom = Join-Path $Work 'integrity-env-bom'; $igEnvDir = Join-Path $Work 'integrity-env-folder'
+    foreach ($d in (Join-Path $igEnvBom 'Stack'), (Join-Path (Join-Path $igEnvDir 'Stack') '.env')) { New-Item -ItemType Directory -Force -Path $d | Out-Null }
+    Set-Content -LiteralPath (Join-Path (Join-Path $igEnvBom 'Stack') '.env') -Encoding UTF8 -Value @('OLLAMA_BASE_URL=http://render-guard:11434', 'WEBUI_PORT=3000')
+    $igEnvBomMap = Get-LaiIntegrityEnv -AIRoot $igEnvBom
+    Assert-That ($igEnvBomMap -is [hashtable] -and @($igEnvBomMap.Keys).Count -eq 1 -and [string]$igEnvBomMap['OLLAMA_BASE_URL'] -eq [string]$igEnvMap['OLLAMA_BASE_URL'] -and $null -eq (Get-LaiIntegrityEnv -AIRoot $igEnvDir)) "a .env that starts with a byte order mark is read from its handle like any other (its first setting is found), and a folder called .env cannot be told"
+}
 
 # What counts as a difference, and how it reads (pure: made-up baselines).
 $igBase = @{

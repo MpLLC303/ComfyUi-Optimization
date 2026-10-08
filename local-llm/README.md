@@ -126,11 +126,16 @@ scheduled tasks run without administrator rights, and removes the old `C:\AI\Ins
   not after the downloads.
 - **Open WebUI:** it restarts briefly for the backup step.
 - **Your settings:** on the presets the installer refreshes only what it manages (base model,
-  system prompt, tool mode, capabilities). Your additions (attached knowledge, tools, access, extra
-  parameters, hiding a preset) are kept, and so are two switches it only sets when it creates a
-  preset: **Think** (Uncensored Fast's reasoning) and **Image Generation** (e.g. after you connect
-  ComfyUI in Admin Panel > Settings > Images). Code execution stays off. The RAG settings (chunking,
-  top-k, web search, image scaling, the fetched-page limit) are reset to the installer's values.
+  system prompt, tool mode, capabilities and the 16 switches for Open WebUI's built-in tools). Your
+  additions (attached knowledge, attached tools, access, extra parameters, hiding a preset) are
+  kept, and so are four switches it only sets when it creates a preset: **Think** (Uncensored
+  Fast's reasoning), **Image Generation** (e.g. after you connect ComfyUI in
+  Admin Panel > Settings > Images), and the two built-in tools that only ask you a question or
+  read the files of the chat. Every other built-in tool switch is put back on every run: code
+  execution and past-chat search stay off, and so do the note, task, automation, calendar,
+  notification, channel and sub-agent tools, also after you switched one on (see *Security
+  model*). The RAG settings (chunking, top-k, web search, image scaling, the fetched-page limit)
+  are reset to the installer's values.
 - **Document search models:** the embedder and reranker (roughly 7 GB together: Open WebUI fetches
   each model's whole repository) download into Open WebUI's data folder on the first run that sets
   them, which takes a few minutes; they are left out of the backups (they download again after a
@@ -463,6 +468,17 @@ differs.
 - **When it cannot compare:** while an install or a model update runs, nothing is compared (files
   are being replaced). If that lasts 6 hours, or a comparison keeps failing, you get "Local AI:
   changes are not being checked", and the health check says that its result is an old one.
+- **When it cannot read a folder:** the watch never reads through a junction or symbolic link. If
+  `C:\AI\Scripts` or `C:\AI\Stack` is one, or `C:\AI` itself is (for example because the folder was
+  moved to another drive and a link left in its place), or Windows will not let the watch open the
+  folder, it reads nothing in that folder. The notice then says that the folder "is a link to
+  another place" or "could not be read, so the files in it were not compared", instead of calling
+  every file gone. If you accept that state with `-AcceptBaseline`, the notice stops, but the files
+  in that folder are still not watched: the baseline's own line (in the installer's log, in
+  `watch.log` and in the health check's **Integrity watch** line) then reads "none in Scripts ...:
+  changes there are NOT noticed" instead of counting files. The installer does not work in a
+  linked install folder either: it says so and stops. Put the real folder back in place of the
+  link.
 - **What it is not:** the baseline sits in the install folder, which your Windows account can
   write. It catches accidents, other software and clumsy tampering. It does not stop, or even
   notice, someone who already runs as you and rewrites the baseline together with the change, and
@@ -574,9 +590,9 @@ failures.
   switch that is missing counts as on, so the installer writes all 16:
   - **On:** telling the time and date; asking you a question; searching the web and opening a web
     page; reading the knowledge collections attached to the preset or the chat; reading the files
-    of the chat; and memory. Memory is the one group that is on and changes something: the model
-    can save a memory, and it can also change and delete memories, all without asking. That is how
-    it learns you; what it holds is in Settings > Personalization > Memory.
+    of the chat; and memory. Memory is the one of these groups that is on and changes something:
+    the model can save a memory, and it can also change and delete memories, all without asking.
+    That is how it learns you; what it holds is in Settings > Personalization > Memory.
   - **Off:** searching and reading your past chats; running code; making pictures; writing and
     changing notes; making and changing task lists; automations (creating, changing, switching on
     or off and deleting things that run later by themselves); the calendar (reading, creating,
@@ -586,9 +602,14 @@ failures.
   Three things have no switch among the 16. A preset that has skills can always read one
   (`view_skill`). The terminal tools have none either; the toolkit sets up no terminal for them to
   reach. And a chat you open from inside a note can read and write notes whatever the notes switch
-  says. To switch a group on, tick it in the preset's list of built-in tools (Workspace > Models,
-  edit the preset). The next install or update switches it off again: only *asking you a question*,
-  *reading the files of the chat* and *making pictures* stay as you set them. `Test-LocalAI.ps1`
+  says. The 16 switches are also about Open WebUI's built-in tools only. A preset can call the
+  tools attached to it just the same, without asking: the installer attaches one, the *skill
+  notebook*, which saves a skill draft that stays switched off until you switch it on (see *It
+  improves itself, with your approval* above), and a tool or tool server you attach yourself is
+  called the same way. To switch a group on, tick it in the preset's list of built-in tools
+  (Workspace > Models, edit the preset). The next install or update switches it off again: only
+  *asking you a question*, *reading the files of the chat* and *making pictures* stay as you set
+  them, on or off. `Test-LocalAI.ps1`
   looks at past-chat search and code execution only, and so does the clean-up after restoring an
   older backup: a preset from a backup made before this can have the note, task, automation,
   calendar, notification, channel and sub-agent tools on again until you run Start menu > Local AI >
