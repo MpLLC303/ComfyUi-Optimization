@@ -29,6 +29,31 @@ function Assert-That([bool]$Condition, [string]$Message) {
     if ($Condition) { Write-Host "  ASSERT OK   $Message" -ForegroundColor Green }
     else { Write-Host "  ASSERT FAIL $Message" -ForegroundColor Red; $script:failures++ }
 }
+# The colour a captured Write-Host line was written in, as a colour name, or '' when it has none
+# that can be passed on. A line written with no -ForegroundColor carries the host's current colour,
+# and PowerShell on Linux gives that as -1 (not known): no colour name, and handed to Write-Host it
+# ends the suite with 'Cannot bind parameter ForegroundColor' (the first CI round of batch 5 stopped
+# that way in phase 6d, at the first blank line of the installer run it captures).
+function ConvertTo-ColourName($Carried) {
+    if ($null -eq $Carried -or -not [Enum]::IsDefined([ConsoleColor], $Carried)) { return '' }
+    return [string]$Carried
+}
+function Get-ScreenColour($Line) {
+    if ($Line -isnot [System.Management.Automation.InformationRecord] -or $Line.MessageData -isnot [System.Management.Automation.HostInformationMessage]) { return '' }
+    return (ConvertTo-ColourName $Line.MessageData.ForegroundColor)
+}
+# Asked here, in the first second of the suite, and not twenty minutes in where phase 6d needs it:
+# the value Linux gives, and a line this host writes with no colour of its own, read back and
+# printed again the way phase 6d does it.
+$plainColour = '?'; $plainShown = ''
+try {
+    $plainLine = @(Write-Host '  a line with no colour of its own, captured and printed again' 6>&1)[0]
+    $plainColour = Get-ScreenColour $plainLine
+    if ($plainColour) { Write-Host "$plainLine" -ForegroundColor $plainColour } else { Write-Host "$plainLine" }
+    $plainShown = 'printed'
+} catch { $plainShown = "not printed: $($_.Exception.Message)" }
+Assert-That ($plainShown -eq 'printed' -and ($plainColour -eq '' -or [Enum]::GetNames([ConsoleColor]) -contains $plainColour)) "a captured line with no colour of its own can be printed again: it is given a colour only when it carries a colour name (carried: '$plainColour'; $plainShown)"
+Assert-That ((ConvertTo-ColourName ([Enum]::ToObject([ConsoleColor], -1))) -eq '' -and (ConvertTo-ColourName $null) -eq '' -and (ConvertTo-ColourName ([ConsoleColor]::Red)) -eq 'Red') 'the colour of a captured line is passed on only as a colour name: -1 (what PowerShell on Linux gives for no colour) and nothing at all are no colour, Red is Red'
 
 # ---- sandbox layout ------------------------------------------------------------------------
 if (Test-Path $Work) { Remove-Item -Recurse -Force $Work }
@@ -868,8 +893,8 @@ Set-Content -LiteralPath $realTest6d -Value @('param([string]$AIRoot)', "Write-H
 $screen6d = @()
 try {
     $screen6d = @(& (Join-Path $aiRoot 'Scripts/Install-LocalAI.ps1') -AIRoot $aiRoot 6>&1 | ForEach-Object {
-            $line6d = "$_"; $colour6d = ''
-            if ($_ -is [System.Management.Automation.InformationRecord] -and $_.MessageData -is [System.Management.Automation.HostInformationMessage]) { $colour6d = [string]$_.MessageData.ForegroundColor }
+            # '' for a line with no colour of its own (Get-ScreenColour): on Linux such a line carries -1.
+            $line6d = "$_"; $colour6d = Get-ScreenColour $_
             if ($colour6d) { Write-Host $line6d -ForegroundColor $colour6d } else { Write-Host $line6d }
             [pscustomobject]@{ Text = $line6d; Colour = $colour6d }
         })
