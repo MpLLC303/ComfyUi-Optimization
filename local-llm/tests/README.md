@@ -53,22 +53,28 @@ stop with its log when it does not answer. Batch 5 made three of these jobs long
 and `models` (step 3 of the model update test: about 8 more re-tunes). The first CI round of that
 batch measured the whole jobs, setup included: `gate` 4 minutes (cut off at 20), `stack` 5,
 `models` 12, `webui-update` 18 and `integration` 21 (each of these four cut off at 40).
-`integration` is the one to watch: it uses 21 of its 40 minutes, more than half, and every new
-section of the integration test or the watch test adds to that. The `installer` job had no measured
+`integration` was the one to watch then: it used 21 of its 40 minutes, more than half, and every
+new section of the integration test or the watch test adds to that. The `installer` job had no measured
 time in that round: the mock run stopped in phase 6d, 21 minutes into the job, over a mistake
 in the suite's own printing, with the rest of 6d and phases 7 and 8 still to run (21 installer
 runs, 4 of them complete installs). In the round batch 5 shipped with (`main` at 1e9e510, both
 workflows green) the suite reached its end, and the `installer` job took 27 of its 40 minutes
 (a figure from the hand-over of batch 6). These are the numbers of single rounds, not averages.
-Batch 6 makes five of the jobs longer, and none of it is measured yet: `gate` (the unit tests'
-new child-process runs, about a minute for the lock wait among them, and about 12 s more in the
-render guard test), `installer` (phase 4a's two health check runs and the refused Preflight
-runs of 7g, on top of the 27 minutes), `webui-update` (about a minute for 5i to 5l), `models`
-(about 30 s for the three pull attempts of a failed download, and one short rollback run) and
-`integration` (a few seconds: the watch test's 4b now waits 3 s for the lock, twice). Read the
-times off the first round of batch 6 and put them here.
+Batch 6 makes five of the jobs longer: `gate` (the unit tests' new child-process runs, about a
+minute for the lock wait among them, and about 12 s more in the render guard test), `installer`
+(phase 4a's two health check runs and the refused Preflight runs of 7g, on top of the 27
+minutes), `webui-update` (about a minute for 5i to 5l), `models` (about 30 s for the three pull
+attempts of a failed download, and one short rollback run) and `integration` (a few seconds: the
+watch test's 4b now waits 3 s for the lock, twice). The first CI round of batch 6 (commit
+d64e9d9) measured the whole jobs, setup included: `gate` 5 minutes (cut off at 20), `stack` 4,
+`models` 15, `webui-update` 18, `integration` 23 and `installer` 30 (each of these five cut off
+at 40). `installer` is now the one to watch: it uses 30 of its 40 minutes, and every installer
+run that a new phase of the mock run adds comes on top of that. `integration` uses 23 of its
+40. The `gate` figure leaves out one step: in that round the job stopped at a failed assertion
+in the cross-platform unit tests, so the bootstrap update review, which comes after them, did
+not run. These too are the numbers of a single round, not averages.
 The `gate` job is cut off at 20 minutes, not 40: it took 2.8 before the render guard test and the
-unit tests grew in batch 3, and 4 in that round. Adding a job
+unit tests grew in batch 3, and 4 in the first CI round of batch 5. Adding a job
 means adding it to the `needs` list of `all-passed`. If the branch protection requires `local-llm Linux - every job
 passed` only, nothing else has to change. A rule that names a single job holds that job's title,
 and the installer job's title changed (it was `Installer mock run and Open WebUI update / rollback
@@ -79,7 +85,9 @@ batch 4: the bootstrap suite now starts several dozen child PowerShell runs ther
 tests grew; batch 5 added the module three blocks and the Start again cases; the whole job took 13
 minutes in the first CI round of batch 5, and 13 again in the round that batch shipped with;
 batch 6 adds the DPAPI round trips, the permission cases with real `icacls` calls and about
-fifteen more child-process runs, not yet measured): a check
+fifteen more child-process runs, and its first CI round took 16 of the 30 minutes, a figure that
+leaves out the last step: the job stopped at a failed assertion in the unit tests, so the
+bootstrap suite, which comes after them, did not run): a check
 of the skip rule below (a made-up suite that prints a SKIP line must fail its step with a line that
 names the skip, and pass once the job declares it; a suite's own exit code and an argument with a
 space must come through; a made-up suite with the file name of a real one that ends with exit 0

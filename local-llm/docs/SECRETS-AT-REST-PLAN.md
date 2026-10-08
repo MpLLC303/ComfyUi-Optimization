@@ -664,7 +664,8 @@ above as it stands plus these two:
   file empty. Without the three points the white space file is not refused at all, and the
   script's message names `-PromptCurrent`.
   As built, the tests cover less than this: test 32 reads an empty file, a cut-off file and a
-  JSON list, and the empty file once more with `-NoPassword`. A file of white space only, the
+  JSON list, each once more with `-NoPassword` (since the first CI round of batch 6; before it,
+  only the empty file was read a second time). A file of white space only, the
   text `null`, a quoted text and a number are refused by the reader's code and by no test, and
   the assertion over an empty admin file in the harness of test 24 is not built. Both are step
   2's to add (IMPROVEMENTS.md has the row).
@@ -687,7 +688,14 @@ stand with the other both-jobs assertions on the reader and the save, before the
 started in child processes, and 34 stands right after 22. The hand-written marker is
 `dpapi-user-9`.
 
-32. `a secret file that is empty, was cut off or holds no JSON object is refused with a message of its own, with -NoPassword too`
+32. Six assertions since the first CI round of batch 6, one for each of three files and each way
+    of reading it: `<the file> is refused with a message of its own (it said: '<message>')` and
+    `<the file> is refused the same way with -NoPassword (it said: '<message>')`, where the file is
+    `an empty secret file`, `a secret file that was cut off` or `a secret file that holds a JSON
+    list and no object`, and the message is what the reader said, with the file's path as
+    `<file>`. It was one assertion at first (`a secret file that is empty, was cut off or holds no
+    JSON object is refused with a message of its own, with -NoPassword too`), and when it failed
+    the log did not say for which file ("Step 1 as built", point 11).
 33. `a save over a file with a marker this version does not know is refused, with -Form Plain too, and leaves it byte for byte`
 34. `a pending password stays in the pending file when the admin file has a marker this version does not know, and the admin file is unchanged (got '<result>', sign-ins: <n>)`
 35. `a file marked as protected without its value is refused with a message of its own, on every system`
@@ -803,11 +811,31 @@ and 3 are cut from the build.
     Backups, on the other sub-folders or on a password file that an earlier run wrote is not
     reached (IMPROVEMENTS.md has the row). Under `-UserAccess ReadOnly` a user who owns the
     folder stays its owner, and can so give itself write access again (the same row).
+11. What the first CI round found (commit d64e9d9, both jobs, one failed assertion: test 32).
+    Point 2 was not true of an empty file. The reader did refuse it, but with "You cannot call a
+    method on a null-valued expression" and not with M7. Both file functions read the text with
+    `[string](Get-Content -Raw ...)`. An empty file gives no output at all, and a cast of no
+    output to `[string]` is null, not '' (only a cast of `$null` is ''), so the next method call
+    on the text ended the function. Tried on copies of the two functions outside the toolkit,
+    under Windows PowerShell 5.1; the Linux job failed the same assertion under PowerShell 7.
+    Nothing was read as an empty password: with `$ErrorActionPreference = 'Stop'` (point 4) the
+    error ended the call. But the message named no file. `Save-LaiSecretFile` ended the same
+    way over an empty file, in every `-Form`. Read from the code, not run:
+    `Set-OpenWebUIPassword.ps1` passed the reader's message on as it was, and a pending
+    password could not be promoted over an empty admin file (the pending file stayed, as it
+    must, and every later run ended there again). Fixed in both: the text is '' unless
+    something was read. An empty file is now
+    refused with M7 by the reader, and a save over it writes the plain form, as for a file that
+    is not there (step 2 of the save, "text that is not JSON gives Plain"; point 9 says what
+    step 3 has to settle about that). The assertion was right and is kept, as six assertions
+    (test 32 above), and one more is new: `a save over an empty file writes it plain, like a
+    file that is not there (it said: '<message>')`.
 
 Tests as built, where they differ from the lists above. 32 to 35: their names and their place
 are given with the four names above, and 32 reads fewer kinds of file than the M7 block asks
-for. Built and not in the lists: the M8 cases (a refusal for an empty, a null and a missing
-password, and the same files returned under `-NoPassword`); a rotation over an admin file
+for. Built and not in the lists: a save over an empty file (point 11); the M8 cases (a refusal
+for an empty, a null and a missing password, and the same files returned under
+`-NoPassword`); a rotation over an admin file
 without a password (stopped before any sign-in, `-PromptCurrent` named, nothing changed) and
 the same file rotated with `-CurrentPassword`; that a given password is not printed back and a
 made one is shown once; the comparison of the two typed entries, taken from the script's own

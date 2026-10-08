@@ -304,9 +304,11 @@ $sfBefore = & $sfHex $sfNew
 $sfWhy = & $sfRefusal { Save-LaiSecretFile -Path $sfNew -Value @{ email = 'admin@localhost' } }
 $sfWhy2 = & $sfRefusal { Save-LaiSecretFile -Path $sfNew -Value @{ email = 'admin@localhost'; password = '' } }
 Assert-That ($sfWhy -match 'Nothing to store in .+: the value has no password' -and $sfWhy2 -match 'the value has no password' -and (& $sfHex $sfNew) -eq $sfBefore) 'a value without a password is refused'
-# A file with nothing in it, one cut off mid-write, and JSON that is no object: refused in words of
-# their own (an empty file reads as no text at all, which 5.1 and 7 hand to ConvertFrom-Json
-# differently).
+# A file with nothing in it, one cut off mid-write, and JSON that is no object: each refused in the
+# reader's own words, with -NoPassword too. One assertion for each file and each way of reading
+# it, and each prints what the reader said (the file's path as <file>). They were one assertion
+# at first, and its first CI run failed on both systems without a word on which file it was: the
+# empty one, which is read as no output at all and ended the reader in a null-valued call.
 $sfEmpty = Join-Path $sfDir 'empty.json'
 [System.IO.File]::WriteAllBytes($sfEmpty, [byte[]]@())
 $sfCut = Join-Path $sfDir 'cut.json'
@@ -314,11 +316,26 @@ Set-Content -LiteralPath $sfCut -Value '{"email": "admin@localhost", "passw' -En
 $sfNoObject = Join-Path $sfDir 'noobject.json'
 Set-Content -LiteralPath $sfNoObject -Value '["admin@localhost", "Stored-Password-0a"]' -Encoding UTF8
 $sfM7 = 'is empty or was cut off: it holds no stored password'
-$sfWhy = & $sfRefusal { Read-LaiSecretFile -Path $sfEmpty }
-$sfWhy2 = & $sfRefusal { Read-LaiSecretFile -Path $sfCut }
-$sfWhy3 = & $sfRefusal { Read-LaiSecretFile -Path $sfNoObject }
-$sfWhy4 = & $sfRefusal { Read-LaiSecretFile -Path $sfEmpty -NoPassword }
-Assert-That ($sfWhy -match $sfM7 -and $sfWhy2 -match $sfM7 -and $sfWhy3 -match $sfM7 -and $sfWhy4 -match $sfM7) 'a secret file that is empty, was cut off or holds no JSON object is refused with a message of its own, with -NoPassword too'
+$sfSaid = { param([string]$Text, [string]$File) ($Text.Replace($File, '<file>') -replace '\s+', ' ') }
+$sfBroken = @(
+    @{ File = $sfEmpty; What = 'an empty secret file' },
+    @{ File = $sfCut; What = 'a secret file that was cut off' },
+    @{ File = $sfNoObject; What = 'a secret file that holds a JSON list and no object' }
+)
+foreach ($sfCase in $sfBroken) {
+    $sfCaseFile = [string]$sfCase['File']
+    $sfWhy = & $sfRefusal { Read-LaiSecretFile -Path $sfCaseFile }
+    Assert-That ($sfWhy -match $sfM7) "$($sfCase['What']) is refused with a message of its own (it said: '$(& $sfSaid $sfWhy $sfCaseFile)')"
+    $sfWhy2 = & $sfRefusal { Read-LaiSecretFile -Path $sfCaseFile -NoPassword }
+    Assert-That ($sfWhy2 -match $sfM7) "$($sfCase['What']) is refused the same way with -NoPassword (it said: '$(& $sfSaid $sfWhy2 $sfCaseFile)')"
+}
+# A save over an empty file: it has no marker to keep, so it is written plain, like a file that
+# is not there. (The save read the old text the way the reader did, and ended the same way.)
+$sfEmptySave = Join-Path $sfDir 'emptysave.json'
+[System.IO.File]::WriteAllBytes($sfEmptySave, [byte[]]@())
+$sfWhy = & $sfRefusal { Save-LaiSecretFile -Path $sfEmptySave -Value @{ email = 'admin@localhost'; password = 'Fresh-Password-0m' } }
+$sfOld = & $sfOnDisk $sfEmptySave
+Assert-That ($sfWhy -eq '' -and $sfOld.password -ceq 'Fresh-Password-0m' -and $sfOld.email -eq 'admin@localhost' -and (& $sfNames $sfOld) -notcontains 'protected') "a save over an empty file writes it plain, like a file that is not there (it said: '$(& $sfSaid $sfWhy $sfEmptySave)')"
 $sfBefore = & $sfHex $sfUnknown
 $sfWhy = & $sfRefusal { Save-LaiSecretFile -Path $sfUnknown -Value @{ email = 'admin@localhost'; password = 'Other-Password-0b' } }
 $sfWhy2 = & $sfRefusal { Save-LaiSecretFile -Path $sfUnknown -Value @{ email = 'admin@localhost'; password = 'Other-Password-0b' } -Form Plain }
@@ -735,7 +752,12 @@ if ($onWindows) {
     try { $aclBlindCall = & $aclCall $aclBlind }
     finally { Remove-Item -LiteralPath 'Function:\Get-Acl' -Force -ErrorAction SilentlyContinue }
     $aclBlindGone = ($null -eq (Get-Command Get-Acl -CommandType Function -ErrorAction SilentlyContinue))
-    Assert-That ($aclBlindGone -and $aclBlindCall.Result.ExitCode -ne 0 -and [string]$aclBlindCall.Result.Text -match 'its owner and the entries other accounts hold on it could not be read \(stand-in: the permissions cannot be read\)' -and (Get-Acl -LiteralPath $aclBlind).AreAccessRulesProtected) "permissions that cannot be read make the call a failure that says so, and the three names are set all the same (exit $($aclBlindCall.Result.ExitCode))"
+    # The three names are counted, as for the folder above. The exit code cannot tell here: it is
+    # not 0 because of what could not be read, and would be not 0 as well had the icacls call
+    # itself failed. (Only with the stand-in gone: the count asks Get-Acl.)
+    $aclBlindThree = -1
+    if ($aclBlindGone) { $aclBlindThree = @(& $rules $aclBlind | Where-Object { $three -contains $_.Sid }).Count }
+    Assert-That ($aclBlindGone -and $aclBlindCall.Result.ExitCode -ne 0 -and [string]$aclBlindCall.Result.Text -match 'its owner and the entries other accounts hold on it could not be read \(stand-in: the permissions cannot be read\)' -and (Get-Acl -LiteralPath $aclBlind).AreAccessRulesProtected -and $aclBlindThree -eq 3) "permissions that cannot be read make the call a failure that says so, and the three names are set all the same (exit $($aclBlindCall.Result.ExitCode); entries of the three names: $aclBlindThree)"
 } else { Skip 'ACL test runs on Windows only' }
 
 # ---- the installer's own functions on real Windows ---------------------------------------------

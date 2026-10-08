@@ -530,10 +530,19 @@ function Read-LaiSecretFile {
     # Inside a module the caller's $ErrorActionPreference does not apply, and an error that only
     # ends its own statement would let this go on to its return with no password filled in.
     $ErrorActionPreference = 'Stop'
-    $text = [string](Get-Content -LiteralPath $Path -Raw -Encoding UTF8 -ErrorAction Stop)
+    # An empty file is read as no output at all, and a cast of no output to [string] gives null,
+    # not '' (only a cast of $null gives ''; tried under Windows PowerShell 5.1, and the same
+    # assertion failed under PowerShell 7 in CI). The next method call on it then ended this
+    # function with "You cannot call a method on a null-valued expression" in place of the
+    # refusal below. So the text is '' unless something was read.
+    $text = ''
+    $read = Get-Content -LiteralPath $Path -Raw -Encoding UTF8 -ErrorAction Stop
+    if ($null -ne $read) { $text = [string]$read }
     if ($text.Length -gt 0 -and $text[0] -eq [char]0xFEFF) { $text = $text.Substring(1) }
-    # The text is judged here, not by ConvertFrom-Json: an empty file reads as no text at all, which
-    # 5.1 and 7 take differently, and only an object ('{') is a secret file.
+    # The text is judged here, not by ConvertFrom-Json: under Windows PowerShell 5.1 that takes an
+    # empty text, white space and 'null' without an error, and hands a list, a quoted text and a
+    # number back as they are. Only text that begins an object ('{') and parses to one is a secret
+    # file.
     $o = $null
     if ($text.TrimStart().StartsWith('{', [System.StringComparison]::Ordinal)) { try { $o = ConvertFrom-Json -InputObject $text -ErrorAction Stop } catch { $o = $null } }
     if ($o -isnot [System.Management.Automation.PSCustomObject]) { throw "$Path is empty or was cut off: it holds no stored password." }
@@ -597,7 +606,11 @@ function Save-LaiSecretFile {
     # 2. The form. Only the marker of the file that is there is looked at, as text.
     $marker = $null
     if (Test-Path -LiteralPath $Path) {
-        $oldText = [string](Get-Content -LiteralPath $Path -Raw -Encoding UTF8 -ErrorAction Stop)
+        # '' unless something was read, as in Read-LaiSecretFile: an empty file gives no output, a
+        # cast of that is null, and a save over an empty file ended here in a null-valued call.
+        $oldText = ''
+        $oldRead = Get-Content -LiteralPath $Path -Raw -Encoding UTF8 -ErrorAction Stop
+        if ($null -ne $oldRead) { $oldText = [string]$oldRead }
         if ($oldText.Length -gt 0 -and $oldText[0] -eq [char]0xFEFF) { $oldText = $oldText.Substring(1) }
         $old = $null
         if ($oldText.TrimStart().StartsWith('{', [System.StringComparison]::Ordinal)) { try { $old = ConvertFrom-Json -InputObject $oldText -ErrorAction Stop } catch { $old = $null } }
