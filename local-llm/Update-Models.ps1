@@ -19,7 +19,12 @@
     -Rollback also pins the model: later runs download nothing for it until -Unpin. They still rebuild
     its preset when the alias is missing, when it was last measured on other content than the tag
     holds now (a rollback whose re-tune was not completed: the GPU stayed busy, a load or the
-    measurement failed) or with -Retune.
+    measurement failed, the run was stopped) or with -Retune.
+
+    Before it loads and measures a model, a run someone started waits up to -GpuWaitMinutes (10) for
+    other programs (ComfyUI, a game) to free the GPU, and ends with their names when they do not;
+    -GpuWaitMinutes 0 does not wait at all. -CatalogPath names another model catalog than
+    config\models.psd1 next to this script; the health check at the end reads the same one.
 
     -RecheckOnly downloads nothing. It loads, on the Ollama installed now, only the presets measured
     on another Ollama version (the Ollama app updates itself) or left partly on the CPU by an earlier
@@ -45,6 +50,8 @@
     .\Update-Models.ps1 -DropPrevious      # delete the kept previous versions to free the disk space
 .EXAMPLE
     .\Update-Models.ps1 -Unpin main        # after a -Rollback: let updates touch Uncensored Main again
+.EXAMPLE
+    .\Update-Models.ps1 -GpuWaitMinutes 0  # a GPU other programs are using ends the run at once, with their names
 #>
 param(
     # Install folder (the installer's -AIRoot).
@@ -62,9 +69,14 @@ param(
     [switch]$RecheckOnly,
     # For the nightly task: -RecheckOnly -SkipTests that never waits and skips while the PC is in use.
     [switch]$Scheduled,
-    # Test only (tests/Invoke-ModelUpdateTest.ps1; no shortcut and no scheduled task passes it): the
-    # wait for a quiet GPU ends at once, the way it ends when the card stays busy.
-    [switch]$TestGpuStaysBusy
+    # How many minutes a run someone started waits for other programs to free the GPU before it loads
+    # and measures a model (the installer's -GpuWaitMinutes). 0 = no waiting: a busy GPU ends the run.
+    [int]$GpuWaitMinutes = 10,
+    # The model catalog. Defaults to config\models.psd1 next to this script.
+    [string]$CatalogPath = '',
+    # Test only (tests/Invoke-ModelUpdateTest.ps1, whose machine has no GPU; no shortcut and no
+    # scheduled task passes it): a preset placed partly on the CPU counts as fitting. The run says so.
+    [switch]$TestAllowCpu
 )
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
@@ -93,6 +105,9 @@ if ($Scheduled) {
         $script:transcriptOn = $true
     } catch { Write-Verbose "no transcript: $($_.Exception.Message)" }
 }
+# Said at the start of every run that got it (after the transcript started, so the nightly log would
+# have it too).
+if ($TestAllowCpu) { Write-LaiLog WARN 'Test run: -TestAllowCpu was passed, so a preset placed partly on the CPU counts as fitting on the GPU. Only tests/Invoke-ModelUpdateTest.ps1 passes it (no shortcut, no scheduled task): if you did not mean to, run this again without it.' }
 function Close-Run {
     # The setup lock stays owned as long as this thread lives, and the Start-menu window keeps it
     # alive at 'press Enter to close': release it, or that open window would block the nightly
@@ -148,16 +163,16 @@ $ollamaUrl = 'http://127.0.0.1:11434'
 if ($config.ContainsKey('OllamaUrl') -and $config['OllamaUrl']) { $ollamaUrl = $config['OllamaUrl'] }
 $selected = @()
 if ($config.ContainsKey('SelectedModels')) { $selected = @($config['SelectedModels']) }
-$catalogPath = Join-Path (Join-Path $PSScriptRoot 'config') 'models.psd1'
-if ($env:LOCALAI_TEST_CATALOG) { $catalogPath = $env:LOCALAI_TEST_CATALOG }
-$catalog = Get-LaiCatalog -Path $catalogPath -IncludeKeys $selected
+if (-not $CatalogPath) { $CatalogPath = Join-Path (Join-Path $PSScriptRoot 'config') 'models.psd1' }
+if (-not (Test-Path -LiteralPath $CatalogPath -PathType Leaf)) { throw "The model catalog was not found: $CatalogPath (without -CatalogPath it is config\models.psd1 next to this script)." }
+$catalog = Get-LaiCatalog -Path $CatalogPath -IncludeKeys $selected
 $system = (Get-Content -Encoding UTF8 -LiteralPath (Join-Path (Join-Path $PSScriptRoot 'config') 'system-prompt.txt') -Raw).Trim()
 $minFree = 768; if ($config.ContainsKey('MinFreeVramMiB')) { $minFree = [int]$config['MinFreeVramMiB'] }
 $maxBusy = 3500; if ($config.ContainsKey('MaxBusyVramMiB')) { $maxBusy = [int]$config['MaxBusyVramMiB'] }
-$allowCpu = ($env:LOCALAI_TEST_ALLOW_CPU -eq '1')
-# The test hook of the wait for a quiet GPU, as Wait-GpuIdle reads it. A parameter of this run and
-# nothing else, like the health watch's: no new variable is read from the environment for it.
-$hookGpuStaysBusy = [bool]$TestGpuStaysBusy
+# Parameters of this run and nothing else: this script reads none of its settings from the environment.
+$allowCpu = [bool]$TestAllowCpu
+# The longest wait for a quiet GPU, as Wait-GpuIdle hands it on (0, or less: no waiting).
+$gpuWaitSec = [Math]::Max(0, $GpuWaitMinutes) * 60
 
 if ($UpdateOllama) {
     $winget = Get-Command winget -ErrorAction SilentlyContinue
@@ -217,6 +232,23 @@ function Get-ModelGB([string]$Name) {
     if ($t) { return [Math]::Round($t.size / 1GB, 1) }
     return 0
 }
+function Test-PresetBehind($Model, [string]$TagDigest) {
+    # Is the preset (the tuned alias) missing, or was it last measured on other content than the tag
+    # holds now (-TagDigest)? Then a plain run rebuilds it, whether or not the model is pinned.
+    $tunedDigest = ''
+    if ($state['tuning'].ContainsKey($Model.Key) -and $state['tuning'][$Model.Key]['Digest']) { $tunedDigest = [string]$state['tuning'][$Model.Key]['Digest'] }
+    return (($tunedDigest -and $tunedDigest -ne $TagDigest) -or -not (Test-LaiOllamaModel -BaseUrl $ollamaUrl -Name $Model.Alias))
+}
+function Write-PlainRunHint($Model) {
+    # For a -Rollback that finds no kept version of a model. After an earlier rollback that could
+    # not rebuild the preset, a second one is not what repairs it: the plain run is. Said only when
+    # that run really would rebuild it: the model is pinned (no download), its tag is still there,
+    # and the test the plain run itself makes (Test-PresetBehind) finds the preset behind.
+    if ($pinned -notcontains $Model.Key) { return }
+    $tagNow = Get-LaiOllamaDigest -BaseUrl $ollamaUrl -Name $Model.Source
+    if (-not $tagNow -or -not (Test-PresetBehind $Model $tagNow)) { return }
+    Write-LaiLog INFO "$($Model.Display): it is pinned after an earlier rollback, and its preset is missing or was last measured on other content than $($Model.Source) holds now. Run Update-Models.ps1 without the rollback option to rebuild it: that downloads nothing for a pinned model."
+}
 
 $changed = @()
 $failedPulls = @()
@@ -233,25 +265,9 @@ if ($DropPrevious) {
     }
     Stop-Run 0
 }
-if ($Rollback.Count -gt 0) {
-    foreach ($m in $catalog.Models) {
-        if ($Rollback -notcontains 'all' -and $Rollback -notcontains $m.Key) { continue }
-        $pn = Get-PrevName $m.Source
-        if (-not (Test-LaiOllamaModel -BaseUrl $ollamaUrl -Name $pn)) { Write-LaiLog WARN "$($m.Display): no previous version kept ($pn)"; continue }
-        Copy-Model $pn (Resolve-LaiModelName $m.Source)
-        # Pinned and saved right here, before the preset is rebuilt: if the re-tune below does not
-        # happen (GPU busy, a failed load, the window closed), the next plain run must rebuild the
-        # preset on this tag, not pull the new upload over it again.
-        if ($pinned -notcontains $m.Key) { $script:pinned = @($pinned) + $m.Key }
-        Save-Pins
-        Remove-Model $pn
-        # Not an OK yet: the preset still runs the newer upload until it is rebuilt (Write-RollbackResult).
-        Write-LaiLog INFO "$($m.Display): the previous version ($((Get-LaiOllamaDigest -BaseUrl $ollamaUrl -Name $m.Source).Substring(0, 12))) is back under $($m.Source) and pinned; rebuilding its preset now (if this run stops before that is done, run Update-Models.ps1 without the rollback option to finish it)"
-        $changed += $m
-    }
-    if ($changed.Count -eq 0) { throw "Nothing to roll back for: $($Rollback -join ', ')" }
-} elseif (-not $RecheckOnly) {
-    # (-RecheckOnly: no downloads, so no model counts as changed; only the re-check below runs.)
+if ($Rollback.Count -eq 0 -and -not $RecheckOnly) {
+    # (-Rollback: its own block, further down. -RecheckOnly: no downloads, so no model counts as
+    # changed; only the re-check below runs.)
     $offline = $false
     foreach ($m in $catalog.Models) {
         if ($pinned -contains $m.Key) {
@@ -272,16 +288,13 @@ if ($Rollback.Count -gt 0) {
             try {
                 if ($old -and -not $NoKeepPrevious) { Copy-Model (Resolve-LaiModelName $m.Source) $candidate }
                 try {
-                    if ($env:LOCALAI_TEST_PULL_FROM) { Copy-Model $env:LOCALAI_TEST_PULL_FROM (Resolve-LaiModelName $m.Source) }   # test hook: simulated re-publish
-                    else { Invoke-LaiOllamaPull -BaseUrl $ollamaUrl -Name $m.Source }
+                    Invoke-LaiOllamaPull -BaseUrl $ollamaUrl -Name $m.Source
                 } catch {
                     # Keep going: the models already updated in this run still get re-tuned below.
                     Write-LaiLog WARN "  $($m.Display): download failed, kept the current version ($((Get-LaiHttpErrorText $_)))"
                     $failedPulls += $m.Display
                     # Offline: the remaining models would each spend ~30 s in retries for nothing.
-                    $probeUrl = 'https://registry.ollama.ai/v2/'
-                    if ($env:LOCALAI_TEST_REGISTRY_URL) { $probeUrl = $env:LOCALAI_TEST_REGISTRY_URL }
-                    if (-not (Test-LaiRegistryReachable -Url $probeUrl)) { $offline = $true; Write-LaiLog WARN '  The model registry is unreachable (offline?); skipping the remaining downloads.' }
+                    if (-not (Test-LaiRegistryReachable -Url 'https://registry.ollama.ai/v2/')) { $offline = $true; Write-LaiLog WARN '  The model registry is unreachable (offline?); skipping the remaining downloads.' }
                     continue
                 }
                 $new = Get-LaiOllamaDigest -BaseUrl $ollamaUrl -Name $m.Source
@@ -296,9 +309,7 @@ if ($Rollback.Count -gt 0) {
         }
         # Also when the tuned alias was built from other content than the tag holds now: a run cut off
         # after the download but before the re-tune would otherwise report "unchanged" for good.
-        $tunedDigest = ''
-        if ($state['tuning'].ContainsKey($m.Key) -and $state['tuning'][$m.Key]['Digest']) { $tunedDigest = [string]$state['tuning'][$m.Key]['Digest'] }
-        if ($old -ne $new -or $Retune -or ($tunedDigest -and $tunedDigest -ne $new) -or -not (Test-LaiOllamaModel -BaseUrl $ollamaUrl -Name $m.Alias)) {
+        if ($old -ne $new -or $Retune -or (Test-PresetBehind $m $new)) {
             Write-LaiLog INFO ("  {0}: {1} -> {2}" -f $m.Display, $(if ($old) { $old.Substring(0, 12) } else { 'missing' }), $new.Substring(0, 12))
             $changed += $m
         } else {
@@ -343,23 +354,26 @@ function Write-RollbackResult {
     # newer upload. After that (the new alias did not load, its speed could not be measured) it is
     # already built on the restored one, at a context install-state.json does not record. Hence
     # "may still get", and the same way out for both: the next plain run.
+    # The WARN is also the last word of a run that an error or Ctrl+C ended between the pin and the
+    # re-tune (the 'finally' below). There the error is shown after this line, and a run stopped by
+    # hand shows none: so the line does not say where the reason stands, only where to look for it.
     param([object]$Model, [switch]$Rebuilt)
+    # Off the list of open rollbacks first: this is the one last word on the model, whatever follows.
+    $script:rollbackOpen = @($script:rollbackOpen | Where-Object { $_.Key -ne $Model.Key })
     if ($Rebuilt) {
         Write-LaiLog OK "$($Model.Display): back to the previous version ($((Get-LaiOllamaDigest -BaseUrl $ollamaUrl -Name $Model.Source).Substring(0, 12))); pinned so the next update leaves it alone (Update-Models.ps1 -Unpin $($Model.Key) to undo)"
     } else {
-        Write-LaiLog WARN "$($Model.Display): its tag is back on the previous version and pinned, but the rebuild of its preset was not completed (the reason is above), so chats may still get the version you rolled back from. Once that cause is fixed, run Update-Models.ps1 without the rollback option: it downloads nothing for a pinned model and rebuilds the preset."
+        Write-LaiLog WARN "$($Model.Display): its tag is back on the previous version and pinned, but the rebuild of its preset was not completed, so chats may still get the version you rolled back from. The FAIL line or the error message of this run says why (there is none if you stopped the run yourself). Once that cause is fixed, run Update-Models.ps1 without the rollback option: it downloads nothing for a pinned model and rebuilds the preset."
     }
 }
 function Wait-GpuIdle {
-    # A run someone started waits for a quiet card; one that stays busy ends the run with a plain
-    # message instead of an error trace. -RolledBack: the models a -Rollback run just put back; their
-    # presets are not rebuilt when the run ends here, and the run says so.
+    # A run someone started waits for a quiet card, as long as -GpuWaitMinutes allows; one that stays
+    # busy ends the run with a plain message instead of an error trace. -RolledBack: the models a
+    # -Rollback run just put back; their presets are not rebuilt when the run ends here, and the run
+    # says so.
     param([object[]]$RolledBack = @())
     try {
-        # Test hook (-TestGpuStaysBusy, which only tests/Invoke-ModelUpdateTest.ps1 passes): the wait
-        # ends here the way Wait-LaiGpuIdle ends it for a card that stays busy, with the reason named.
-        if ($hookGpuStaysBusy) { throw 'The GPU counts as busy for this run: the test parameter -TestGpuStaysBusy was passed. No shortcut and no scheduled task passes it, so something else started this run.' }
-        return (Wait-LaiGpuIdle -MaxUsedMiB $maxBusy -TimeoutSec 600)
+        return (Wait-LaiGpuIdle -MaxUsedMiB $maxBusy -TimeoutSec $gpuWaitSec)
     } catch {
         Write-LaiLog FAIL $_.Exception.Message
         foreach ($rb in $RolledBack) { Write-RollbackResult -Model $rb }
@@ -367,23 +381,59 @@ function Wait-GpuIdle {
     }
 }
 
-if ($changed.Count -gt 0) {
-    $isRollback = ($Rollback.Count -gt 0)
-    Stop-LaiOllamaModels -BaseUrl $ollamaUrl
-    if ($isRollback) { $gpu = Wait-GpuIdle -RolledBack $changed } else { $gpu = Wait-GpuIdle }
-    $fingerprint = Get-CurrentFingerprint $gpu
-    $done = @()
-    foreach ($m in $changed) {
-        # -Changed only for a model whose tag this run pulled: not after a rollback (nothing was
-        # downloaded, and its -prev is used up), and not for a pinned model a plain run only rebuilds.
-        $pulled = (-not $isRollback) -and ($pinned -notcontains $m.Key)
-        $rebuilt = $false
-        if (Invoke-ModelSetup -Model $m -SetupArgs @{ Fingerprint = $fingerprint; Retune = $true } -Changed:$pulled) { $rebuilt = $true; $done += $m.Display }
-        if ($isRollback) { Write-RollbackResult -Model $m -Rebuilt:$rebuilt }
+# The models this run's -Rollback has put back and pinned and has not said its last word on yet
+# (Write-RollbackResult takes a model off the list).
+$script:rollbackOpen = @()
+# One 'try' around the rollback and the re-tune: when an error (which the trap above then reports)
+# or Ctrl+C (which no trap sees) ends the run in between, its 'finally' still says for every model
+# left on the list that its preset was not rebuilt. Here and not in the trap, which also covers the
+# lines above the functions it would need.
+try {
+    if ($Rollback.Count -gt 0) {
+        foreach ($m in $catalog.Models) {
+            if ($Rollback -notcontains 'all' -and $Rollback -notcontains $m.Key) { continue }
+            $pn = Get-PrevName $m.Source
+            if (-not (Test-LaiOllamaModel -BaseUrl $ollamaUrl -Name $pn)) {
+                Write-LaiLog WARN "$($m.Display): no previous version kept ($pn)"
+                Write-PlainRunHint $m
+                continue
+            }
+            Copy-Model $pn (Resolve-LaiModelName $m.Source)
+            # Pinned and saved right here, before the preset is rebuilt: if the re-tune below does not
+            # happen (GPU busy, a failed load, the window closed), the next plain run must rebuild the
+            # preset on this tag, not pull the new upload over it again.
+            if ($pinned -notcontains $m.Key) { $script:pinned = @($pinned) + $m.Key }
+            Save-Pins
+            # From here on the run owes this model a last word (Write-RollbackResult).
+            $script:rollbackOpen = @($script:rollbackOpen) + $m
+            Remove-Model $pn
+            # Not an OK yet: the preset still runs the newer upload until it is rebuilt (Write-RollbackResult).
+            Write-LaiLog INFO "$($m.Display): the previous version ($((Get-LaiOllamaDigest -BaseUrl $ollamaUrl -Name $m.Source).Substring(0, 12))) is back under $($m.Source) and pinned; rebuilding its preset now (if this run stops before that is done, run Update-Models.ps1 without the rollback option to finish it)"
+            $changed += $m
+        }
+        if ($changed.Count -eq 0) { throw "Nothing to roll back for: $($Rollback -join ', ')" }
     }
-    if ($done.Count) { Write-LaiLog OK "Re-tuned: $($done -join ', ')" }
-} elseif (-not $RecheckOnly) {
-    Write-LaiLog OK 'All models are current; nothing to re-tune.'
+
+    if ($changed.Count -gt 0) {
+        $isRollback = ($Rollback.Count -gt 0)
+        Stop-LaiOllamaModels -BaseUrl $ollamaUrl
+        if ($isRollback) { $gpu = Wait-GpuIdle -RolledBack $changed } else { $gpu = Wait-GpuIdle }
+        $fingerprint = Get-CurrentFingerprint $gpu
+        $done = @()
+        foreach ($m in $changed) {
+            # -Changed only for a model whose tag this run pulled: not after a rollback (nothing was
+            # downloaded, and its -prev is used up), and not for a pinned model a plain run only rebuilds.
+            $pulled = (-not $isRollback) -and ($pinned -notcontains $m.Key)
+            $rebuilt = $false
+            if (Invoke-ModelSetup -Model $m -SetupArgs @{ Fingerprint = $fingerprint; Retune = $true } -Changed:$pulled) { $rebuilt = $true; $done += $m.Display }
+            if ($isRollback) { Write-RollbackResult -Model $m -Rebuilt:$rebuilt }
+        }
+        if ($done.Count) { Write-LaiLog OK "Re-tuned: $($done -join ', ')" }
+    } elseif (-not $RecheckOnly) {
+        Write-LaiLog OK 'All models are current; nothing to re-tune.'
+    }
+} finally {
+    foreach ($rb in @($script:rollbackOpen)) { Write-RollbackResult -Model $rb }
 }
 
 # A new Ollama (this run's -UpdateOllama, or one the tray app installed by itself) can place layers
@@ -507,7 +557,7 @@ if ($failedPulls.Count -gt 0) {
 }
 $problems = $failedPulls.Count + $failedSetups.Count
 if (-not $SkipTests) {
-    & (Join-Path $PSScriptRoot 'Test-LocalAI.ps1') -AIRoot $AIRoot -Quick
+    & (Join-Path $PSScriptRoot 'Test-LocalAI.ps1') -AIRoot $AIRoot -Quick -CatalogPath $CatalogPath
     Stop-Run ([Math]::Max($LASTEXITCODE, $problems))
 }
 Stop-Run $problems

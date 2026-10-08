@@ -5,9 +5,19 @@
 
 .DESCRIPTION
     Works on private copies of the stand-in model (testorg/update-test:1b plus a variant with a
-    different digest), so the models the other suites use are never touched. A re-publish upstream is
-    simulated with LOCALAI_TEST_PULL_FROM (Update-Models copies that model over the tag instead of
-    pulling, which the offline sandbox could not do anyway).
+    different digest), so the models the other suites use are never touched.
+
+    Update-Models.ps1 has no test switch but -TestAllowCpu (this machine has no GPU) and reads no
+    test variable of its own, so what a run meets is put in its way from outside:
+      - an 'ollama' program, first on PATH for every run. Invoke-LaiOllamaPull uses the ollama CLI
+        when it finds one; this one plays 'pull <tag>' by copying the model named for that run over
+        the tag (a re-publish upstream; the registry has no such tag), and fails when none is named
+        or it does not exist.
+      - an 'nvidia-smi' program, first on PATH for one run only: a card another program fills.
+      - -CatalogPath (the one-model catalog written below) and -GpuWaitMinutes, parameters the owner
+        has too.
+    The variables the module reads (LOCALAI_TEST_GPU_BUSY, _LOAD_FAIL, _SPEED_FAIL,
+    _CHATS_IN_FLIGHT) are still set here.
 #>
 param(
     [string]$OllamaUrl = 'http://127.0.0.1:11434',
@@ -33,13 +43,34 @@ function Remove-IfThere([string]$Name) {
     if (Test-LaiOllamaModel -BaseUrl $OllamaUrl -Name $Name) { Invoke-LaiApi -Method DELETE -Uri "$OllamaUrl/api/delete" -Body @{ model = $Name } | Out-Null }
 }
 function Get-Digest([string]$Name) { return (Get-LaiOllamaDigest -BaseUrl $OllamaUrl -Name $Name) }
+function New-StandIn([string]$Program, [string]$Body) {
+    # A program for a run's PATH: an sh file named like the real one, in a folder of its own under
+    # $Work (so that putting one on PATH brings no other with it). Returns the folder.
+    $dir = Join-Path $Work "standin-$Program"
+    New-Item -ItemType Directory -Force -Path $dir | Out-Null
+    Set-Content -LiteralPath (Join-Path $dir $Program) -Value $Body.Replace("`r", '')
+    & chmod +x (Join-Path $dir $Program)
+    return $dir
+}
+function Invoke-WithPath([string]$Dir, [scriptblock]$Body) {
+    $saved = $env:PATH
+    $env:PATH = $Dir + [System.IO.Path]::PathSeparator + $saved
+    try { return (& $Body) } finally { $env:PATH = $saved }
+}
+function Get-Count([string]$Text, [string]$Phrase) {
+    # How many times a run printed a phrase.
+    return [regex]::Matches($Text, [regex]::Escape($Phrase)).Count
+}
 function Invoke-Update([string[]]$Arguments, [string]$PullFrom) {
-    $env:LOCALAI_TEST_PULL_FROM = $PullFrom
+    # -PullFrom: the model this run's 'ollama pull' copies over the tag ('' = none: a pull fails).
+    Set-Content -LiteralPath $pullFromFile -Value $PullFrom
+    $fixed = @('-CatalogPath', $catalogFile)
+    if ($run.AllowCpu) { $fixed += '-TestAllowCpu' }
     $prevPref = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
-    $out = & pwsh -NoProfile -File (Join-Path $src 'Update-Models.ps1') -AIRoot $aiRoot -SkipTests @Arguments 2>&1 | ForEach-Object { "$_" }
-    $code = $LASTEXITCODE
-    $ErrorActionPreference = $prevPref
-    $env:LOCALAI_TEST_PULL_FROM = ''
+    try {
+        $out = Invoke-WithPath $pullStandIn { & pwsh -NoProfile -File (Join-Path $src 'Update-Models.ps1') -AIRoot $aiRoot -SkipTests @fixed @Arguments 2>&1 | ForEach-Object { "$_" } }
+        $code = $LASTEXITCODE
+    } finally { $ErrorActionPreference = $prevPref }
     $out | Select-Object -Last 3 | ForEach-Object { Write-Host "    | $_" }
     return [pscustomobject]@{ Code = $code; Text = ($out -join "`n") }
 }
@@ -67,17 +98,72 @@ $catalogFile = Join-Path $Work 'models.update-test.psd1'
 }
 "@ | Set-Content -LiteralPath $catalogFile
 ConvertTo-Json @{ OllamaUrl = $OllamaUrl; SelectedModels = @('main') } | Set-Content -LiteralPath (Join-Path $aiRoot 'localai-config.json')
-$env:LOCALAI_TEST_CATALOG = $catalogFile
-$env:LOCALAI_TEST_ALLOW_CPU = '1'
+# What every run of Update-Models.ps1 below gets (Invoke-Update): the catalog above, and
+# -TestAllowCpu unless a case turns it off (no GPU here, so every preset is placed on the CPU).
+$run = @{ AllowCpu = $true }
+# 'ollama pull <tag>': copies the model named in $pullFromFile over <tag>, as a re-publish upstream
+# would bring new content. Nothing named, or a model that is not there: the pull fails.
+$pullFromFile = Join-Path $Work 'pull-from.txt'
+$pullStandIn = New-StandIn 'ollama' (@'
+#!/bin/sh
+# Stand-in for the ollama CLI (tests/Invoke-ModelUpdateTest.ps1): only 'pull' is played.
+if [ "$1" != "pull" ]; then echo "ollama stand-in: '$1' is not played" >&2; exit 2; fi
+from=$(cat 'PULLFROMFILE' 2>/dev/null)
+if [ -z "$from" ]; then echo "ollama stand-in: this run was given nothing to pull for $2" >&2; exit 1; fi
+code=$(curl -s -o /dev/null -w '%{http_code}' -X POST -H 'Content-Type: application/json' -d "{\"source\":\"$from\",\"destination\":\"$2\"}" 'OLLAMAURL/api/copy')
+if [ "$code" != "200" ]; then echo "ollama stand-in: copying $from over $2 answered HTTP $code" >&2; exit 1; fi
+echo "ollama stand-in: copied $from over $2"
+'@).Replace('PULLFROMFILE', $pullFromFile).Replace('OLLAMAURL', $OllamaUrl)
+# 'nvidia-smi': one card, 20000 of its 24576 MiB in use by another program. Get-LaiGpuInfo and
+# Wait-LaiGpuIdle ask nvidia-smi, so the run that has this first on PATH meets a GPU that stays busy.
+$busyGpuStandIn = New-StandIn 'nvidia-smi' @'
+#!/bin/sh
+# Stand-in for nvidia-smi (tests/Invoke-ModelUpdateTest.ps1): a card another program fills.
+case "$*" in
+    *--query-gpu=*) echo 'Stand-in GPU, 1.0, 24576, 20000, 4576' ;;
+    *--query-compute-apps=*) echo '4242, busy-test-app' ;;
+    *) echo "nvidia-smi stand-in: not played: $*" >&2; exit 2 ;;
+esac
+'@
 # The nightly re-check skips while a chat answer is being written: the shared sandbox's render guard
 # may be serving one, so the count comes from the hook (and no docker call is made).
 $env:LOCALAI_TEST_CHATS_IN_FLIGHT = '0'
 
 $holder = $null
 try {
+    Write-Host "`n=== 0. the script itself: no test variable, one announced test switch, one try around the rollback ===" -ForegroundColor Cyan
+    # Read from the script's syntax tree: what no run can show (a variable nobody sets here, Ctrl+C
+    # between the pin and the re-tune, the health check this suite skips with -SkipTests).
+    $umFile = Join-Path $src 'Update-Models.ps1'
+    $umAst = [System.Management.Automation.Language.Parser]::ParseFile($umFile, [ref]$null, [ref]$null)
+    $umCommands = {
+        param([System.Management.Automation.Language.Ast]$In, [string]$Name)
+        foreach ($c in $In.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] }, $true)) { if ($c.GetCommandName() -eq $Name) { $c } }
+    }
+    $umEnv = @($umAst.FindAll({ param($n) $n -is [System.Management.Automation.Language.VariableExpressionAst] -and $n.VariablePath.UserPath -like 'env:*' }, $true) | ForEach-Object { $_.VariablePath.UserPath.Substring(4) } | Sort-Object -Unique)
+    $umTestText = @($umAst.FindAll({ param($n) ($n -is [System.Management.Automation.Language.StringConstantExpressionAst] -or $n -is [System.Management.Automation.Language.ExpandableStringExpressionAst]) -and $n.Value -match 'LOCALAI_TEST_' }, $true))
+    Assert-That (@($umEnv | Where-Object { $_ -like 'LOCALAI_TEST_*' }).Count -eq 0 -and $umTestText.Count -eq 0 -and (Get-Content -LiteralPath $umFile -Raw -Encoding UTF8) -notmatch 'LOCALAI_TEST_') "Update-Models.ps1 reads no LOCALAI_TEST_ variable and does not name one (environment variables it uses: $($umEnv -join ', '))"
+    $umParams = @($umAst.ParamBlock.Parameters | ForEach-Object { $_.Name.VariablePath.UserPath })
+    $umTestParams = @($umParams | Where-Object { $_ -like 'Test*' })
+    Assert-That (($umTestParams -join ',') -eq 'TestAllowCpu' -and $umParams -contains 'GpuWaitMinutes' -and $umParams -contains 'CatalogPath') "its only test switch is -TestAllowCpu; the wait for the GPU and the catalog are parameters the owner has too ($($umTestParams -join ', '))"
+    # Ctrl+C runs no trap, only 'finally': the pin (Save-Pins) and the re-tune (Invoke-ModelSetup)
+    # of a rollback stand in one 'try', and its 'finally' gives the not-rebuilt warning
+    # (Write-RollbackResult without -Rebuilt) for what is still open.
+    $umTries = @($umAst.FindAll({ param($n) $n -is [System.Management.Automation.Language.TryStatementAst] -and $n.Finally -and @(& $umCommands $n.Finally 'Write-RollbackResult').Count -gt 0 }, $true))
+    $umGuarded = $false
+    if ($umTries.Count -eq 1) {
+        $umLast = @(& $umCommands $umTries[0].Finally 'Write-RollbackResult')
+        $umGuarded = @(& $umCommands $umTries[0].Body 'Save-Pins').Count -ge 1 -and @(& $umCommands $umTries[0].Body 'Invoke-ModelSetup').Count -ge 1 -and
+            @($umLast | ForEach-Object { $_.CommandElements } | Where-Object { $_ -is [System.Management.Automation.Language.CommandParameterAst] -and $_.ParameterName -eq 'Rebuilt' }).Count -eq 0
+    }
+    Assert-That $umGuarded "the rollback's pin and its re-tune stand in one try whose finally gives the not-rebuilt warning for every model still open: that is what Ctrl+C in between runs ($($umTries.Count) such try)"
+    $umHealth = @($umAst.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] -and $n.InvocationOperator -eq 'Ampersand' -and $n.Extent.Text -match 'Test-LocalAI\.ps1' }, $true))
+    Assert-That ($umHealth.Count -eq 1 -and @($umHealth | ForEach-Object { $_.CommandElements } | Where-Object { $_ -is [System.Management.Automation.Language.CommandParameterAst] -and $_.ParameterName -eq 'CatalogPath' }).Count -eq 1) "the health check at the end is handed the same catalog with -CatalogPath ($($umHealth.Count) call)"
+
     Write-Host "`n=== 1. nothing changed upstream ===" -ForegroundColor Cyan
     $r = Invoke-Update @() $tag
     Assert-That ($r.Code -eq 0) "update exits 0 (got $($r.Code))"
+    Assert-That ((Get-Count $r.Text '-TestAllowCpu was passed') -eq 1) 'a run that is handed the test switch -TestAllowCpu says so, once'
     Assert-That ((Get-Digest $tag) -eq $original) 'digest unchanged'
     Assert-That (-not (Test-LaiOllamaModel -BaseUrl $OllamaUrl -Name $prev)) 'no -prev kept when nothing changed'
     Assert-That (-not (Test-LaiOllamaModel -BaseUrl $OllamaUrl -Name "$tag-prevnew")) 'temporary reference cleaned up'
@@ -198,9 +284,11 @@ try {
     # A preset an earlier check left partly on the CPU is searched again from the largest context,
     # not reloaded at its stored, shrunken one (which on a quiet card would load at 100% and stay small).
     $s2 = Read-LaiState -Path $stPath; $s2['tuning']['main']['GpuPercent'] = 50; $s2['tuning']['main']['Context'] = 4096; Save-LaiState -State $s2 -Path $stPath
-    $env:LOCALAI_TEST_ALLOW_CPU = ''
-    try { $r = Invoke-Update @('-RecheckOnly') '' } finally { $env:LOCALAI_TEST_ALLOW_CPU = '1' }
+    # The one run without -TestAllowCpu: on this machine a preset partly on the CPU is what it finds.
+    $run.AllowCpu = $false
+    try { $r = Invoke-Update @('-RecheckOnly') '' } finally { $run.AllowCpu = $true }
     Assert-That ($r.Text -match 'Update test' -and $r.Text -notmatch 'reusing tuned context' -and $r.Text -match 'ctx\s+8192:') "a preset left partly on the CPU is re-tuned from the top, not reused at 4096 (exit $($r.Code))"
+    Assert-That ($r.Text -notmatch 'TestAllowCpu') 'and a run that is not handed -TestAllowCpu announces no test switch'
     $s2 = Read-LaiState -Path $stPath; $s2['tuning']['main']['GpuPercent'] = 100; Save-LaiState -State $s2 -Path $stPath
     & $setOld
 
@@ -221,6 +309,9 @@ try {
     Write-Host "`n=== 3. -Rollback main ===" -ForegroundColor Cyan
     # The words of the WARN a rollback ends with when its preset was not rebuilt to the end.
     $notRebuilt = 'rebuild of its preset was not completed'
+    # The words with which a -Rollback that finds no kept version names the plain run, when that is
+    # what rebuilds the preset.
+    $plainRunHint = 'without the rollback option to rebuild it'
     $tunedOn = { [string](Read-LaiState -Path $stPath)['tuning']['main']['Digest'] }
     $pinnedNow = { $f = (Read-LaiState -Path $stPath)['flags']; if ($f -is [hashtable]) { @($f['pinnedModels']) } else { @() } }
     $r = Invoke-Update @('-Rollback', 'main') ''
@@ -235,6 +326,7 @@ try {
     Assert-That ($r.Text -match 'Re-tuned:' -and $r.Text -notmatch $notRebuilt -and (& $tunedOn) -eq $original) 'and the preset was rebuilt on the restored version'
     $r = Invoke-Update @('-Rollback', 'main') ''
     Assert-That ($r.Code -ne 0 -and $r.Text -match 'Nothing to roll back') 'second rollback refuses clearly'
+    Assert-That ($r.Text -notmatch $plainRunHint) 'and sends nobody to a plain run: the first rollback finished, there is no preset left to rebuild'
     $r = Invoke-Update @() $variant
     Assert-That ((Get-Digest $tag) -eq $original -and $r.Text -match 'pinned after a rollback') 'rolled-back model is pinned: the next update leaves it alone'
     Assert-That ($r.Code -eq 0 -and $r.Text -notmatch 'Re-tuned:') "and its preset, already built on the restored version, is not re-tuned again (exit $($r.Code))"
@@ -256,6 +348,7 @@ try {
     Assert-That ([string](Read-LaiState -Path $stPath)['tuning']['main']['Digest'] -eq $variantDigest) 'install-state still records the upload the preset was really built on'
     $r = Invoke-Update @('-Rollback', 'main') ''
     Assert-That ($r.Code -ne 0 -and $r.Text -match 'Nothing to roll back') 'a second rollback has nothing to roll back: it cannot be what repairs the preset'
+    Assert-That ($r.Text -match 'no previous version kept' -and (Get-Count $r.Text $plainRunHint) -eq 1) 'and it names what does repair it: the plain run, which rebuilds the preset without a download'
     # While the cause lasts, a plain run tries the pinned model again and fails the same honest way.
     $env:LOCALAI_TEST_LOAD_FAIL = $tag
     try { $r = Invoke-Update @() $variant } finally { $env:LOCALAI_TEST_LOAD_FAIL = '' }
@@ -287,13 +380,45 @@ try {
 
     # The GPU stays busy: the run ends at the wait for a quiet card, before anything is tuned. The
     # tag is back and pinned by then, so the run must say that the preset is not, and not only why
-    # it stopped. (-TestGpuStaysBusy ends the wait the way ten minutes of a busy card end it.)
+    # it stopped. The nvidia-smi stand-in, on PATH for this run only, shows a card another program
+    # fills, and -GpuWaitMinutes 0 ends the wait at the first look instead of after ten minutes: the
+    # message is Wait-LaiGpuIdle's own, with the program nvidia-smi named.
     & $republish 'the GPU stays busy'
-    $r = Invoke-Update @('-Rollback', 'main', '-TestGpuStaysBusy') ''
-    Assert-That ($r.Code -eq 1 -and $r.Text -match 'The GPU counts as busy' -and $r.Text -notmatch 'Tuning Update test') "a rollback that finds the GPU busy ends there with the reason and exit 1, before any tuning (exit $($r.Code))"
+    $busyWatch = [System.Diagnostics.Stopwatch]::StartNew()
+    $r = Invoke-WithPath $busyGpuStandIn { Invoke-Update @('-Rollback', 'main', '-GpuWaitMinutes', '0') '' }
+    $busySec = [int]$busyWatch.Elapsed.TotalSeconds
+    Assert-That ($r.Code -eq 1 -and $r.Text -match 'GPU compute processes: busy-test-app' -and $r.Text -notmatch 'Tuning Update test') "a rollback that finds the GPU busy ends there with the reason and exit 1, before any tuning (exit $($r.Code))"
     Assert-That ($r.Text -match $notRebuilt -and $r.Text -notmatch 'pinned so the next update') 'it says the tag is back but the rebuild of the preset was not completed, and prints no OK for the rollback'
     Assert-That ((Get-Digest $tag) -eq $original -and -not (Test-LaiOllamaModel -BaseUrl $OllamaUrl -Name $prev)) 'its tag is back on the original, and -prev is used up'
     Assert-That (@(& $pinnedNow) -contains 'main' -and (& $tunedOn) -eq $variantDigest) "install-state.json has the model pinned and still records the upload the preset was built on (pinned: $(@(& $pinnedNow) -join ', '))"
+    Assert-That ($r.Text -match '20000 MiB of VRAM is in use' -and $r.Text -notmatch 'waiting up to' -and $busySec -lt 60) "-GpuWaitMinutes 0 does not wait for the card the stand-in shows as full: the run was over after $busySec s"
+    $warnings = Get-Count $r.Text $notRebuilt
+    Assert-That ($warnings -eq 1) "the not-rebuilt warning is the run's last word on the model exactly once, not once at the wait and again as the run ends ($warnings)"
+
+    # The run ends through an error nobody planned for, between the pin and the re-tune: the script's
+    # trap. No hook for it: an entry without content under 'tuning' in install-state.json makes the
+    # read of the stored fingerprint fail, right after the wait for the GPU. The tag is put on the
+    # new upload again and the original kept as -prev through the API (the state the busy-GPU
+    # rollback started from, with the model already pinned), so this adds no re-tune.
+    Invoke-LaiApi -Method POST -Uri "$OllamaUrl/api/copy" -Body @{ source = $variant; destination = $tag } | Out-Null
+    Invoke-LaiApi -Method POST -Uri "$OllamaUrl/api/copy" -Body @{ source = $BaseModel; destination = $prev } | Out-Null
+    $stBroken = Read-LaiState -Path $stPath
+    # Whichever entry the script reads first: with no fingerprint on the real one it goes on to the broken one.
+    $fingerprintKept = [string]$stBroken['tuning']['main']['Fingerprint']
+    if ($fingerprintKept) { $stBroken['tuning']['main']['Fingerprint'] = '' }
+    $stBroken['tuning']['broken-entry'] = $null
+    Save-LaiState -State $stBroken -Path $stPath
+    try { $r = Invoke-Update @('-Rollback', 'main') '' }
+    finally {
+        $stBroken = Read-LaiState -Path $stPath
+        $stBroken['tuning'].Remove('broken-entry')
+        if ($fingerprintKept) { $stBroken['tuning']['main']['Fingerprint'] = $fingerprintKept }
+        Save-LaiState -State $stBroken -Path $stPath
+    }
+    Assert-That ($r.Code -ne 0 -and $r.Text -match 'Cannot index into a null array' -and $r.Text -notmatch 'Tuning Update test') "a rollback that an unexpected error ends between the pin and the re-tune exits non-zero with that error, before any tuning (exit $($r.Code))"
+    $warnings = Get-Count $r.Text $notRebuilt
+    Assert-That ($warnings -eq 1 -and $r.Text -notmatch 'pinned so the next update') "it still says, exactly once, that the tag is back but the rebuild of the preset was not completed, and prints no OK for the rollback ($warnings)"
+    Assert-That ((Get-Digest $tag) -eq $original -and -not (Test-LaiOllamaModel -BaseUrl $OllamaUrl -Name $prev) -and @(& $pinnedNow) -contains 'main' -and (& $tunedOn) -eq $variantDigest) "and leaves what the busy GPU left: the tag on the original, -prev used up, the model pinned, the preset still recorded on the upload it was built on (pinned: $(@(& $pinnedNow) -join ', '))"
     & $finish 'a busy GPU'
 
     # The failure comes after the alias was rebuilt: the search on the restored tag finds a context,
@@ -373,7 +498,7 @@ try {
     $lockFreeAfter = {
         param([string]$ScriptArgs)
         Remove-Item -LiteralPath $stayReady -Force -ErrorAction SilentlyContinue
-        Set-Content -LiteralPath $stayScript -Value ("try {{ & '{0}' -AIRoot '{1}' -SkipTests {2} }} catch {{ Write-Host `$_.Exception.Message }}; Set-Content -LiteralPath '{3}' -Value x; Start-Sleep -Seconds 60" -f (Join-Path $src 'Update-Models.ps1'), $aiRoot, $ScriptArgs, $stayReady)
+        Set-Content -LiteralPath $stayScript -Value ("try {{ & '{0}' -AIRoot '{1}' -SkipTests -CatalogPath '{4}' -TestAllowCpu {2} }} catch {{ Write-Host `$_.Exception.Message }}; Set-Content -LiteralPath '{3}' -Value x; Start-Sleep -Seconds 60" -f (Join-Path $src 'Update-Models.ps1'), $aiRoot, $ScriptArgs, $stayReady, $catalogFile)
         $stay = Start-Process -FilePath 'pwsh' -ArgumentList @('-NoProfile', '-File', $stayScript) -PassThru
         for ($i = 0; $i -lt 600 -and -not (Test-Path -LiteralPath $stayReady) -and -not $stay.HasExited; $i++) { Start-Sleep -Milliseconds 200 }
         $free = $false
@@ -386,9 +511,7 @@ try {
 } finally {
     if ($holder -and -not $holder.HasExited) { $holder.Kill() }
     foreach ($n in @($tag, $variant, $prev, "$tag-prevnew", $alias)) { try { Remove-IfThere $n } catch { Write-Verbose "cleanup $n" } }
-    $env:LOCALAI_TEST_CATALOG = ''
     $env:LOCALAI_TEST_CHATS_IN_FLIGHT = ''
-    $env:LOCALAI_TEST_ALLOW_CPU = ''
 }
 
 if ($failures -eq 0) { Write-Host "`nMODEL UPDATE TEST PASSED" -ForegroundColor Green } else { Write-Host "`nMODEL UPDATE TEST FAILED ($failures)" -ForegroundColor Red }
