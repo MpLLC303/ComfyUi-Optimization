@@ -1019,8 +1019,8 @@ $stopOf = { param([hashtable]$Arguments)
 }
 $lkNone = @{ Waited = $null; Known = $null; Text = 'not run'; Seconds = -1; Said = @() }
 $lkStopArgs = @(); if ($stopDefs.Count -eq 1) { $lkStopArgs = @($stopDefs[0].Body.ParamBlock.Parameters | ForEach-Object { [string]$_.Name.VariablePath.UserPath }) }
-$lkCanRun = ($stopDefs.Count -eq 1 -and $lkStopArgs -contains 'WaitSec' -and $lkStopArgs -contains 'Otherwise' -and $lkStopArgs -contains 'EnoughSec')
-$lkFree = $lkNone; $lkHold = $lkNone; $lkShort = $lkNone; $lkLong = $lkNone; $lkReleased = $lkNone; $lkBusy = $false; $lkRun = [pscustomobject]@{ Code = -1; Text = 'not run' }
+$lkCanRun = ($stopDefs.Count -eq 1 -and $lkStopArgs -contains 'WaitSec' -and $lkStopArgs -contains 'Otherwise' -and $lkStopArgs -contains 'EnoughSec' -and $lkStopArgs -contains 'Again')
+$lkFree = $lkNone; $lkHold = $lkNone; $lkShort = $lkNone; $lkLong = $lkNone; $lkAgain = $lkNone; $lkReleased = $lkNone; $lkBusy = $false; $lkRun = [pscustomobject]@{ Code = -1; Text = 'not run' }
 $lkHoldFile = Join-Path $lkRoot 'open-webui-hold.json'
 if ($lkCanRun) {
     # The lock is free: no wait, and the row's own words are the reason; with the hold a failed
@@ -1044,10 +1044,13 @@ if ($lkCanRun) {
         while (-not (Test-LaiVolumeLockBusy) -and (Get-Date) -lt $lkDeadline -and -not $lkProc.HasExited) { Start-Sleep -Milliseconds 300 }
         $lkBusy = Test-LaiVolumeLockBusy
         if ($lkBusy) {
-            # Held past the end of the wait, twice: after a wait shorter than a backup, restore or
-            # update takes, and after one that is as long as any of them takes (3 s stands in for it).
+            # Held past the end of the wait, twice: after a wait that was cut short, and after one
+            # that is longer than a backup, restore or update normally takes (3 s stands in for it).
             $lkShort = & $stopOf @{ WaitSec = 3; Otherwise = 'exited - Start again' }
             $lkLong = & $stopOf @{ WaitSec = 3; Otherwise = 'exited - Start again'; EnoughSec = 3 }
+            # Asked by a run that has waited for the lock once already: no second wait, whatever
+            # the bound is (a lock let go and taken again cost the whole bound a second time).
+            $lkAgain = & $stopOf @{ WaitSec = 120; Otherwise = 'exited - Start again'; Again = $true }
             # The whole health check under that lock, nothing answering on its ports: the row that
             # meets the stopped Open WebUI fails, and the run does not end with 0 failures.
             $lkRun = Invoke-Child 'Test-LocalAI.ps1' @('-AIRoot', $lkRoot, '-NoContainers', '-Quick', '-LockWaitSec', '3')
@@ -1065,9 +1068,17 @@ Assert-That ($lkFree.Waited -eq $false -and $lkFree.Known -eq $false -and $lkFre
 Assert-That ($lkHold.Waited -eq $false -and $lkHold.Known -eq $true -and $lkHold.Text -ceq 'kept stopped after a failed restore (restore and its rollback failed (unit)). Recover first: run the recovery command (unit)') "lock free, with the hold a failed restore left: the reason is the hold, with its Reason and Recover line, word for word as before ($($lkHold.Text))"
 Assert-That ($lkCanRun -and $lkBusy) 'setup: another process holds the volume lock'
 Assert-That ($lkShort.Waited -eq $true -and $lkShort.Known -eq $true -and $lkShort.Seconds -ge 2.5 -and $lkShort.Seconds -lt 60 -and $lkShort.Said.Count -eq 1 -and [string]$lkShort.Said[0] -match '^\[INFO\] .*Waiting up to 3 s for the lock' -and
-    $lkShort.Text -cmatch '^Open WebUI is down and the volume lock was still held after the 3 s this check was told to wait \(-LockWaitSec\), too short a time to tell a backup, restore or update at work from a lock that is stuck\. Run the health check again without -LockWaitSec') ("lock held past a wait that was cut short: said once that it waits, then the words of a failure that claim no more than was seen, with one next step ({0:N1} s: {1})" -f $lkShort.Seconds, $lkShort.Text)
-Assert-That ($lkLong.Waited -eq $true -and $lkLong.Known -eq $true -and $lkLong.Seconds -ge 2.5 -and $lkLong.Seconds -lt 60 -and
-    $lkLong.Text -cmatch '^Open WebUI is still down, and the volume lock has been held longer than any backup, restore or update takes \(this check waited 3 s for it\), so none of them explains it: what holds the lock is stuck, or is another program\. Restart the PC, which ends whatever holds it, then run the health check again$') ("lock held past the bound, a wait as long as any backup, restore or update takes: the reason is that the lock has been held longer than any of them takes, with one next step ({0:N1} s: {1})" -f $lkLong.Seconds, $lkLong.Text)
+    $lkShort.Text -cmatch '^Open WebUI is down and the volume lock was still held after the 3 s this check was told to wait \(-LockWaitSec\), too short a time to tell a backup, restore or update at work from a lock that is stuck\. Run the health check again without -LockWaitSec: it then waits 600 s, longer than any of them normally takes$') ("lock held past a wait that was cut short: said once that it waits, then the words of a failure that claim no more than was seen, with one next step ({0:N1} s: {1})" -f $lkShort.Seconds, $lkShort.Text)
+# The step for a lock that stays held ends no work in progress. The toolkit's own scripts wait
+# longer for this lock than the health check does (an update keeps it through its download), so
+# 'held longer than any backup, restore or update takes, restart the PC' was more than the check
+# knew, and a restart in the middle of a restore leaves the volume half-swapped.
+$lkLetFinish = 'If a Local AI window is still at work on a backup, restore or update, let it finish and run the health check again\. If none is, restart the PC, which ends whatever holds the lock, and run the health check again$'
+$lkOverclaim = 'longer than any backup|none of them explains|is stuck, or is another program'
+Assert-That ($lkLong.Waited -eq $true -and $lkLong.Known -eq $true -and $lkLong.Seconds -ge 2.5 -and $lkLong.Seconds -lt 60 -and $lkLong.Text -cnotmatch $lkOverclaim -and
+    $lkLong.Text -cmatch ('^Open WebUI is still down, and the volume lock was still held after the 3 s this check waits for it, longer than a backup, restore or update normally takes\. ' + $lkLetFinish)) ("lock held past the bound, a wait longer than a backup, restore or update normally takes: the reason says that and no more (not that none of them can be at work), and its step lets a window that is still working finish before the PC is restarted ({0:N1} s: {1})" -f $lkLong.Seconds, $lkLong.Text)
+Assert-That ($lkAgain.Waited -eq $false -and $lkAgain.Known -eq $true -and $lkAgain.Seconds -ge 0 -and $lkAgain.Seconds -lt 20 -and $lkAgain.Said.Count -eq 0 -and
+    $lkAgain.Text -cmatch ('^Open WebUI is down and the volume lock is held\. This run has waited for that lock once already and does not wait a second time\. ' + $lkLetFinish)) ("lock held, asked by a run that has waited for it once already: no second wait and no second 'Waiting' line, the reason says so and gives the same step ({0:N1} s of a bound of 120: {1})" -f $lkAgain.Seconds, $lkAgain.Text)
 Assert-That ($lkReleased.Waited -eq $true -and $lkReleased.Known -eq $false -and $lkReleased.Text -ceq 'exited - Start again' -and $lkReleased.Seconds -ge 1 -and $lkReleased.Seconds -lt 100 -and $lkReleased.Said.Count -eq 1) ("lock held and released inside the bound: the wait ends when the lock is let go, the row is told to look once more (Waited), and without a hold the reason is again what the row saw ({0:N1} s of 120: {1})" -f $lkReleased.Seconds, $lkReleased.Text)
 $lkRunRow = @($lkRun.Text -split "`n" | Where-Object { $_ -match ' (PASS|WARN|FAIL|SKIP) Open WebUI reachable: ' }) -join ' '
 $lkRunEnd = @($lkRun.Text -split "`n" | Where-Object { $_ -match 'V1 COMPLETE|checks failed' }) -join ' '
@@ -1079,14 +1090,92 @@ $stopNot = @()
 foreach ($stopRow in $stopRows) {
     $stopName = [string]$stopRow.CommandElements[1].Extent.Text
     $stopBody = $stopRow.CommandElements[2].ScriptBlock
-    if (@($stopBody.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] -and $n.GetCommandName() -eq 'Get-WebUIStopReason' -and [string]$n.Extent.Text -cmatch '^Get-WebUIStopReason -WaitSec \$LockWaitSec -Otherwise ' }, $true)).Count -ne 1) { $stopNot += "$stopName does not ask Get-WebUIStopReason once, with -WaitSec `$LockWaitSec and its own words" }
+    if (@($stopBody.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] -and $n.GetCommandName() -eq 'Get-WebUIStopReason' -and [string]$n.Extent.Text -cmatch '^Get-WebUIStopReason -WaitSec \$LockWaitSec -Again:\$script:lockWaited -Otherwise ' }, $true)).Count -ne 1) { $stopNot += "$stopName does not ask Get-WebUIStopReason once, with -WaitSec `$LockWaitSec, -Again from what this run has waited already, and its own words" }
     if (@($stopBody.FindAll({ param($n) $n -is [System.Management.Automation.Language.ReturnStatementAst] -and [string]$n.Extent.Text -ceq 'return (Fail $stop.Text)' }, $true)).Count -ne 1) { $stopNot += "$stopName does not hand the reason back with 'return (Fail `$stop.Text)'" }
     if (@($stopBody.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] -and @('Warn', 'Pass', 'Skip') -contains $n.GetCommandName() -and [string]$n.Extent.Text -match '\$stop\b' }, $true)).Count -ne 0) { $stopNot += "$stopName gives a verdict other than Fail from the reason" }
 }
 $lkParam = @(); if ($hcAst.ParamBlock) { $lkParam = @($hcAst.ParamBlock.Parameters | Where-Object { [string]$_.Name.VariablePath.UserPath -eq 'LockWaitSec' }) }
 $lkEnough = @(); if ($stopDefs.Count -eq 1 -and $stopDefs[0].Body.ParamBlock) { $lkEnough = @($stopDefs[0].Body.ParamBlock.Parameters | Where-Object { [string]$_.Name.VariablePath.UserPath -eq 'EnoughSec' }) }
-Assert-That ($stopRows.Count -eq 2 -and $stopNot.Count -eq 0 -and ([string]$hcAst.Extent.Text) -notmatch 'a backup, restore or update is running and has stopped Open WebUI for a few minutes') "the Container row and the Open WebUI reachable row each ask why with the script's bound and hand the answer back as a failure; neither warns from it, and the sentence that took a held lock for a backup is gone (not so: $($stopNot -join '; '))"
-Assert-That ($lkParam.Count -eq 1 -and $lkParam[0].StaticType -eq [int] -and $lkParam[0].DefaultValue -and [string]$lkParam[0].DefaultValue.Extent.Text -ceq '600' -and $lkEnough.Count -eq 1 -and $lkEnough[0].DefaultValue -and [string]$lkEnough[0].DefaultValue.Extent.Text -ceq '600') 'the bound is the script''s -LockWaitSec, a number of seconds, 600 unless given, and that is also what the reason takes for as long as any backup, restore or update takes'
+Assert-That ($stopRows.Count -eq 2 -and $stopNot.Count -eq 0 -and ([string]$hcAst.Extent.Text) -notmatch 'a backup, restore or update is running and has stopped Open WebUI for a few minutes' -and ([string]$hcAst.Extent.Text) -cnotmatch $lkOverclaim) "the Container row and the Open WebUI reachable row each ask why with the script's bound and hand the answer back as a failure; neither warns from it, the sentence that took a held lock for a backup is gone, and so is the one that ruled a backup out (not so: $($stopNot -join '; '))"
+Assert-That ($lkParam.Count -eq 1 -and $lkParam[0].StaticType -eq [int] -and $lkParam[0].DefaultValue -and [string]$lkParam[0].DefaultValue.Extent.Text -ceq '600' -and $lkEnough.Count -eq 1 -and $lkEnough[0].DefaultValue -and [string]$lkEnough[0].DefaultValue.Extent.Text -ceq '600') 'the bound is the script''s -LockWaitSec, a number of seconds, 600 unless given, and that is also the wait the reason takes for longer than a backup, restore or update normally takes'
+# The two rows themselves, run from their own text and each in a scope of its own, as Add-Check runs
+# them, with the health check's own Pass, Fail, Warn, Skip and Get-WebUIStopReason. What a row looks
+# at is given by the case, in the order it is asked for (the last answer goes on): Lock (is the
+# volume lock held), Docker (the container's status at each look), Page (does the page answer at
+# each wait) and Hold (what a failed restore left). The rows keep what they learn in the script's
+# own variables ($script:...), which here are this file's: set before a case, removed after the
+# last. Until now only Get-WebUIStopReason ran in a test. What a row does with its answer did not:
+# the second look after a wait that ended inside the bound, and the second asking in one run.
+$rowText = @{}
+foreach ($stopRow in $stopRows) { $rowText[[string]$stopRow.CommandElements[1].Extent.Text] = [string]$stopRow.CommandElements[2].ScriptBlock.Extent.Text }
+$rowC = '"Container $c"'; $rowP = "'Open WebUI reachable'"
+$rowsOf = { param([hashtable]$Case)
+    foreach ($fd in @($hcFns) + @($stopDefs)) { . ([scriptblock]::Create($fd.Extent.Text)) }
+    $seen = @{ LockAsks = 0; Looks = 0; Waits = (New-Object System.Collections.ArrayList); Said = (New-Object System.Collections.ArrayList) }
+    # The answer for the n-th asking, and the last one for every asking after it.
+    $nth = { param([object[]]$Answers, [int]$Asked) $Answers[[Math]::Min($Asked, $Answers.Count - 1)] }
+    function Test-LaiVolumeLockBusy { $busy = [bool](& $nth @($Case['Lock']) $seen['LockAsks']); $seen['LockAsks']++; return $busy }
+    function Get-LaiWebUIHold { param($AIRoot) $null = $AIRoot; return $Case['Hold'] }
+    function Write-LaiLog([string]$Level, [string]$Message) { [void]$seen['Said'].Add("[$Level] $Message") }
+    function Wait-LaiWebUI { param($BaseUrl, [int]$TimeoutSec) $null = $BaseUrl; $answers = [bool](& $nth @($Case['Page']) $seen['Waits'].Count); [void]$seen['Waits'].Add($TimeoutSec); if (-not $answers) { throw 'no answer (unit)' } }
+    $containerLook = { param([string]$Name)
+        $status = [string](& $nth @($Case['Docker']) $seen['Looks']); $seen['Looks']++
+        return @{ Hung = ($status -eq 'hung'); Down = ($status -notmatch '^running'); Status = $status; Why = "$Name $status - Start again (look $($seen['Looks']))" }
+    }
+    # What the rows read from the script around them, under the script's own names.
+    $c = 'open-webui'; $hungMsg = 'docker gave no answer (unit)'; $LockWaitSec = [int]$Case['Bound']; $webBackSec = 77
+    $webUrl = 'http://unit.invalid'; $webPort = 39989; $startAgain = 'Start again (unit)'; $AIRoot = $lkRoot
+    $null = $c, $hungMsg, $LockWaitSec, $webBackSec, $webUrl, $webPort, $startAgain, $AIRoot, $containerLook
+    $script:engineUp = $true; $script:searxUp = $true; $script:webStopSaid = $false; $script:webAnswerSec = 30; $script:lockWaited = $false; $script:webUp = $false
+    $verdicts = @{}
+    foreach ($rowName in @($Case['Rows'])) {
+        $rowBody = & ([scriptblock]::Create($rowText[$rowName]))
+        $verdict = @(& $rowBody | Where-Object { $_ -is [hashtable] -and $_['Status'] }) | Select-Object -Last 1
+        $verdicts[$rowName] = 'no verdict'
+        if ($null -ne $verdict) { $verdicts[$rowName] = ('{0} {1}' -f $verdict['Status'], $verdict['Detail']) }
+    }
+    @{ C = [string]$verdicts[$rowC]; P = [string]$verdicts[$rowP]; LockAsks = [int]$seen['LockAsks']; Looks = [int]$seen['Looks']; Waits = (@($seen['Waits']) -join ','); Said = @($seen['Said'])
+        StopSaid = [bool]$script:webStopSaid; AnswerSec = [int]$script:webAnswerSec; Waited = [bool]$script:lockWaited; Up = [bool]$script:webUp }
+}
+$rowNone = @{ C = 'not run'; P = 'not run'; LockAsks = -1; Looks = -1; Waits = 'not run'; Said = @(); StopSaid = $null; AnswerSec = -1; Waited = $null; Up = $null }
+$rowStill = $rowNone; $rowUp = $rowNone; $rowPast = $rowNone; $rowFree = $rowNone; $rowHold = $rowNone; $pageStill = $rowNone; $pageUp = $rowNone; $pagePast = $rowNone; $bothBack = $rowNone; $bothPast = $rowNone; $bothAgain = $rowNone
+if ($lkCanRun -and $hcFns.Count -eq 5 -and $stopRows.Count -eq 2 -and $rowText.ContainsKey($rowC) -and $rowText.ContainsKey($rowP)) {
+    try {
+        # The Container row. The lock is let go inside the bound (held at the first asking, free at
+        # the second, one second later): the container is looked at once more, and it is still
+        # down, or running again. Then held past a bound of 1 s, free from the start, and free
+        # with the hold a failed restore left.
+        $rowStill = & $rowsOf @{ Rows = @($rowC); Bound = 60; Lock = @($true, $false); Docker = @('exited') }
+        $rowUp = & $rowsOf @{ Rows = @($rowC); Bound = 60; Lock = @($true, $false); Docker = @('exited', 'running healthy always') }
+        $rowPast = & $rowsOf @{ Rows = @($rowC); Bound = 1; Lock = @($true); Docker = @('exited') }
+        $rowFree = & $rowsOf @{ Rows = @($rowC); Bound = 60; Lock = @($false); Docker = @('exited') }
+        $rowHold = & $rowsOf @{ Rows = @($rowC, $rowP); Bound = 60; Lock = @($false); Docker = @('exited'); Page = @($false); Hold = @{ Reason = 'the swap failed (unit)'; Recover = 'the recovery command (unit)' } }
+        # The row for the page, when it is the one that meets the stopped Open WebUI (-NoContainers).
+        $pageStill = & $rowsOf @{ Rows = @($rowP); Bound = 60; Lock = @($true, $false); Page = @($false) }
+        $pageUp = & $rowsOf @{ Rows = @($rowP); Bound = 60; Lock = @($true, $false); Page = @($false, $true) }
+        $pagePast = & $rowsOf @{ Rows = @($rowP); Bound = 1; Lock = @($true); Page = @($false) }
+        # Both rows in one run: the container back after the wait, the lock held past the bound,
+        # and the lock let go inside the bound and taken again before the row for the page asks.
+        $bothBack = & $rowsOf @{ Rows = @($rowC, $rowP); Bound = 60; Lock = @($true, $false); Docker = @('exited', 'running healthy always'); Page = @($true) }
+        $bothPast = & $rowsOf @{ Rows = @($rowC, $rowP); Bound = 1; Lock = @($true); Docker = @('exited'); Page = @($false) }
+        $bothAgain = & $rowsOf @{ Rows = @($rowC, $rowP); Bound = 60; Lock = @($true, $false, $true); Docker = @('exited'); Page = @($false) }
+    } catch { Write-Host "  the row cases stopped: $($_.Exception.Message)" }
+    finally { Remove-Variable -Name engineUp, searxUp, webStopSaid, webAnswerSec, lockWaited, webUp -Scope Script -ErrorAction SilentlyContinue }
+}
+$rowNoAnswer = 'FAIL no answer on http://localhost:39989 - Start again (unit); if it persists: docker logs --tail 50 open-webui'
+$rowHeldPast = '^FAIL Open WebUI is down and the volume lock was still held after the 1 s this check was told to wait \(-LockWaitSec\)'
+Assert-That ($rowStill.C -ceq 'FAIL open-webui exited - Start again (look 2)' -and $rowStill.Looks -eq 2 -and $rowStill.LockAsks -eq 2 -and $rowStill.Waited -eq $true -and $rowStill.StopSaid -eq $false -and $rowStill.AnswerSec -eq 30 -and @($rowStill.Said | Where-Object { $_ -match 'Waiting up to 60 s for the lock' }).Count -eq 1) "the Container row, lock let go inside the bound and the container still down: it looks once more and fails with what that look saw, never a pass or a warning ($($rowStill.C); looks: $($rowStill.Looks))"
+Assert-That ($rowUp.C -ceq 'PASS running healthy always' -and $rowUp.Looks -eq 2 -and $rowUp.Waited -eq $true -and $rowUp.StopSaid -eq $false -and $rowUp.AnswerSec -eq 77) "the Container row, lock let go inside the bound and the container running again: it passes on the second look, and the page gets the longer time to come up ($($rowUp.C); the page gets $($rowUp.AnswerSec) s)"
+Assert-That ($rowPast.C -cmatch $rowHeldPast -and $rowPast.Looks -eq 2 -and $rowPast.StopSaid -eq $true -and $rowPast.Waited -eq $true -and $rowFree.C -ceq 'FAIL open-webui exited - Start again (look 1)' -and $rowFree.Looks -eq 1 -and $rowFree.LockAsks -eq 1 -and $rowFree.Waited -eq $false -and $rowFree.Said.Count -eq 0) "the Container row, lock held past the bound: it fails with the lock's words; lock free: no wait, one look, and it fails with what that look saw ($($rowPast.C) | $($rowFree.C))"
+Assert-That ($rowHold.C -ceq 'FAIL kept stopped after a failed restore (the swap failed (unit)). Recover first: the recovery command (unit)' -and $rowHold.StopSaid -eq $true -and $rowHold.P -ceq 'SKIP Open WebUI is down (see Container open-webui)' -and $rowHold.Waits -ceq '' -and
+    $bothPast.C -cmatch $rowHeldPast -and $bothPast.P -ceq 'SKIP Open WebUI is down (see Container open-webui)' -and $bothPast.Waits -ceq '') "a hold, or a lock held past the bound, is failed by the Container row, and the row for the page skips without waiting for the page ($($rowHold.C) / $($rowHold.P) | $($bothPast.P))"
+Assert-That ($pageStill.P -ceq $rowNoAnswer -and $pageStill.Waits -ceq '30,77' -and $pageStill.Waited -eq $true -and $pageStill.Up -eq $false -and $pageUp.P -ceq 'PASS http://localhost:39989' -and $pageUp.Waits -ceq '30,77' -and $pageUp.Up -eq $true) "the row for the page, lock let go inside the bound: Open WebUI gets the longer time to come up, and the row fails when it still does not answer and passes when it does ($($pageStill.P) | $($pageUp.P); waits: $($pageStill.Waits))"
+Assert-That ($pagePast.P -cmatch $rowHeldPast -and $pagePast.Waits -ceq '30,5' -and $pagePast.Up -eq $false -and $bothBack.C -ceq 'PASS running healthy always' -and $bothBack.P -ceq 'PASS http://localhost:39989' -and $bothBack.Waits -ceq '77' -and $bothBack.Up -eq $true) "the row for the page, lock held past the bound: a short look, then it fails with the lock's words; and after a wait that brought the container back, the page is given the longer time and passes ($($pagePast.P) | waits: $($pagePast.Waits) and $($bothBack.Waits))"
+# A lock let go inside the bound and taken again: the Container row waited and failed on what it
+# saw, and the row for the page, asking a second time in the same run, waited the whole bound again
+# (about twenty minutes in all with the bound as shipped). The wait is taken once in a run.
+Assert-That ($bothAgain.C -ceq 'FAIL open-webui exited - Start again (look 2)' -and $bothAgain.P -cmatch '^FAIL Open WebUI is down and the volume lock is held\. This run has waited for that lock once already and does not wait a second time\. ' -and $bothAgain.LockAsks -eq 3 -and $bothAgain.Waits -ceq '30' -and
+    @($bothAgain.Said | Where-Object { $_ -match 'Waiting up to' }).Count -eq 1) "a second asking in one run does not wait for the lock again: the row for the page asks once, is told at once that the lock is held, and fails with that ($($bothAgain.P); the lock was asked $($bothAgain.LockAsks) times, 'Waiting' was said $(@($bothAgain.Said | Where-Object { $_ -match 'Waiting up to' }).Count) time(s))"
 # Before the count at the end: a run that did not find Open WebUI answering and has no failed row
 # gets one. The judge of that on canned rows, and its place in the script.
 $lkDown = @()
@@ -1102,6 +1191,48 @@ $guardIf = @($hcAst.EndBlock.Statements | Where-Object { $_ -is [System.Manageme
 $failsSet = @($hcAst.EndBlock.Statements | Where-Object { $_ -is [System.Management.Automation.Language.AssignmentStatementAst] -and [string]$_.Left.Extent.Text -eq '$fails' })
 $guardAdds = ''; if ($guardIf.Count -eq 1) { $guardAdds = [string]$guardIf[0].Clauses[0].Item2.Extent.Text }
 Assert-That ($guardIf.Count -eq 1 -and $failsSet.Count -eq 1 -and $guardIf[0].Extent.EndOffset -lt $failsSet[0].Extent.StartOffset -and $guardAdds -cmatch "Add-Check 'Open WebUI answers' \{ Fail `"Open WebUI did not answer in this run") "the health check asks that right before it counts its failures and adds a failed row, so a run in which Open WebUI is stopped never ends with 0 failures ($guardAdds)"
+# The third part of this item is the installer's, and its cases are in the installer's mock run,
+# which runs on Linux only. One of them needs Windows as well and is kept here, with the other two
+# parts: the installer's look at a models folder follows no junction and no symbolic link. Such a
+# folder lies in the user's profile, where any program of the user's can put a link in place of a
+# folder, and the look is taken with administrator rights: through a link it listed a folder only
+# administrators can read and said whether a manifest was in it (Windows PowerShell 5.1's
+# Get-ChildItem -Recurse follows a junction at any depth). The installer's own function, on a
+# folder with a link in place of manifests, with one under manifests, with one next to a real
+# manifest, and on a link in place of the models folder itself; 'victim' is what the links lead to.
+$mlDef = ([System.Management.Automation.Language.Parser]::ParseFile((Join-Path $src 'Install-LocalAI.ps1'), [ref]$null, [ref]$null)).Find({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Get-ModelFolderContent' }, $true)
+$mlRoot = Join-Path $Work 'model-links'
+$mlIn = { param([string[]]$Parts) $at = $mlRoot; foreach ($part in $Parts) { $at = Join-Path $at $part }; $at }
+$mlManifest = @('registry', 'library', 'm')
+foreach ($mlFolder in @((& $mlIn (@('victim') + $mlManifest)), (& $mlIn (@('plain', 'manifests') + $mlManifest)), (& $mlIn @('at-manifests')), (& $mlIn @('under-manifests', 'manifests')), (& $mlIn (@('beside', 'manifests') + $mlManifest)))) { New-Item -ItemType Directory -Force -Path $mlFolder | Out-Null }
+foreach ($mlFile in @((& $mlIn (@('victim') + $mlManifest + @('latest'))), (& $mlIn (@('plain', 'manifests') + $mlManifest + @('latest'))), (& $mlIn (@('beside', 'manifests') + $mlManifest + @('latest'))))) { Set-Content -LiteralPath $mlFile -Value '{}' }
+$mlLink = { param([string]$Link, [string]$Target)
+    if ($onWindows) { $prev = $ErrorActionPreference; $ErrorActionPreference = 'Continue'; & cmd.exe /c mklink /J $Link $Target 2>&1 | Out-Null; $ErrorActionPreference = $prev } else { & ln -s $Target $Link }
+}
+& $mlLink (& $mlIn @('at-manifests', 'manifests')) (& $mlIn @('victim'))
+& $mlLink (& $mlIn @('under-manifests', 'manifests', 'registry')) (& $mlIn @('victim', 'registry'))
+& $mlLink (& $mlIn @('beside', 'manifests', 'other')) (& $mlIn @('victim'))
+& $mlLink (& $mlIn @('whole')) (& $mlIn @('plain'))
+$mlMade = (Test-Path -LiteralPath (& $mlIn (@('at-manifests', 'manifests') + $mlManifest + @('latest')))) -and (Test-Path -LiteralPath (& $mlIn (@('under-manifests', 'manifests') + $mlManifest + @('latest')))) -and
+    (Test-Path -LiteralPath (& $mlIn (@('beside', 'manifests', 'other') + $mlManifest + @('latest')))) -and (Test-Path -LiteralPath (& $mlIn (@('whole', 'manifests') + $mlManifest + @('latest'))))
+$mlGot = @{}
+if ($mlDef) {
+    try {
+        $mlGot = & {
+            . ([scriptblock]::Create($mlDef.Extent.Text))
+            $mlSaid = @{}
+            foreach ($mlName in 'plain', 'at-manifests', 'under-manifests', 'beside', 'whole') { $mlSaid[$mlName] = [string](Get-ModelFolderContent -Path (& $mlIn @($mlName))) }
+            # A folder that is not there: below a real folder, and below the link.
+            $mlSaid['gone'] = [string](Get-ModelFolderContent -Path (& $mlIn @('plain', 'not-there')))
+            $mlSaid['gone below a link'] = [string](Get-ModelFolderContent -Path (& $mlIn @('whole', 'not-there')))
+            $mlSaid
+        }
+    } catch { Write-Host "  the models folder cases stopped: $($_.Exception.Message)" }
+}
+Assert-That ($mlMade -and $mlGot['plain'] -ceq 'models') "setup: each link leads to a manifest in another folder, and a models folder without links holds models (links: $mlMade; plain: $($mlGot['plain']))"
+Assert-That ($mlGot['at-manifests'] -ceq 'link' -and $mlGot['under-manifests'] -ceq 'link' -and $mlGot['whole'] -ceq 'link') "the installer's look at a models folder follows no link: a link in place of manifests, one under manifests, and one in place of the folder itself are each answered 'link', not with what lies behind them (at manifests: $($mlGot['at-manifests']); under manifests: $($mlGot['under-manifests']); the folder itself: $($mlGot['whole']))"
+Assert-That ($mlGot['beside'] -ceq 'models') "and a manifest in a folder that is no link still counts, whatever link lies next to it ($($mlGot['beside']))"
+Assert-That ($mlGot['gone'] -ceq 'absent' -and $mlGot['gone below a link'] -ceq 'link') "a folder that is not there is 'absent' below a real folder, and below a link it is 'link' like everything else there: whether it exists is not said either (below a real folder: $($mlGot['gone']); below the link: $($mlGot['gone below a link']))"
 
 Write-Host "`n=== Test-LocalAI: anything listening beyond localhost is reported ===" -ForegroundColor Cyan
 if ($onWindows) {

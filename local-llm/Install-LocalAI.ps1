@@ -630,18 +630,6 @@ function Get-FreeGB {
     return [Math]::Round($disk.FreeSpace / 1GB, 1)
 }
 
-function Get-FolderSizeText {
-    # '18.6 GB' or '412 MB': the files under a folder, added up ('0 MB' when it is not there).
-    param([Parameter(Mandatory)][string]$Path)
-    $bytes = [long]0
-    # (Asked first: -File is the file system's own parameter, unknown for a drive that is not there.)
-    if (Test-Path -LiteralPath $Path) {
-        foreach ($f in @(Get-ChildItem -LiteralPath $Path -Recurse -File -Force -ErrorAction SilentlyContinue)) { $bytes += $f.Length }
-    }
-    if ($bytes -ge 1GB) { return "$([Math]::Round($bytes / 1GB, 1)) GB" }
-    return "$([Math]::Round($bytes / 1MB)) MB"
-}
-
 function Get-OllamaLiveConfig {
     # OLLAMA_MODELS / OLLAMA_HOST as the Ollama server last started with them (its server.log), after
     # the tray app's own settings overrode the environment; $null when there is no such log line.
@@ -651,33 +639,64 @@ function Get-OllamaLiveConfig {
 function Get-ModelFolderContent {
     # What a models folder holds, as far as it can be looked at: 'models' (at least one manifest),
     # 'empty' (it was read, and there is none), 'absent' (no such folder, on a drive that is there:
-    # nothing can be in it) or 'unknown' (nothing can be said: its drive is unplugged or offline, or
-    # reading it failed). Only 'empty' and 'absent' say that no models are there.
-    # Test-Path first: on a drive that is not there, Join-Path and -File stop the script.
+    # nothing can be in it), 'unknown' (nothing can be said: its drive is unplugged or offline, or
+    # reading it failed) or 'link' (nothing can be said either: the folder, a folder above it, its
+    # manifests folder or a folder in that is a junction or symbolic link, and no link is
+    # followed). Only 'empty' and 'absent' say that no models are there.
+    # Why no link is followed: this run has administrator rights, and the folder, though one the
+    # installer chose, lies where the user, and so any program of the user's, can put a link in
+    # place of a folder (the user profile; and the plan is kept in the install folder's state,
+    # which the user can write). Followed, a link at the folder, above it or under manifests would
+    # have this run list a folder only administrators can read, and the answer, 'models' or not,
+    # goes into the install log, which the user can read. Windows PowerShell 5.1's
+    # Get-ChildItem -Recurse follows junctions, so manifests is walked here folder by folder.
+    # A file found in a folder that is no link is 'models' whatever links lie next to it. Links are
+    # asked for before 'absent' is said: below a link, whether a folder is there is not said either.
+    # Test-Path first: on a drive that is not there, Join-Path stops the script (and there is
+    # nothing above the folder to ask for links).
     param([Parameter(Mandatory)][string]$Path)
-    if (-not (Test-Path -LiteralPath $Path)) {
+    $there = Test-Path -LiteralPath $Path
+    if (-not $there) {
         $root = ''
         try { $root = [string][System.IO.Path]::GetPathRoot($Path) } catch { Write-Verbose "no root in $Path" }
-        if ($root -and (Test-Path -LiteralPath $root)) { return 'absent' }
-        return 'unknown'
+        if (-not ($root -and (Test-Path -LiteralPath $root))) { return 'unknown' }
     }
+    if (Get-LaiReparsePath -Path $Path) { return 'link' }
+    if (-not $there) { return 'absent' }
     $manifests = Join-Path $Path 'manifests'
     if (-not (Test-Path -LiteralPath $manifests)) { return 'empty' }
-    $readErrors = @()
-    $first = @(Get-ChildItem -LiteralPath $manifests -Recurse -File -Force -ErrorAction SilentlyContinue -ErrorVariable readErrors | Select-Object -First 1)
-    if ($first.Count -gt 0) { return 'models' }
-    if (@($readErrors).Count -gt 0) { return 'unknown' }
+    $linked = $false; $unread = $false
+    $todo = New-Object System.Collections.Stack
+    $todo.Push($manifests)
+    while ($todo.Count -gt 0) {
+        $folder = [string]$todo.Pop()
+        # Asked of the folder itself right before it is listed: manifests on the first turn, and on
+        # later ones a folder that could have been swapped for a link since it was listed.
+        $self = Get-Item -LiteralPath $folder -Force -ErrorAction SilentlyContinue
+        if (-not $self) { $unread = $true; continue }
+        if ($self.Attributes -band [IO.FileAttributes]::ReparsePoint) { $linked = $true; continue }
+        $readErrors = @()
+        $inside = @(Get-ChildItem -LiteralPath $folder -Force -ErrorAction SilentlyContinue -ErrorVariable readErrors)
+        if (@($readErrors).Count -gt 0) { $unread = $true }
+        foreach ($item in $inside) {
+            if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) { $linked = $true; continue }
+            if ($item.PSIsContainer) { $todo.Push($item.FullName); continue }
+            return 'models'
+        }
+    }
+    if ($linked) { return 'link' }
+    if ($unread) { return 'unknown' }
     return 'empty'
 }
 
 function Test-OwnModelFolder {
     # $true for a folder the installer chose itself: one of -Own (the model folder in its state, the
     # value it wrote into OLLAMA_MODELS, Ollama's default folder; an empty entry counts for nothing).
-    # Only such a folder is opened and listed by this run, which has administrator rights. The
-    # folder Ollama uses now is read from Ollama's log, or from the user's OLLAMA_MODELS, and any
-    # program of this user can write both: a folder that only they name could be one this user
-    # cannot list, and whether it exists, whether it holds a manifest and how big it is would
-    # end up in the install log, which this user can read.
+    # Only such a folder is opened and listed by this run, which has administrator rights, and
+    # then without following a link (Get-ModelFolderContent). The folder Ollama uses now is read
+    # from Ollama's log, or from the user's OLLAMA_MODELS, and any program of this user can write
+    # both: a folder that only they name could be one this user cannot list, and whether it exists
+    # and whether it holds a manifest would end up in the install log, which this user can read.
     param([string]$Path, [string[]]$Own = @())
     foreach ($folder in $Own) { if ($folder -and (Test-LaiSamePath $Path $folder)) { return $true } }
     return $false
@@ -687,7 +706,8 @@ function Get-OllamaListedContent {
     # Whether the running Ollama has models, from its own list and without looking at any folder:
     # Content is 'models' (it lists some), 'empty' (it lists none) or 'unknown' (it did not answer),
     # and Listed how many it lists (-1 without an answer). Asked in place of Get-ModelFolderContent
-    # for a folder in use that the installer did not choose itself (Test-OwnModelFolder).
+    # for a folder in use that the installer did not choose itself (Test-OwnModelFolder), and for
+    # one it chose that is, or lies behind, a link.
     param([string]$OllamaUrl)
     try { $listed = @(Get-LaiOllamaModelNames -BaseUrl $OllamaUrl | Where-Object { $_ }).Count }
     catch { return @{ Content = 'unknown'; Listed = -1 } }
@@ -1342,13 +1362,21 @@ Invoke-Stage 'Preflight' {
     elseif ($State.flags['modelDir'] -and -not (Test-LaiSamePath ([string]$State.flags['modelDir']) $defaultModels)) { $ownModelsVar = [string]$State.flags['modelDir'] }
     # What the folder in use holds: 'models', 'empty', 'absent' or 'unknown'. It is looked at only
     # when the installer chose it itself: Ollama's default folder, the folder of the last plan, or
-    # the value the installer wrote into OLLAMA_MODELS (Test-OwnModelFolder says why). A folder that
-    # only Ollama's log or a variable of the user's names is never opened here: for it the running
-    # Ollama's own list of models decides (some: 'models', none: 'empty', no answer: 'unknown').
+    # the value the installer wrote into OLLAMA_MODELS (Test-OwnModelFolder says why), and only as
+    # far as no junction or symbolic link has to be followed (Get-ModelFolderContent says why, and
+    # answers 'link'). A folder that only Ollama's log or a variable of the user's names is never
+    # opened here, and neither is one behind a link: for both the running Ollama's own list of
+    # models decides (some: 'models', none: 'empty', no answer: 'unknown'). $lookedAt says which
+    # of the two ways it was, and $notLookedWhy why the folder was left alone.
     $inUseOwn = Test-OwnModelFolder -Path $inUse -Own @($defaultModels, [string]$State.flags['modelDir'], $ownModelsVar)
-    $inUseContent = 'empty'; $ollamaListed = -1
-    if ($otherModelDir -and $inUseOwn) { $inUseContent = Get-ModelFolderContent -Path $inUse }
-    elseif ($otherModelDir) {
+    $inUseContent = 'empty'; $ollamaListed = -1; $lookedAt = $false
+    $notLookedWhy = "$inUseSaidBy names it, and the installer did not choose it itself"
+    if ($otherModelDir -and $inUseOwn) {
+        $inUseContent = Get-ModelFolderContent -Path $inUse
+        $lookedAt = ($inUseContent -ne 'link')
+        $notLookedWhy = 'it is, or lies behind, a junction or symbolic link, which the installer does not follow with administrator rights'
+    }
+    if ($otherModelDir -and -not $lookedAt) {
         $byList = Get-OllamaListedContent -OllamaUrl $OllamaUrl
         $inUseContent = $byList['Content']; $ollamaListed = $byList['Listed']
     }
@@ -1363,7 +1391,10 @@ Invoke-Stage 'Preflight' {
         if ($State.flags['modelDir']) { $planWithout = [string]$State.flags['modelDir'] } elseif ($envModels) { $planWithout = $envModels }
         $keep = 'without -ModelDir'
         if (-not (Test-LaiSamePath $planWithout $inUse)) { $keep = 'with -ModelDir ' + (ConvertTo-PsLiteral $inUse) }
-        $move = 'quit Ollama from its tray icon, move everything in {0} into {1}, and run the installer again with -ModelDir {2}' -f $inUse, $target, (ConvertTo-PsLiteral $target)
+        # After the move Ollama is started again when the folder was not looked at: the next run
+        # goes by Ollama's list there too, and without an answer it could only warn and wait.
+        $thenRun = 'and run'; if (-not $lookedAt) { $thenRun = 'start Ollama again, and run' }
+        $move = 'quit Ollama from its tray icon, move everything in {0} into {1}, {3} the installer again with -ModelDir {2}' -f $inUse, $target, (ConvertTo-PsLiteral $target), $thenRun
         # With Ollama's default folder as the target no variable is written, and one that is not the
         # installer's own stays, as the Ollama stage decides it (Get-OllamaModelsVarPlan). Ollama
         # would go on using the folder that variable names, and every model moved out of it would
@@ -1374,21 +1405,34 @@ Invoke-Stage 'Preflight' {
                 $move = ("first remove the OLLAMA_MODELS variable from {0} (Start menu > '{1}'): it names {2} and is not the installer's own setting, so the installer leaves it, and while it is there Ollama keeps its models in that folder, not in {3}. Then " -f $stays['Where'], $stays['Editor'], $stays['Kept'], $target) + $move
             }
         }
-        # Where the models are: with their size for a folder the installer chose and has looked at.
-        # For any other folder what is known is what Ollama lists and who names the folder: it was
-        # not looked at, and no size is taken from it.
-        if ($inUseOwn) { $modelsAre = 'they are in {0} (about {1})' -f $inUse, (Get-FolderSizeText (Join-Path $inUse 'blobs')) }
-        else { $modelsAre = 'the running Ollama lists {0} model(s), and {1} names {2} as the folder they are in. The installer did not choose that folder itself, so it was not looked at and no size is given' -f $ollamaListed, $inUseSaidBy, $inUse }
-        throw ("-ModelDir {0} is not the folder Ollama keeps its models in now: {1}. Going on would download every model again into {0} and leave the old copy where it is. Nothing was changed. Either run the installer again {2} (the models stay in {3}), or {4}." -f $target, $modelsAre, $keep, $inUse, $move)
+        # Where the models are, and the two ways on. Of a folder that was looked at: that they are
+        # in it, and that they stay there. Of one that was not, what is known is what Ollama lists
+        # and why the folder was left alone. That the models are in it is then the owner's to check
+        # before a run plans that folder (the installer would create it with administrator rights
+        # and keep it as its own from then on): the way that keeps them is given on that condition,
+        # with the place where Ollama shows its folder. No size is given of any folder: adding one
+        # up meant listing every file under it, through whatever link lay there.
+        $modelsAre = 'they are in {0}' -f $inUse
+        $ways = 'Either run the installer again {0} (the models stay in {1}), or {2}.' -f $keep, $inUse, $move
+        if (-not $lookedAt) {
+            $modelsAre = 'the running Ollama lists {0} model(s), and {1}, the folder they should be in, was not looked at ({2})' -f $ollamaListed, $inUse, $notLookedWhy
+            $ways = 'If your models are in {1} (the Ollama app shows the folder it uses under Settings > Model location), run the installer again {0} to keep them there. To move them instead: {2}.' -f $keep, $inUse, $move
+        }
+        throw ("-ModelDir {0} is not the folder Ollama keeps its models in now: {1}. Going on would download every model again into {0} and leave the old copy where it is. Nothing was changed. {2}" -f $target, $modelsAre, $ways)
     }
     if ($inUseContent -eq 'unknown') {
         # Not refused: a disk that is gone for good must not keep the owner from another folder. But
         # said, and with time to stop: what follows is the very download this check is there for.
-        # For a folder the installer did not choose, 'unknown' is an Ollama that did not answer: the
-        # folder was not looked at, and the warning says that, not that it cannot be looked at.
-        $notSeen = 'cannot be looked at (its drive is unplugged or offline, or the folder cannot be read)'; $toSee = 'connect the drive'
-        if (-not $inUseOwn) { $notSeen = "was not looked at ($inUseSaidBy names it, and the installer did not choose it itself), and Ollama, whose list of models would tell, did not answer"; $toSee = 'start Ollama' }
-        Write-LaiLog WARN ("The folder Ollama uses now, {0}, {3}, so the installer cannot tell whether models are in it. This run goes on with {1}: models in {0} are not used any more, and every model that is not in {1} yet is downloaded again. Not wanted? Close this window now, {4}, and run the installer again with -ModelDir {2}. Continuing in 20 seconds." -f $inUse, $target, (ConvertTo-PsLiteral $inUse), $notSeen, $toSee)
+        # For a folder that was not looked at, 'unknown' is an Ollama that did not answer: the
+        # warning says that, not that the folder cannot be looked at, and what it gives to do is to
+        # start Ollama and run the same command again, not to plan a folder nobody has looked at.
+        $notSeen = 'cannot be looked at (its drive is unplugged or offline, or the folder cannot be read)'
+        $stopNow = 'connect the drive, and run the installer again with -ModelDir ' + (ConvertTo-PsLiteral $inUse)
+        if (-not $lookedAt) {
+            $notSeen = "was not looked at ($notLookedWhy), and Ollama, whose list of models would tell, did not answer"
+            $stopNow = 'start Ollama, and run the installer again in the same way: it then goes by the models Ollama lists'
+        }
+        Write-LaiLog WARN ("The folder Ollama uses now, {0}, {2}, so the installer cannot tell whether models are in it. This run goes on with {1}: models in {0} are not used any more, and every model that is not in {1} yet is downloaded again. Not wanted? Close this window now, {3}. Continuing in 20 seconds." -f $inUse, $target, $notSeen, $stopNow)
         Start-Sleep -Seconds 20
     }
     if ($ownModelsVar -and -not $State.flags.ContainsKey('ollamaModelsEnv')) { $State.flags['ollamaModelsEnv'] = $ownModelsVar }
@@ -1413,11 +1457,11 @@ Invoke-Stage 'Preflight' {
         if ($otherModelDir) {
             $inFolder = @($present | Select-Object -Unique)
             $inFolderText = 'none there yet'; if ($inFolder.Count) { $inFolderText = $inFolder -join ', ' }
-            # 'holds no models' only of a folder that was read; of one the installer did not choose,
-            # and so did not read, what the running Ollama's list said.
+            # 'holds no models' only of a folder that was read; of one that was not looked at (not
+            # the installer's own choice, or behind a link), what the running Ollama's list said.
             $inUseText = 'which holds no models'
             if ($inUseContent -eq 'absent') { $inUseText = 'a folder that is not there' } elseif ($inUseContent -eq 'unknown') { $inUseText = 'which could not be looked at' }
-            if (-not $inUseOwn) {
+            if (-not $lookedAt) {
                 $inUseText = 'which was not looked at; the running Ollama lists no models'
                 if ($inUseContent -eq 'unknown') { $inUseText = 'which was not looked at, and Ollama did not answer' }
             }

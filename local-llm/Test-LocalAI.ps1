@@ -42,6 +42,7 @@ param(
     [switch]$CpuCheck,
     # Seconds to wait, when Open WebUI is found down while a backup, restore or update holds the
     # volume lock, for that work to finish before Open WebUI is judged (they stop it for minutes).
+    # The wait is taken once in a run.
     [int]$LockWaitSec = 600
 )
 $ErrorActionPreference = 'Stop'
@@ -94,19 +95,31 @@ function Skip([string]$d) { @{ Status = 'SKIP'; Detail = $d } }
 # the wait; the hold a failed restore left, with its reason and the way out; else -Otherwise, what
 # the row itself saw. Known says that it is one of the first two. The lock is asked first, as the
 # health watch does: a restore still running has written its hold already, but has not failed.
-# -EnoughSec is what any backup, restore or update finishes within (the default of -LockWaitSec):
-# only a wait of at least that long says that the lock was held longer than any of them takes. A
-# shorter one (-LockWaitSec given) cannot tell work in progress from a lock that is stuck, says so,
-# and is a failure all the same.
+# The words for a lock that stays held claim what was seen and no more: that it was still held
+# after the wait. Who holds it is not known, and the toolkit's own scripts wait longer for this
+# lock than this check does (Start again, the installer, an update; and an update keeps the lock
+# through its download), so the words never say that no backup, restore or update can be at
+# work, and the step they give ends none of them: a window that is still working is left to
+# finish, and the PC is restarted only when there is none (a restore cut off by a restart leaves
+# the volume half-swapped). -EnoughSec is the wait that is longer than a backup, restore or
+# update normally takes (the default of -LockWaitSec). A shorter one (-LockWaitSec given) cannot
+# tell work in progress from a lock that is stuck, says so, and is a failure all the same.
+# -Again: this run has waited for the lock once already, and the wait is taken once in a run. A
+# lock that is let go and taken again, or that the next row meets still held, would otherwise be
+# waited for a second time, -LockWaitSec seconds each. Asked again, a held lock is said at once.
 function Get-WebUIStopReason {
-    param([int]$WaitSec = 0, [string]$Otherwise = '', [int]$EnoughSec = 600)
+    param([int]$WaitSec = 0, [string]$Otherwise = '', [int]$EnoughSec = 600, [switch]$Again)
+    if ($Again) { $WaitSec = 0 }
+    $letFinish = 'If a Local AI window is still at work on a backup, restore or update, let it finish and run the health check again. If none is, restart the PC, which ends whatever holds the lock, and run the health check again'
     $waited = $false
     $until = (Get-Date).AddSeconds([Math]::Max(0, $WaitSec))
     while (Test-LaiVolumeLockBusy) {
         if ((Get-Date) -ge $until) {
-            $held = "Open WebUI is down and the volume lock was still held after the $WaitSec s this check was told to wait (-LockWaitSec), too short a time to tell a backup, restore or update at work from a lock that is stuck. Run the health check again without -LockWaitSec: it then waits as long as any of them takes"
-            if ($WaitSec -ge $EnoughSec) { $held = "Open WebUI is still down, and the volume lock has been held longer than any backup, restore or update takes (this check waited $WaitSec s for it), so none of them explains it: what holds the lock is stuck, or is another program. Restart the PC, which ends whatever holds it, then run the health check again" }
-            return @{ Waited = $true; Known = $true; Text = $held }
+            $held = "Open WebUI is down and the volume lock was still held after the $WaitSec s this check was told to wait (-LockWaitSec), too short a time to tell a backup, restore or update at work from a lock that is stuck. Run the health check again without -LockWaitSec: it then waits $EnoughSec s, longer than any of them normally takes"
+            if ($WaitSec -ge $EnoughSec) { $held = "Open WebUI is still down, and the volume lock was still held after the $WaitSec s this check waits for it, longer than a backup, restore or update normally takes. $letFinish" }
+            if ($Again) { $held = "Open WebUI is down and the volume lock is held. This run has waited for that lock once already and does not wait a second time. $letFinish" }
+            # Waited only when this call did wait: the row then looks at Open WebUI once more.
+            return @{ Waited = $waited; Known = $true; Text = $held }
         }
         if (-not $waited) { Write-LaiLog INFO "Open WebUI is down and the volume lock is held: a backup, restore or update may be at work, which stops it for a few minutes. Waiting up to $WaitSec s for the lock before judging" }
         $waited = $true
@@ -171,8 +184,11 @@ $script:webStopSaid = $false
 # restore or update to finish, which start it again as their last step (its page needs a while).
 $webBackSec = 120
 $script:webAnswerSec = 30
-# The wait for the volume lock (-LockWaitSec) has an end, also when a number below 0 was given.
+# The wait for the volume lock (-LockWaitSec) has an end, also when a number below 0 was given,
+# and it is taken once in a run: the row that waited says so here, and a row that asks after it
+# (Get-WebUIStopReason -Again) is told of a held lock at once, without a second wait.
 if ($LockWaitSec -lt 0) { $LockWaitSec = 0 }
+$script:lockWaited = $false
 $startAgain = 'Start menu > Local AI > Start again'
 # Every docker call has a time limit. A Docker Desktop that stopped answering (it can after sleep) is
 # then one failed check with what to do, not a window that waits without a word.
@@ -322,8 +338,9 @@ if ($NoContainers) {
                 # then one more look. Still down, it is a failure whatever the reason: a lock that
                 # is still held, the hold of a failed restore (neither is a container to start
                 # again or to install again), or what the look itself says.
-                $stop = Get-WebUIStopReason -WaitSec $LockWaitSec -Otherwise $look.Why
+                $stop = Get-WebUIStopReason -WaitSec $LockWaitSec -Again:$script:lockWaited -Otherwise $look.Why
                 if ($stop.Waited) {
+                    $script:lockWaited = $true
                     $look = & $containerLook $c
                     if ($look.Hung) { $script:engineUp = $false; return (Fail $hungMsg) }
                     # The row's own words are those of the last look.
@@ -405,8 +422,9 @@ Add-Check 'Open WebUI reachable' {
         # backup, restore or update at work gets the time to finish, and then one more look. Still
         # no answer, it is a failure whatever the reason; with a lock that stays held or a hold,
         # Start again is the wrong advice (it waits for the lock, or refuses on the hold).
-        $stop = Get-WebUIStopReason -WaitSec $LockWaitSec -Otherwise "no answer on http://localhost:$webPort - $startAgain; if it persists: docker logs --tail 50 open-webui"
+        $stop = Get-WebUIStopReason -WaitSec $LockWaitSec -Again:$script:lockWaited -Otherwise "no answer on http://localhost:$webPort - $startAgain; if it persists: docker logs --tail 50 open-webui"
         if ($stop.Waited) {
+            $script:lockWaited = $true
             # The lock was let go and no hold is left: Open WebUI was just started again and gets
             # the time to come up. Else a short look is enough.
             $againSec = 5; if (-not $stop.Known) { $againSec = $webBackSec }
