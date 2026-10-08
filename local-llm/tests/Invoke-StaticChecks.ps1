@@ -49,9 +49,15 @@ $files = Get-ChildItem -Path $Root -Recurse -File -Include *.ps1, *.psm1, *.psd1
 #            forever by default; on an always-on PC they grow without limit).
 #   NATIVEQUOTE a literal double quote inside an argument for a native program (docker, wsl, ...):
 #            Windows PowerShell 5.1 does not escape it, so the program receives it stripped.
-#   HANG     a docker call without a time limit in a scheduled task's script: any direct docker call
-#            in Watch-LocalAI.ps1, or the engine probe ('version') in Watch or Backup-OpenWebUI.ps1.
-#            Docker Desktop can stop answering after sleep; the task then hangs silently until killed.
+#   HANG     a docker call without a time limit in a script that a stuck Docker Desktop would hang
+#            without a word: any direct docker call in Watch-LocalAI.ps1 (a scheduled task) and in
+#            Start-LocalAI.ps1, Stop-LocalAI.ps1, Test-LocalAI.ps1 and Get-LocalAIDiagnostics.ps1 (the
+#            windows the owner opens when something is wrong), and in those five and in
+#            Backup-OpenWebUI.ps1 the engine probe ('version'), called directly or through
+#            Invoke-Docker. Docker Desktop can stop answering after sleep; a task then hangs
+#            silently until killed, a window waits without a word. The rule goes by the command's
+#            name: a timed call through Invoke-LaiTimedNative or Invoke-Capture is not looked at,
+#            and neither is another program that can wait (wsl.exe --shutdown in Stop-LocalAI.ps1).
 #   HIDDENTASK a scheduled task action that runs powershell.exe directly: on Windows 11 (Windows
 #            Terminal as console host) -WindowStyle Hidden still shows a window, and closing it kills
 #            the run. Use Get-LaiHiddenTaskLaunch (conhost --headless).
@@ -140,13 +146,16 @@ function Find-Pitfall([System.Management.Automation.Language.Ast]$Ast, [string[]
                 Where-Object { $_.Value -match '"' })
             if ($quoted.Count) { & $add 'NATIVEQUOTE' $c "argument with a double quote for a native program ($($quoted[0].Extent.Text)): 5.1 strips it; use backticks in Go templates or avoid the quote" }
         }
-        # Scheduled tasks' scripts: docker only through the timed helpers (Test-LaiDockerEngine,
-        # Invoke-LaiTimedNative), at least for the engine probe, which is where a stuck Docker hangs first.
-        if (@('Watch-LocalAI.ps1', 'Backup-OpenWebUI.ps1') -contains $FileName -and -not (& $marker $c 'hang')) {
+        # Scheduled tasks' scripts, and the four the owner runs when something is wrong: docker only
+        # through the timed helpers (Test-LaiDockerEngine, Invoke-LaiTimedNative), at least for the
+        # engine probe, which is where a stuck Docker hangs first. In $hangNoDirect no direct docker
+        # call at all (the backup script keeps its own untimed wrapper for the long calls).
+        $hangNoDirect = @('Watch-LocalAI.ps1', 'Start-LocalAI.ps1', 'Stop-LocalAI.ps1', 'Test-LocalAI.ps1', 'Get-LocalAIDiagnostics.ps1')
+        if ((@('Backup-OpenWebUI.ps1') + $hangNoDirect) -contains $FileName -and -not (& $marker $c 'hang')) {
             $isDocker = @('docker', 'docker.exe') -contains $name
             $probe = (($isDocker -or $name -eq 'Invoke-Docker') -and @($c.FindAll({ param($n) $n -is [System.Management.Automation.Language.StringConstantExpressionAst] -and $n.Value -eq 'version' }, $true)).Count -gt 0)
-            if ($probe -or ($isDocker -and $FileName -eq 'Watch-LocalAI.ps1')) {
-                & $add 'HANG' $c 'docker without a time limit in a scheduled task: a stuck Docker Desktop hangs it silently; use Test-LaiDockerEngine / Invoke-LaiTimedNative'
+            if ($probe -or ($isDocker -and $hangNoDirect -contains $FileName)) {
+                & $add 'HANG' $c 'docker without a time limit: a stuck Docker Desktop hangs this script without a word; use Test-LaiDockerEngine / Invoke-LaiTimedNative'
             }
         }
         # A task action that runs powershell.exe itself shows a window on Windows 11.
@@ -607,6 +616,23 @@ $canaries = @(
     @{ Rule = 'HANG'; Fire = $false; File = 'Watch-LocalAI.ps1'; Code = '$engine = Test-LaiDockerEngine -TimeoutSec $dockerLimit' }
     @{ Rule = 'HANG'; Fire = $false; File = 'Backup-OpenWebUI.ps1'; Code = 'Invoke-Docker -Arguments @(''volume'', ''inspect'', $Volume) -AllowFail' }
     @{ Rule = 'HANG'; Fire = $false; File = 'Update-OpenWebUI.ps1'; Code = '& docker version' }
+    # The four scripts the owner runs when something is wrong: no direct docker call, and no engine
+    # probe through their own Invoke-Docker.
+    @{ Rule = 'HANG'; Fire = $true; File = 'Start-LocalAI.ps1'; Code = '& docker version --format ''{{.Server.Version}}'' 2>$null | Out-Null' }
+    @{ Rule = 'HANG'; Fire = $true; File = 'Start-LocalAI.ps1'; Code = '$s = & docker inspect -f ''{{.State.Status}}'' $Name 2>$null' }
+    @{ Rule = 'HANG'; Fire = $true; File = 'Start-LocalAI.ps1'; Code = '$r = Invoke-Docker @(''version'', ''--format'', ''{{.Server.Version}}'')' }
+    @{ Rule = 'HANG'; Fire = $true; File = 'Stop-LocalAI.ps1'; Code = '& docker version --format ''{{.Server.Version}}'' 2>$null | Out-Null' }
+    @{ Rule = 'HANG'; Fire = $true; File = 'Stop-LocalAI.ps1'; Code = '$s = & docker inspect -f ''{{.State.Status}}'' $Name 2>$null' }
+    @{ Rule = 'HANG'; Fire = $true; File = 'Stop-LocalAI.ps1'; Code = '$r = Invoke-Docker @(''version'', ''--format'', ''{{.Server.Version}}'') -TimeoutSec $slowLimit' }
+    @{ Rule = 'HANG'; Fire = $true; File = 'Test-LocalAI.ps1'; Code = '& docker version --format ''{{.Server.Version}}'' 2>$null | Out-Null' }
+    @{ Rule = 'HANG'; Fire = $true; File = 'Test-LocalAI.ps1'; Code = '$s = & docker inspect -f ''{{.State.Status}}'' $Name 2>$null' }
+    @{ Rule = 'HANG'; Fire = $true; File = 'Get-LocalAIDiagnostics.ps1'; Code = '& docker version --format ''{{.Server.Version}}'' 2>$null | Out-Null' }
+    @{ Rule = 'HANG'; Fire = $true; File = 'Get-LocalAIDiagnostics.ps1'; Code = '$s = & docker.exe inspect -f ''{{.State.Status}}'' $Name 2>$null' }
+    @{ Rule = 'HANG'; Fire = $false; File = 'Start-LocalAI.ps1'; Code = '$engine = Test-LaiDockerEngine -TimeoutSec $dockerLimit' }
+    @{ Rule = 'HANG'; Fire = $false; File = 'Stop-LocalAI.ps1'; Code = '$r = Invoke-Docker @(''compose'', ''--project-directory'', $stackDir, ''-f'', $compose, ''stop'') -TimeoutSec $slowLimit' }
+    # The two timed calls that carry the word 'version', as they stand in the scripts: not this rule's.
+    @{ Rule = 'HANG'; Fire = $false; File = 'Test-LocalAI.ps1'; Code = '$r = Invoke-LaiTimedNative -File ''docker'' -Arguments @(''version'', ''--format'', ''{{.Server.Version}}'') -TimeoutSec $dockerLimit' }
+    @{ Rule = 'HANG'; Fire = $false; File = 'Get-LocalAIDiagnostics.ps1'; Code = '$dockerVer = Invoke-Capture ''docker'' @(''version'', ''--format'', ''{{.Server.Version}}'')' }
     @{ Rule = 'HIDDENTASK'; Fire = $true; Code = '$a = New-ScheduledTaskAction -Execute ''powershell.exe'' -Argument $x' }
     @{ Rule = 'HIDDENTASK'; Fire = $false; Code = '$a = New-ScheduledTaskAction -Execute $l.Execute -Argument $l.Argument' }
     @{ Rule = 'HIDDENTASK'; Fire = $false; Code = '$a = New-ScheduledTaskAction -Execute ''powershell.exe'' -Argument $x   # lai-ok: window' }
