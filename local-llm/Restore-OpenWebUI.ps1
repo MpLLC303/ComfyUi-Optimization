@@ -17,6 +17,11 @@
          fails, the container is left stopped and the exact recovery command is printed.
     A machine-wide lock stops the scheduled backup from running at the same time.
 
+    A backup leaves out the document-search and speech models Open WebUI downloaded (about 7 GB).
+    The ones in the volume are kept through the swap, so Open WebUI does not fetch them again; only
+    a volume that had none (a new PC, a wiped volume) downloads them at the first start, which can
+    take longer than the 5 minutes this script waits for an answer.
+
     A backup carries the settings of its day, so once Open WebUI is back this install's own are
     applied again: its Ollama connection, sign-up off, and on the toolkit's presets no past-chat
     search, no code execution and (uncensored ones) no web search without being asked. An archive
@@ -69,8 +74,15 @@ function Invoke-Docker {
 
 # The archive is always mounted as /restore.tar.gz, so its file name never reaches the shell.
 # No double quotes anywhere in this script: Windows PowerShell 5.1 mangles them in native arguments.
+# The 'for' line: a backup leaves out the document-search and speech models Open WebUI downloaded
+# (cache/embedding/models and cache/whisper/models, about 7 GB), and the delete after it takes all
+# the volume holds. So the two folders move into the staging tree first and come back with it,
+# unless the archive brings its own. Every restore, and every rollback to a safety backup, used to
+# end with Open WebUI downloading them again.
 $swapScript = 'set -e; rm -rf /data/.restore-staging; mkdir /data/.restore-staging; ' +
     'tar xzf /restore.tar.gz -C /data/.restore-staging; test -f /data/.restore-staging/webui.db; ' +
+    'for m in cache/embedding/models cache/whisper/models; do if [ -d /data/$m ]; then if [ ! -e /data/.restore-staging/$m ]; then ' +
+    'mkdir -p /data/.restore-staging/${m%/*}; mv /data/$m /data/.restore-staging/$m; fi; fi; done; ' +
     'find /data -mindepth 1 -maxdepth 1 ! -name .restore-staging -exec rm -rf {} +; ' +
     'cd /data/.restore-staging; find . -mindepth 1 -maxdepth 1 -exec mv {} /data/ \; ; ' +
     'cd /; rmdir /data/.restore-staging'
@@ -431,9 +443,18 @@ if ($stoppedContainers.Count -gt 0) {
     $port = 3000
     if ($config.ContainsKey('WebUIPort')) { $port = [int]$config['WebUIPort'] }
     $up = $false
-    try { Wait-LaiWebUI -BaseUrl "http://127.0.0.1:$port" -TimeoutSec 300; Write-LaiLog OK "Open WebUI is back on http://localhost:$port"; $up = $true }
+    # LOCALAI_TEST_WEBUI_WAIT_SEC: test hook, a shorter wait. It counts only as a positive whole
+    # number: anything else keeps the 5 minutes.
+    $waitSec = 300; $askedWait = 0
+    if ($env:LOCALAI_TEST_WEBUI_WAIT_SEC -and [int]::TryParse([string]$env:LOCALAI_TEST_WEBUI_WAIT_SEC, [ref]$askedWait) -and $askedWait -gt 0) { $waitSec = $askedWait }
+    try { Wait-LaiWebUI -BaseUrl "http://127.0.0.1:$port" -TimeoutSec $waitSec; Write-LaiLog OK "Open WebUI is back on http://localhost:$port"; $up = $true }
     catch {
-        Write-LaiLog WARN "Data restored, but Open WebUI did not answer within 5 minutes: check 'docker logs --tail 100 $Container'."
+        # The models a backup leaves out came along in the swap if the volume had them. A volume that
+        # had none (a new one, or the models were deleted) makes Open WebUI download them at this start.
+        Write-LaiLog WARN "Data restored, but Open WebUI did not answer within $([math]::Round($waitSec / 60, 1)) minutes. It may still be fetching its document-search models (several GB, when the volume had none): give it some minutes, and check 'docker logs --tail 100 $Container'."
+        if ($safety) {
+            Write-LaiLog INFO "If it does not come up, the data from before this restore is in $($safety.Name). To go back to it: & $(ConvertTo-LaiPsQuoted (Join-Path $PSScriptRoot 'Restore-OpenWebUI.ps1')) -AIRoot $(ConvertTo-LaiPsQuoted $AIRoot) -Archive $(ConvertTo-LaiPsQuoted $safety.FullName)"
+        }
         $notReapplied = 'Open WebUI did not answer'
     }
 
