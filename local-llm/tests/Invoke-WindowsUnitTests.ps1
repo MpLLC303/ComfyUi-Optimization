@@ -2484,6 +2484,26 @@ $odI = Find-PcsOpenDriver -Drivers @() -DriversRead $false -Probe $odProbe
 Assert-That ($odE.Status -eq 'SKIP' -and $odE.Detail -match 'without Run as administrator' -and $odE.Detail -notmatch 'elevated window' -and ($script:odAsked -join ',') -eq 'EneIo' -and $odF.Status -eq 'SKIP' -and $odG.Status -eq 'SKIP' -and $odH.Status -eq 'SKIP' -and $odI.Status -eq 'SKIP') "open driver could not be read: elevated is SKIP and the probe is never asked; no such device, another error, a probe that throws, an unreadable driver list ($($odE.Status) $($odF.Status) $($odG.Status) $($odH.Status) $($odI.Status))"
 $odJ = Find-PcsOpenDriver -Drivers $drvIn -Apps @([pscustomobject]@{ Name = 'Armoury Crate Service'; Version = '5.0'; InstallLocation = '' }) -Probe { 'opened' }
 Assert-That (@($odJ.Hits).Count -eq 1 -and $odJ.Hits[0].Driver -eq 'AsIO.sys' -and $odJ.Hits[0].Device -eq 'Asusgio' -and $odJ.Hits[0].From -match 'installed here: Armoury Crate Service') "open driver: of the vulnerable-driver fixture only AsIO.sys is on this list; a driver in the Windows folder gets its program by name ($(@($odJ.Hits | ForEach-Object { $_.Driver }) -join ', '))"
+# What the probe makes of the status of its open (NTSTATUS, read as it is). One status only says the
+# device refused; 'what was opened is a folder' (0xC00000BA) is not it, although Windows hands a
+# program the same error number, 5, for both: a device name pointed at a folder read 'denied' that way.
+Assert-That ((ConvertFrom-PcsOpenStatus -Status 0) -eq 'opened' -and (ConvertFrom-PcsOpenStatus -Status 0xC0000022) -eq 'denied' -and (ConvertFrom-PcsOpenStatus -Status 0xC0000034) -eq 'absent' -and (ConvertFrom-PcsOpenStatus -Status 0xC000003A) -eq 'absent') 'the status of the open: 0 is opened, 0xC0000022 denied, 0xC0000034 and 0xC000003A no such device'
+$osFolder = ConvertFrom-PcsOpenStatus -Status 0xC00000BA
+$osWin32 = @(5, 2, 3 | ForEach-Object { ConvertFrom-PcsOpenStatus -Status $_ })
+Assert-That ($osFolder -ceq 'error 0xC00000BA' -and ($osWin32 -join ',') -ceq 'error 0x00000005,error 0x00000002,error 0x00000003') "a folder where the device was expected is an error with its status, never 'denied'; the error numbers 5, 2 and 3 of a failed CreateFile are no statuses and mean nothing here ($osFolder; $($osWin32 -join ', '))"
+# Every status in the first 512 of each of the four kinds (success, information, warning, error).
+$osOpened = @(); $osDenied = @(); $osAbsent = @(); $osErrors = 0; $osOdd = @()
+foreach ($osKind in 0, 0x40000000, 0x80000000, 0xC0000000) {
+    for ($i = 0; $i -lt 512; $i++) {
+        $osHex = '0x{0:X8}' -f [int]($osKind + $i)
+        $osSays = [string](ConvertFrom-PcsOpenStatus -Status ($osKind + $i))
+        if ($osSays -ceq 'opened') { $osOpened += $osHex } elseif ($osSays -ceq 'denied') { $osDenied += $osHex } elseif ($osSays -ceq 'absent') { $osAbsent += $osHex }
+        elseif ($osSays -ceq "error $osHex") { $osErrors++ } else { $osOdd += "$osHex = $osSays" }
+    }
+}
+Assert-That (($osOpened -join ',') -eq '0x00000000' -and ($osDenied -join ',') -eq '0xC0000022' -and ($osAbsent -join ',') -eq '0xC0000034,0xC000003A' -and $osErrors -eq 2044 -and $osOdd.Count -eq 0) "of 2048 statuses exactly one is opened, one denied and two no such device; every other one is an error that names it (opened: $($osOpened -join ' '); denied: $($osDenied -join ' '); absent: $($osAbsent -join ' '); errors: $osErrors; odd: $($osOdd -join ' '))"
+$odK = Find-PcsOpenDriver -Drivers $odLoaded -Apps $odApps -Probe { ConvertFrom-PcsOpenStatus -Status 0xC00000BA }
+Assert-That ($odK.Status -eq 'SKIP' -and $odK.Detail -match 'the test ended with: error 0xC00000BA' -and $odK.Detail -notmatch 'refused') "open driver could not be read: a loaded driver whose name led to a folder is not tested, never fine ($($odK.Status): $($odK.Detail))"
 
 $fwPy = 'v2.30|Action=Allow|Active=TRUE|Dir=In|Protocol=6|Profile=Private|Profile=Public|App=C:\Python312\python.exe|Name=python.exe|Desc=python.exe|Defer=User|'
 $fwQuiet = @(
@@ -2510,6 +2530,46 @@ if ($onWindows) {
     $devNone = Test-PcsDeviceOpen -Device ('LaiNoSuchDevice' + (Get-Random -Minimum 100000 -Maximum 999999))
     $devFile = Test-PcsDeviceOpen -Device 'C:\Windows\win.ini'
     Assert-That ($devNul -eq 'opened' -and $devNone -eq 'absent' -and $devFile -like 'error*') "the device-open reader: NUL opens, a made-up device name does not (absent), a file path is turned away unopened ($devNul / $devNone / $devFile)"
+    # A device name of this sign-in session's own, pointed at the Windows folder: what any program may
+    # do without administrator rights to the name of a driver's device (DefineDosDevice, the call
+    # behind 'subst'; declared here for this test only, the script imports no such thing). Opened as
+    # \\.\<name>, as the check once did, the name leads to that folder, and a folder opened like a
+    # device is refused with the same error number as a device that refuses: the check read 'denied'
+    # and said the driver was fine. Asked in Windows' own list of device names, the name is not
+    # there. (Holds for every account but LocalSystem, whose names are the global ones.) The name is
+    # taken away again whatever happens; it would otherwise last until this account signs out.
+    if (-not ('LaiTestDosDevice' -as [type])) {
+        $ddMembers = @(
+            '[System.Runtime.InteropServices.DllImport("kernel32.dll", CharSet = System.Runtime.InteropServices.CharSet.Unicode, SetLastError = true)]'
+            'public static extern bool DefineDosDeviceW(uint dwFlags, string lpDeviceName, string lpTargetPath);'
+            '[System.Runtime.InteropServices.DllImport("kernel32.dll", CharSet = System.Runtime.InteropServices.CharSet.Unicode, SetLastError = true)]'
+            'public static extern uint GetFileAttributesW(string lpFileName);'
+        ) -join "`n"
+        Add-Type -Namespace '' -Name 'LaiTestDosDevice' -MemberDefinition $ddMembers
+    }
+    $ddName = 'LaiShadow' + (Get-Random -Minimum 100000 -Maximum 999999)
+    $ddTarget = [string]$env:SystemRoot
+    $ddBefore = Test-PcsDeviceOpen -Device $ddName
+    $ddSet = $false; $ddSeen = $false; $ddRemoved = $false; $ddAttr = [uint32]::MaxValue; $devShadow = ''
+    try {
+        # 0 = a name for this session, its target a path as a program writes it.
+        $ddSet = [LaiTestDosDevice]::DefineDosDeviceW(0, $ddName, $ddTarget)
+        # FILE_ATTRIBUTE_DIRECTORY is 0x10; 0xFFFFFFFF = nothing of that name.
+        $ddAttr = [LaiTestDosDevice]::GetFileAttributesW('\\.\' + $ddName)
+        $ddSeen = ($ddAttr -ne [uint32]::MaxValue -and ($ddAttr -band 0x10) -ne 0)
+        $devShadow = Test-PcsDeviceOpen -Device $ddName
+    } finally {
+        # 6 = DDD_REMOVE_DEFINITION | DDD_EXACT_MATCH_ON_REMOVE: this definition and no other. Should
+        # Windows not find it that way, 2 with no target takes away the newest one of that name.
+        if ($ddSet) {
+            $ddRemoved = [LaiTestDosDevice]::DefineDosDeviceW(6, $ddName, $ddTarget)
+            if (-not $ddRemoved) { $ddRemoved = [LaiTestDosDevice]::DefineDosDeviceW(2, $ddName, [NullString]::Value) }
+        }
+    }
+    $ddAfter = [LaiTestDosDevice]::GetFileAttributesW('\\.\' + $ddName)
+    Assert-That ($ddBefore -eq 'absent' -and $ddSet -and $ddSeen) "setup: a made-up device name ($ddName) was pointed at the Windows folder for this session without asking anybody, and \\.\$ddName now leads to that folder (before: $ddBefore; set: $ddSet; attributes: $ddAttr)"
+    Assert-That ($devShadow -eq 'absent') "the device-open reader is not fooled by it: the name is in no way a device of this PC, so the answer is 'absent' (not checked), not 'denied' (fine) ($devShadow)"
+    Assert-That ($ddRemoved -and $ddAfter -eq [uint32]::MaxValue) "and the name is gone again afterwards (removed: $ddRemoved; attributes: $ddAfter)"
     $fwReal = Get-PcsFirewallRuleText
     $fwShaped = @($fwReal.Rules | Where-Object { $_ -match '^v\d+\.\d+\|' } | Where-Object { $_ -match '\|Action=(Allow|Block)\|' } | Where-Object { $_ -match '\|Dir=(In|Out)\|' } | Where-Object { $_ -match '\|Active=(TRUE|FALSE)\|' })
     $fwRealVerdict = Find-PcsInterpreterRule -Rules $fwReal.Rules -RulesRead $fwReal.Read
@@ -2538,10 +2598,14 @@ $changing = @($pcsCmds | Where-Object { ($_ -match '^([A-Za-z]+)-' -and $changeV
 Assert-That ($pcsCmds.Count -gt 20 -and $changing.Count -eq 0) "Test-PCSecurity.ps1 runs no command that changes the PC ($($pcsCmds.Count) commands; changing: $($changing -join ', '))"
 # That list sees command names only, not what the script's one piece of compiled code calls in Windows
 # itself (the C# in Test-PcsDeviceOpen). So what that code may do is pinned here: one Add-Type, given
-# $members; two imports from kernel32.dll, CreateFileW and CloseHandle, under their own names; one
-# CreateFileW call, asking for no access (dwDesiredAccess 0) to something that exists (OPEN_EXISTING, 3);
-# and no other call: nothing that reads, writes or sends a driver a control code. Whoever changes that
-# code has to change this list with it.
+# $members; two imports under their own names, NtOpenFile from ntdll.dll and CloseHandle from
+# kernel32.dll, and no CreateFile of any kind; one NtOpenFile call, asking for neither read nor write
+# access (0x00100080 = SYNCHRONIZE | FILE_READ_ATTRIBUTES) to something that exists (NtOpenFile
+# creates nothing); object attributes that leave the path alone to say what is opened (no root
+# directory, 0x40 = the name whatever its case, nothing else set); that path being \GLOBAL??\ and
+# the device name the function has checked, never \\.\ (which a program without administrator rights
+# can point somewhere else); and no other call: nothing that reads, writes or sends a driver a
+# control code. Whoever changes that code has to change this list with it.
 $pcsSource = [string]$pcsAst.Extent.Text
 $pcsAddType = @($pcsAst.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] -and $n.GetCommandName() -eq 'Add-Type' }, $true))
 $pcsMemberSets = @($pcsAst.FindAll({ param($n) $n -is [System.Management.Automation.Language.AssignmentStatementAst] -and $n.Left.Extent.Text -eq '$members' }, $true))
@@ -2552,18 +2616,42 @@ if ($pcsMemberSets.Count -eq 1) {
 }
 $pcsAddTypeOk = ($pcsAddType.Count -eq 1 -and $pcsMemberSets.Count -eq 1 -and ([string]$pcsAddType[0].Extent.Text).EndsWith('-MemberDefinition $members'))
 $pcsExterns = @([regex]::Matches($pcsSource, '\bextern\s+[\w\.]+\s+(\w+)\s*\(') | ForEach-Object { $_.Groups[1].Value })
-$pcsImportsOk = ($pcsExterns.Count -eq 2 -and $pcsExterns -ccontains 'CreateFileW' -and $pcsExterns -ccontains 'CloseHandle' -and
-    [regex]::Matches($pcsSource, 'DllImport').Count -eq 2 -and [regex]::Matches($pcsSource, 'DllImport\("kernel32\.dll"').Count -eq 2 -and $pcsSource -notmatch 'EntryPoint')
-$pcsOpens = @([regex]::Matches($pcsCs, 'CreateFileW\s*\([^)]*\)') | ForEach-Object { $_.Value })
+$pcsImportsOk = ($pcsExterns.Count -eq 2 -and $pcsExterns -ccontains 'NtOpenFile' -and $pcsExterns -ccontains 'CloseHandle' -and [regex]::Matches($pcsSource, 'DllImport').Count -eq 2 -and
+    [regex]::Matches($pcsCs, 'DllImport\("ntdll\.dll"\)\]\s*static extern int NtOpenFile\(').Count -eq 1 -and
+    [regex]::Matches($pcsCs, 'DllImport\("kernel32\.dll", SetLastError = true\)\]\s*static extern bool CloseHandle\(').Count -eq 1 -and
+    $pcsSource -notmatch 'EntryPoint' -and $pcsCs -notmatch 'CreateFile')
+$pcsOpens = @([regex]::Matches($pcsCs, 'NtOpenFile\s*\([^)]*\)') | ForEach-Object { $_.Value })
+# Every field of the object attributes as the code sets it (each once, in this order).
+$pcsFields = @([regex]::Matches($pcsCs, '\battributes\.\w+ = [^;]*;') | ForEach-Object { $_.Value })
+$pcsFieldsWant = @(
+    'attributes.Length = (uint)System.Runtime.InteropServices.Marshal.SizeOf(typeof(OBJECT_ATTRIBUTES));'
+    'attributes.RootDirectory = System.IntPtr.Zero;'
+    'attributes.ObjectName = namePointer;'
+    'attributes.Attributes = 0x40;'
+    'attributes.SecurityDescriptor = System.IntPtr.Zero;'
+    'attributes.SecurityQualityOfService = System.IntPtr.Zero;'
+)
 $pcsOpenOk = ($pcsOpens.Count -eq 2 -and
-    $pcsOpens -ccontains 'CreateFileW(string lpFileName, uint dwDesiredAccess, uint dwShareMode, System.IntPtr lpSecurityAttributes, uint dwCreationDisposition, uint dwFlagsAndAttributes, System.IntPtr hTemplateFile)' -and
-    $pcsOpens -ccontains 'CreateFileW(name, 0, 3, System.IntPtr.Zero, 3, 0, System.IntPtr.Zero)')
-$pcsMayCall = @('DllImport', 'CreateFileW', 'CloseHandle', 'TryOpen', 'IntPtr', 'GetLastWin32Error', 'if')
+    $pcsOpens -ccontains 'NtOpenFile(out System.IntPtr FileHandle, uint DesiredAccess, ref OBJECT_ATTRIBUTES ObjectAttributes, out IO_STATUS_BLOCK IoStatusBlock, uint ShareAccess, uint OpenOptions)' -and
+    $pcsOpens -ccontains 'NtOpenFile(out handle, 0x00100080, ref attributes, out io, 3, 0x60)' -and
+    ($pcsFields -join "`n") -ceq ($pcsFieldsWant -join "`n"))
+$pcsMayCall = @('DllImport', 'NtOpenFile', 'CloseHandle', 'StructLayout', 'TryOpen', 'StringToHGlobalUni', 'AllocHGlobal', 'SizeOf', 'typeof', 'StructureToPtr', 'if', 'FreeHGlobal')
 $pcsCalled = @([regex]::Matches($pcsCs, '([A-Za-z_]\w*)\s*\(') | ForEach-Object { $_.Groups[1].Value } | Select-Object -Unique)
 $pcsStray = @($pcsCalled | Where-Object { $pcsMayCall -cnotcontains $_ })
 $pcsUnseen = @($pcsMayCall | Where-Object { $pcsCalled -cnotcontains $_ })
-Assert-That ($pcsAddTypeOk -and $pcsImportsOk) "the script compiles code once (Add-Type with `$members) and imports CreateFileW and CloseHandle from kernel32.dll, nothing else ($($pcsAddType.Count) Add-Type; imports: $($pcsExterns -join ', '))"
-Assert-That ($pcsOpenOk -and $pcsStray.Count -eq 0 -and $pcsUnseen.Count -eq 0) "and that code makes one CreateFileW call, with no access asked for (name, 0, 3, null, 3, 0, null), closes the handle and calls nothing else ($($pcsOpens.Count) CreateFileW text(s); calls: $($pcsCalled -join ', '); not on the list: $($pcsStray -join ', '); expected and not found: $($pcsUnseen -join ', '))"
+# What that code is given to open: one call in the whole script, the global list's own name before
+# a device name that was checked first; and no text anywhere in the script that begins a path this
+# session's device names decide (\\.\ or \\?\).
+$pcsOpenFn = $pcsAst.Find({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Test-PcsDeviceOpen' }, $true)
+$pcsOpenFnText = ''; if ($pcsOpenFn) { $pcsOpenFnText = [string]$pcsOpenFn.Extent.Text }
+$pcsTryOpens = @($pcsAst.FindAll({ param($n) $n -is [System.Management.Automation.Language.InvokeMemberExpressionAst] -and [string]$n.Member.Extent.Text -eq 'TryOpen' }, $true) | ForEach-Object { [string]$_.Extent.Text })
+$pcsSessionPaths = @($pcsAst.FindAll({ param($n) $n -is [System.Management.Automation.Language.StringConstantExpressionAst] -and ([string]$n.Value) -match '^\\\\[.?]' }, $true) | ForEach-Object { [string]$_.Value })
+$pcsNameCheckAt = $pcsOpenFnText.IndexOf('if ($Device -notmatch ''^[A-Za-z0-9_]{1,64}$'') { return ')
+$pcsTryOpenAt = $pcsOpenFnText.IndexOf('[PcsDevice]::TryOpen(')
+$pcsPathOk = ($pcsTryOpens.Count -eq 1 -and $pcsTryOpens[0] -ceq '[PcsDevice]::TryOpen(''\GLOBAL??\'' + $Device)' -and $pcsSessionPaths.Count -eq 0 -and $pcsNameCheckAt -ge 0 -and $pcsTryOpenAt -gt $pcsNameCheckAt)
+Assert-That ($pcsAddTypeOk -and $pcsImportsOk) "the script compiles code once (Add-Type with `$members) and imports NtOpenFile from ntdll.dll and CloseHandle from kernel32.dll, nothing else and no CreateFile ($($pcsAddType.Count) Add-Type; imports: $($pcsExterns -join ', '))"
+Assert-That ($pcsOpenOk -and $pcsStray.Count -eq 0 -and $pcsUnseen.Count -eq 0) "and that code makes one NtOpenFile call, with neither read nor write access asked for (handle, 0x00100080, attributes, io, 3, 0x60), no root directory and the name whatever its case (0x40), closes the handle and calls nothing else ($($pcsOpens.Count) NtOpenFile text(s); attributes: $($pcsFields.Count) field(s) set; calls: $($pcsCalled -join ', '); not on the list: $($pcsStray -join ', '); expected and not found: $($pcsUnseen -join ', '))"
+Assert-That $pcsPathOk "and what it is given to open is \GLOBAL??\ and a device name checked first, in one place: never a name that this session's own device names decide ($($pcsTryOpens -join ' | '); session paths: $($pcsSessionPaths -join ' | '); name check at $pcsNameCheckAt, call at $pcsTryOpenAt)"
 # Add-Check keeps a hashtable with one of the four results; anything else a row's code returns is no
 # answer. Convert-Verdict is what turns a judge's answer into that hashtable, so the four rows must end in it,
 # and a status it does not know must come out as not checked. (Loaded in a scope of its own: the
