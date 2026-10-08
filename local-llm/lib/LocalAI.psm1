@@ -339,9 +339,15 @@ function Set-LaiPrivateAcl {
     <#
     .SYNOPSIS
         Replaces a file's or folder's permissions with: the given user, SYSTEM and Administrators
-        (inheritance from the parent removed, so "Authenticated Users" from C:\ no longer applies).
+        (inheritance from the parent removed, so "Authenticated Users" from C:\ no longer applies;
+        an entry any other account was given by name on it is taken out, and when another account
+        owns it Administrators become its owner, because an owner can give itself an entry again).
+        Each entry taken out and each owner changed is logged with the account it was.
+        Only the file or folder it is given: what lies in a folder keeps the entries and the owner
+        of its own, so a caller names every one it means.
         -UserAccess ReadOnly gives the user read/execute only. Windows only; returns icacls' exit
-        code and output.
+        code and output (a code that is not 0, with the reason first, when the owner or an entry of
+        another account could not be read, changed or taken out).
     #>
     param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][string]$UserSid, [ValidateSet('Full', 'ReadOnly')][string]$UserAccess = 'Full')
     # icacls changes what a symbolic link points at: granting the user full control there would hand
@@ -353,11 +359,66 @@ function Set-LaiPrivateAcl {
     $userGrant = $inherit + 'F'
     if ($UserAccess -eq 'ReadOnly') { $userGrant = $inherit + 'RX' }
     $prev = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
+    $left = @()
     try {
+        # The call below sets the entries of the three names it is given (/grant:r) and drops what
+        # was handed down from the folder above (/inheritance:r). An entry that some other account
+        # was given by name on this very file or folder is neither of the two and would stay: those
+        # are taken out first. Windows only (elsewhere there is no Get-Acl). .NET is asked as well as
+        # the OS variable: a per-user variable of that name replaces the system's one in that user's
+        # processes, the elevated installer included, and going by the variable alone anything
+        # running as the user could switch this off.
+        if ($env:OS -eq 'Windows_NT' -or [System.Environment]::OSVersion.Platform -eq [System.PlatformID]::Win32NT) {
+            $keep = @($UserSid, 'S-1-5-18', 'S-1-5-32-544')
+            # An account as the log and a reason name it: the name Windows has for it, then its SID.
+            $nameOf = {
+                param([string]$Sid)
+                $name = ''
+                try { $name = [string](New-Object System.Security.Principal.SecurityIdentifier($Sid)).Translate([System.Security.Principal.NTAccount]).Value }
+                catch { Write-Verbose "Windows has no name for $Sid" }
+                if ($name) { return "$name ($Sid)" }
+                return $Sid
+            }
+            $owner = ''
+            $others = @()
+            $wasRead = $false
+            try {
+                $acl = Get-Acl -LiteralPath $Path -ErrorAction Stop
+                $ownerSid = $acl.GetOwner([System.Security.Principal.SecurityIdentifier])
+                if ($null -ne $ownerSid) { $owner = [string]$ownerSid.Value }
+                # ($true, $false): the entries it holds as its own, not the ones handed down.
+                $others = @($acl.GetAccessRules($true, $false, [System.Security.Principal.SecurityIdentifier]) |
+                    ForEach-Object { [string]$_.IdentityReference.Value } | Where-Object { $keep -notcontains $_ } | Sort-Object -Unique)
+                $wasRead = $true
+            } catch { $left += "its owner and the entries other accounts hold on it could not be read ($(([string]$_.Exception.Message).Trim()))" }
+            # The owner first. Whoever owns a file or folder may rewrite its permissions whatever
+            # they say, so an owner outside the three could put its entry straight back; and with
+            # Administrators as the owner the calls after this one are allowed in any case.
+            if ($wasRead -and -not $owner) { $left += 'its owner could not be read' }
+            elseif ($owner -and $keep -notcontains $owner) {
+                $who = & $nameOf $owner
+                $said = & icacls.exe $Path '/setowner' '*S-1-5-32-544' 2>&1 | ForEach-Object { "$_" }
+                if ($LASTEXITCODE -ne 0) { $left += "its owner is $who, who can give itself access again, and that could not be changed ($($said -join ' '))" }
+                else { Write-LaiLog INFO "Permissions on ${Path}: it was owned by $who, who could have given itself access again; Administrators own it now" }
+            }
+            foreach ($other in $others) {
+                $who = & $nameOf $other
+                $said = & icacls.exe $Path '/remove' "*$other" 2>&1 | ForEach-Object { "$_" }
+                if ($LASTEXITCODE -ne 0) { $left += "the entry of $who could not be removed ($($said -join ' '))" }
+                else { Write-LaiLog INFO "Permissions on ${Path}: the entry of $who was removed (only the user, SYSTEM and Administrators are to have one)" }
+            }
+        }
         $out = & icacls.exe $Path '/inheritance:r' '/grant:r' "*${UserSid}:$userGrant" "*S-1-5-18:${inherit}F" "*S-1-5-32-544:${inherit}F" 2>&1 | ForEach-Object { "$_" }
         $code = $LASTEXITCODE
     } finally { $ErrorActionPreference = $prev }
-    return [pscustomobject]@{ ExitCode = $code; Text = ($out -join "`n") }
+    $text = ($out -join "`n")
+    if ($left.Count -gt 0) {
+        # The three names are set all the same. What may be left for somebody else is a failure, in
+        # words, even where the call above went through.
+        if ($code -eq 0) { $code = 1 }
+        $text = ((@($left) + @($text)) -join "`n")
+    }
+    return [pscustomobject]@{ ExitCode = $code; Text = $text }
 }
 
 function Get-LaiWebUIHold {
@@ -393,6 +454,176 @@ function New-LaiPassword {
     try { $rng.GetBytes($buffer) } finally { $rng.Dispose() }
     $chars = foreach ($b in $buffer) { $alphabet[$b % $alphabet.Length] }
     return ('Lai-' + (-join $chars) + '-9x')
+}
+
+function Protect-LaiSecretText {
+    # The text protected with the Windows account that runs this (DPAPI, scope CurrentUser, no extra
+    # entropy), as Base64: only that account on this Windows opens it again. It throws when it
+    # cannot and never returns nothing or an empty text. A failed .NET call only ends its own
+    # statement, and this module sets no error preference: so every one sits in a try that throws.
+    # The type is loaded here, behind the check for Windows, never when the module is imported, and
+    # is asked for by name: Windows PowerShell does not have it until System.Security is loaded.
+    param([Parameter(Mandatory)][string]$Text)
+    if ($env:OS -ne 'Windows_NT') { throw 'Protecting a stored password with the Windows account works on Windows only.' }
+    $blob = ''
+    try {
+        $protector = 'System.Security.Cryptography.ProtectedData' -as [type]
+        if (-not $protector) {
+            Add-Type -AssemblyName System.Security -ErrorAction Stop
+            $protector = 'System.Security.Cryptography.ProtectedData' -as [type]
+        }
+        if (-not $protector) { throw 'the type ProtectedData is not there' }
+        $bytes = [System.Text.Encoding]::UTF8.GetBytes($Text)
+        $blob = [Convert]::ToBase64String($protector::Protect($bytes, $null, 'CurrentUser'))
+    } catch {
+        $said = $_.Exception
+        if ($said.InnerException) { $said = $said.InnerException }
+        throw "Windows data protection did not work in this session ($(([string]$said.Message).Trim()))."
+    }
+    if (-not $blob) { throw 'Windows data protection did not work in this session (no result).' }
+    return $blob
+}
+
+function Unprotect-LaiSecretText {
+    # The text Protect-LaiSecretText protected. Text that is not Base64, that was changed, or that
+    # another account protected throws: a value this account cannot open is never an empty text.
+    param([Parameter(Mandatory)][string]$Blob)
+    if ($env:OS -ne 'Windows_NT') { throw 'Protecting a stored password with the Windows account works on Windows only.' }
+    $protector = $null
+    try {
+        $protector = 'System.Security.Cryptography.ProtectedData' -as [type]
+        if (-not $protector) {
+            Add-Type -AssemblyName System.Security -ErrorAction Stop
+            $protector = 'System.Security.Cryptography.ProtectedData' -as [type]
+        }
+        if (-not $protector) { throw 'the type ProtectedData is not there' }
+    } catch {
+        $said = $_.Exception
+        if ($said.InnerException) { $said = $said.InnerException }
+        throw "Windows data protection did not work in this session ($(([string]$said.Message).Trim()))."
+    }
+    $cannotOpen = "This Windows account cannot open the protected password (protected by another account, or the Windows password was reset, or Windows was reinstalled, or this is a remote session without the account's key)."
+    $text = $null
+    try {
+        $bytes = $protector::Unprotect([Convert]::FromBase64String($Blob), $null, 'CurrentUser')
+        if ($null -ne $bytes) { $text = [System.Text.Encoding]::UTF8.GetString($bytes) }
+    } catch { throw $cannotOpen }
+    if ($null -eq $text) { throw $cannotOpen }
+    return $text
+}
+
+function Read-LaiSecretFile {
+    <#
+    .SYNOPSIS
+        Reads a stored password file (JSON: an e-mail or user name, the password, other fields) in
+        either form and returns its object with 'password' filled in. The plain form ("password") is
+        returned as it is. The protected form ("protected": "dpapi-user-1", the value in
+        "passwordProtected") is opened with the Windows account that runs this.
+        Every failure throws, each with words of its own: a file that is empty or was cut off, a form
+        this version does not know, a plain file without a password, a protected file without its
+        value, a value this account cannot open. None of them is ever read as an empty password.
+        -NoPassword opens nothing and asks for no password: a protected file comes back with
+        'password' set to '', a plain one as it is, with a password or without (for a caller that
+        needs the other fields only). The two refusals of the file itself stay.
+    #>
+    param([Parameter(Mandatory)][string]$Path, [switch]$NoPassword)
+    # Inside a module the caller's $ErrorActionPreference does not apply, and an error that only
+    # ends its own statement would let this go on to its return with no password filled in.
+    $ErrorActionPreference = 'Stop'
+    $text = [string](Get-Content -LiteralPath $Path -Raw -Encoding UTF8 -ErrorAction Stop)
+    if ($text.Length -gt 0 -and $text[0] -eq [char]0xFEFF) { $text = $text.Substring(1) }
+    # The text is judged here, not by ConvertFrom-Json: an empty file reads as no text at all, which
+    # 5.1 and 7 take differently, and only an object ('{') is a secret file.
+    $o = $null
+    if ($text.TrimStart().StartsWith('{', [System.StringComparison]::Ordinal)) { try { $o = ConvertFrom-Json -InputObject $text -ErrorAction Stop } catch { $o = $null } }
+    if ($o -isnot [System.Management.Automation.PSCustomObject]) { throw "$Path is empty or was cut off: it holds no stored password." }
+    # The form goes by the marker being there, not by what it holds: an empty marker is no plain file.
+    $marker = $o.PSObject.Properties['protected']
+    if ($null -eq $marker) {
+        if ($NoPassword) { return $o }
+        # A plain file is returned as it is, when it holds a password. One that holds none (the
+        # field empty, or gone, or the marker of a protected file lost in an edit by hand) would
+        # reach the caller as an empty password, which is what this function never hands back.
+        $plain = $o.PSObject.Properties['password']
+        if ($null -ne $plain -and $null -ne $plain.Value -and [string]$plain.Value -ne '') { return $o }
+        $why = "$Path holds no password."
+        if ($null -ne $o.PSObject.Properties['passwordProtected']) { $why += " It has a 'passwordProtected' value, but not the 'protected' field that says in which form." }
+        throw $why
+    }
+    if (-not ($marker.Value -is [string] -and $marker.Value -ceq 'dpapi-user-1')) { throw "$Path is protected in a form this toolkit version does not know ('$([string]$marker.Value)'). Update the toolkit." }
+    if ($NoPassword) {
+        Add-Member -InputObject $o -NotePropertyName 'password' -NotePropertyValue '' -Force
+        return $o
+    }
+    # Before anything is opened, so this file is refused with these words on every system.
+    $held = $o.PSObject.Properties['passwordProtected']
+    $blob = ''
+    if ($null -ne $held -and $null -ne $held.Value) { $blob = ([string]$held.Value).Trim() }
+    if (-not $blob) { throw "$Path is marked as protected but holds no protected password." }
+    $password = ''
+    try { $password = [string](Unprotect-LaiSecretText -Blob $blob) }
+    catch { throw "Cannot read the password in ${Path}: $($_.Exception.Message)" }
+    if (-not $password) { throw "$Path is marked as protected but holds no protected password." }
+    Add-Member -InputObject $o -NotePropertyName 'password' -NotePropertyValue $password -Force
+    return $o
+}
+
+function Save-LaiSecretFile {
+    <#
+    .SYNOPSIS
+        Writes a stored password file: the fields of -Value (a hashtable or an object, which must
+        hold a password) in the plain form ("password") or the protected one ("protected":
+        "dpapi-user-1" and "passwordProtected", the password protected with the Windows account that
+        runs this). A file never holds both.
+        -Form Keep (the default) keeps the form of the file that is there. It goes by that file's
+        marker alone and opens nothing, so it also writes over a protected value this account cannot
+        open. A file that is not there, or that holds no JSON object, is written plain.
+        A file with a marker this version does not know is left alone, whatever -Form says.
+        Whatever fails throws, and throws before the file is touched: a caller reaches the line after
+        its save only with the new password on disk. The content is replaced in place (no delete, no
+        temp file swapped in), so the file keeps the permissions the installer gave it.
+    #>
+    param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)]$Value, [ValidateSet('Keep', 'Plain', 'Protected')][string]$Form = 'Keep')
+    # Inside a module the caller's $ErrorActionPreference does not apply, and an error that only
+    # ends its own statement would let this run to its end, and the caller go on, with nothing saved.
+    $ErrorActionPreference = 'Stop'
+    # 1. The fields of the value, in its own order (a hashtable has none).
+    $fields = [ordered]@{}
+    if ($Value -is [System.Collections.IDictionary]) { foreach ($key in @($Value.Keys)) { $fields[[string]$key] = $Value[$key] } }
+    else { foreach ($prop in @($Value.PSObject.Properties)) { $fields[[string]$prop.Name] = $prop.Value } }
+    $password = ''
+    if ($fields.Contains('password') -and $null -ne $fields['password']) { $password = [string]$fields['password'] }
+    if (-not $password) { throw "Nothing to store in ${Path}: the value has no password." }
+    # 2. The form. Only the marker of the file that is there is looked at, as text.
+    $marker = $null
+    if (Test-Path -LiteralPath $Path) {
+        $oldText = [string](Get-Content -LiteralPath $Path -Raw -Encoding UTF8 -ErrorAction Stop)
+        if ($oldText.Length -gt 0 -and $oldText[0] -eq [char]0xFEFF) { $oldText = $oldText.Substring(1) }
+        $old = $null
+        if ($oldText.TrimStart().StartsWith('{', [System.StringComparison]::Ordinal)) { try { $old = ConvertFrom-Json -InputObject $oldText -ErrorAction Stop } catch { $old = $null } }
+        if ($old -is [System.Management.Automation.PSCustomObject]) { $marker = $old.PSObject.Properties['protected'] }
+    }
+    $isProtected = ($null -ne $marker -and $marker.Value -is [string] -and $marker.Value -ceq 'dpapi-user-1')
+    if ($null -ne $marker -and -not $isProtected) { throw "$Path is protected in a form this toolkit version does not know ('$([string]$marker.Value)'). Update the toolkit." }
+    $toForm = $Form
+    if ($toForm -eq 'Keep') {
+        $toForm = 'Plain'
+        if ($isProtected) { $toForm = 'Protected' }
+    }
+    # 3. The whole new text, in memory: the other fields, then the password in its form.
+    $out = [ordered]@{}
+    foreach ($name in @($fields.Keys)) { if (@('password', 'protected', 'passwordProtected') -notcontains $name) { $out[$name] = $fields[$name] } }
+    if ($toForm -eq 'Protected') {
+        $blob = ''
+        try { $blob = [string](Protect-LaiSecretText -Text $password) }
+        catch { throw "Cannot store the password in ${Path}: $($_.Exception.Message)" }
+        if (-not $blob) { throw "Cannot store the password in ${Path}: Windows data protection did not work in this session (no result)." }
+        $out['protected'] = 'dpapi-user-1'
+        $out['passwordProtected'] = $blob
+    } else { $out['password'] = $password }
+    $json = ConvertTo-Json -InputObject $out -Depth 20
+    # 4. Only now the file.
+    Set-Content -LiteralPath $Path -Value $json -Encoding UTF8 -ErrorAction Stop
 }
 
 function Invoke-LaiRetry {
@@ -2543,8 +2774,10 @@ function Resolve-LaiPendingPassword {
         }
         return 'none'
     }
-    # Replace the content only, so the credentials file keeps its restricted permissions.
-    Get-Content -Encoding UTF8 -LiteralPath $pending -Raw | Set-Content -LiteralPath $credFile -Encoding UTF8 -NoNewline -ErrorAction Stop
+    # Replace the content only, so the credentials file keeps its restricted permissions, and in the
+    # form that file has (a raw copy of the pending text would turn a protected one plain). No try:
+    # a save that fails throws, and this must end before the pending file, then the only copy, goes.
+    Save-LaiSecretFile -Path $credFile -Value $p
     Remove-Item -LiteralPath $pending -Force
     Write-LaiLog OK "An interrupted password change had gone through; $credFile now holds the new password."
     return 'promoted'
