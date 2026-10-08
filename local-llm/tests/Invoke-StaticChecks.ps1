@@ -111,8 +111,16 @@ $files = Get-ChildItem -Path $Root -Recurse -File -Include *.ps1, *.psm1, *.psd1
 #            GetEnvironmentVariable($n)); a read under another .NET call (the table that
 #            GetEnvironmentVariables() returns, ExpandEnvironmentVariables); 'Get-ChildItem Env:'
 #            with the names picked out afterwards; a read in code that a script holds as text for
-#            another PowerShell or for cmd; and a second read of a pinned name in its file, which
-#            passes with the first.
+#            another PowerShell or for cmd; a second read of a pinned name in its file, which
+#            passes with the first; and a test parameter under a name that does not begin Test.
+#            So an entry goes stale when its read is gone, and just as well when the read only
+#            moved into one of those: taking the entry out then removes the last trace of a hook
+#            that is still read. The sentence for a stale entry says so, and where a string outside
+#            tests still holds the entry's name, or the start of it from LOCALAI_TEST_ on
+#            ('LOCALAI_TEST_' + $what), it names that place and does not ask for the entry to go.
+#            Such a string is looked at for a stale entry only. By itself it is no problem (a
+#            message may name a variable), so a read that never had an entry and is written in one
+#            of those ways still passes.
 function Find-Pitfall([System.Management.Automation.Language.Ast]$Ast, [string[]]$Lines, [string]$FileName = '', [switch]$UserFacing) {
     $found = New-Object System.Collections.Generic.List[object]
     $add = { param($Rule, $Node, $Msg) $found.Add([pscustomobject]@{ Rule = $Rule; Line = $Node.Extent.StartLineNumber; Message = $Msg }) }
@@ -567,11 +575,17 @@ function Find-TestHook([System.Management.Automation.Language.Ast]$Ast, [string]
     # Rule TESTHOOK, the finding half: every place where the script $Ast takes something from a
     # test. One object per place: File (as given), Kind ('env' for a read of a test variable from
     # the environment, 'param' for a script parameter that begins Test), Name, Line, and Seen (the
-    # form, for the message). The syntax tree only, never the text: comments and messages name
-    # these variables (Watch-LocalAI.ps1 says why it reads none of them).
+    # form, for the message). The syntax tree only, never the file's text: comments name these
+    # variables (Watch-LocalAI.ps1 says why it reads none of them).
+    # A third kind, 'text', is no such place and no problem: a string that holds a test
+    # variable's name, or the start of one, and is none of the reads. It is what a read leaves
+    # behind when it moves out of this rule's sight; Find-TestHookProblem holds a stale entry
+    # against it.
     $found = New-Object System.Collections.Generic.List[object]
     $nameRx = [regex]'(?i)^(?:LOCALAI_TEST_.*|LOCALAI_DOCKER_TIMEOUT|LOCALAI_TS_TIMEOUT)$'
     $add = { param($Kind, $Name, $Node, $Seen) $found.Add([pscustomobject]@{ File = $File; Kind = $Kind; Name = $Name; Line = $Node.Extent.StartLineNumber; Seen = $Seen }) }
+    # The strings that are a read below (by where they begin): not looked at again as 'text'.
+    $counted = @{}
 
     # $env:NAME, also inside a double-quoted string.
     foreach ($v in $Ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.VariableExpressionAst] }, $true)) {
@@ -593,6 +607,7 @@ function Find-TestHook([System.Management.Automation.Language.Ast]$Ast, [string]
         $first = @($im.Arguments)[0]
         if ($first -is [System.Management.Automation.Language.StringConstantExpressionAst] -and $nameRx.IsMatch([string]$first.Value)) {
             & $add 'env' ([string]$first.Value) $im ("GetEnvironmentVariable('{0}')" -f $first.Value)
+            $counted[$first.Extent.StartOffset] = $true
         }
     }
 
@@ -606,7 +621,34 @@ function Find-TestHook([System.Management.Automation.Language.Ast]$Ast, [string]
             $word = [string]$s.Value
             if ($word -notmatch '^env:[\\/]?') { continue }
             $name = $word -replace '^env:[\\/]?', ''
-            if ($nameRx.IsMatch($name)) { & $add 'env' $name $s ('{0} Env:{1}' -f $cmd, $name) }
+            if ($nameRx.IsMatch($name)) { & $add 'env' $name $s ('{0} Env:{1}' -f $cmd, $name); $counted[$s.Extent.StartOffset] = $true }
+        }
+    }
+
+    # Kind 'text': a string (quoted, a here-string, a bare word, a key) that holds such a name, or
+    # LOCALAI_TEST_ with as much of a name as follows it there, and is none of the reads above. A
+    # name put together at run time ('LOCALAI_TEST_' + $what), one kept in a variable or looked up
+    # in the table of all variables, and code held as text for another PowerShell all leave one.
+    # So do a message that names a variable and a call that sets one: no read, hence no problem.
+    $wordRx = [regex]'(?i)(?<![A-Za-z0-9_])(?:LOCALAI_TEST_[A-Za-z0-9_]*|LOCALAI_DOCKER_TIMEOUT|LOCALAI_TS_TIMEOUT)(?![A-Za-z0-9_])'
+    foreach ($s in $Ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.StringConstantExpressionAst] -or $n -is [System.Management.Automation.Language.ExpandableStringExpressionAst] }, $true)) {
+        if ($counted.ContainsKey($s.Extent.StartOffset)) { continue }
+        $text = [string]$s.Extent.Text
+        if ($s -is [System.Management.Automation.Language.ExpandableStringExpressionAst]) {
+            # What the string expands is not the string's own text ("... $env:NAME" is a read
+            # above): blanked, the line breaks kept for the line number.
+            $chars = $text.ToCharArray()
+            foreach ($ne in $s.NestedExpressions) {
+                $to = [Math]::Min($ne.Extent.EndOffset - $s.Extent.StartOffset, $chars.Length)
+                for ($i = [Math]::Max($ne.Extent.StartOffset - $s.Extent.StartOffset, 0); $i -lt $to; $i++) {
+                    if ($chars[$i] -ne [char]10) { $chars[$i] = [char]32 }
+                }
+            }
+            $text = -join $chars
+        }
+        foreach ($m in $wordRx.Matches($text)) {
+            $line = $s.Extent.StartLineNumber + @($text.Substring(0, $m.Index) -split "`n").Count - 1
+            $found.Add([pscustomobject]@{ File = $File; Kind = 'text'; Name = $m.Value; Line = $line; Seen = 'a string' })
         }
     }
 
@@ -627,9 +669,16 @@ function Find-TestHookProblem($Hits, [string[]]$Pins = @()) {
     # '<file> <kind> <name>', the file as its path below the toolkit folder with '/', and stands
     # for itself only: no wildcard, no pattern. The list is handed in, so the canaries judge with
     # their own and the real one is read in one place. Nothing in a script can switch this off.
+    # A hit of kind 'text' is no problem and no entry allows one: a stale 'env' entry is held
+    # against them. An entry goes stale when its read is gone, and just as well when the read
+    # only moved out of this rule's sight (the header lists where to). Told 'take it out' and no
+    # more, the reader deletes the last trace of a hook that is still read, and the build is
+    # green: so the sentence gives both cases, and names the string a moved read left behind.
     $out = New-Object System.Collections.Generic.List[string]
     $used = @{}; $said = @{}
+    $texts = New-Object System.Collections.Generic.List[object]
     foreach ($h in $Hits) {
+        if ($h.Kind -eq 'text') { $texts.Add($h); continue }
         $key = '{0} {1} {2}' -f $h.File, $h.Kind, $h.Name
         if ($Pins -contains $key) { $used[$key] = $true; continue }
         # Two reads of one name on one line are one sentence.
@@ -642,15 +691,39 @@ function Find-TestHookProblem($Hits, [string[]]$Pins = @()) {
             $out.Add("$at test variable $($h.Name) is read from the environment ($($h.Seen)): any program running as the user can set it for good; use a stand-in the test puts on PATH, a real parameter, or a -Test parameter the run announces")
         }
     }
+    $list = '$testHookPins in tests/Invoke-StaticChecks.ps1'
+    $moved = 'a helper, a name put together at run time, code held as text for another PowerShell'
     foreach ($p in $Pins) {
-        if (-not $used.ContainsKey($p)) { $out.Add("pinned entry '$p' matches nothing any more: take it out of `$testHookPins in tests/Invoke-StaticChecks.ps1 (the list only shrinks)") }
+        if ($used.ContainsKey($p)) { continue }
+        $gone = "pinned entry '$p' matches nothing any more"
+        $entry = [regex]::Match($p, '^(?<file>.+) (?<kind>env|param) (?<name>\S+)$')
+        if (-not $entry.Success) {
+            $out.Add("${gone}: an entry is '<file> env <name>' or '<file> param <name>', nothing else; take it out of $list")
+            continue
+        }
+        $pinFile = $entry.Groups['file'].Value; $pinName = $entry.Groups['name'].Value
+        if ($entry.Groups['kind'].Value -eq 'param') {
+            $out.Add("${gone}: if $pinFile has that parameter under no other name either, take the entry out of $list (the list only shrinks); a test parameter that only got a name that does not begin Test is a new hook this rule cannot see, not a removed one")
+            continue
+        }
+        # The strings, in any script, that hold the entry's name or the start of it.
+        $held = @($texts | Where-Object { $pinName.StartsWith([string]$_.Name, [System.StringComparison]::OrdinalIgnoreCase) })
+        if ($held.Count) {
+            $more = ''; if ($held.Count -gt 1) { $more = ' (and {0} more outside tests)' -f ($held.Count - 1) }
+            $out.Add("$gone, but $($held[0].File):$($held[0].Line) still holds '$($held[0].Name)' in a string${more}: a read that only moved ($moved) is a new hook this rule cannot see, not a removed one; take the entry out of $list only when nothing there reads $pinName")
+        } else {
+            $out.Add("${gone}: if neither $pinFile nor anything it calls reads $pinName any more, take the entry out of $list (the list only shrinks); if the read only moved ($moved), it is a new hook this rule cannot see, not a removed one, and the entry is its last trace")
+        }
     }
     return $out.ToArray()
 }
 
 # Rule TESTHOOK: what main held when the rule came. One entry per file, kind and name, each
 # written out (Find-TestHookProblem compares whole entries). Nothing is added here for a new read
-# from the environment; an entry whose read or parameter is gone must go too.
+# from the environment; an entry whose read or parameter is gone must go too. Gone, not moved: a
+# read that went into a helper, into a name put together at run time or into text for another
+# PowerShell is still read, this rule no longer sees it, and its entry is the last trace of it.
+# Put such a read back where the rule sees it, or replace it, before the entry goes.
 $testHookPins = @(
     'Backup-OpenWebUI.ps1 env LOCALAI_TEST_CHAT_POLL_SEC'
     'Enable-TailscaleAccess.ps1 env LOCALAI_TS_TIMEOUT'
@@ -898,8 +971,30 @@ $testHookCanaries = @(
     @{ Fire = $true; Gaps = 2; Says = '^Canary\.ps1:1 test variable LOCALAI_TEST_X is read.* \| pinned entry ''Other\.ps1 env LOCALAI_TEST_X'' matches nothing any more'; Pins = @('Other.ps1 env LOCALAI_TEST_X'); Code = '$x = $env:LOCALAI_TEST_X' }
     @{ Fire = $true; Gaps = 2; Says = '^Canary\.ps1:1 test variable LOCALAI_TEST_Y is read.* \| pinned entry ''Canary\.ps1 env LOCALAI_TEST_X'' matches nothing any more'; Pins = @('Canary.ps1 env LOCALAI_TEST_X'); Code = '$y = $env:LOCALAI_TEST_Y' }
     @{ Fire = $true; Gaps = 2; Says = '^Canary\.ps1:1 test variable LOCALAI_TEST_X is read.* \| pinned entry ''Canary\.ps1 env LOCALAI_TEST_\*'' matches nothing any more'; Pins = @('Canary.ps1 env LOCALAI_TEST_*'); Code = '$x = $env:LOCALAI_TEST_X' }
-    @{ Fire = $true; Says = '^pinned entry ''Canary\.ps1 env LOCALAI_TEST_X'' matches nothing any more: take it out of \$testHookPins .*the list only shrinks'; Pins = @('Canary.ps1 env LOCALAI_TEST_X'); Code = '$a = 1' }
-    @{ Fire = $true; Says = '^pinned entry ''Canary\.ps1 param TestX'' matches nothing any more'; Pins = @('Canary.ps1 env LOCALAI_TEST_X', 'Canary.ps1 param TestX'); Code = "param([switch]`$Force)`n`$x = `$env:LOCALAI_TEST_X" }
+    # A stale entry is to go only when its read is gone, and the sentence says so: one whose read
+    # only moved out of this rule's sight would lose its last trace, and the build would be green.
+    @{ Fire = $true; Says = '^pinned entry ''Canary\.ps1 env LOCALAI_TEST_X'' matches nothing any more: if neither Canary\.ps1 nor anything it calls reads LOCALAI_TEST_X any more, take the entry out of \$testHookPins in tests/Invoke-StaticChecks\.ps1 \(the list only shrinks\); if the read only moved \(.*\), it is a new hook this rule cannot see, not a removed one, and the entry is its last trace$'; Pins = @('Canary.ps1 env LOCALAI_TEST_X'); Code = '$a = 1' }
+    @{ Fire = $true; Says = '^pinned entry ''Canary\.ps1 param TestX'' matches nothing any more: if Canary\.ps1 has that parameter under no other name either, take the entry out of \$testHookPins .*the list only shrinks.* a test parameter that only got a name that does not begin Test is a new hook this rule cannot see, not a removed one$'; Pins = @('Canary.ps1 env LOCALAI_TEST_X', 'Canary.ps1 param TestX'); Code = "param([switch]`$Force)`n`$x = `$env:LOCALAI_TEST_X" }
+    # The read that moved leaves a string with the name, or with the start of it: then the sentence
+    # names that place, in whatever script it is (the entry is Update.ps1's, the helper the
+    # library's), and does not ask for the entry to go. A helper that puts the name together, code
+    # held as text for another PowerShell, a name kept in a variable, a path put together in a
+    # string and a look in the table of all variables, text over several lines.
+    @{ Fire = $true; Says = '^pinned entry ''Update\.ps1 env LOCALAI_TEST_CATALOG'' matches nothing any more, but lib/Canary\.psm1:2 still holds ''LOCALAI_TEST_'' in a string: a read that only moved \(.*\) is a new hook this rule cannot see, not a removed one; take the entry out of \$testHookPins in tests/Invoke-StaticChecks\.ps1 only when nothing there reads LOCALAI_TEST_CATALOG$'; Pins = @('Update.ps1 env LOCALAI_TEST_CATALOG'); File = 'lib/Canary.psm1'; Code = "function Get-LaiTestHook([string]`$Name) {`n    return [Environment]::GetEnvironmentVariable('LOCALAI_TEST_' + `$Name)`n}" }
+    @{ Fire = $true; Says = '^pinned entry ''Canary\.ps1 env LOCALAI_TEST_X'' matches nothing any more, but Canary\.ps1:1 still holds ''LOCALAI_TEST_X'' in a string: '; Pins = @('Canary.ps1 env LOCALAI_TEST_X'); Code = '$cmd = ''if ($env:LOCALAI_TEST_X) { exit 3 }''; & powershell.exe -NoProfile -Command $cmd' }
+    @{ Fire = $true; Says = ' matches nothing any more, but Canary\.ps1:1 still holds ''LOCALAI_TS_TIMEOUT'' in a string: '; Pins = @('Canary.ps1 env LOCALAI_TS_TIMEOUT'); Code = '$n = ''LOCALAI_TS_TIMEOUT''; $v = [Environment]::GetEnvironmentVariable($n)' }
+    @{ Fire = $true; Says = ' matches nothing any more, but Canary\.ps1:2 still holds ''LOCALAI_TEST_FAIL_'' in a string \(and 1 more outside tests\): .* only when nothing there reads LOCALAI_TEST_FAIL_SWAP$'; Pins = @('Canary.ps1 env LOCALAI_TEST_FAIL_SWAP'); Code = "`$a = 1`n`$v = (Get-Item `"Env:LOCALAI_TEST_FAIL_`$what`").Value; `$all = [Environment]::GetEnvironmentVariables()['LOCALAI_TEST_FAIL_SWAP']" }
+    @{ Fire = $true; Says = ' matches nothing any more, but Canary\.ps1:4 still holds ''LOCALAI_DOCKER_TIMEOUT'' in a string: '; Pins = @('Canary.ps1 env LOCALAI_DOCKER_TIMEOUT'); Code = "`$a = 1`n`$cmd = @'`nWrite-Host started`nif (`$env:LOCALAI_DOCKER_TIMEOUT) { exit 3 }`n'@" }
+    # No such string, no such claim. The pinned reads of the name in another script are reads, not
+    # strings (one of them inside a string); another variable's name is not the start of this one;
+    # a comment is not looked at.
+    @{ Fire = $true; Says = '^pinned entry ''Other\.ps1 env LOCALAI_TEST_X'' matches nothing any more: if neither Other\.ps1 nor anything it calls reads LOCALAI_TEST_X any more, take the entry out '; Pins = @('Canary.ps1 env LOCALAI_TEST_X', 'Other.ps1 env LOCALAI_TEST_X'); Code = 'Write-Host "catalog: $env:LOCALAI_TEST_X"; $v = [Environment]::GetEnvironmentVariable(''LOCALAI_TEST_X''); $i = Get-Item Env:LOCALAI_TEST_X' }
+    @{ Fire = $true; Says = '^pinned entry ''Canary\.ps1 env LOCALAI_TEST_CATALOG'' matches nothing any more: if neither '; Pins = @('Canary.ps1 env LOCALAI_TEST_CATALOG'); Code = 'Write-Host ''LOCALAI_TEST_OTHER is set''; $s = ''LOCALAI_TEST_CATALOG_DIR''' }
+    @{ Fire = $true; Says = '^pinned entry ''Canary\.ps1 env LOCALAI_TS_TIMEOUT'' matches nothing any more: if neither '; Pins = @('Canary.ps1 env LOCALAI_TS_TIMEOUT'); Code = "# LOCALAI_TS_TIMEOUT is read no more.`n`$a = 'LOCALAI_TS_TIMEOUT_SEC'; `$b = 'MY_LOCALAI_TS_TIMEOUT'; `$c = 'LOCALAI_TESTING'" }
+    # Such a string cannot be pinned: an entry is a read or a parameter.
+    @{ Fire = $true; Says = '^pinned entry ''Canary\.ps1 text LOCALAI_TEST_'' matches nothing any more: an entry is ''<file> env <name>'' or ''<file> param <name>'', nothing else; take it out of \$testHookPins '; Pins = @('Canary.ps1 text LOCALAI_TEST_'); Code = '$n = ''LOCALAI_TEST_'' + $what' }
+    # And it is no problem by itself: the entry here still has its read.
+    @{ Fire = $false; Pins = @('Canary.ps1 env LOCALAI_TEST_X'); Code = 'if ($env:LOCALAI_TEST_X) { $n = ''LOCALAI_TEST_X''; Write-Host "LOCALAI_TEST_$n" }' }
     @{ Fire = $false; Pins = @('Canary.ps1 env LOCALAI_TEST_X'); Code = 'if ($env:LOCALAI_TEST_X) { $p = $env:LOCALAI_TEST_X }' }
     @{ Fire = $false; Pins = @('lib/Canary.psm1 env LOCALAI_DOCKER_TIMEOUT'); File = 'lib/Canary.psm1'; Code = 'if ($env:LOCALAI_DOCKER_TIMEOUT) { 1 }' }
     @{ Fire = $false; Pins = @('Canary.ps1 param TestX'); Code = "param(`n    [switch]`$TestX`n)`n`$hook = [bool]`$TestX" }
@@ -999,7 +1094,8 @@ foreach ($f in $files) {
 }
 
 # TESTHOOK: every script outside tests against the pinned list. All of them are read first and
-# judged once: an entry is stale only when no script holds its read or parameter any more.
+# judged once: an entry is stale only when no script holds its read or parameter any more, and a
+# stale one is held against the strings of all of them (a read may have moved into the library).
 $testHookHits = @()
 foreach ($f in ($files | Where-Object { $_.Extension -in '.ps1', '.psm1' })) {
     # The path below $Root with '/', on Windows as on Linux: the entries are written that way.
