@@ -9,12 +9,13 @@
     in <AIRoot>\Stack\.env, so nothing changes until you run this. Data lives in the "open-webui"
     volume and survives the container being recreated.
 
-    An update whose new version does not answer within 10 minutes is remembered as one that had not
-    answered when it ended. Running the same update again then waits for Open WebUI once more and
-    says how it went (it never says 'Already on'). An update to another version first looks whether
-    Open WebUI answers by now; while it runs and still does not, that update is refused (-Rollback
-    goes back first), because its backup would hold the broken state and replace the rollback
-    point. While Open WebUI is stopped nothing can be seen, so both say to start it first.
+    An update whose new version does not answer within 10 minutes (-WebUIWaitSec sets another
+    wait) is remembered as one that had not answered when it ended. Running the same update again
+    then waits for Open WebUI once more and says how it went (it never says 'Already on'). An
+    update to another version first looks whether Open WebUI answers by now; while it runs and
+    still does not, that update is refused (-Rollback goes back first), because its backup would
+    hold the broken state and replace the rollback point. While Open WebUI is stopped nothing can
+    be seen, so both say to start it first.
 
 .EXAMPLE
     .\Update-OpenWebUI.ps1 -Latest              # newest GitHub release of Open WebUI
@@ -42,11 +43,36 @@ param(
     [switch]$Rollback,
     # Skip the "type YES" confirmation of -Rollback. With -Version or -Latest: update all the same
     # when the last update had not answered and Open WebUI still does not (without it that is refused).
-    [switch]$Force
+    [switch]$Force,
+    # The models catalog for the health check that ends an update, and for the restore of -Rollback
+    # (handed on to Test-LocalAI.ps1 and Restore-OpenWebUI.ps1). Defaults to config\models.psd1 next
+    # to those scripts.
+    [string]$CatalogPath = '',
+    # How many seconds the new version gets to answer (10 minutes unless given). With -Rollback the
+    # restore waits that long as well (5 minutes unless given).
+    [ValidateRange(1, [int]::MaxValue)][int]$WebUIWaitSec = 600
 )
 $ErrorActionPreference = 'Stop'
 [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
 Import-Module (Join-Path (Join-Path $PSScriptRoot 'lib') 'LocalAI.psm1') -Force
+
+# -CatalogPath and -WebUIWaitSec go to the restore of a rollback only when given: without them
+# Restore-OpenWebUI.ps1 keeps its own defaults. A catalog that was given is looked at before
+# anything is changed (the scripts that read it run after the update, or in the middle of a
+# rollback) and kept as a full path.
+# The health check (Test-LocalAI.ps1) is always handed a catalog: the one given, else the toolkit's
+# own, which is the file it takes by itself. Left to pick one, it looks in the environment for a
+# test catalog first, so an update that named none still took a test hook from there: with that
+# variable naming a file that is not there, every update and every rollback ended on a health
+# check that could not start (a failed update, and no older image removed).
+$restoreArgs = @{}
+$healthArgs = @{ CatalogPath = (Join-Path (Join-Path $PSScriptRoot 'config') 'models.psd1') }
+if ($CatalogPath) {
+    if (-not (Test-Path -LiteralPath $CatalogPath -PathType Leaf)) { throw "The models catalog given with -CatalogPath was not found: $CatalogPath. Nothing was changed." }
+    $restoreArgs['CatalogPath'] = (Resolve-Path -LiteralPath $CatalogPath).ProviderPath
+    $healthArgs['CatalogPath'] = $restoreArgs['CatalogPath']
+}
+if ($PSBoundParameters.ContainsKey('WebUIWaitSec')) { $restoreArgs['WebUIWaitSec'] = $WebUIWaitSec }
 
 $stack = Join-Path $AIRoot 'Stack'
 $envPath = Join-Path $stack '.env'
@@ -88,10 +114,8 @@ function Get-DockerResult {
 $config = Read-LaiState -Path $configPath
 $port = 3000; if ($config.ContainsKey('WebUIPort')) { $port = [int]$config['WebUIPort'] }
 $base = @('compose', '--project-directory', $stack, '-f', $compose)
-# How long a new version gets to answer. LOCALAI_TEST_WEBUI_WAIT_SEC: test hook, a shorter wait. It
-# counts only as a positive whole number: anything else keeps the 10 minutes.
-$waitSec = 600; $askedWait = 0
-if ($env:LOCALAI_TEST_WEBUI_WAIT_SEC -and [int]::TryParse([string]$env:LOCALAI_TEST_WEBUI_WAIT_SEC, [ref]$askedWait) -and $askedWait -gt 0) { $waitSec = $askedWait }
+# How long a new version gets to answer: -WebUIWaitSec, 10 minutes unless given.
+$waitSec = $WebUIWaitSec
 
 function Clear-UpdatePending {
     # Open WebUI answered: the last update is no longer one that had not answered (see UpdatePending below).
@@ -202,7 +226,7 @@ if ($Rollback) {
         catch { throw "Could not download Open WebUI $prevVer, nothing was changed: $($_.Exception.Message)" }
         Set-EnvVersion -OpenWebUI $prevVer
         Invoke-Docker -Arguments ($base + @('up', '-d', 'open-webui'))
-        & (Join-Path $PSScriptRoot 'Restore-OpenWebUI.ps1') -AIRoot $AIRoot -Archive $archive -Force
+        & (Join-Path $PSScriptRoot 'Restore-OpenWebUI.ps1') -AIRoot $AIRoot -Archive $archive -Force @restoreArgs
         if ($LASTEXITCODE -ne 0) {
             # The volume still holds the data the current version migrated (the restore rolled back, or
             # holds Open WebUI down): go back to the current version, never the old image on that data.
@@ -230,7 +254,7 @@ if ($Rollback) {
         throw "$why. To return to Open WebUI $cur and the data from just before this rollback: Update-OpenWebUI.ps1 -Version $cur -SkipBackup first, then Restore-OpenWebUI.ps1 -Archive $(ConvertTo-LaiPsQuoted $safetyNew.FullName)"
     }
     Write-UpdateLog OK "Rolled back to Open WebUI $((Invoke-LaiApi -Uri "http://127.0.0.1:$port/api/version").version)"
-    & (Join-Path $PSScriptRoot 'Test-LocalAI.ps1') -AIRoot $AIRoot -Quick
+    & (Join-Path $PSScriptRoot 'Test-LocalAI.ps1') -AIRoot $AIRoot -Quick @healthArgs
     exit $LASTEXITCODE
 }
 
@@ -366,7 +390,7 @@ $running = (Invoke-LaiApi -Uri "http://127.0.0.1:$port/api/version").version
 Write-UpdateLog OK "Open WebUI $running is up on http://localhost:$port (was $current)"
 if ($pre -and $Version) { Write-UpdateLog INFO "If this version misbehaves: Update-OpenWebUI.ps1 -Rollback (back to $current with the data from $($pre.Name))" }
 
-& (Join-Path $PSScriptRoot 'Test-LocalAI.ps1') -AIRoot $AIRoot -Quick
+& (Join-Path $PSScriptRoot 'Test-LocalAI.ps1') -AIRoot $AIRoot -Quick @healthArgs
 $testExit = $LASTEXITCODE
 if ($testExit -eq 0 -and $Version) {
     # Each Open WebUI image is several GB and Docker's disk image never shrinks by itself: keep the
