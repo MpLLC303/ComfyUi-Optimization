@@ -18,15 +18,18 @@
       and that nothing else does: no other value, no fetched text, no other variable.
     - The bootstrap's own flow, read from its syntax tree: the ref is checked before GitHub is asked,
       one question, before the one download and the one request for administrator rights; the
-      installer is started in one place only, in the step that has those rights, after its checks.
+      installer is started in one place only, in the step that has those rights, after its checks;
+      the downloaded file is read once and nothing is unpacked in the temp folder; the step uses
+      the path in the temp folder for one read and removes nothing there.
     - The gate (Get-UpdateConsent) with a stand-in for the keyboard: only an OK typed after the review
       goes on; no keyboard, an error, a piped-in OK or an unreadable review does not.
     - What is installed is the commit that was shown: git's id of a file, the one line-end rule
-      (.cmd), GitHub's list of a commit's files (and every answer that is not used as one), a
-      download that differs in one byte, holds a file the list does not or lacks one, an update
-      without that list, the rules of a folder only administrators can change (as data), the text
-      and the command the step with administrator rights is handed, archives with names that would
-      land outside the folder they are unpacked into.
+      (.cmd), GitHub's list of a commit's files (every answer that is not used as one, and what
+      lies outside local-llm and so stands in nobody's way), a download that differs in one byte,
+      holds a file the list does not or lacks one (as files and as an archive read from its
+      bytes), an update without that list, the rules of a folder only administrators can change
+      (as data), the text and the command the step with administrator rights is handed, archives
+      with names that would land outside the folder they are unpacked into.
     - Windows only: the whole bootstrap in a child process, started the way 'irm | iex' starts it,
       with GitHub replaced by stand-ins and a stand-in installer in the archive. With nobody to type
       OK, or with an OK piped in, nothing is downloaded and no installer starts; with the reviewed
@@ -34,16 +37,32 @@
       an install the bootstrap looks for (in the AI folder, and the all-users Start-menu folder
       outside it, which is created for that run and removed again) makes it ask; a ref that is no
       plain name reaches neither GitHub nor the download.
-      The request for administrator rights is a stand-in too (the test machine's user is an
-      administrator already): it starts the same command line and waits. The step behind it is the
-      real one: it makes its folder under Program Files of the test machine, runs the stand-in
-      installer from there and removes the folder again. A download that is not the commit, an
-      archive swapped in the temp folder after the first comparison and a changed step are refused;
-      a real folder that Users may modify does not pass the check of its rules; no run leaves
-      anything in the temp folder or under Program Files.
+      The test machine's user is an administrator already, so those runs take the bootstrap's
+      route for a window that has the rights: the step runs in it, with no stand-in at all, makes
+      its folder under Program Files of the test machine, runs the stand-in installer from there
+      and removes the folder again; the installer's result is reported in that same window.
+      The other route, a window of its own, cannot be reached through the whole bootstrap on such
+      a machine. It is run from the download on (Install-ToolkitDownload, the function the
+      bootstrap calls, with the route given), with a stand-in for the one request to Windows that
+      starts the same command line and waits: an archive swapped in the temp folder after the
+      first comparison and a changed step are refused, a declined request and a window that never
+      answers are told apart, and nothing with administrator rights removes a file in the temp
+      folder. The step itself is also called directly, with a wrong archive and a wrong digest.
+      A real folder that Users may modify does not pass the check of its rules; a folder made with
+      its rules in one call has them from the start; no run leaves anything in the temp folder or
+      under Program Files.
+    - Only when asked (-ProbeCommit <full id of a pushed commit>, and -ProbeRepo owner/name when it
+      is not the bootstrap's repository): GitHub itself. Its list of that commit's files and its
+      archive of that commit are fetched and held against each other with the bootstrap's own
+      functions. That is the one part that needs a network; GITHUB_TOKEN is sent to GitHub's API
+      when the environment holds one (its hourly limit without one is small).
     Exit code = number of failed assertions.
 #>
-param([string]$Work = (Join-Path ([System.IO.Path]::GetTempPath()) 'lai-getlocalai-test'))
+param(
+    [string]$Work = (Join-Path ([System.IO.Path]::GetTempPath()) 'lai-getlocalai-test'),
+    [string]$ProbeCommit = '',
+    [string]$ProbeRepo = ''
+)
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 # The Windows part starts the bootstrap for real (with stand-ins): only on a throwaway test machine.
@@ -58,8 +77,6 @@ function Assert-That([bool]$Condition, [string]$Message) {
 function Skip([string]$Message) { Write-Host "  SKIP        $Message" -ForegroundColor DarkGray }
 
 Write-Host "PowerShell $($PSVersionTable.PSVersion) ($($PSVersionTable.PSEdition)) on $(if ($onWindows) { 'Windows' } else { 'non-Windows' })"
-$childExe = 'pwsh'
-if ($PSVersionTable.PSEdition -eq 'Desktop') { $childExe = 'powershell.exe' }
 
 # ---- the review functions, straight out of the bootstrap ------------------------------------------
 Write-Host "`n=== Get-LocalAI.ps1: the review functions ===" -ForegroundColor Cyan
@@ -69,8 +86,9 @@ $ast = [System.Management.Automation.Language.Parser]::ParseFile($bootstrap, [re
 $fnAsts = @($ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true))
 $wanted = @('ConvertTo-ReviewText', 'Get-ReviewField', 'ConvertTo-ReviewBody', 'ConvertFrom-ReviewJson', 'Get-PatchCommit', 'ConvertTo-ReviewDate', 'ConvertTo-ReviewCount', 'Get-CommitSummary', 'Test-ToolkitRef', 'Test-DirectCommitRef', 'Get-IncomingCommit',
     'Get-InstalledToolkit', 'Test-PlainRepoPath', 'Get-ChangedFileGroup', 'Get-ChangedFileReport', 'Get-UpdateReview', 'Test-UpdateAnswer', 'Get-UpdateConsent',
-    'Get-Sha256Hex', 'Get-GitBlobId', 'Get-ToolkitFileId', 'Get-TreeManifest', 'Compare-ToolkitTree', 'Get-ToolkitDigest', 'Test-AdminOnlyRule', 'Get-DownloadCheck', 'Get-ElevatedFunctionList', 'Get-ElevatedStage', 'Get-ElevatedLauncher',
-    'Get-ToolkitFileList', 'ConvertTo-FolderRule', 'Get-FolderRule', 'Set-AdminOnlyRule', 'Expand-ToolkitArchive', 'Remove-ToolkitTree', 'Remove-HandedOverFile', 'Invoke-ElevatedInstall')
+    'Get-Sha256Hex', 'Get-GitBlobId', 'Get-ToolkitFileId', 'Get-TreeManifest', 'Compare-ToolkitTree', 'Get-ToolkitDigest', 'Test-AdminOnlyRule', 'Get-DownloadCheck', 'Get-ToolkitEntry', 'Get-ElevationRoute', 'Get-ElevatedFunctionList', 'Get-ElevatedStage', 'Get-ElevatedLauncher',
+    'Get-ToolkitFileList', 'ConvertTo-FolderRule', 'Get-FolderRule', 'Get-AdminOnlySecurity', 'Set-AdminOnlyRule', 'Expand-ToolkitArchive', 'Get-ArchiveFileList', 'Remove-ToolkitTree', 'Copy-HandedOverArchive', 'New-HandOverSignal', 'Send-HandOverSignal', 'Invoke-ElevatedInstall',
+    'Start-ElevatedWindow', 'Install-ToolkitDownload')
 $have = @($fnAsts | ForEach-Object { $_.Name })
 $missing = @($wanted | Where-Object { $have -notcontains $_ })
 $haveFunctions = (@($parseErrors).Count -eq 0 -and $missing.Count -eq 0)
@@ -604,39 +622,69 @@ if ($haveFunctions) {
         if ($path -like '*.cmd') { $stored = $utf8.GetBytes($utf8.GetString($stored).Replace("`r`n", "`n")); $mode = '100755' }
         $treeEntries += (New-TreeEntry $path (Get-GitBlobId -Bytes $stored) -Mode $mode)
     }
-    $manifest = Get-TreeManifest -Tree (New-TreeAnswer $treeEntries)
-    Assert-That ($manifest -is [array] -and $manifest.Count -eq 4 -and @($manifest | Where-Object { $_.Path -notlike 'local-llm/*' -or $_.Id -cnotmatch '^[0-9a-f]{40}\z' }).Count -eq 0 -and (@($manifest | ForEach-Object { $_.Path }) -join ' ') -ceq (@($arrived.Keys) -join ' ')) "GitHub's list of a commit's files gives the files under local-llm with their ids, and nothing from outside it ($(@($manifest).Count) file(s))"
-    $manifestFromDictionaries = Get-TreeManifest -Tree (ConvertTo-TestDictionary @{ sha = ('f' * 40); truncated = $false; tree = $treeEntries })
+    $listing = Get-TreeManifest -Tree (New-TreeAnswer $treeEntries)
+    $manifest = $listing.Files
+    Assert-That ($manifest -is [array] -and $manifest.Count -eq 4 -and @($manifest | Where-Object { $_.Path -notlike 'local-llm/*' -or $_.Id -cnotmatch '^[0-9a-f]{40}\z' }).Count -eq 0 -and (@($manifest | ForEach-Object { $_.Path }) -join ' ') -ceq (@($arrived.Keys) -join ' ') -and $listing.Why -eq '' -and $listing.Lasting -eq $false) "GitHub's list of a commit's files gives the files under local-llm with their ids, and nothing from outside it ($(@($manifest).Count) file(s))"
+    $manifestFromDictionaries = (Get-TreeManifest -Tree (ConvertTo-TestDictionary @{ sha = ('f' * 40); truncated = $false; tree = $treeEntries })).Files
     Assert-That (@($manifestFromDictionaries).Count -eq 4 -and (Get-ToolkitDigest -Files $manifestFromDictionaries) -ceq (Get-ToolkitDigest -Files $manifest)) 'the same answer read into dictionaries and arrays (the second JSON reader of Windows PowerShell 5.1) gives the same list'
-    $single = Get-TreeManifest -Tree (New-TreeAnswer @((New-TreeEntry 'local-llm' -Mode '040000' -Type 'tree'), (New-TreeEntry 'local-llm/Install-LocalAI.ps1')))
+    $single = (Get-TreeManifest -Tree (New-TreeAnswer @((New-TreeEntry 'local-llm' -Mode '040000' -Type 'tree'), (New-TreeEntry 'local-llm/Install-LocalAI.ps1')))).Files
     Assert-That ($single -is [array] -and $single.Count -eq 1) 'a list of one file stays a list'
     $withEntry = { param([object[]]$More) New-TreeAnswer (@($treeEntries) + @($More)) }
+    # Not usable, and whether asking again later can change it (Lasting: it is the commit's own list).
     $notUsable = [ordered]@{
-        'cut off by GitHub'                        = (New-TreeAnswer $treeEntries $true)
-        'no word on whether it is cut off'         = (ConvertFrom-Json -InputObject (ConvertTo-Json -Depth 6 -InputObject @{ sha = ('f' * 40); tree = $treeEntries }))
-        'cut off answered as text'                 = (New-TreeAnswer $treeEntries 'false')
-        'no list in it'                            = (ConvertFrom-Json -InputObject '{"sha": "x", "truncated": false}')
-        'an empty list'                            = (ConvertFrom-Json -InputObject '{"sha": "x", "truncated": false, "tree": []}')
-        'a list that is text'                      = (ConvertFrom-Json -InputObject '{"truncated": false, "tree": "local-llm/Install-LocalAI.ps1"}')
-        'an error message'                         = (ConvertFrom-Json -InputObject '{"message": "Not Found"}')
-        'plain text'                               = 'Not Found'
-        'nothing at all'                           = $null
-        'a symbolic link'                          = (& $withEntry (New-TreeEntry 'local-llm/link' -Mode '120000'))
-        'a submodule'                              = (& $withEntry (New-TreeEntry 'vendor' -Mode '160000' -Type 'commit'))
-        'an entry of an unknown kind'              = (& $withEntry (New-TreeEntry 'local-llm/new.ps1' -Type 'tag'))
-        'two files that differ in capitals only'   = (& $withEntry (New-TreeEntry 'local-llm/install-localai.ps1'))
-        'two folders that differ in capitals only' = (& $withEntry @((New-TreeEntry 'local-llm/Lib' -Mode '040000' -Type 'tree'), (New-TreeEntry 'local-llm/Lib/x.ps1')))
-        'a name that ends in a dot'                = (& $withEntry (New-TreeEntry 'local-llm./Install-LocalAI.ps1'))
-        'a name with a backslash'                  = (& $withEntry (New-TreeEntry 'local-llm\Evil.ps1'))
-        'a name with a colon'                      = (& $withEntry (New-TreeEntry 'local-llm/x.txt:Install-LocalAI.ps1'))
-        'a short 8.3 name'                         = (& $withEntry (New-TreeEntry 'LOCAL-~1/x.ps1'))
-        'a name outside ASCII'                     = (& $withEntry (New-TreeEntry ('docs/x' + [char]0xE9 + '.md')))
-        'an id that is no git id'                  = (& $withEntry (New-TreeEntry 'local-llm/new.ps1' 'abc'))
-        'an id in capitals'                        = (& $withEntry (New-TreeEntry 'local-llm/new.ps1' ('A' * 40)))
-        'no file under local-llm'                  = (New-TreeAnswer @((New-TreeEntry 'README.md'), (New-TreeEntry 'Local-LLM' -Mode '040000' -Type 'tree'), (New-TreeEntry 'Local-LLM/Install-LocalAI.ps1')))
+        'cut off by GitHub'                        = @{ Lasting = $true; Tree = (New-TreeAnswer $treeEntries $true) }
+        'no word on whether it is cut off'         = @{ Lasting = $false; Tree = (ConvertFrom-Json -InputObject (ConvertTo-Json -Depth 6 -InputObject @{ sha = ('f' * 40); tree = $treeEntries })) }
+        'cut off answered as text'                 = @{ Lasting = $false; Tree = (New-TreeAnswer $treeEntries 'false') }
+        'no list in it'                            = @{ Lasting = $false; Tree = (ConvertFrom-Json -InputObject '{"sha": "x", "truncated": false}') }
+        'an empty list'                            = @{ Lasting = $true; Tree = (ConvertFrom-Json -InputObject '{"sha": "x", "truncated": false, "tree": []}') }
+        'a list that is text'                      = @{ Lasting = $false; Tree = (ConvertFrom-Json -InputObject '{"truncated": false, "tree": "local-llm/Install-LocalAI.ps1"}') }
+        'an error message'                         = @{ Lasting = $false; Tree = (ConvertFrom-Json -InputObject '{"message": "Not Found"}') }
+        'plain text'                               = @{ Lasting = $false; Tree = 'Not Found' }
+        'nothing at all'                           = @{ Lasting = $false; Tree = $null }
+        'a symbolic link'                          = @{ Lasting = $true; Tree = (& $withEntry (New-TreeEntry 'local-llm/link' -Mode '120000')) }
+        'local-llm itself a symbolic link'         = @{ Lasting = $true; Tree = (New-TreeAnswer @((New-TreeEntry 'README.md'), (New-TreeEntry 'local-llm' -Mode '120000'))) }
+        'a submodule'                              = @{ Lasting = $true; Tree = (& $withEntry (New-TreeEntry 'local-llm/vendor' -Mode '160000' -Type 'commit')) }
+        'an entry of an unknown kind'              = @{ Lasting = $true; Tree = (& $withEntry (New-TreeEntry 'local-llm/new.ps1' -Type 'tag')) }
+        'two files that differ in capitals only'   = @{ Lasting = $true; Tree = (& $withEntry (New-TreeEntry 'local-llm/install-localai.ps1')) }
+        'two folders that differ in capitals only' = @{ Lasting = $true; Tree = (& $withEntry @((New-TreeEntry 'local-llm/Lib' -Mode '040000' -Type 'tree'), (New-TreeEntry 'local-llm/Lib/x.ps1'))) }
+        'the toolkit folder twice, in capitals'    = @{ Lasting = $true; Tree = (& $withEntry @((New-TreeEntry 'Local-LLM' -Mode '040000' -Type 'tree'), (New-TreeEntry 'Local-LLM/Install-LocalAI.ps1'))) }
+        'a name that ends in a dot'                = @{ Lasting = $true; Tree = (& $withEntry (New-TreeEntry 'local-llm/Install-LocalAI.ps1.')) }
+        'a name with a backslash'                  = @{ Lasting = $true; Tree = (& $withEntry (New-TreeEntry 'local-llm\Evil.ps1')) }
+        'a name with a colon'                      = @{ Lasting = $true; Tree = (& $withEntry (New-TreeEntry 'local-llm/x.txt:Install-LocalAI.ps1')) }
+        'a short 8.3 name'                         = @{ Lasting = $true; Tree = (& $withEntry (New-TreeEntry 'local-llm/INSTAL~1.PS1')) }
+        'a name outside ASCII'                     = @{ Lasting = $true; Tree = (& $withEntry (New-TreeEntry ('local-llm/docs/x' + [char]0xE9 + '.md'))) }
+        'an id that is no git id'                  = @{ Lasting = $false; Tree = (& $withEntry (New-TreeEntry 'local-llm/new.ps1' 'abc')) }
+        'an id in capitals'                        = @{ Lasting = $false; Tree = (& $withEntry (New-TreeEntry 'local-llm/new.ps1' ('A' * 40))) }
+        'no file under local-llm'                  = @{ Lasting = $true; Tree = (New-TreeAnswer @((New-TreeEntry 'README.md'), (New-TreeEntry 'Local-LLM' -Mode '040000' -Type 'tree'), (New-TreeEntry 'Local-LLM/Install-LocalAI.ps1'))) }
     }
-    $wronglyUsed = @($notUsable.Keys | Where-Object { $null -ne (Get-TreeManifest -Tree $notUsable[$_]) })
-    Assert-That ($wronglyUsed.Count -eq 0) "an answer that cannot be compared exactly with what Windows unpacks is not used as a list at all: cut off, no list, a link, a submodule, capitals, names Windows stores elsewhere ($($notUsable.Count) kinds; wrongly used: $($wronglyUsed -join ', '))"
+    $wronglyUsed = New-Object System.Collections.Generic.List[string]
+    $wronglyExplained = New-Object System.Collections.Generic.List[string]
+    foreach ($kind in $notUsable.Keys) {
+        $read = Get-TreeManifest -Tree $notUsable[$kind].Tree
+        if ($null -ne $read.Files) { $wronglyUsed.Add($kind) }
+        if (-not $read.Why -or $read.Why -match '[^\x20-\x7E]' -or $read.Lasting -isnot [bool] -or $read.Lasting -ne $notUsable[$kind].Lasting) { $wronglyExplained.Add($kind) }
+    }
+    Assert-That ($wronglyUsed.Count -eq 0) "an answer that cannot be compared exactly with what Windows unpacks is not used as a list at all: cut off, no list, and under local-llm a link, a submodule, capitals, names Windows stores elsewhere ($($notUsable.Count) kinds; wrongly used: $($wronglyUsed -join ', '))"
+    Assert-That ($wronglyExplained.Count -eq 0) "each of them says why in plain text, and whether asking again later can change it: a list GitHub cut off or a name in the commit itself stays as it is; an answer that is no list may be another one next time (wrong: $($wronglyExplained -join ', '))"
+    # What lies outside local-llm is neither read nor written on this PC. A name out there that
+    # Windows could not store, a link or a submodule must not stop an install or an update: before,
+    # one such file anywhere in the repository did, for good.
+    $outside = [ordered]@{
+        'a name outside ASCII in another folder'  = (New-TreeEntry ('docs/caf' + [char]0xE9 + '.md'))
+        'a dash outside ASCII in a workflow name' = (New-TreeEntry ('.github/workflows/build ' + [char]0x2013 + ' test.yml'))
+        'a symbolic link at the root'             = (New-TreeEntry 'latest' -Mode '120000')
+        'a submodule beside local-llm'            = (New-TreeEntry 'vendor' -Mode '160000' -Type 'commit')
+        'a name with a colon in another folder'   = (New-TreeEntry 'notes/a:b.txt')
+        'a name with a backslash elsewhere'       = (New-TreeEntry 'docs\x.md')
+        'two names in other capitals elsewhere'   = @((New-TreeEntry 'docs/Notes.md'), (New-TreeEntry 'docs/notes.md'))
+        'a folder that only looks like local-llm' = @((New-TreeEntry 'local-llm.' -Mode '040000' -Type 'tree'), (New-TreeEntry 'local-llm./Install-LocalAI.ps1'), (New-TreeEntry 'LOCAL-~1/x.ps1'))
+        'an entry without a name'                 = (New-TreeEntry '')
+    }
+    $wronglyRefused = @($outside.Keys | Where-Object {
+            $read = Get-TreeManifest -Tree (& $withEntry $outside[$_])
+            $null -eq $read.Files -or (Get-ToolkitDigest -Files $read.Files) -cne (Get-ToolkitDigest -Files $manifest)
+        })
+    Assert-That ($wronglyRefused.Count -eq 0) "what the repository holds outside local-llm stands in nobody's way: an unusual name, a link or a submodule there leaves the list as it is, the same four files ($($outside.Count) kinds; wrongly refused or changed: $($wronglyRefused -join ', '))"
 
     Write-Host "`n=== what is installed is the commit that was shown: the download against that list ===" -ForegroundColor Cyan
     $same = Compare-ToolkitTree -Manifest $manifest -Files (Get-TestFileList $arrived)
@@ -694,6 +742,17 @@ if ($haveFunctions) {
     Assert-That ($wentOn -eq 0) "GitHub's API not answering for the list stops the update: every kind of update, asked about or with the reviewed commit named, whatever the error ($($updateReviews.Count * $noListReasons.Count) cases, $wentOn went on)"
     $noList = Get-DownloadCheck -Review $skipUpdate -Manifest $null -ManifestError 'The remote server returned an error: (403) Forbidden.'
     Assert-That ($noList.Stop -match 'could not be used \(The remote server returned an error: \(403\) Forbidden\.\)' -and $noList.Stop -match 'never installed unchecked' -and $noList.Stop -match 'Try again later') 'it says why, that an update is never installed unchecked, and to try again later'
+    # "Try again later" is advice only where later can differ. A list GitHub cut off, or a name in
+    # the commit itself, is the same tomorrow: the stop then says so instead.
+    $cutListing = Get-TreeManifest -Tree (New-TreeAnswer $treeEntries $true)
+    $lastingStop = Get-DownloadCheck -Review $skipUpdate -Manifest $cutListing.Files -ManifestError $cutListing.Why -Lasting $cutListing.Lasting
+    $linkListing = Get-TreeManifest -Tree (& $withEntry (New-TreeEntry 'local-llm/link' -Mode '120000'))
+    $linkStop = Get-DownloadCheck -Review $update -Manifest $linkListing.Files -ManifestError $linkListing.Why -Lasting $linkListing.Lasting
+    Assert-That ($lastingStop.Stop -match 'GitHub cut the list off' -and $lastingStop.Stop -match 'never installed unchecked' -and $lastingStop.Stop -notmatch 'Try again later' -and $lastingStop.Stop -match 'Trying again later changes nothing' -and -not $lastingStop.Compare) "a list GitHub cut off stops the update without the advice to try again later: waiting does not make the list shorter ($($lastingStop.Stop))"
+    Assert-That ($linkStop.Stop -match 'no plain file \(a link or a submodule\): local-llm/link' -and $linkStop.Stop -notmatch 'Try again later' -and $linkStop.Stop -match 'fix in the repository' -and $linkStop.Stop -notmatch '[^\x20-\x7E]') 'and so does a name in the commit itself: the stop names it and says that the repository needs the fix'
+    $unreadListing = Get-TreeManifest -Tree 'Not Found'
+    $passingStop = Get-DownloadCheck -Review $update -Manifest $unreadListing.Files -ManifestError $unreadListing.Why -Lasting $unreadListing.Lasting
+    Assert-That ($passingStop.Stop -match 'could not be used \(its answer is no list of files\)' -and $passingStop.Stop -match 'Try again later' -and $passingStop.Stop -notmatch 'changes nothing') 'an answer that is no list at all (a proxy page, an error text) may be another one next time: that stop keeps the advice'
     $checkFirst = Get-DownloadCheck -Review $first -Manifest $manifest
     Assert-That (-not $checkFirst.Stop -and $checkFirst.Compare -and (Get-ReviewText $checkFirst) -match 'cannot be compared with a reviewed commit' -and (Get-ReviewText $checkFirst) -match 'compared with the 4 file\(s\) GitHub lists') 'a first install says plainly that its download cannot be compared with a reviewed commit; with the list it is still held against the commit it shows'
     $checkFirstNoList = Get-DownloadCheck -Review $first -Manifest $null -ManifestError 'The operation has timed out.'
@@ -765,7 +824,23 @@ if ($haveFunctions) {
     Assert-That ($wronglyAccepted.Count -eq 0) "the check of a folder's rules refuses a folder a normal user can write: modify, full control, a generic write, making files or folders, deleting, changing the rules, owning it; and rules it cannot read ($($writable.Count) cases; wrongly accepted: $($wronglyAccepted -join ', '))"
     Assert-That ($wronglyRefused.Count -eq 0) "it accepts a folder that SYSTEM, Administrators and TrustedInstaller alone can change, whoever else may read and run ($($adminsOnly.Count) cases; wrongly refused: $($wronglyRefused -join ', '))"
     Assert-That ((Test-AdminOnlyRule -Rule $writable['Users may modify']) -match '^S-1-5-32-545 may change it \(rights 0x001301BF\)' -and (Test-AdminOnlyRule -Rule $writable['a user owns it']) -match '^its owner is not SYSTEM, Administrators or TrustedInstaller \(owner: S-1-5-21-1-2-3-1001\)') 'and it says who may change the folder, or that its owner is the trouble'
-    Assert-That ((Test-AdminOnlyRule -Rule $writable['an inherit-only rule for a user'] -Parent) -eq '' -and (Test-AdminOnlyRule -Rule $writable['Users may modify'] -Parent) -ne '' -and (Test-AdminOnlyRule -Rule $writable['a user owns it'] -Parent) -ne '') 'for the folder above, only the inherit-only rules are left out: a user who may modify it, or who owns it, is still a no'
+    # The folder above (-Parent): one rule is left out, the one Program Files hands to CREATOR OWNER
+    # in folders made later. Every other inherit-only rule decides who may write into a folder
+    # that is made there, the step's own included, and counts like any rule.
+    $handsDown = [ordered]@{
+        'an inherit-only rule for a user'      = $writable['an inherit-only rule for a user']
+        'Users may modify what is made in it'  = (& $withRule (New-TestRule $sidUsers $modify -InheritOnly))
+        'Users get a generic write in it'      = (& $withRule (New-TestRule $sidUsers $genericWrite -InheritOnly))
+        'Everyone gets full control in it'     = (& $withRule (New-TestRule 'S-1-1-0' $genericAll -InheritOnly))
+        'CREATOR OWNER on the folder itself'   = (& $withRule (New-TestRule 'S-1-3-0' $genericAll))
+        'CREATOR GROUP in what is made in it'  = (& $withRule (New-TestRule 'S-1-3-1' $genericAll -InheritOnly))
+        'Users may modify the folder itself'   = $writable['Users may modify']
+        'a user owns it'                       = $writable['a user owns it']
+    }
+    $parentAccepted = @($handsDown.Keys | Where-Object { (Test-AdminOnlyRule -Rule $handsDown[$_] -Parent) -eq '' })
+    Assert-That ($parentAccepted.Count -eq 0) "the folder above is refused when it hands a right to change down to folders made in it: an inherit-only rule for anyone but CREATOR OWNER counts, as the rules for the folder itself and its owner do ($($handsDown.Count) cases; wrongly accepted: $($parentAccepted -join ', '))"
+    $handsDownReading = (& $withRule @((New-TestRule $sidUsers $genericReadRun -InheritOnly), (New-TestRule 'S-1-15-2-1' $genericReadRun -InheritOnly), (New-TestRule 'S-1-3-0' $genericAll -InheritOnly), (New-TestRule $sidInstaller $genericAll -InheritOnly)))
+    Assert-That ((Test-AdminOnlyRule -Rule $handsDownReading -Parent) -eq '' -and (Test-AdminOnlyRule -Rule $handsDown['Users may modify what is made in it'] -Parent) -match '^S-1-5-32-545 may change it') "what Windows itself sets up passes: reading handed down to Users, and full control to CREATOR OWNER, who is whoever was allowed to make the folder ('$(Test-AdminOnlyRule -Rule $handsDownReading -Parent)')"
 
     Write-Host "`n=== the step with administrator rights: its text, and the command that starts it ===" -ForegroundColor Cyan
     $stageNames = @(Get-ElevatedFunctionList)
@@ -787,26 +862,45 @@ if ($haveFunctions) {
     $oddRoot = 'D:\My AI''s $(calc) `n "q" ' + [char]0xE9 + '\'
     $oddZip = 'T:\temp folder\localai-installer.zip'
     $oddStage = 'T:\temp folder\localai-elevated-step.txt'
-    $standInBody = ' param($Zip, $StageFile, $Digest, $Commit, $Root, [string[]]$Extra) [pscustomobject]@{ Zip = $Zip; StageFile = $StageFile; Digest = $Digest; Commit = $Commit; Root = $Root; Extra = $Extra } '
-    $probeStage = Get-ElevatedStage -Definitions ([ordered]@{ 'Invoke-ElevatedInstall' = $standInBody }) -Zip $oddZip -StageFile $oddStage -Digest $digest -Commit '' -Root $oddRoot -Extra @('-OfficialModels', 'none')
+    $oddSignal = 'LocalAI-Update-0123456789abcdef0123456789abcdef'
+    $zipHashProbe = Get-Sha256Hex -Bytes $utf8.GetBytes('stand-in archive')
+    $standInBody = ' param($Zip, $ZipHash, $Digest, $Commit, $Root, [string[]]$Extra, $Signal) [pscustomobject]@{ Zip = $Zip; ZipHash = $ZipHash; Digest = $Digest; Commit = $Commit; Root = $Root; Extra = $Extra; Signal = $Signal } '
+    $probeStage = Get-ElevatedStage -Definitions ([ordered]@{ 'Invoke-ElevatedInstall' = $standInBody }) -Zip $oddZip -ZipHash $zipHashProbe -Digest $digest -Commit '' -Root $oddRoot -Extra @('-OfficialModels', 'none') -Signal $oddSignal
     $handed = & ([scriptblock]::Create($probeStage))
-    Assert-That ($handed.Zip -ceq $oddZip -and $handed.StageFile -ceq $oddStage -and $handed.Digest -ceq $digest -and $handed.Commit -ceq '' -and $handed.Root -ceq $oddRoot -and @($handed.Extra).Count -eq 2 -and (@($handed.Extra) -join ' ') -ceq '-OfficialModels none') "every value reaches the step as it was, also a folder name with a quote, a '`$(', a space and a letter outside ASCII (root '$($handed.Root)')"
-    Assert-That (-not $probeStage.Contains('My AI') -and -not $probeStage.Contains('temp folder') -and -not $probeStage.Contains('OfficialModels')) 'and none of them stands in the text as it is: they travel as base64, so no name can become part of the command'
-    $handedNone = & ([scriptblock]::Create((Get-ElevatedStage -Definitions ([ordered]@{ 'Invoke-ElevatedInstall' = $standInBody }) -Zip 'z' -StageFile 's' -Digest $digest -Commit $shaNew -Root 'C:\AI' -Extra @())))
-    Assert-That (@($handedNone.Extra).Count -eq 0 -and $handedNone.Commit -ceq $shaNew -and $handedNone.Root -ceq 'C:\AI') 'no options are no options, and a commit id arrives as the id'
-    $realStage = Get-ElevatedStage -Definitions $definitions -Zip $oddZip -StageFile $oddStage -Digest $digest -Commit $shaNew -Root $oddRoot -Extra @()
+    Assert-That ($handed.Zip -ceq $oddZip -and $handed.ZipHash -ceq $zipHashProbe -and $handed.Digest -ceq $digest -and $handed.Commit -ceq '' -and $handed.Root -ceq $oddRoot -and $handed.Signal -ceq $oddSignal -and @($handed.Extra).Count -eq 2 -and (@($handed.Extra) -join ' ') -ceq '-OfficialModels none') "every value reaches the step as it was, also a folder name with a quote, a '`$(', a space and a letter outside ASCII (root '$($handed.Root)')"
+    Assert-That (-not $probeStage.Contains('My AI') -and -not $probeStage.Contains('temp folder') -and -not $probeStage.Contains('OfficialModels') -and -not $probeStage.Contains($zipHashProbe)) 'and none of them stands in the text as it is: they travel as base64, so no name can become part of the command'
+    $handedNone = & ([scriptblock]::Create((Get-ElevatedStage -Definitions ([ordered]@{ 'Invoke-ElevatedInstall' = $standInBody }) -Zip 'z' -ZipHash $zipHashProbe -Digest $digest -Commit $shaNew -Root 'C:\AI' -Extra @())))
+    Assert-That (@($handedNone.Extra).Count -eq 0 -and $handedNone.Commit -ceq $shaNew -and $handedNone.Root -ceq 'C:\AI' -and $handedNone.Signal -ceq '') 'no options are no options, a commit id arrives as the id, and no signal is none'
+    $realStage = Get-ElevatedStage -Definitions $definitions -Zip $oddZip -ZipHash $zipHashProbe -Digest $digest -Commit $shaNew -Root $oddRoot -Extra @() -Signal $oddSignal
     $stageErrors = $null
     $stageAst = [System.Management.Automation.Language.Parser]::ParseInput($realStage, [ref]$null, [ref]$stageErrors)
     $stageDefined = @($stageAst.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $false) | ForEach-Object { $_.Name })
     $lastStatement = @($stageAst.EndBlock.Statements)[-1]
     Assert-That (@($stageErrors).Count -eq 0 -and $stageDefined.Count -eq $stageNames.Count -and @($stageNames | Where-Object { $stageDefined -notcontains $_ }).Count -eq 0 -and $lastStatement.Extent.Text -like 'Invoke-ElevatedInstall -Zip *') "the step's text is a script of its own: it parses, defines the $($stageNames.Count) functions and ends in the one call of Invoke-ElevatedInstall ($(@($stageErrors).Count) parse error(s))"
+    # The call names every parameter the step has, and no other: a value the step is not told
+    # (the hash the archive must have) would make it refuse every download.
+    $stepParameters = @(@($fnAsts | Where-Object { $_.Name -eq 'Invoke-ElevatedInstall' })[0].Body.ParamBlock.Parameters | ForEach-Object { $_.Name.VariablePath.UserPath } | Sort-Object)
+    $callParameters = @($lastStatement.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandParameterAst] }, $true) | ForEach-Object { $_.ParameterName } | Sort-Object)
+    Assert-That ($stepParameters.Count -eq 7 -and ($callParameters -join ' ') -ceq ($stepParameters -join ' ') -and $stepParameters -contains 'ZipHash' -and $stepParameters -notcontains 'StageFile') "the step's call hands over exactly the parameters the step has, the hash of the archive among them; the file its own text came from is not among them, the step has no business with it (step: $($stepParameters -join ' '); call: $($callParameters -join ' '))"
     $stageHash = Get-Sha256Hex -Bytes $utf8.GetBytes($realStage)
-    $launcher = Get-ElevatedLauncher -StageFile $oddStage -Zip $oddZip -Hash $stageHash
+    $launcher = Get-ElevatedLauncher -StageFile $oddStage -Hash $stageHash -Signal $oddSignal
     $launcherErrors = $null
     $null = [System.Management.Automation.Language.Parser]::ParseInput($launcher, [ref]$null, [ref]$launcherErrors)
-    Assert-That (@($launcherErrors).Count -eq 0 -and -not $launcher.Contains('"') -and $launcher -notmatch '\s\s|[\r\n\t]' -and $launcher.Contains("'$stageHash'") -and -not $launcher.Contains('temp folder') -and $launcher.Length -lt 2000) "the command the window with administrator rights is started with is one line that can be cut at its spaces and joined again: no double quote, no two spaces in a row, the paths as base64, the hash in it ($($launcher.Length) characters)"
-    # The command itself, run here on two stand-in files: with the hash of the step's text it runs
-    # that text; with any other hash, or without the file, it runs nothing and removes both files.
+    Assert-That (@($launcherErrors).Count -eq 0 -and -not $launcher.Contains('"') -and $launcher -notmatch '\s\s|[\r\n\t]' -and $launcher.Contains("'$stageHash'") -and -not $launcher.Contains('temp folder') -and $launcher.Length -lt 2000) "the command the window with administrator rights is started with is one line that can be cut at its spaces and joined again: no double quote, no two spaces in a row, the path as base64, the hash in it ($($launcher.Length) characters)"
+    # That command runs with administrator rights on a path in the user's temp folder, where a
+    # program of the user can make a name stand for any file on the PC. It reads one file there
+    # and does nothing else to that folder: no removal, no write, no second path.
+    $launcherAst = [System.Management.Automation.Language.Parser]::ParseInput($launcher, [ref]$null, [ref]$null)
+    $launcherCalls = @($launcherAst.FindAll({ param($n) $n -is [System.Management.Automation.Language.InvokeMemberExpressionAst] }, $true) | ForEach-Object { [string]$_.Member.Value })
+    $launcherCommands = @($launcherAst.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] }, $true) | ForEach-Object { $_.GetCommandName() } | Where-Object { $_ } | Sort-Object -Unique)
+    # Every method the command calls, by name: one that removes, moves or writes a file would be a new name here.
+    $callNames = (@($launcherCalls | Sort-Object -Unique) -join ' ')
+    Assert-That (@($launcherCalls | Where-Object { $_ -eq 'ReadAllBytes' }).Count -eq 1 -and $callNames -ceq 'Close ComputeHash Create FromBase64String GetString OpenExisting ReadAllBytes Replace Set ToString' -and ($launcherCommands -join ' ') -ceq 'New-Object Write-Host' -and $launcher -notmatch 'Remove-Item|FileInfo|Delete' -and $launcher.Contains("OpenExisting('$oddSignal')")) "that command reads the step's file once and removes or writes nothing: beside the read it takes the hash, makes the script block from the text it read (Create) and, at a refusal, tells the first window by its signal (calls: $callNames; commands: $($launcherCommands -join ' '))"
+    $noSignal = @((Get-ElevatedLauncher -StageFile $oddStage -Hash $stageHash), (Get-ElevatedLauncher -StageFile $oddStage -Hash $stageHash -Signal "x');Write-Host injected;('"), (Get-ElevatedLauncher -StageFile $oddStage -Hash $stageHash -Signal 'two words'))
+    Assert-That (@($noSignal | Where-Object { $_.Contains('OpenExisting') -or $_.Contains('injected') -or $_ -cne $noSignal[0] }).Count -eq 0) "a signal's name is letters, digits and '-' or it is left out of the command: no name can become part of it"
+    # The command itself, run here on a stand-in file: with the hash of the step's text it runs
+    # that text; with any other hash, or without the file, it runs nothing, says so, and leaves the
+    # files in the folder exactly as they are.
     $fileWork = Join-Path $Work 'files'
     if (Test-Path -LiteralPath $fileWork) { Remove-Item -LiteralPath $fileWork -Recurse -Force }
     New-Item -ItemType Directory -Force -Path $fileWork | Out-Null
@@ -817,15 +911,21 @@ if ($haveFunctions) {
         param([string]$Hash)
         [System.IO.File]::WriteAllBytes($probeStep, $stepBytes)
         [System.IO.File]::WriteAllText($probeZip, 'stand-in archive')
-        $said = @(& ([scriptblock]::Create((Get-ElevatedLauncher -StageFile $probeStep -Zip $probeZip -Hash $Hash))) 6>&1 | ForEach-Object { "$_" })
-        return [pscustomobject]@{ Said = ($said -join "`n"); StepLeft = (Test-Path -LiteralPath $probeStep); ZipLeft = (Test-Path -LiteralPath $probeZip) }
+        $said = @(& ([scriptblock]::Create((Get-ElevatedLauncher -StageFile $probeStep -Hash $Hash -Signal $oddSignal))) 6>&1 | ForEach-Object { "$_" })
+        $stepNow = ''; if (Test-Path -LiteralPath $probeStep) { $stepNow = [System.IO.File]::ReadAllText($probeStep) }
+        return [pscustomobject]@{ Said = ($said -join "`n"); StepLeft = ($stepNow -ceq "'the step ran'"); ZipLeft = (Test-Path -LiteralPath $probeZip); Files = @(Get-ChildItem -LiteralPath $fileWork -Force).Count }
     }
     $rightHash = & $runLauncher (Get-Sha256Hex -Bytes $stepBytes)
-    Assert-That ($rightHash.Said -ceq 'the step ran' -and $rightHash.StepLeft -and $rightHash.ZipLeft) "started with the hash the file has, the command runs the step's text, and leaves the files to the step ('$($rightHash.Said)')"
+    Assert-That ($rightHash.Said -ceq 'the step ran' -and $rightHash.StepLeft -and $rightHash.ZipLeft) "started with the hash the file has, the command runs the step's text ('$($rightHash.Said)')"
     $wrongHash = & $runLauncher ('0' * 64)
-    Assert-That ($wrongHash.Said -match 'Stopped: the file that carries the step with administrator rights was changed or removed' -and $wrongHash.Said -match 'Nothing was installed or changed' -and $wrongHash.Said -notmatch 'the step ran' -and -not $wrongHash.StepLeft -and -not $wrongHash.ZipLeft) "a file that does not have the hash the window was started with is not run: the command says so and removes both files ($($wrongHash.Said -replace '\s+', ' '))"
-    $goneFile = @(& ([scriptblock]::Create((Get-ElevatedLauncher -StageFile (Join-Path $fileWork 'no-such-step.txt') -Zip (Join-Path $fileWork 'no-such.zip') -Hash (Get-Sha256Hex -Bytes $stepBytes)))) 6>&1 | ForEach-Object { "$_" }) -join "`n"
-    Assert-That ($goneFile -match 'Stopped: ' -and $goneFile -notmatch 'the step ran') 'a file that is gone is refused the same way'
+    Assert-That ($wrongHash.Said -match 'Stopped: the file that carries the step with administrator rights was changed or removed' -and $wrongHash.Said -match 'Nothing was installed or changed' -and $wrongHash.Said -notmatch 'the step ran' -and @($wrongHash.Said -split "`n").Count -eq 2) "a file that does not have the hash the window was started with is not run: the command says so, in two lines, and no more ($($wrongHash.Said -replace '\s+', ' '))"
+    Assert-That ($wrongHash.StepLeft -and $wrongHash.ZipLeft -and $wrongHash.Files -eq 2) "and it removes nothing: with administrator rights no file in the user's folder is removed by its name, so both files are still there, as they were (step there: $($wrongHash.StepLeft), archive there: $($wrongHash.ZipLeft), files in the folder: $($wrongHash.Files))"
+    $goneFile = @(& ([scriptblock]::Create((Get-ElevatedLauncher -StageFile (Join-Path $fileWork 'no-such-step.txt') -Hash (Get-Sha256Hex -Bytes $stepBytes) -Signal $oddSignal))) 6>&1 | ForEach-Object { "$_" }) -join "`n"
+    Assert-That ($goneFile -match 'Stopped: ' -and $goneFile -notmatch 'the step ran' -and @(Get-ChildItem -LiteralPath $fileWork -Force).Count -eq 2) 'a file that is gone is refused the same way'
+    # Where the step runs: in this window only when it has the rights already and is Windows
+    # PowerShell; else in a window of its own. The step checks its rights itself either way.
+    $routes = @((Get-ElevationRoute -Administrator $true -Edition 'Desktop'), (Get-ElevationRoute -Administrator $false -Edition 'Desktop'), (Get-ElevationRoute -Administrator $true -Edition 'Core'), (Get-ElevationRoute -Administrator $false -Edition 'Core'), (Get-ElevationRoute -Administrator $true -Edition ''), (Get-ElevationRoute -Administrator $true -Edition 'desktop'))
+    Assert-That (($routes -join ' ') -ceq 'here window window window window window') "a Windows PowerShell window that has administrator rights already runs the step itself; without the rights, or in another PowerShell, a window of its own is asked for ($($routes -join ' '))"
 
     Write-Host "`n=== unpacking: the toolkit only, and no name decides where a file lands ===" -ForegroundColor Cyan
     $topName = "example-repo-$shaNew"
@@ -839,6 +939,62 @@ if ($haveFunctions) {
     $unpackedDiff = Compare-ToolkitTree -Manifest $manifest -Files $unpacked
     Assert-That ((Split-Path -Leaf $topFolder) -ceq $topName -and (Test-Path -LiteralPath $topFolder -PathType Container) -and @($unpacked).Count -eq 4 -and $unpackedDiff.Count -eq 0 -and (Get-ToolkitDigest -Files $unpacked) -ceq (Get-ToolkitDigest -Files $manifest)) "an archive as GitHub sends it is unpacked, and the files that were unpacked are the commit's list of files, by name and by id ($(@($unpacked).Count) file(s); $($unpackedDiff -join '; '))"
     Assert-That (-not (Test-Path -LiteralPath (Join-Path $topFolder 'README.md')) -and -not (Test-Path -LiteralPath (Join-Path $topFolder '.github')) -and @(Get-ChildItem -LiteralPath $topFolder -Force).Count -eq 1) 'nothing outside local-llm is unpacked: it is not compared, so it is not there to be run either'
+    # The same archive read from its bytes, without a file being written: what the first
+    # comparison works on. It has to list what the unpacking writes, name for name and id for id.
+    $goodBytes = [System.IO.File]::ReadAllBytes($goodZip)
+    $filesBefore = @(Get-ChildItem -LiteralPath $fileWork -Recurse -Force).Count
+    $inArchive = Get-ArchiveFileList -Bytes $goodBytes
+    $inArchiveDiff = Compare-ToolkitTree -Manifest $manifest -Files $inArchive.Files
+    Assert-That ($inArchive.Top -ceq $topName -and $inArchive.Files -is [array] -and $inArchive.Files.Count -eq 4 -and $inArchiveDiff.Count -eq 0 -and (Get-ToolkitDigest -Files $inArchive.Files) -ceq (Get-ToolkitDigest -Files $unpacked) -and $inArchive.Version -ceq '2099.01.02' -and @(Get-ChildItem -LiteralPath $fileWork -Recurse -Force).Count -eq $filesBefore) "a correct download passes when it is read from its bytes: the same four files with the same ids as the commit lists and as the unpacking writes, the version read on the way, and no file written for it ($($inArchive.Files.Count) file(s); $($inArchiveDiff -join '; '))"
+    # The three downloads that must be refused, as archives: one byte off, one file more, one less.
+    $asArchive = {
+        param($Table)
+        $entries = @(@{ Name = "$topName/"; Text = '' }, @{ Name = "$topName/README.md"; Text = 'outside local-llm' })
+        foreach ($path in $Table.Keys) { $entries += @{ Name = "$topName/$path"; Text = $utf8.GetString($Table[$path]) } }
+        $file = Join-Path $fileWork 'as-archive.zip'
+        New-TestZip $file $entries
+        return , [System.IO.File]::ReadAllBytes($file)
+    }
+    $archiveDiffs = [ordered]@{
+        'one byte'  = (Compare-ToolkitTree -Manifest $manifest -Files (Get-ArchiveFileList -Bytes (& $asArchive $oneByte)).Files)
+        'one more'  = (Compare-ToolkitTree -Manifest $manifest -Files (Get-ArchiveFileList -Bytes (& $asArchive $unlisted)).Files)
+        'one less'  = (Compare-ToolkitTree -Manifest $manifest -Files (Get-ArchiveFileList -Bytes (& $asArchive $lacking)).Files)
+        'unchanged' = (Compare-ToolkitTree -Manifest $manifest -Files (Get-ArchiveFileList -Bytes (& $asArchive $arrived)).Files)
+    }
+    Assert-That (($archiveDiffs['one byte'] -join '; ') -ceq 'not as in the commit: local-llm/lib/LocalAI.psm1' -and ($archiveDiffs['one more'] -join '; ') -ceq 'not in the commit: local-llm/Extra-Tool.ps1' -and ($archiveDiffs['one less'] -join '; ') -ceq 'missing: local-llm/VERSION' -and $archiveDiffs['unchanged'].Count -eq 0) "read from its bytes, a download that differs from the commit in one byte is refused, and so is one with a file the list does not hold and one that lacks a file; the unchanged one passes ($(@($archiveDiffs.Keys | ForEach-Object { $_ + ': ' + ($archiveDiffs[$_] -join ', ') }) -join ' | '))"
+    $twiceEntries = @(@{ Name = "$topName/local-llm/Install-LocalAI.ps1"; Text = 'one' }, @{ Name = "$topName/Local-LLM/install-localai.PS1"; Text = 'two' })
+    New-TestZip (Join-Path $fileWork 'twice.zip') $twiceEntries
+    $twiceError = ''
+    try { $null = Get-ArchiveFileList -Bytes ([System.IO.File]::ReadAllBytes((Join-Path $fileWork 'twice.zip'))) } catch { $twiceError = $_.Exception.Message }
+    $notArchive = ''
+    try { $null = Get-ArchiveFileList -Bytes $utf8.GetBytes('<html>not an archive</html>') } catch { $notArchive = 'refused' }
+    $cappedRead = ''
+    try { $null = Get-ArchiveFileList -Bytes $goodBytes -MaxBytes 20 } catch { $cappedRead = $_.Exception.Message }
+    Assert-That ($twiceError -match 'holds a file twice' -and $notArchive -eq 'refused' -and $cappedRead -match 'far more than a toolkit holds') "read from its bytes, an archive that holds a file twice (also under names that differ in capitals only: Windows keeps one of them), bytes that are no archive and one that unpacks to more than the limit are errors ('$twiceError'; '$cappedRead')"
+    # What lies outside local-llm is neither read nor written, so its names decide nothing: an
+    # archive of a repository with such names elsewhere unpacks, and lists, like any other.
+    $elsewhere = @(
+        @{ Name = "$topName/"; Text = '' }
+        @{ Name = ("$topName/docs/caf" + [char]0xE9 + '.md'); Text = 'a letter outside ASCII' }
+        @{ Name = ("$topName/.github/workflows/build " + [char]0x2013 + ' test.yml'); Text = 'a dash outside ASCII' }
+        @{ Name = "$topName/notes/a:b.txt"; Text = 'a colon' }
+        @{ Name = "$topName/trailing./dot.txt"; Text = 'a folder that ends in a dot' }
+        @{ Name = "$topName/local-llm./escaped.txt"; Text = 'beside local-llm, not in it' }
+        @{ Name = "$topName/LOCAL-~1/escaped.txt"; Text = 'a short name' }
+        @{ Name = "$topName/latest"; Text = 'local-llm' }
+    )
+    foreach ($path in $arrived.Keys) { $elsewhere += @{ Name = "$topName/$path"; Text = $utf8.GetString($arrived[$path]) } }
+    $elsewhereZip = Join-Path $fileWork 'elsewhere.zip'
+    New-TestZip $elsewhereZip $elsewhere
+    $elsewhereError = ''
+    $elsewhereList = @(); $elsewhereRead = @(); $elsewhereTop = ''
+    try {
+        $elsewhereTop = Expand-ToolkitArchive -Zip $elsewhereZip -Destination (Join-Path $fileWork 'unpacked-elsewhere')
+        $elsewhereList = Get-ToolkitFileList -Top $elsewhereTop
+        $elsewhereRead = (Get-ArchiveFileList -Bytes ([System.IO.File]::ReadAllBytes($elsewhereZip))).Files
+    } catch { $elsewhereError = $_.Exception.Message }
+    $writtenElsewhere = @(Get-ChildItem -LiteralPath (Join-Path $fileWork 'unpacked-elsewhere') -Recurse -Force -File -ErrorAction SilentlyContinue | Where-Object { $_.FullName -notlike '*local-llm*' -or $_.Name -eq 'escaped.txt' })
+    Assert-That ($elsewhereError -eq '' -and (Compare-ToolkitTree -Manifest $manifest -Files $elsewhereList).Count -eq 0 -and (Compare-ToolkitTree -Manifest $manifest -Files $elsewhereRead).Count -eq 0 -and $writtenElsewhere.Count -eq 0 -and @(Get-ChildItem -LiteralPath $elsewhereTop -Force).Count -eq 1) "an archive with names outside local-llm that Windows could not store (a letter or dash outside ASCII, a colon, a trailing dot, a short name) is unpacked and read all the same: the toolkit's four files, and none of the others ('$elsewhereError'; written beside the toolkit: $($writtenElsewhere.Count))"
     $backslashZip = Join-Path $fileWork 'backslash.zip'
     New-TestZip $backslashZip @(@{ Name = "$topName\local-llm\Install-LocalAI.ps1"; Text = 'one' }, @{ Name = "$topName\local-llm\lib\LocalAI.psm1"; Text = 'two' })
     $backslashList = Get-ToolkitFileList -Top (Expand-ToolkitArchive -Zip $backslashZip -Destination (Join-Path $fileWork 'unpacked-backslash'))
@@ -850,8 +1006,14 @@ if ($haveFunctions) {
         'a name from the root'                = @(@{ Name = "/$topName/local-llm/escaped.txt"; Text = 'out' })
         'a name with a drive'                 = @(@{ Name = "$topName/local-llm/C:/escaped.txt"; Text = 'out' })
         'a name with a stream'                = @(@{ Name = "$topName/local-llm/ok.txt:escaped.txt"; Text = 'out' })
-        'a folder name that ends in a dot'    = @(@{ Name = "$topName/local-llm./escaped.txt"; Text = 'out' })
+        'a folder name that ends in a dot'    = @(@{ Name = "$topName/local-llm/lib./escaped.txt"; Text = 'out' })
+        'a short name under local-llm'        = @(@{ Name = "$topName/local-llm/INSTAL~1/escaped.txt"; Text = 'out' })
+        'a letter outside ASCII in the kit'   = @(@{ Name = ("$topName/local-llm/caf" + [char]0xE9 + '/escaped.txt'); Text = 'out' })
+        'a top folder that is ..'             = @(@{ Name = '../local-llm/escaped.txt'; Text = 'out' })
+        'a top folder with a drive'           = @(@{ Name = 'C:/local-llm/escaped.txt'; Text = 'out' })
+        'a top folder that ends in a dot'     = @(@{ Name = 'top./README.md'; Text = 'outside local-llm' }, @{ Name = 'top./local-llm/escaped.txt'; Text = 'out' })
         'a second top folder'                 = @(@{ Name = "$topName/local-llm/ok.txt"; Text = 'ok' }, @{ Name = 'other-top/local-llm/escaped.txt'; Text = 'out' })
+        'a second top folder, outside the kit' = @(@{ Name = "$topName/local-llm/ok.txt"; Text = 'ok' }, @{ Name = 'other-top/README.md'; Text = 'outside local-llm' })
         'a file beside the top folder'        = @(@{ Name = 'escaped.txt'; Text = 'out' })
         'the same file twice'                 = @(@{ Name = "$topName/local-llm/ok.txt"; Text = 'one' }, @{ Name = "$topName/local-llm/ok.txt"; Text = 'two' })
         'a file where a folder has to be'     = @(@{ Name = "$topName/local-llm/lib"; Text = 'a file' }, @{ Name = "$topName/local-llm/lib/escaped.txt"; Text = 'out' })
@@ -890,9 +1052,12 @@ $asks = @($commands | Where-Object { $_.GetCommandName() -eq 'Read-Host' })
 $webRequests = @($commands | Where-Object { $_.GetCommandName() -eq 'Invoke-WebRequest' })
 $downloads = @($webRequests | Where-Object { @($_.CommandElements | Where-Object { $_ -is [System.Management.Automation.Language.CommandParameterAst] -and $_.ParameterName -eq 'OutFile' }).Count -gt 0 })
 $questions = @($webRequests | Where-Object { $downloads -notcontains $_ })
-# The bootstrap does not start the installer itself any more: it asks Windows for administrator
-# rights once (Start-Process -Verb RunAs), for the step that checks the download again and then
-# starts the installer from its own folder. So: one question, then one download, then that one request.
+# The bootstrap does not start the installer itself. After the question its own flow makes one call,
+# Install-ToolkitDownload, which downloads once and then takes one of two routes to the step that
+# checks the download again and starts the installer from its own folder: in this window when it
+# has administrator rights already, else in a window Windows is asked for once
+# (Start-ElevatedWindow, the one Start-Process -Verb RunAs). So: one question, then that call; and
+# in it one download, then one of the two routes, with no other way to either.
 $ownerFunction = {
     # The function a node of the syntax tree stands in; $null for the bootstrap's own flow.
     param($Node)
@@ -900,11 +1065,40 @@ $ownerFunction = {
     while ($at -and $at -isnot [System.Management.Automation.Language.FunctionDefinitionAst]) { $at = $at.Parent }
     return $at
 }
+$ownerName = { param($Node) $owner = & $ownerFunction $Node; if ($owner) { return [string]$owner.Name }; return '' }
 $elevations = @($commands | Where-Object { $_.GetCommandName() -eq 'Start-Process' })
-$inOrder = ($asks.Count -eq 1 -and $downloads.Count -eq 1 -and $elevations.Count -eq 1)
-if ($inOrder) { $inOrder = ($asks[0].Extent.StartOffset -lt $downloads[0].Extent.StartOffset -and $downloads[0].Extent.StartOffset -lt $elevations[0].Extent.StartOffset) }
-if ($inOrder) { $inOrder = ($null -eq (& $ownerFunction $asks[0]) -or (& $ownerFunction $asks[0]).Name -eq 'Get-UpdateConsent') -and $null -eq (& $ownerFunction $downloads[0]) -and $null -eq (& $ownerFunction $elevations[0]) -and $elevations[0].Extent.Text -match '-Verb RunAs\b' }
-Assert-That $inOrder "the bootstrap asks once, before its one download and its one request for administrator rights (Read-Host: $($asks.Count), Invoke-WebRequest -OutFile: $($downloads.Count), Start-Process -Verb RunAs: $($elevations.Count))"
+$installCalls = @($commands | Where-Object { $_.GetCommandName() -eq 'Install-ToolkitDownload' })
+$windowCalls = @($commands | Where-Object { $_.GetCommandName() -eq 'Start-ElevatedWindow' })
+$hereCalls = @($commands | Where-Object { $_.GetCommandName() -eq 'Invoke-ElevatedInstall' })
+$routeCalls = @($commands | Where-Object { $_.GetCommandName() -eq 'Get-ElevationRoute' })
+$inOrder = ($asks.Count -eq 1 -and $downloads.Count -eq 1 -and $elevations.Count -eq 1 -and $installCalls.Count -eq 1 -and $windowCalls.Count -eq 1 -and $hereCalls.Count -eq 1 -and $routeCalls.Count -eq 1)
+if ($inOrder) { $inOrder = (@('', 'Get-UpdateConsent') -contains (& $ownerName $asks[0]) -and (& $ownerName $routeCalls[0]) -eq '' -and (& $ownerName $installCalls[0]) -eq '' -and $asks[0].Extent.StartOffset -lt $routeCalls[0].Extent.StartOffset -and $routeCalls[0].Extent.StartOffset -lt $installCalls[0].Extent.StartOffset) }
+if ($inOrder) { $inOrder = ((& $ownerName $downloads[0]) -eq 'Install-ToolkitDownload' -and (& $ownerName $hereCalls[0]) -eq 'Install-ToolkitDownload' -and (& $ownerName $windowCalls[0]) -eq 'Install-ToolkitDownload' -and $downloads[0].Extent.StartOffset -lt $hereCalls[0].Extent.StartOffset -and $downloads[0].Extent.StartOffset -lt $windowCalls[0].Extent.StartOffset) }
+if ($inOrder) { $inOrder = ((& $ownerName $elevations[0]) -eq 'Start-ElevatedWindow' -and $elevations[0].Extent.Text -match '-Verb RunAs\b') }
+Assert-That $inOrder "the bootstrap asks once, and only then makes its one call that downloads and installs; in it one download, before either route to the step: this window, or the one request for administrator rights (Read-Host: $($asks.Count), Install-ToolkitDownload: $($installCalls.Count), Invoke-WebRequest -OutFile: $($downloads.Count), Invoke-ElevatedInstall: $($hereCalls.Count), Start-ElevatedWindow: $($windowCalls.Count), Start-Process -Verb RunAs: $($elevations.Count))"
+# The route is the one Get-ElevationRoute names from two facts about this window, and the step runs
+# here only on the answer 'here'. No environment variable and no other value picks the route.
+$routeAssignments = @($ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.AssignmentStatementAst] -and $n.Left.Extent.Text -eq '$route' }, $true))
+$hereIf = $null
+if ($hereCalls.Count -eq 1) { $hereIf = $hereCalls[0].Parent; while ($hereIf -and $hereIf -isnot [System.Management.Automation.Language.IfStatementAst]) { $hereIf = $hereIf.Parent } }
+Assert-That ($routeAssignments.Count -eq 1 -and $routeAssignments[0].Right.Extent.Text -like 'Get-ElevationRoute -Administrator $administrator -Edition *PSVersionTable.PSEdition*' -and $installCalls.Count -eq 1 -and $installCalls[0].Extent.Text -match '-Route \$route\b' -and $hereIf -and $hereIf.Clauses[0].Item1.Extent.Text -eq '$Route -ceq ''here''') "the step runs in this window only when Get-ElevationRoute said 'here' (a Windows PowerShell window that has administrator rights already); every other answer asks Windows for a window of its own"
+# The downloaded file is read once, and all that follows works on those bytes: their SHA-256, the
+# list of the toolkit's files in them, the comparison. Nothing is unpacked in the temp folder, where
+# a program of the user could rewrite a file between the unpacking and the reading; and both routes
+# hand the step the SHA-256 the archive must have, with the digest.
+$installFn = @($fnAsts | Where-Object { $_.Name -eq 'Install-ToolkitDownload' })
+$readOnce = $false
+if ($installFn.Count -eq 1 -and $hereCalls.Count -eq 1 -and $windowCalls.Count -eq 1) {
+    $installCommands = @($installFn[0].FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] }, $true))
+    $installNames = @($installCommands | ForEach-Object { $_.GetCommandName() } | Where-Object { $_ })
+    $zipReads = @($installFn[0].FindAll({ param($n) $n -is [System.Management.Automation.Language.InvokeMemberExpressionAst] -and @('ReadAllBytes', 'ReadAllText', 'ReadAllLines', 'OpenRead', 'Open') -contains [string]$n.Member.Value }, $true))
+    $listed = @($installCommands | Where-Object { $_.GetCommandName() -eq 'Get-ArchiveFileList' })
+    $hashed = @($installCommands | Where-Object { $_.GetCommandName() -eq 'Get-Sha256Hex' })
+    $readOnce = ($zipReads.Count -eq 1 -and $zipReads[0].Extent.Text -eq '[System.IO.File]::ReadAllBytes($Zip)' -and $listed.Count -eq 1 -and $listed[0].Extent.Text -eq 'Get-ArchiveFileList -Bytes $zipBytes' -and $hashed.Count -eq 1 -and $hashed[0].Extent.Text -eq 'Get-Sha256Hex -Bytes $zipBytes' -and
+        @($installNames | Where-Object { @('Expand-ToolkitArchive', 'Get-ToolkitFileList', 'Expand-Archive', 'Get-Content', 'Get-ChildItem') -contains $_ }).Count -eq 0 -and
+        $hereCalls[0].Extent.Text -match '-ZipHash \$zipHash\b' -and $hereCalls[0].Extent.Text -match '-Digest \$digest\b' -and $windowCalls[0].Extent.Text -match '-ZipHash \$zipHash\b' -and $windowCalls[0].Extent.Text -match '-Digest \$digest\b')
+}
+Assert-That $readOnce 'the downloaded file is read once; its SHA-256, the list of its files and the comparison all come from those bytes; nothing is unpacked or listed in the temp folder; and both routes tell the step that SHA-256 and the digest'
 # The installer is started in exactly one place: in the step with administrator rights, by the
 # full path of Windows PowerShell, from the folder that step made under Program Files.
 $starts = @($commands | Where-Object { $_.InvocationOperator -eq 'Ampersand' -and @($_.CommandElements | Where-Object { $_ -is [System.Management.Automation.Language.CommandParameterAst] -and $_.ParameterName -eq 'File' }).Count -gt 0 })
@@ -922,22 +1116,43 @@ if ($stepAst) {
         'the folder is made'           = (& $firstOffset @($members | Where-Object { [string]$_.Member.Value -eq 'CreateDirectory' }))
         'owner and rules are set'      = (& $firstOffset @($inStep | Where-Object { $_.GetCommandName() -eq 'Set-AdminOnlyRule' }))
         'the rules are read back'      = (& $firstOffset @($ruleChecks | Where-Object { $_.Extent.Text -notmatch '-Parent\b' }))
-        'the archive is copied in'     = (& $firstOffset @($members | Where-Object { [string]$_.Member.Value -eq 'Copy' }))
+        'it has to be empty'           = (& $firstOffset @($stepAst.FindAll({ param($n) $n -is [System.Management.Automation.Language.IfStatementAst] -and $n.Clauses[0].Item1.Extent.Text -eq '@($stageFolder.GetFileSystemInfos()).Count -ne 0' -and $null -ne $n.Clauses[0].Item2.Find({ param($m) $m -is [System.Management.Automation.Language.ThrowStatementAst] }, $true) }, $true)))
+        'the archive is copied in'     = (& $firstOffset @($inStep | Where-Object { $_.GetCommandName() -eq 'Copy-HandedOverArchive' }))
+        'the first window is told'     = (& $firstOffset @($inStep | Where-Object { $_.GetCommandName() -eq 'Send-HandOverSignal' }))
+        'the copy is held to its hash' = (& $firstOffset @($stepAst.FindAll({ param($n) $n -is [System.Management.Automation.Language.IfStatementAst] -and $n.Clauses[0].Item1.Extent.Text -eq '$copied -cne $ZipHash' -and $null -ne $n.Clauses[0].Item2.Find({ param($m) $m -is [System.Management.Automation.Language.ThrowStatementAst] }, $true) }, $true)))
         'it is unpacked there'         = (& $firstOffset @($inStep | Where-Object { $_.GetCommandName() -eq 'Expand-ToolkitArchive' }))
         'its digest is taken'          = (& $firstOffset @($inStep | Where-Object { $_.GetCommandName() -eq 'Get-ToolkitDigest' }))
-        'the digest is compared'       = (& $firstOffset @($stepAst.FindAll({ param($n) $n -is [System.Management.Automation.Language.IfStatementAst] -and $n.Clauses[0].Item1.Extent.Text -eq '$found -cne $Digest' }, $true)))
+        'the digest is compared'       = (& $firstOffset @($stepAst.FindAll({ param($n) $n -is [System.Management.Automation.Language.IfStatementAst] -and $n.Clauses[0].Item1.Extent.Text -eq '$found -cne $Digest' -and $null -ne $n.Clauses[0].Item2.Find({ param($m) $m -is [System.Management.Automation.Language.ThrowStatementAst] }, $true) }, $true)))
         'COMMIT is written'            = (& $firstOffset @($members | Where-Object { [string]$_.Member.Value -eq 'WriteAllText' -and $_.Extent.Text -match "'COMMIT'" }))
         'the installer is started'     = $starts[0].Extent.StartOffset
     }
     $offsets = @($stepOrder.Values)
     $outOfOrder = @(0..($offsets.Count - 2) | Where-Object { $offsets[$_] -lt 0 -or $offsets[$_] -ge $offsets[$_ + 1] })
-    Assert-That ($ruleChecks.Count -eq 2 -and $outOfOrder.Count -eq 0) "inside that step: the folder above is checked, the folder is made, given to administrators alone, its rules read back, the archive copied in, unpacked, its digest compared, COMMIT written, and only then the installer started (out of order at: $(@($outOfOrder | ForEach-Object { @($stepOrder.Keys)[$_] }) -join ', '))"
+    Assert-That ($ruleChecks.Count -eq 2 -and $outOfOrder.Count -eq 0) "inside that step: the folder above is checked, the folder is made, given to administrators alone, its rules read back, found empty, the archive copied in and held to its SHA-256 before it is opened, unpacked, its digest compared, COMMIT written, and only then the installer started (out of order at: $(@($outOfOrder | ForEach-Object { @($stepOrder.Keys)[$_] }) -join ', '))"
+    # The folder is made with its owner and rules in the same call: it never has the rules Program
+    # Files hands down, so there is no moment at which somebody else could put a folder into it.
+    $makes = @($members | Where-Object { [string]$_.Member.Value -eq 'CreateDirectory' })
+    Assert-That ($makes.Count -eq 1 -and @($makes[0].Arguments).Count -eq 2 -and $makes[0].Arguments[0].Extent.Text -eq '$stage' -and $makes[0].Arguments[1].Extent.Text -eq '(Get-AdminOnlySecurity)') "the step makes its folder with owner and rules in one call, not first open and closed afterwards ($(if ($makes.Count -eq 1) { $makes[0].Extent.Text }))"
     $refusals = @($stepAst.FindAll({ param($n) $n -is [System.Management.Automation.Language.ThrowStatementAst] }, $true))
     $outerTry = $stepAst.Find({ param($n) $n -is [System.Management.Automation.Language.TryStatementAst] }, $true)
     $cleaning = @()
     if ($outerTry -and $outerTry.Finally) { $cleaning = @($outerTry.Finally.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] }, $true) | ForEach-Object { $_.GetCommandName() }) }
     $startInTry = ($outerTry -and $starts[0].Extent.StartOffset -gt $outerTry.Body.Extent.StartOffset -and $starts[0].Extent.EndOffset -lt $outerTry.Body.Extent.EndOffset)
-    Assert-That ($refusals.Count -ge 8 -and @($refusals | Where-Object { $_.Extent.StartOffset -gt $starts[0].Extent.StartOffset }).Count -eq 0 -and $startInTry -and $cleaning -contains 'Remove-ToolkitTree' -and @($cleaning | Where-Object { $_ -eq 'Remove-HandedOverFile' }).Count -eq 2) "every refusal of the step comes before the installer start ($($refusals.Count) of them), and whatever happens its 'finally' removes the folder and the two files in the temp folder (it calls: $($cleaning -join ', '))"
+    Assert-That ($refusals.Count -ge 10 -and @($refusals | Where-Object { $_.Extent.StartOffset -gt $starts[0].Extent.StartOffset }).Count -eq 0 -and $startInTry -and $cleaning -contains 'Remove-ToolkitTree' -and $cleaning -contains 'Send-HandOverSignal' -and @($cleaning | Where-Object { @('Remove-ToolkitTree', 'Send-HandOverSignal', 'Start-Sleep', 'Write-Host', 'ConvertTo-ReviewText') -notcontains $_ }).Count -eq 0) "every refusal of the step comes before the installer start ($($refusals.Count) of them), and whatever happens its 'finally' removes its own folder and tells the first window that its files are needed no longer (it calls: $($cleaning -join ', '))"
+    # With administrator rights nothing is removed or written by a name in the user's folders: a
+    # program of the user can make such a name stand for any file on the PC. The step uses the
+    # path it was handed once, to read; all it removes lies in the folder it made itself under
+    # Program Files; and what it runs (its own functions, by their text) removes nothing else.
+    $zipUses = @($stepAst.FindAll({ param($n) $n -is [System.Management.Automation.Language.VariableExpressionAst] -and $n.VariablePath.UserPath -eq 'Zip' -and $n.Parent -isnot [System.Management.Automation.Language.ParameterAst] }, $true))
+    $zipUser = $null
+    if ($zipUses.Count -eq 1) { $zipUser = $zipUses[0].Parent; while ($zipUser -and $zipUser -isnot [System.Management.Automation.Language.CommandAst]) { $zipUser = $zipUser.Parent } }
+    $stepDeletes = @($members | Where-Object { @('Delete', 'Move', 'MoveTo', 'Replace', 'Copy', 'CopyTo') -contains [string]$_.Member.Value } | ForEach-Object { $_.Extent.Text })
+    $stepRemovals = @($inStep | Where-Object { $_.GetCommandName() -like 'Remove-*' } | ForEach-Object { $_.Extent.Text } | Sort-Object -Unique)
+    $copyFn = @($fnAsts | Where-Object { $_.Name -eq 'Copy-HandedOverArchive' })
+    $copyOpens = @()
+    if ($copyFn.Count -eq 1) { $copyOpens = @($copyFn[0].FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] -and $n.GetCommandName() -eq 'New-Object' -and $n.Extent.Text -match 'FileStream' }, $true) | ForEach-Object { $_.Extent.Text }) }
+    Assert-That ($zipUses.Count -eq 1 -and $zipUser -and $zipUser.Extent.Text -eq 'Copy-HandedOverArchive -From $Zip -To $zipCopy' -and ($stepDeletes -join ' | ') -ceq '[System.IO.File]::Delete($lockFile)' -and ($stepRemovals -join ' | ') -ceq 'Remove-ToolkitTree -Path $stage' -and $have -notcontains 'Remove-HandedOverFile' -and
+        $copyOpens.Count -eq 2 -and $copyOpens[0] -ceq 'New-Object System.IO.FileStream($From, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::Read)' -and $copyOpens[1] -like 'New-Object System.IO.FileStream($To, `[System.IO.FileMode`]::CreateNew, *') "the step uses the path in the temp folder once, to read (one handle, opened for reading); it removes only its own lock file and its own folder under Program Files, and nothing in the temp folder (uses of the path: $($zipUses.Count); removals: $(@($stepDeletes + $stepRemovals) -join ' | '))"
     $stepStrings = @($stepAst.FindAll({ param($n) $n -is [System.Management.Automation.Language.StringConstantExpressionAst] }, $true) | ForEach-Object { $_.Value })
     $stepEnv = @($stepAst.FindAll({ param($n) $n -is [System.Management.Automation.Language.VariableExpressionAst] -and $n.VariablePath.DriveName -eq 'env' }, $true))
     Assert-That ($stepStrings -contains 'ProgramFiles' -and $stepStrings -contains 'LocalAI-Update' -and $stepStrings -notcontains 'LocalAI' -and $stepStrings -contains 'System' -and $stepEnv.Count -eq 0 -and $stepAst.Extent.Text -match "GetFolderPath\('ProgramFiles'\)") "the step asks Windows where Program Files is (no variable of the session decides it) and works in LocalAI-Update there, not in the installer's own LocalAI folder"
@@ -954,10 +1169,11 @@ $treeCalls = @($commands | Where-Object { $_.GetCommandName() -eq 'Get-GitHubTex
 $checkCalls = @($commands | Where-Object { $_.GetCommandName() -eq 'Get-DownloadCheck' })
 $stopReturns = @($ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.IfStatementAst] -and $n.Clauses[0].Item1.Extent.Text -eq '$check.Stop' -and $null -ne $n.Clauses[0].Item2.Find({ param($m) $m -is [System.Management.Automation.Language.ReturnStatementAst] }, $true) }, $true))
 $urlAssignments = @($ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.AssignmentStatementAst] -and $n.Left.Extent.Text -eq '$url' }, $true) | Where-Object { $null -eq (& $ownerFunction $_) })
-$checkedFirst = ($treeCalls.Count -eq 1 -and $checkCalls.Count -eq 1 -and $stopReturns.Count -eq 1 -and $asks.Count -eq 1 -and $downloads.Count -eq 1)
-if ($checkedFirst) { $checkedFirst = ($treeCalls[0].Extent.StartOffset -lt $checkCalls[0].Extent.StartOffset -and $checkCalls[0].Extent.StartOffset -lt $stopReturns[0].Extent.StartOffset -and $stopReturns[0].Extent.StartOffset -lt $asks[0].Extent.StartOffset) }
-Assert-That $checkedFirst "the list of the commit's files is asked for by the commit's id, and an update without it is stopped before the question and before the download (tree calls: $($treeCalls.Count), checks: $($checkCalls.Count), stops: $($stopReturns.Count))"
-Assert-That ($downloads.Count -eq 1 -and $downloads[0].Extent.Text -match '-Uri \$url\b' -and $urlAssignments.Count -eq 1 -and $urlAssignments[0].Right.Extent.Text -eq '$review.Url') 'and the download still goes to the address the review built from the commit id, nowhere else'
+$checkedFirst = ($treeCalls.Count -eq 1 -and $checkCalls.Count -eq 1 -and $stopReturns.Count -eq 1 -and $asks.Count -eq 1 -and $downloads.Count -eq 1 -and $installCalls.Count -eq 1)
+if ($checkedFirst) { $checkedFirst = ($treeCalls[0].Extent.StartOffset -lt $checkCalls[0].Extent.StartOffset -and $checkCalls[0].Extent.StartOffset -lt $stopReturns[0].Extent.StartOffset -and $stopReturns[0].Extent.StartOffset -lt $asks[0].Extent.StartOffset -and $asks[0].Extent.StartOffset -lt $installCalls[0].Extent.StartOffset) }
+if ($checkedFirst) { $checkedFirst = ($checkCalls[0].Extent.Text -match '-Manifest \$manifest\b' -and $checkCalls[0].Extent.Text -match '-Lasting \$manifestLasting\b' -and $installCalls[0].Extent.Text -match '-Manifest \$manifest\b' -and $installCalls[0].Extent.Text -match '-Compare \$check\.Compare\b') }
+Assert-That $checkedFirst "the list of the commit's files is asked for by the commit's id, and an update without it is stopped before the question and before the one call that downloads; that call is handed the same list, and the check's word on whether to compare (tree calls: $($treeCalls.Count), checks: $($checkCalls.Count), stops: $($stopReturns.Count))"
+Assert-That ($downloads.Count -eq 1 -and $downloads[0].Extent.Text -match '-Uri \$Url\b' -and $installCalls.Count -eq 1 -and $installCalls[0].Extent.Text -match '-Url \$url\b' -and $urlAssignments.Count -eq 1 -and $urlAssignments[0].Right.Extent.Text -eq '$review.Url') 'and the download still goes to the address the review built from the commit id, nowhere else'
 $askOwner = $null
 if ($asks.Count -eq 1) { $askOwner = $asks[0].Parent; while ($askOwner -and $askOwner -isnot [System.Management.Automation.Language.CommandAst]) { $askOwner = $askOwner.Parent } }
 Assert-That ($askOwner -and $askOwner.GetCommandName() -eq 'Get-UpdateConsent') 'and only through the gate: Get-UpdateConsent decides whether to ask and what the answer means'
@@ -972,8 +1188,11 @@ $pageCalls = @($textCalls | Where-Object { $_.Extent.Text -match 'github\.com/\$
 Assert-That ($pageCalls.Count -eq 1 -and $asks.Count -eq 1 -and $pageCalls[0].Extent.StartOffset -lt $asks[0].Extent.StartOffset -and $pageCalls[0].Extent.Text -notmatch 'api\.github\.com') "the commit's page on github.com (not the API) is the second source for the commit, asked before the question"
 # LOCALAI_REF is part of every address GitHub is asked for: it is checked before the first of them.
 $refChecks = @($commands | Where-Object { $_.GetCommandName() -eq 'Test-ToolkitRef' })
-$firstFetch = @($commands | Where-Object { @('Invoke-RestMethod', 'Invoke-WebRequest', 'Get-GitHubText') -contains $_.GetCommandName() -and $_ -ne $questions[0] } | ForEach-Object { $_.Extent.StartOffset } | Sort-Object | Select-Object -First 1)
-Assert-That ($refChecks.Count -eq 1 -and $firstFetch.Count -eq 1 -and $refChecks[0].Extent.StartOffset -lt $firstFetch[0]) "the ref is checked to be a plain name before GitHub is asked anything (checks: $($refChecks.Count))"
+# Every request lives in one of two functions (the question in Get-GitHubText, the download in
+# Install-ToolkitDownload); what counts is where the bootstrap's own flow first calls either.
+$strayRequests = @($webRequests | Where-Object { @('Get-GitHubText', 'Install-ToolkitDownload') -notcontains (& $ownerName $_) })
+$firstFetch = @($commands | Where-Object { @('Invoke-RestMethod', 'Invoke-WebRequest', 'Get-GitHubText', 'Install-ToolkitDownload') -contains $_.GetCommandName() -and (& $ownerName $_) -eq '' } | ForEach-Object { $_.Extent.StartOffset } | Sort-Object | Select-Object -First 1)
+Assert-That ($refChecks.Count -eq 1 -and (& $ownerName $refChecks[0]) -eq '' -and $strayRequests.Count -eq 0 -and $firstFetch.Count -eq 1 -and $refChecks[0].Extent.StartOffset -lt $firstFetch[0]) "the ref is checked to be a plain name before GitHub is asked anything (checks: $($refChecks.Count), requests outside the two functions: $($strayRequests.Count))"
 # Every setting the bootstrap takes from outside is an environment variable (it has no parameters:
 # 'irm | iex' could not pass any). A new one is a new way in and has to be added here on purpose.
 # ProgramData is not among them: a session that points it at an empty folder would make an install
@@ -1017,6 +1236,12 @@ Assert-That ($resumeText -match 'Install-LocalAI\.ps1' -and $resumeText -notmatc
 Write-Host "`n=== Get-LocalAI.ps1 end to end, with a stand-in for GitHub ===" -ForegroundColor Cyan
 if ($onWindows) {
     if (Test-Path -LiteralPath $Work) { Remove-Item -LiteralPath $Work -Recurse -Force }
+    # The bootstrap is written for Windows PowerShell: every run below starts it there, whichever
+    # PowerShell runs this test. And the step it ends in needs administrator rights, which nobody
+    # is there to grant at a prompt: this part runs on a machine whose user has them (the Windows job).
+    $windowsPowerShell = [System.IO.Path]::Combine([Environment]::GetFolderPath('System'), 'WindowsPowerShell', 'v1.0', 'powershell.exe')
+    $testIsAdministrator = (New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+    Assert-That ($testIsAdministrator -and (Test-Path -LiteralPath $windowsPowerShell)) "this part of the test runs with administrator rights, on a machine that has Windows PowerShell (administrator: $testIsAdministrator; without the rights the runs below cannot reach the installer, and their assertions fail for that reason alone)"
     $e2e = Join-Path $Work 'e2e'
     $e2eTemp = Join-Path $e2e 'temp'
     $apiFull = Join-Path $e2e 'api-full'
@@ -1059,7 +1284,8 @@ if ($onWindows) {
     # down that it ran and which COMMIT file was put next to it; and, in a second file, where it ran
     # from, the rules of the folder two levels up (the one the step with administrator rights made),
     # whether it has administrator rights, the options it was given, and whether the step's lock
-    # file was there.
+    # file was there. It ends with the exit code named behind -StandInExit among its options (0
+    # without one), the way the real installer ends with 3010 or an error.
     $installerStub = @'
 param([string]$AIRoot)
 $commit = ''
@@ -1069,7 +1295,9 @@ if (Test-Path -LiteralPath $commitFile) { $commit = [System.IO.File]::ReadAllTex
 $madeFolder = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
 $asAdmin = (New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 [System.IO.File]::WriteAllLines((Join-Path $AIRoot 'installer-from.txt'), [string[]]@($PSScriptRoot, (Get-Acl -LiteralPath $madeFolder).Sddl, [string]$asAdmin, ($args -join ' '), [string](Test-Path -LiteralPath (Join-Path $madeFolder 'in-use'))))
-exit 0
+$endWith = 0
+for ($i = 0; $i -lt $args.Count - 1; $i++) { if ([string]$args[$i] -eq '-StandInExit') { $endWith = [int][string]$args[$i + 1] } }
+exit $endWith
 '@
     $moduleFile = Join-Path (Join-Path $zipLlm 'lib') 'LocalAI.psm1'
     [System.IO.File]::WriteAllText((Join-Path $zipLlm 'Install-LocalAI.ps1'), $installerStub)
@@ -1077,10 +1305,19 @@ exit 0
     [System.IO.File]::WriteAllText((Join-Path $zipLlm 'VERSION'), '2099.01.02')
     [System.IO.File]::WriteAllText($moduleFile, "# stand-in module`n")
     [System.IO.File]::WriteAllText((Join-Path $zipTop 'README.md'), 'outside local-llm')
+    # Outside local-llm the repository of this commit holds what Windows could not store under the
+    # name git gives it, or what is no plain file: a file with a letter outside ASCII in its name,
+    # a symbolic link at the root (in GitHub's archive a small file with the link's target in it)
+    # and a submodule. None of it is read or written on this PC, so none of it may stand in the way.
+    $oddName = 'caf' + [char]0xE9 + '.md'
+    New-Item -ItemType Directory -Force -Path (Join-Path $zipTop 'docs') | Out-Null
+    [System.IO.File]::WriteAllText((Join-Path (Join-Path $zipTop 'docs') $oddName), 'a letter outside ASCII in the name')
+    [System.IO.File]::WriteAllText((Join-Path $zipTop 'latest'), 'local-llm')
     # GitHub's list of that commit's files, with the ids git gives them: of the bytes as they are in
     # the archive, and for the .cmd (CRLF in the archive) of its LF form, as the repository holds it.
     $encoding = [System.Text.Encoding]::UTF8
-    $standInTree = @(@{ path = 'README.md'; mode = '100644'; type = 'blob'; sha = (Get-GitBlobId -Bytes ([System.IO.File]::ReadAllBytes((Join-Path $zipTop 'README.md')))) }, @{ path = 'local-llm'; mode = '040000'; type = 'tree'; sha = ('0' * 40) }, @{ path = 'local-llm/lib'; mode = '040000'; type = 'tree'; sha = ('0' * 40) })
+    $standInTree = @(@{ path = 'README.md'; mode = '100644'; type = 'blob'; sha = (Get-GitBlobId -Bytes ([System.IO.File]::ReadAllBytes((Join-Path $zipTop 'README.md')))) }, @{ path = 'local-llm'; mode = '040000'; type = 'tree'; sha = ('0' * 40) }, @{ path = 'local-llm/lib'; mode = '040000'; type = 'tree'; sha = ('0' * 40) },
+        @{ path = 'docs'; mode = '040000'; type = 'tree'; sha = ('0' * 40) }, @{ path = "docs/$oddName"; mode = '100644'; type = 'blob'; sha = ('1' * 40) }, @{ path = 'latest'; mode = '120000'; type = 'blob'; sha = ('2' * 40) }, @{ path = 'vendor'; mode = '160000'; type = 'commit'; sha = ('3' * 40) })
     foreach ($relative in @('Install-LocalAI.ps1', 'Install-LocalAI.cmd', 'VERSION', 'lib/LocalAI.psm1')) {
         $fileBytes = [System.IO.File]::ReadAllBytes((Join-Path $zipLlm ($relative.Replace('/', '\'))))
         if ($relative -like '*.cmd') { $fileBytes = $encoding.GetBytes($encoding.GetString($fileBytes).Replace("`r`n", "`n")) }
@@ -1138,21 +1375,20 @@ exit 0
     # cmdlets; Invoke-RestMethod fails the run, should it come back), then the bootstrap's text
     # through Invoke-Expression, as 'irm | iex' runs it. An answer is handed over as text, the way
     # the cmdlet does it: the bootstrap's own JSON reader has to read it, the long one included.
-    # Windows is not asked for administrator rights either (the test machine's user has them, and
-    # nobody is there to click Yes): the stand-in for Start-Process starts the same program with the
-    # same arguments, joined by spaces as Start-Process hands them over, and waits for it. Only
-    # -NoExit is left out, which would keep that window open. Before it starts the program it can
-    # play the program of the user that the step is written against: put another archive in the temp
-    # folder (-StandInSwap), or change the file with the step's text (-StandInEdit).
-    # Everything else is the real thing: the review, the gate, Read-Host, the comparison, the command
-    # line of the window with administrator rights, the step itself with its folder under Program
-    # Files, and Windows PowerShell for the installer.
+    # The test machine's user has administrator rights, so the bootstrap takes its route for a
+    # window that has them already: the step runs right there, with no stand-in at all. Should it
+    # ask Windows for a window of its own all the same, the stand-in for Start-Process writes that
+    # down (START) and starts the same program with the same arguments, so that the run still ends:
+    # the runs below then show a request where none belongs.
+    # Everything else is the real thing: the review, the gate, Read-Host, the one read of the
+    # download, the comparison, the step itself with its folder under Program Files, and Windows
+    # PowerShell for the installer.
     # The stand-ins are called from inside the bootstrap's script block, and PowerShell looks a
     # variable up in the caller's scope first: a harness value named like one of the bootstrap's own
     # variables ($zip, $root, $ref) would be read as the bootstrap's. Hence the StandIn names, and
     # $script: wherever a stand-in function reads one.
     $harnessText = @'
-param([string]$StandInBootstrap, [string]$StandInZip, [string]$StandInLog, [string]$StandInApi, [string]$StandInRoot, [string]$StandInRef, [string]$StandInReviewed, [string]$StandInTemp, [string]$StandInProgramData, [string]$StandInOptions, [string]$StandInSwap, [string]$StandInEdit)
+param([string]$StandInBootstrap, [string]$StandInZip, [string]$StandInLog, [string]$StandInApi, [string]$StandInRoot, [string]$StandInRef, [string]$StandInReviewed, [string]$StandInTemp, [string]$StandInProgramData, [string]$StandInOptions)
 $ErrorActionPreference = 'Stop'
 $env:TEMP = $StandInTemp
 if ($StandInProgramData -ne 'NONE') { $env:ProgramData = $StandInProgramData }
@@ -1171,8 +1407,6 @@ function Start-Process {
     [CmdletBinding()]
     param([string]$FilePath, [string[]]$ArgumentList, [string]$Verb)
     [System.IO.File]::AppendAllText($script:StandInLog, "START $Verb $FilePath`r`n")
-    if ($script:StandInSwap -ne 'NONE') { Copy-Item -LiteralPath $script:StandInSwap -Destination (Join-Path $script:StandInTemp 'localai-installer.zip') -Force }
-    if ($script:StandInEdit -ne 'NONE') { [System.IO.File]::AppendAllText((Join-Path $script:StandInTemp 'localai-elevated-step.txt'), "`n# changed after it was written") }
     $standInStart = New-Object System.Diagnostics.ProcessStartInfo
     $standInStart.FileName = $FilePath
     $standInStart.Arguments = (@($ArgumentList | Where-Object { $_ -ne '-NoExit' }) -join ' ')
@@ -1200,40 +1434,87 @@ function Invoke-WebRequest {
 Invoke-Expression ([System.IO.File]::ReadAllText($StandInBootstrap))
 '@
     [System.IO.File]::WriteAllText($harness, $harnessText)
-    # No name the harness reads may be one the bootstrap assigns: that was a real fault here (the
+
+    # The second harness: the bootstrap's other route, a window of its own. On a machine whose user
+    # has administrator rights the whole bootstrap never takes it, so here the function the
+    # bootstrap's flow ends in is called as that flow calls it, with the route given: the download,
+    # the one read of it, the first comparison, the step's text and the command line for the window,
+    # the wait for that window's signal and the tidying up are all the bootstrap's own code.
+    # The request to Windows is the stand-in: it starts the same program with the same arguments,
+    # joined by spaces as Start-Process hands them over, and waits for it. Only -NoExit is left out,
+    # which would keep that window open. Before it starts the program it can play the program of the
+    # user that the step is written against: put another archive in the temp folder (-StandInSwap),
+    # or change the file with the step's text (-StandInEdit). -StandInAnswer: 'declined' is 'No' at
+    # the prompt of Windows; 'silent' a window that never says it has read the files. When the
+    # window has ended, and before the first one tidies up, it writes down which of the two files
+    # are still in the temp folder (AFTER): what the window with administrator rights left alone.
+    $windowHarness = Join-Path $e2e 'window-harness.ps1'
+    $windowHarnessText = @'
+param([string]$StandInBootstrap, [string]$StandInZip, [string]$StandInLog, [string]$StandInTree, [string]$StandInRoot, [string]$StandInCommit, [string]$StandInTemp, [string]$StandInOptions, [string]$StandInSwap, [string]$StandInEdit, [string]$StandInAnswer, [int]$StandInWait)
+$ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
+$standInAst = [System.Management.Automation.Language.Parser]::ParseFile($StandInBootstrap, [ref]$null, [ref]$null)
+. ([scriptblock]::Create((@($standInAst.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true) | ForEach-Object { $_.Extent.Text }) -join "`n")))
+function Start-Process {
+    [CmdletBinding()]
+    param([string]$FilePath, [string[]]$ArgumentList, [string]$Verb)
+    [System.IO.File]::AppendAllText($script:StandInLog, "START $Verb $FilePath`r`n")
+    if ($script:StandInAnswer -eq 'declined') { throw 'The operation was canceled by the user.' }
+    if ($script:StandInSwap -ne 'NONE') { Copy-Item -LiteralPath $script:StandInSwap -Destination (Join-Path $script:StandInTemp 'localai-installer.zip') -Force }
+    if ($script:StandInEdit -ne 'NONE') { [System.IO.File]::AppendAllText((Join-Path $script:StandInTemp 'localai-elevated-step.txt'), "`n# changed after it was written") }
+    if ($script:StandInAnswer -eq 'silent') { return }
+    $standInStart = New-Object System.Diagnostics.ProcessStartInfo
+    $standInStart.FileName = $FilePath
+    $standInStart.Arguments = (@($ArgumentList | Where-Object { $_ -ne '-NoExit' }) -join ' ')
+    $standInStart.UseShellExecute = $false
+    $standInStarted = [System.Diagnostics.Process]::Start($standInStart)
+    $standInStarted.WaitForExit()
+    $standInStill = @(Get-ChildItem -LiteralPath $script:StandInTemp -Force | Where-Object { $_.Name -like 'localai*' } | ForEach-Object { $_.Name } | Sort-Object)
+    [System.IO.File]::AppendAllText($script:StandInLog, ('AFTER ' + ($standInStill -join ' ') + "`r`n"))
+}
+function Invoke-WebRequest {
+    param([string]$Uri, [string]$OutFile, $Headers, [switch]$UseBasicParsing, [int]$TimeoutSec)
+    if (-not $OutFile) { [System.IO.File]::AppendAllText($script:StandInLog, "OTHER $Uri`r`n"); throw 'The stand-in for GitHub sends the download only.' }
+    [System.IO.File]::AppendAllText($script:StandInLog, "GET $Uri`r`n")
+    Copy-Item -LiteralPath $script:StandInZip -Destination $OutFile -Force
+}
+$standInManifest = $null
+if ($StandInTree -ne 'NONE') { $standInManifest = (Get-TreeManifest -Tree (ConvertFrom-ReviewJson -Text ([System.IO.File]::ReadAllText($StandInTree)))).Files }
+$standInExtra = @()
+if ($StandInOptions -ne 'NONE') { $standInExtra = @($StandInOptions.Substring(8) -split '\s+' | Where-Object { $_ }) }
+Install-ToolkitDownload -Url "https://codeload.github.com/example-owner/example-repo/zip/$StandInCommit" -Ref 'main' -Commit $StandInCommit -Manifest $standInManifest -Compare ($null -ne $standInManifest) -Zip (Join-Path $StandInTemp 'localai-installer.zip') -StageFile (Join-Path $StandInTemp 'localai-elevated-step.txt') -OldFolder (Join-Path $StandInTemp 'LocalAI-Installer') -Root $StandInRoot -Extra $standInExtra -Route 'window' -WaitSeconds $StandInWait
+'@
+    [System.IO.File]::WriteAllText($windowHarness, $windowHarnessText)
+    # No name a harness reads may be one the bootstrap assigns: that was a real fault here (the
     # download stand-in read the bootstrap's $zip, copied the target onto itself, and no installer ran).
     $bootstrapNames = @($ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.VariableExpressionAst] }, $true) | ForEach-Object { $_.VariablePath.UserPath } | Select-Object -Unique)
-    $harnessAst = [System.Management.Automation.Language.Parser]::ParseInput($harnessText, [ref]$null, [ref]$null)
-    $harnessNames = @($harnessAst.FindAll({ param($n) $n -is [System.Management.Automation.Language.VariableExpressionAst] }, $true) | ForEach-Object { $_.VariablePath.UserPath -replace '^script:', '' } | Where-Object { $_ -like 'StandIn*' } | Select-Object -Unique)
+    $harnessNames = @()
+    foreach ($text in @($harnessText, $windowHarnessText)) {
+        $harnessAst = [System.Management.Automation.Language.Parser]::ParseInput($text, [ref]$null, [ref]$null)
+        $harnessNames += @($harnessAst.FindAll({ param($n) $n -is [System.Management.Automation.Language.VariableExpressionAst] }, $true) | ForEach-Object { $_.VariablePath.UserPath -replace '^script:', '' } | Where-Object { $_ -like 'StandIn*' })
+    }
+    $harnessNames = @($harnessNames | Select-Object -Unique)
     $shared = @($harnessNames | Where-Object { $bootstrapNames -contains $_ })
-    Assert-That ($harnessNames.Count -ge 9 -and $shared.Count -eq 0) "the harness's own values have names the bootstrap does not use ($($harnessNames.Count) names, shared: $($shared -join ', '))"
+    Assert-That ($harnessNames.Count -ge 18 -and $shared.Count -eq 0) "the harnesses' own values have names the bootstrap does not use ($($harnessNames.Count) names, shared: $($shared -join ', '))"
 
-    function Invoke-Bootstrap {
-        # One run of Get-LocalAI.ps1 through the harness; nobody can type on it: -NonInteractive, and
-        # on the CI runner no keyboard at all. -Ref: LOCALAI_REF. -Reviewed: LOCALAI_REVIEWED_COMMIT
-        # (NONE: not set). -ProgramData: a folder the session's ProgramData variable is pointed at
-        # (NONE: left as it is). -PipeOk: the text OK is piped into the run instead (no
-        # -NonInteractive, so a Read-Host would take it; the pipe closes after it, so nothing can
-        # wait for more). -Zip: the archive GitHub's stand-in sends. -Options: LOCALAI_ARGS (NONE: not
-        # set). -Swap: an archive put in the temp folder in place of the downloaded one, at the
-        # moment Windows would ask for administrator rights (NONE: none). -Edit: the file with the
-        # step's text is changed at that moment (NONE: left as it is).
+    function Invoke-TestRun {
+        # One run of a harness in a child Windows PowerShell; nobody can type on it: -NonInteractive,
+        # and on the CI runner no keyboard at all. -PipeOk: the text OK is piped into the run instead
+        # (no -NonInteractive, so a Read-Host would take it; the pipe closes after it, so nothing can
+        # wait for more).
         # Before the run, what an earlier run left in the temp folder is removed, so that every run
-        # is judged by itself; after it, whatever is left there or under Program Files is recorded
-        # (Left, and $leftBehind for all runs together).
-        param([string]$Root, [string]$ApiDir, [string]$Ref = 'main', [string]$Reviewed = 'NONE', [string]$ProgramData = 'NONE', [switch]$PipeOk, [string]$Zip = $zipFile, [string]$Options = 'NONE', [string]$Swap = 'NONE', [string]$Edit = 'NONE')
+        # is judged by itself (-KeepTemp: not this time: the run itself has to remove it); after it,
+        # whatever is left there or under Program Files is recorded (Left, and $leftBehind for all
+        # runs together; -LeavesFiles: this run is meant to leave its two files, and is not counted).
+        param([string]$File, [string[]]$Arguments, [string]$Root, [switch]$PipeOk, [switch]$KeepTemp, [switch]$LeavesFiles)
         $marker = Join-Path $Root 'installer-ran.txt'
         $fromFile = Join-Path $Root 'installer-from.txt'
         foreach ($f in @($e2eLog, $marker, $fromFile)) { if (Test-Path -LiteralPath $f) { Remove-Item -LiteralPath $f -Force } }
-        foreach ($old in @(Get-ChildItem -LiteralPath $e2eTemp -Force | Where-Object { $_.Name -like 'localai*' })) { Remove-Item -LiteralPath $old.FullName -Recurse -Force }
-        $optionsArgument = 'NONE'
-        if ($Options -ne 'NONE') { $optionsArgument = 'options=' + $Options }
-        $harnessArgs = @('-StandInBootstrap', $bootstrap, '-StandInZip', $Zip, '-StandInLog', $e2eLog, '-StandInApi', $ApiDir, '-StandInRoot', $Root, '-StandInRef', $Ref, '-StandInReviewed', $Reviewed, '-StandInTemp', $e2eTemp, '-StandInProgramData', $ProgramData,
-            '-StandInOptions', $optionsArgument, '-StandInSwap', $Swap, '-StandInEdit', $Edit)
+        if (-not $KeepTemp) { foreach ($old in @(Get-ChildItem -LiteralPath $e2eTemp -Force | Where-Object { $_.Name -like 'localai*' })) { Remove-Item -LiteralPath $old.FullName -Recurse -Force } }
         $script:bootstrapRuns++
         $prev = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
-        if ($PipeOk) { $out = 'OK' | & $childExe -NoProfile -ExecutionPolicy Bypass -File $harness @harnessArgs 2>&1 | ForEach-Object { "$_" } }
-        else { $out = & $childExe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $harness @harnessArgs 2>&1 | ForEach-Object { "$_" } }
+        if ($PipeOk) { $out = 'OK' | & $windowsPowerShell -NoProfile -ExecutionPolicy Bypass -File $File @Arguments 2>&1 | ForEach-Object { "$_" } }
+        else { $out = & $windowsPowerShell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $File @Arguments 2>&1 | ForEach-Object { "$_" } }
         $code = $LASTEXITCODE
         $ErrorActionPreference = $prev
         $log = @(); if (Test-Path -LiteralPath $e2eLog) { $log = @([System.IO.File]::ReadAllLines($e2eLog)) }
@@ -1241,7 +1522,7 @@ Invoke-Expression ([System.IO.File]::ReadAllText($StandInBootstrap))
         $from = @(); if (Test-Path -LiteralPath $fromFile) { $from = @([System.IO.File]::ReadAllLines($fromFile)) }
         $left = @(Get-ChildItem -LiteralPath $e2eTemp -Force | Where-Object { $_.Name -like 'localai*' } | ForEach-Object { 'temp folder: ' + $_.Name })
         if (Test-Path -LiteralPath $stagingReal) { $left += 'Program Files: LocalAI-Update' }
-        foreach ($item in $left) { $leftBehind.Add("run $($script:bootstrapRuns): $item") }
+        if (-not $LeavesFiles) { foreach ($item in $left) { $leftBehind.Add("run $($script:bootstrapRuns): $item") } }
         return [pscustomobject]@{
             Code  = $code
             Text  = (@($out) -join "`n")
@@ -1251,11 +1532,39 @@ Invoke-Expression ([System.IO.File]::ReadAllText($StandInBootstrap))
             Odd   = @($log | Where-Object { $_ -like 'REST *' -or $_ -like 'OTHER *' })
             Get   = @($log | Where-Object { $_ -like 'GET *' })
             Start = @($log | Where-Object { $_ -like 'START *' })
+            After = @($log | Where-Object { $_ -like 'AFTER *' })
             Ran   = $ran
             From  = $from
             Left  = $left
         }
     }
+    function Invoke-Bootstrap {
+        # One run of the whole Get-LocalAI.ps1 through the first harness. -Ref: LOCALAI_REF.
+        # -Reviewed: LOCALAI_REVIEWED_COMMIT (NONE: not set). -ProgramData: a folder the session's
+        # ProgramData variable is pointed at (NONE: left as it is). -Zip: the archive GitHub's
+        # stand-in sends. -Options: LOCALAI_ARGS (NONE: not set).
+        param([string]$Root, [string]$ApiDir, [string]$Ref = 'main', [string]$Reviewed = 'NONE', [string]$ProgramData = 'NONE', [switch]$PipeOk, [string]$Zip = $zipFile, [string]$Options = 'NONE')
+        $optionsArgument = 'NONE'
+        if ($Options -ne 'NONE') { $optionsArgument = 'options=' + $Options }
+        $harnessArgs = @('-StandInBootstrap', $bootstrap, '-StandInZip', $Zip, '-StandInLog', $e2eLog, '-StandInApi', $ApiDir, '-StandInRoot', $Root, '-StandInRef', $Ref, '-StandInReviewed', $Reviewed, '-StandInTemp', $e2eTemp, '-StandInProgramData', $ProgramData, '-StandInOptions', $optionsArgument)
+        return (Invoke-TestRun -File $harness -Arguments $harnessArgs -Root $Root -PipeOk:$PipeOk)
+    }
+    function Invoke-WindowRoute {
+        # One run of the bootstrap from the download on, on its route for a window of its own,
+        # through the second harness. -Zip: the archive GitHub's stand-in sends. -Tree: GitHub's
+        # list of the commit's files, as a file (NONE: none, as for a first install the API did
+        # not answer for). -Swap: an archive put in the temp folder in place of the downloaded one,
+        # at the moment Windows would ask for administrator rights (NONE: none). -Edit: the file
+        # with the step's text is changed at that moment (NONE: left as it is). -Answer: what
+        # Windows does with the request (yes; declined; silent: a window that never answers).
+        # -Wait: how long the bootstrap waits for the window's signal, in seconds.
+        param([string]$Root, [string]$Zip = $zipFile, [string]$Tree = $treeFile, [string]$Options = 'NONE', [string]$Swap = 'NONE', [string]$Edit = 'NONE', [string]$Answer = 'yes', [int]$Wait = 60, [switch]$KeepTemp, [switch]$LeavesFiles)
+        $optionsArgument = 'NONE'
+        if ($Options -ne 'NONE') { $optionsArgument = 'options=' + $Options }
+        $harnessArgs = @('-StandInBootstrap', $bootstrap, '-StandInZip', $Zip, '-StandInLog', $e2eLog, '-StandInTree', $Tree, '-StandInRoot', $Root, '-StandInCommit', $shaNew, '-StandInTemp', $e2eTemp, '-StandInOptions', $optionsArgument, '-StandInSwap', $Swap, '-StandInEdit', $Edit, '-StandInAnswer', $Answer, '-StandInWait', [string]$Wait)
+        return (Invoke-TestRun -File $windowHarness -Arguments $harnessArgs -Root $Root -KeepTemp:$KeepTemp -LeavesFiles:$LeavesFiles)
+    }
+    $treeFile = Join-Path $apiFull 'tree.json'
     $script:bootstrapRuns = 0
     $leftBehind = New-Object System.Collections.Generic.List[string]
 
@@ -1269,8 +1578,9 @@ Invoke-Expression ([System.IO.File]::ReadAllText($StandInBootstrap))
     Assert-That ($r.Ran -eq "commit=$shaNew" -and $r.Text -match 'Not asking: LOCALAI_REVIEWED_COMMIT') "LOCALAI_REVIEWED_COMMIT naming the incoming commit: the installer from the archive runs, with that commit recorded next to it (installer '$($r.Ran)'; $($r.Tail))"
     Assert-That ($r.Get.Count -eq 1 -and $r.Get[0] -like "GET https://codeload.github.com/*/zip/$shaNew" -and $r.Text -match "To install\s+: commit $shaNew") "and what was downloaded is the commit the review showed, not the branch ($($r.Get -join ' '))"
     # The same run, looked at for what this file is about: a correct download passes both
-    # comparisons, Windows is asked for administrator rights once, and the installer runs from the
-    # folder the step made under Program Files, which only administrators can change.
+    # comparisons, and the installer runs from the folder the step made under Program Files, which
+    # only administrators can change. This window had administrator rights already, so the step
+    # ran in it: no second window is asked for, and none is left open behind the run.
     $ranFrom = ''
     $madeRule = $null
     $madeWhy = 'the installer wrote nothing down'
@@ -1283,8 +1593,18 @@ Invoke-Expression ([System.IO.File]::ReadAllText($StandInBootstrap))
     }
     $madeHolders = @()
     if ($madeRule) { $madeHolders = @($madeRule.Rules | ForEach-Object { $_.Sid } | Sort-Object -Unique) }
-    Assert-That ($r.Start.Count -eq 1 -and $r.Start[0] -like 'START RunAs *\WindowsPowerShell\v1.0\powershell.exe' -and $r.Text -match 'Windows asks for administrator rights next' -and $r.Text -match 'The installer continues in the Administrator window that opened') "a correct download passes: Windows is asked for administrator rights once, for Windows PowerShell by its full path ($($r.Start -join ' '))"
+    Assert-That ($r.Start.Count -eq 0 -and $r.Text -match 'This window has administrator rights already: the installer runs here' -and $r.Text -notmatch 'Windows asks for administrator rights next' -and $r.Text -notmatch 'continues in the Administrator window') "a correct download passes, and a window that has administrator rights already runs the step itself: Windows is not asked for a second window, and the run does not end with the installer still to come somewhere else (requests to Windows: $($r.Start.Count); $($r.Tail))"
     Assert-That ($ranFrom -like (Join-Path $stagingReal '*\local-llm') -and $ranFrom -notlike "$e2eTemp*" -and $r.Text -match 'It is the download that was compared') "and the installer ran from the folder the step made under Program Files, not from the temp folder (ran from '$ranFrom')"
+    Assert-That ($r.Text -notmatch 'A restart is needed' -and $r.Text -notmatch 'The installer stopped with an error' -and $r.Text -notmatch 'Stopped: ') 'an installer that ends well is followed by no word of a restart or an error'
+    # The commit of these runs holds, outside local-llm, a file with a letter outside ASCII in its
+    # name, a symbolic link and a submodule (GitHub's stand-in lists them, and the archive holds
+    # the first two). Before, one such name anywhere in the repository left the list unused and
+    # the archive unread: every update stopped, for good. This one went through with them.
+    $zipNames = @()
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    $zipProbe = [System.IO.Compression.ZipFile]::OpenRead($zipFile)
+    try { $zipNames = @($zipProbe.Entries | ForEach-Object { ([string]$_.FullName).Replace('\', '/') }) } finally { $zipProbe.Dispose() }
+    Assert-That ($treeJson.Contains($oddName) -and $treeJson -match '"120000"' -and $treeJson -match '"160000"' -and @($zipNames | Where-Object { $_ -like "*/docs/$oddName" }).Count -eq 1 -and @($zipNames | Where-Object { $_ -like '*/latest' }).Count -eq 1 -and $r.Ran -eq "commit=$shaNew" -and $r.Text -match 'must hold exactly the 4 file\(s\)') "names outside local-llm that Windows could not store, a link and a submodule there stand in nobody's way: the list was used, the archive read, and the download installed (installer '$($r.Ran)'; $($zipNames.Count) entries in the archive)"
     Assert-That ($madeWhy -eq '' -and $madeRule -and $madeRule.Owner -eq 'S-1-5-32-544' -and ($madeHolders -join ' ') -eq 'S-1-5-18 S-1-5-32-544') "that folder, as the installer found it, is accepted by the check of its rules: owned by Administrators, with rules for SYSTEM and Administrators and nobody else ('$madeWhy'; rules for: $($madeHolders -join ' '))"
     Assert-That ($r.From.Count -ge 5 -and $r.From[2] -eq 'True' -and $r.From[3] -eq '' -and $r.From[4] -eq 'True') 'the installer had administrator rights, got no option it was not given, and ran while the step held its folder'
     Assert-That ($r.Left.Count -eq 0) "after that run nothing is left behind: not the archive, the unpacked files or the step's text in the temp folder, not the folder under Program Files ($($r.Left -join ', '))"
@@ -1292,6 +1612,13 @@ Invoke-Expression ([System.IO.File]::ReadAllText($StandInBootstrap))
     Assert-That ($r.Ran -eq "commit=$shaNew" -and $r.From.Count -ge 5 -and $r.From[3] -eq '-OfficialModels none') "options for the installer (LOCALAI_ARGS) reach it through the step as they were given ('$(if ($r.From.Count -ge 5) { $r.From[3] })')"
     $r = Invoke-Bootstrap -Root $rootInstalled -ApiDir $apiFull -Reviewed $shaNew -Options '-OfficialModels none;more'
     Assert-That ($r.Get.Count -eq 0 -and $r.Start.Count -eq 0 -and -not $r.Ran -and $r.Text -match 'LOCALAI_ARGS may hold only plain options' -and $r.Text -match 'Nothing was downloaded or changed') "options that are more than plain words are refused before anything is downloaded (downloads $($r.Get.Count), installer '$($r.Ran)')"
+    # The installer's result comes back to the window the command was run in: it is that window
+    # the step ran in. A restart it asks for (3010) and an error are both said there, after its own
+    # messages, and the folder under Program Files is removed all the same.
+    $r = Invoke-Bootstrap -Root $rootInstalled -ApiDir $apiFull -Reviewed $shaNew -Options '-StandInExit 3010'
+    Assert-That ($r.Ran -eq "commit=$shaNew" -and $r.Start.Count -eq 0 -and $r.Text -match 'A restart is needed; the installer resumes after you sign in again' -and $r.Text -notmatch 'stopped with an error' -and $r.Left.Count -eq 0) "an installer that ends with 3010 is reported in the window the command was run in: a restart is needed (installer '$($r.Ran)'; $($r.Tail))"
+    $r = Invoke-Bootstrap -Root $rootInstalled -ApiDir $apiFull -Reviewed $shaNew -Options '-StandInExit 7'
+    Assert-That ($r.Ran -eq "commit=$shaNew" -and $r.Start.Count -eq 0 -and $r.Text -match 'The installer stopped with an error \(code 7\)' -and $r.Text -notmatch 'A restart is needed' -and $r.Left.Count -eq 0) "and one that ends with an error is reported there with its code (installer '$($r.Ran)'; $($r.Tail))"
 
     # GitHub's API not answering for the list of the commit's files: an update stops, before the
     # question and before the download, also with the reviewed commit named.
@@ -1300,7 +1627,7 @@ Invoke-Expression ([System.IO.File]::ReadAllText($StandInBootstrap))
     $r = Invoke-Bootstrap -Root $rootInstalled -ApiDir $apiNoTree
     Assert-That ($r.Get.Count -eq 0 -and -not $r.Ran -and $r.Text -match 'could not be used' -and $r.Text -notmatch 'no keyboard to type OK on') "and without it the question is not even asked: there is nothing an OK could be about (installer '$($r.Ran)'; $($r.Tail))"
     $r = Invoke-Bootstrap -Root $rootInstalled -ApiDir $apiCutTree -Reviewed $shaNew
-    Assert-That ($r.Get.Count -eq 0 -and $r.Start.Count -eq 0 -and -not $r.Ran -and $r.Text -match 'could not be used \(its answer is no complete list of plain files') "a list GitHub cut off stops the update the same way (downloads $($r.Get.Count), installer '$($r.Ran)'; $($r.Tail))"
+    Assert-That ($r.Get.Count -eq 0 -and $r.Start.Count -eq 0 -and -not $r.Ran -and $r.Text -match 'could not be used \(GitHub cut the list off' -and $r.Text -match 'Trying again later changes nothing' -and $r.Text -notmatch 'Try again later \(GitHub') "a list GitHub cut off stops the update the same way, without the advice to try again later: waiting does not change that list (downloads $($r.Get.Count), installer '$($r.Ran)'; $($r.Tail))"
 
     # The download is not the commit: refused at the first comparison, before Windows is asked for
     # administrator rights.
@@ -1312,14 +1639,45 @@ Invoke-Expression ([System.IO.File]::ReadAllText($StandInBootstrap))
     $r = Invoke-Bootstrap -Root $rootInstalled -ApiDir $apiFull -Reviewed $shaNew -Zip $zipMissing
     Assert-That ($r.Get.Count -eq 1 -and $r.Start.Count -eq 0 -and -not $r.Ran -and $r.Text -match 'missing: local-llm/VERSION' -and $r.Left.Count -eq 0) "a download that lacks a file of the commit is refused (installer '$($r.Ran)'; $($r.Tail))"
 
+    # The bootstrap's other route: a window of its own, for a window that has no administrator
+    # rights yet. Run from the download on, as the bootstrap's flow calls it (the second harness).
+    # A correct download: Windows is asked once, for Windows PowerShell by its full path; the step
+    # in that window runs the installer from its folder under Program Files; and the first window
+    # removes its two files itself, once the other one has said that it has read them.
+    $bothFiles = 'AFTER localai-elevated-step.txt localai-installer.zip'
+    $r = Invoke-WindowRoute -Root $rootInstalled
+    $ranFrom = ''; if ($r.From.Count -ge 5) { $ranFrom = $r.From[0] }
+    Assert-That ($r.Get.Count -eq 1 -and $r.Get[0] -like "GET https://codeload.github.com/*/zip/$shaNew" -and $r.Start.Count -eq 1 -and $r.Start[0] -like 'START RunAs *\WindowsPowerShell\v1.0\powershell.exe' -and $r.Text -match 'Windows asks for administrator rights next' -and $r.Text -match 'The installer continues in the Administrator window that opened') "a window of its own: Windows is asked for administrator rights once, for Windows PowerShell by its full path ($($r.Start -join ' '); $($r.Tail))"
+    Assert-That ($r.Ran -eq "commit=$shaNew" -and $ranFrom -like (Join-Path $stagingReal '*\local-llm') -and $r.Text -match 'It is the download that was compared' -and $r.From.Count -ge 5 -and $r.From[2] -eq 'True' -and $r.From[3] -eq '' -and $r.From[4] -eq 'True') "the step in that window, started by the command line it was handed, runs the installer from its folder under Program Files, with the commit recorded and no option it was not given (installer '$($r.Ran)', ran from '$ranFrom')"
+    Assert-That ($r.After.Count -eq 1 -and $r.After[0] -ceq $bothFiles -and $r.Left.Count -eq 0 -and $r.Text -notmatch 'has not said within') "the window with administrator rights removed nothing in the temp folder: when it had ended both files were still there, and the first window then removed them itself ($($r.After -join ' '); left: $($r.Left -join ', '))"
+    $r = Invoke-WindowRoute -Root $rootInstalled -Options '-OfficialModels none'
+    Assert-That ($r.Ran -eq "commit=$shaNew" -and $r.From.Count -ge 5 -and $r.From[3] -eq '-OfficialModels none') "options for the installer reach it through the step's text and that command line as they were given ('$(if ($r.From.Count -ge 5) { $r.From[3] })')"
     # A program of the user at work between the first comparison and the click on Yes: the archive
     # in the temp folder is swapped, or the file with the step's text is changed. Both are caught
     # behind the request for administrator rights, and the installer does not run.
-    $r = Invoke-Bootstrap -Root $rootInstalled -ApiDir $apiFull -Reviewed $shaNew -Swap $zipOneByte
+    $r = Invoke-WindowRoute -Root $rootInstalled -Swap $zipOneByte
     Assert-That ($r.Get.Count -eq 1 -and $r.Start.Count -eq 1 -and -not $r.Ran -and $r.From.Count -eq 0 -and $r.Text -match 'Stopped: the archive in the temp folder is not the download that was compared' -and $r.Text -match 'Nothing was installed or changed') "a zip swapped in the temp folder after the first check is refused by the step with administrator rights: the installer in it does not run (installer '$($r.Ran)'; $($r.Tail))"
-    Assert-That ($r.Left.Count -eq 0) "after that refusal nothing is left either: not in the temp folder, not under Program Files ($($r.Left -join ', '))"
-    $r = Invoke-Bootstrap -Root $rootInstalled -ApiDir $apiFull -Reviewed $shaNew -Edit 'yes'
-    Assert-That ($r.Start.Count -eq 1 -and -not $r.Ran -and $r.Text -match 'Stopped: the file that carries the step with administrator rights was changed or removed' -and $r.Text -notmatch 'Checking the download once more' -and $r.Left.Count -eq 0) "the step's own text changed in the temp folder is not run at all: the window was started with the hash of the text as it was written (installer '$($r.Ran)'; left: $($r.Left -join ', '); $($r.Tail))"
+    Assert-That ($r.After.Count -eq 1 -and $r.After[0] -ceq $bothFiles -and $r.Left.Count -eq 0) "after that refusal the swapped archive is still where the program of the user put it (the step removed nothing there), and the first window then removed both files; nothing is left under Program Files ($($r.After -join ' '); left: $($r.Left -join ', '))"
+    $r = Invoke-WindowRoute -Root $rootInstalled -Edit 'yes'
+    Assert-That ($r.Start.Count -eq 1 -and -not $r.Ran -and $r.Text -match 'Stopped: the file that carries the step with administrator rights was changed or removed' -and $r.Text -notmatch 'Checking the download once more') "the step's own text changed in the temp folder is not run at all: the window was started with the hash of the text as it was written (installer '$($r.Ran)'; $($r.Tail))"
+    Assert-That ($r.After.Count -eq 1 -and $r.After[0] -ceq $bothFiles -and $r.Left.Count -eq 0 -and $r.Text -notmatch 'has not said within') "that window removed neither file; it told the first window, which removed both at once instead of waiting out its time ($($r.After -join ' '); left: $($r.Left -join ', '))"
+    # No list of the commit's files (a first install GitHub's API did not answer for): nothing was
+    # compared before the request, and the step is still told the SHA-256 of the archive as it was
+    # read. Another archive in its place is refused; the one that was read is installed.
+    $r = Invoke-WindowRoute -Root $rootInstalled -Tree 'NONE' -Swap $zipOneByte
+    Assert-That ($r.Get.Count -eq 1 -and $r.Start.Count -eq 1 -and -not $r.Ran -and $r.Text -match 'Stopped: the archive in the temp folder is not the download that was compared' -and $r.Left.Count -eq 0) "without a list of the commit's files a swapped archive is refused all the same: the step holds its copy to the SHA-256 of the archive that was read (installer '$($r.Ran)'; $($r.Tail))"
+    $r = Invoke-WindowRoute -Root $rootInstalled -Tree 'NONE'
+    Assert-That ($r.Ran -eq "commit=$shaNew" -and $r.Left.Count -eq 0) "and the archive that was read is installed (installer '$($r.Ran)'; $($r.Tail))"
+    # 'No' at the prompt of Windows: nothing is installed, and the first window removes its files.
+    $r = Invoke-WindowRoute -Root $rootInstalled -Answer 'declined'
+    Assert-That ($r.Start.Count -eq 1 -and -not $r.Ran -and $r.Text -match 'Administrator rights were declined; run the command again and click Yes' -and $r.Text -match 'Nothing was installed or changed' -and $r.Text -notmatch 'continues in the Administrator window' -and $r.Left.Count -eq 0) "administrator rights declined: said so, nothing installed, nothing left in the temp folder (installer '$($r.Ran)'; left: $($r.Left -join ', '); $($r.Tail))"
+    # A window that was started and never says that it has read the files (closed at once, or
+    # hung): the first window does not take the files away from it. It waits its time, leaves them
+    # and says so; the next run removes them before it downloads.
+    $r = Invoke-WindowRoute -Root $rootInstalled -Answer 'silent' -Wait 2 -LeavesFiles
+    Assert-That ($r.Start.Count -eq 1 -and -not $r.Ran -and ($r.Left -join ', ') -ceq 'temp folder: localai-elevated-step.txt, temp folder: localai-installer.zip' -and $r.Text -match 'has not said within 2 seconds' -and $r.Text -match 'the next run of this command removes them') "a window that never answers keeps its two files: the first window waits, leaves them and says where they are (left: $($r.Left -join ', '); $($r.Tail))"
+    $r = Invoke-WindowRoute -Root $rootInstalled -Answer 'declined' -KeepTemp
+    Assert-That ($r.Left.Count -eq 0 -and $r.Get.Count -eq 1) "and the next run removes what that one left, whatever becomes of it ($($r.Left -join ', '))"
 
     $r = Invoke-Bootstrap -Root $rootInstalled -ApiDir $apiFull -Reviewed $shaOther
     Assert-That ($r.Get.Count -eq 0 -and -not $r.Ran -and $r.Text -match 'does not count here') "LOCALAI_REVIEWED_COMMIT naming another commit skips nothing (downloads $($r.Get.Count), installer '$($r.Ran)')"
@@ -1331,11 +1689,7 @@ Invoke-Expression ([System.IO.File]::ReadAllText($StandInBootstrap))
     } else {
         $r = Invoke-Bootstrap -Root $rootEmpty -ApiDir $apiFull
         Assert-That ($r.Ran -eq "commit=$shaNew" -and $r.Text -match 'First install' -and $r.Text -notmatch 'Stopped' -and @($r.Api | Where-Object { $_ -like '*/compare/*' }).Count -eq 0) "a first install is not asked and goes on as before (installer '$($r.Ran)'; $($r.Tail))"
-        Assert-That ($r.Text -match 'a first install was not reviewed, so this download cannot be compared with a reviewed commit' -and $r.Text -match 'It is compared with the 4 file\(s\) GitHub lists' -and $r.Api.Count -eq 2 -and $r.Start.Count -eq 1 -and $r.Left.Count -eq 0) "it says plainly that this first download cannot be compared with a reviewed commit, holds it against the commit it shows, and runs the installer through the same step ($($r.Api.Count) API call(s), left: $($r.Left -join ', '))"
-        # Nobody reviewed a first install, and without the list nothing was compared either. What
-        # runs with administrator rights is still what was downloaded: a swap is caught here too.
-        $r = Invoke-Bootstrap -Root $rootEmpty -ApiDir $apiNone -Swap $zipOneByte
-        Assert-That ($r.Get.Count -eq 1 -and $r.Start.Count -eq 1 -and -not $r.Ran -and $r.Text -match 'Stopped: the archive in the temp folder is not the download that was compared' -and $r.Left.Count -eq 0) "a first install that could not be compared with anything is protected against a swapped archive all the same (installer '$($r.Ran)'; $($r.Tail))"
+        Assert-That ($r.Text -match 'a first install was not reviewed, so this download cannot be compared with a reviewed commit' -and $r.Text -match 'It is compared with the 4 file\(s\) GitHub lists' -and $r.Api.Count -eq 2 -and $r.Start.Count -eq 0 -and $r.Text -match 'It is the download that was compared' -and $r.Left.Count -eq 0) "it says plainly that this first download cannot be compared with a reviewed commit, holds it against the commit it shows, and runs the installer through the same step ($($r.Api.Count) API call(s), left: $($r.Left -join ', '))"
     }
     # The comparison as GitHub sends it across many commits: over 2 million characters. Read in full
     # by Windows PowerShell 5.1, with the file list on screen.
@@ -1414,7 +1768,56 @@ Invoke-Expression ([System.IO.File]::ReadAllText($StandInBootstrap))
     $r = Invoke-Bootstrap -Root $rootEmpty -ApiDir $apiNone -Ref '../../../other/repo/zip/main'
     Assert-That ($r.Api.Count -eq 0 -and $r.Get.Count -eq 0 -and -not $r.Ran -and $r.Text -match 'LOCALAI_REF may hold only' -and $r.Text -match 'Nothing was downloaded or changed') "a LOCALAI_REF with '..' in it is refused before GitHub is asked anything: no lookup, no download, no installer (API $($r.Api.Count), downloads $($r.Get.Count), installer '$($r.Ran)'; $($r.Tail))"
     # Every run above, whether it installed, was refused or stopped: nothing of it stays behind.
-    Assert-That ($script:bootstrapRuns -ge 25 -and $leftBehind.Count -eq 0) "none of the $($script:bootstrapRuns) runs left anything in the temp folder or under Program Files, after a success and after a refusal alike (left: $($leftBehind -join '; '))"
+    Assert-That ($script:bootstrapRuns -ge 35 -and $leftBehind.Count -eq 0) "none of the $($script:bootstrapRuns) runs left anything in the temp folder or under Program Files, after a success and after a refusal alike; the one run that is meant to leave its two files is not counted (left: $($leftBehind -join '; '))"
+
+    # The step with administrator rights, called directly (this test has the rights, and the step's
+    # functions are the bootstrap's own): what it does with an archive that is not the one that
+    # was compared, and what it does not do with the file it was handed. It is Windows PowerShell
+    # only, like the window the bootstrap starts it in.
+    if ($PSVersionTable.PSEdition -eq 'Desktop') {
+        $stepRan = Join-Path $rootInstalled 'installer-ran.txt'
+        $callStep = {
+            param([string]$Zip, [string]$ZipHash, [string]$Digest)
+            if (Test-Path -LiteralPath $stepRan) { Remove-Item -LiteralPath $stepRan -Force }
+            $said = @(Invoke-ElevatedInstall -Zip $Zip -ZipHash $ZipHash -Digest $Digest -Commit $shaNew -Root $rootInstalled -Extra @() 6>&1 | ForEach-Object { "$_" })
+            return [pscustomobject]@{ Said = ($said -join "`n"); Ran = (Test-Path -LiteralPath $stepRan); ZipThere = (Test-Path -LiteralPath $Zip); Staged = (Test-Path -LiteralPath $stagingReal) }
+        }
+        $zipBytesReal = [System.IO.File]::ReadAllBytes($zipFile)
+        $zipHashReal = Get-Sha256Hex -Bytes $zipBytesReal
+        $digestReal = Get-ToolkitDigest -Files (Get-TreeManifest -Tree (ConvertFrom-ReviewJson -Text $treeJson)).Files
+        $notZip = Join-Path $e2e 'not-an-archive.zip'
+        [System.IO.File]::WriteAllText($notZip, 'put here by a program of the user: no archive at all')
+        $s = & $callStep $notZip $zipHashReal $digestReal
+        Assert-That (-not $s.Ran -and $s.Said -match 'Stopped: the archive in the temp folder is not the download that was compared' -and $s.Said -match 'Nothing was installed or changed' -and $s.Said -notmatch 'Central Directory|could not be unpacked|End of') "the step holds its copy of the archive to the SHA-256 it was told before it opens it: a file that is no archive at all is refused for not being the download, not for what is in it ($($s.Said -replace '\s+', ' '))"
+        Assert-That ($s.ZipThere -and [System.IO.File]::ReadAllText($notZip) -ceq 'put here by a program of the user: no archive at all' -and -not $s.Staged) "and it leaves the file it was handed where it is and as it is: with administrator rights nothing in the user's folder is removed; its own folder under Program Files is gone (file there: $($s.ZipThere), folder there: $($s.Staged))"
+        $s = & $callStep $zipOneByte $zipHashReal $digestReal
+        Assert-That (-not $s.Ran -and $s.Said -match 'Stopped: the archive in the temp folder is not the download that was compared' -and $s.ZipThere -and -not $s.Staged) "an archive that differs in one byte from the one that was compared is refused the same way, and left where it is ($($s.Said -replace '\s+', ' '))"
+        $s = & $callStep $zipFile $zipHashReal ('0' * 64)
+        Assert-That (-not $s.Ran -and $s.Said -match 'Stopped: the files that were unpacked are not the files that were compared' -and -not $s.Staged) "the right archive with a digest that is not that of its files is refused too: the second check, of what was unpacked under Program Files ($($s.Said -replace '\s+', ' '))"
+        $s = & $callStep $zipFile 'not-a-hash' $digestReal
+        Assert-That (-not $s.Ran -and $s.Said -match 'Stopped: this step was not told what the download has to be' -and -not $s.Staged) 'a step that is not told the SHA-256 of the archive refuses: it never goes on unchecked'
+        $s = & $callStep $zipFile $zipHashReal $digestReal
+        Assert-That ($s.Ran -and $s.Said -match 'It is the download that was compared' -and $s.Said -notmatch 'Stopped: ' -and $s.ZipThere -and -not $s.Staged) "the archive that was compared, with its SHA-256 and the digest of the commit's list, passes both checks and the installer runs; the archive it was handed is still there afterwards ($($s.Said -replace '\s+', ' '))"
+        # The signal by which the step tells the first window that its files are needed no longer.
+        $signalName = 'LocalAI-Update-' + [guid]::NewGuid().ToString('N')
+        $signal = New-HandOverSignal -Name $signalName
+        $setBefore = $true; $setByOthers = $true; $setAfter = $false; $administratorsMaySet = $false
+        if ($signal) {
+            try {
+                $setBefore = $signal.WaitOne(0)
+                Send-HandOverSignal -Name ''
+                Send-HandOverSignal -Name 'a name that is none'
+                Send-HandOverSignal -Name ('LocalAI-Update-' + [guid]::NewGuid().ToString('N'))
+                $setByOthers = $signal.WaitOne(0)
+                Send-HandOverSignal -Name $signalName
+                $setAfter = $signal.WaitOne(0)
+                $administratorsMaySet = (@($signal.GetAccessControl().GetAccessRules($true, $false, [System.Security.Principal.SecurityIdentifier]) | Where-Object { $_.IdentityReference.Value -eq 'S-1-5-32-544' -and $_.AccessControlType -eq [System.Security.AccessControl.AccessControlType]::Allow }).Count -eq 1)
+            } finally { $signal.Dispose() }
+        }
+        Assert-That ($null -ne $signal -and -not $setBefore -and -not $setByOthers -and $setAfter -and $administratorsMaySet) "the first window's signal is set by its name and by no other; no name, a name that is none and a signal that does not exist are no error; and Administrators may set it, for the case that the rights are another account's (before: $setBefore, by other names: $setByOthers, after: $setAfter, rule for Administrators: $administratorsMaySet)"
+    } else {
+        Skip 'the step with administrator rights called directly, and its signal (Windows PowerShell 5.1 only: the Windows job runs this)'
+    }
 
     # The check of a folder's rules on real folders of this machine (Get-FolderRule reads them,
     # Test-AdminOnlyRule judges them). One folder is first given to SYSTEM and Administrators alone,
@@ -1436,6 +1839,31 @@ Invoke-Expression ([System.IO.File]::ReadAllText($StandInBootstrap))
     $programFilesWhy = Test-AdminOnlyRule -Rule (Get-FolderRule -Path $programFilesReal) -Parent
     $tempWhy = Test-AdminOnlyRule -Rule (Get-FolderRule -Path $e2eTemp)
     Assert-That ($programFilesWhy -eq '' -and $tempWhy -ne '') "Program Files of this machine passes as the folder the step makes its own in; the temp folder the download sits in does not pass (Program Files: '$programFilesWhy'; temp folder: '$tempWhy')"
+    # What Program Files hands down counts too, except to CREATOR OWNER. The real rules of this
+    # machine's Program Files with one more, handed down to Users (the right to modify what is made
+    # in it, as a careless setup leaves it), are refused: before, every inherit-only rule was left
+    # out, and a folder made there was open to Users until its own rules were set.
+    $realParent = Get-FolderRule -Path $programFilesReal
+    $openedParent = [pscustomobject]@{ Owner = $realParent.Owner; Rules = @($realParent.Rules) + @((New-TestRule 'S-1-5-32-545' 1245631 -InheritOnly)) }
+    $openedWhy = Test-AdminOnlyRule -Rule $openedParent -Parent
+    $handedDown = @($realParent.Rules | Where-Object { $_.InheritOnly })
+    Assert-That ($openedWhy -match '^S-1-5-32-545 may change it \(rights 0x001301BF\)' -and $handedDown.Count -ge 1) "Program Files with a right to modify handed down to Users is refused as the folder the step makes its own in, though the folder itself is as Windows set it up ('$openedWhy'; rules this machine's Program Files hands down: $($handedDown.Count))"
+    # The step's folder is made with its owner and rules in one call: it has them from its first
+    # moment, and never those of the folder above (here a folder Users may write to). Whatever is
+    # made in it afterwards is let to SYSTEM and Administrators alone as well.
+    if ($PSVersionTable.PSEdition -eq 'Desktop') {
+        $bornClosed = Join-Path $probeFolder 'born-closed'
+        [void][System.IO.Directory]::CreateDirectory($bornClosed, (Get-AdminOnlySecurity))
+        $bornRule = Get-FolderRule -Path $bornClosed
+        $bornWhy = Test-AdminOnlyRule -Rule $bornRule
+        $bornHolders = @($bornRule.Rules | ForEach-Object { $_.Sid } | Sort-Object -Unique)
+        [void][System.IO.Directory]::CreateDirectory((Join-Path $bornClosed 'made-later'))
+        $laterHolders = @((Get-FolderRule -Path (Join-Path $bornClosed 'made-later')).Rules | Where-Object { $_.Allow } | ForEach-Object { $_.Sid } | Sort-Object -Unique)
+        Assert-That ($bornWhy -eq '' -and $bornRule.Owner -eq 'S-1-5-32-544' -and ($bornHolders -join ' ') -eq 'S-1-5-18 S-1-5-32-544' -and (Test-AdminOnlyRule -Rule (Get-FolderRule -Path $probeFolder)) -ne '') "a folder made with the step's owner and rules in one call has them at once, inside a folder Users may write to: owned by Administrators, rules for SYSTEM and Administrators and nobody else, nothing taken over from above ('$bornWhy'; rules for: $($bornHolders -join ' '))"
+        Assert-That (($laterHolders -join ' ') -eq 'S-1-5-18 S-1-5-32-544') "and what is made in it later is let to SYSTEM and Administrators alone as well (rules for: $($laterHolders -join ' '))"
+    } else {
+        Skip "a folder made with its owner and rules in one call (Windows PowerShell 5.1 only: the Windows job runs this)"
+    }
     # A junction inside a folder that is removed, or among unpacked files: never walked into.
     $linkRoot = Join-Path $e2e 'link-probe'
     $linkTarget = Join-Path $e2e 'link-target'
@@ -1451,6 +1879,63 @@ Invoke-Expression ([System.IO.File]::ReadAllText($StandInBootstrap))
     if ($failures -eq 0) { Remove-Item -LiteralPath $Work -Recurse -Force -ErrorAction SilentlyContinue }
 } else {
     Skip 'the bootstrap end to end, the step with administrator rights and the rules of real folders (Windows only: the Windows job runs this part)'
+}
+
+# ---- GitHub itself (only when asked: the one part that needs a network) ---------------------------
+# Everything above holds GitHub's answers against each other as stand-ins. Two things about the real
+# GitHub decide whether any update can pass at all, and only GitHub can show them: that
+# git/trees/<commit id>?recursive=1 answers for a commit id, and that the archive of a commit holds
+# every file under local-llm byte for byte as the commit does (*.cmd apart, see Get-ToolkitFileId).
+# -ProbeCommit names a commit that was pushed; its list and its archive are fetched and compared by
+# the bootstrap's own functions, read from the bytes and unpacked. A difference here means that
+# every update from an installed copy would stop at "what was downloaded is not commit ...".
+Write-Host "`n=== GitHub itself: its archive of a pushed commit against its list of that commit's files ===" -ForegroundColor Cyan
+if (-not $ProbeCommit) {
+    Skip 'GitHub itself (not asked: no -ProbeCommit; this is the one part that needs a network)'
+} elseif (-not $haveFunctions) {
+    Assert-That $false 'GitHub itself cannot be asked: the functions of the bootstrap are missing'
+} else {
+    # Without -ProbeRepo: the repository the bootstrap itself downloads from, as its own text names it.
+    $probeRepoName = $ProbeRepo
+    $repoAssignment = $ast.Find({ param($n) $n -is [System.Management.Automation.Language.AssignmentStatementAst] -and $n.Left.Extent.Text -eq '$repo' }, $true)
+    if (-not $probeRepoName -and $repoAssignment) {
+        $repoText = $repoAssignment.Right.Find({ param($n) $n -is [System.Management.Automation.Language.StringConstantExpressionAst] }, $true)
+        if ($repoText) { $probeRepoName = [string]$repoText.Value }
+    }
+    $probeAsked = ($ProbeCommit -cmatch '^[0-9a-f]{40}\z' -and $probeRepoName -match '^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+\z')
+    Assert-That $probeAsked "-ProbeCommit is the full id of a commit (40 hex digits, small letters) and the repository is named owner/name ('$ProbeCommit' in '$probeRepoName')"
+    if ($probeAsked) {
+        [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+        $githubWork = Join-Path $Work 'github'
+        if (Test-Path -LiteralPath $githubWork) { Remove-Item -LiteralPath $githubWork -Recurse -Force }
+        New-Item -ItemType Directory -Force -Path $githubWork | Out-Null
+        $githubZip = Join-Path $githubWork 'commit.zip'
+        # The bootstrap asks without a token; a test machine shares its address with many others,
+        # and GitHub's hourly limit for such questions is small. The answer is the same either way.
+        $githubHeaders = @{ Accept = 'application/vnd.github+json' }
+        if ($env:GITHUB_TOKEN) { $githubHeaders['Authorization'] = 'Bearer ' + $env:GITHUB_TOKEN }
+        $githubError = ''
+        $githubListing = $null; $githubArchive = $null; $githubUnpacked = @()
+        try {
+            $treeAnswer = Invoke-WebRequest -Uri "https://api.github.com/repos/$probeRepoName/git/trees/$($ProbeCommit)?recursive=1" -UseBasicParsing -Headers $githubHeaders -TimeoutSec 120
+            $githubListing = Get-TreeManifest -Tree (ConvertFrom-ReviewJson -Text (ConvertTo-ReviewBody -Content $treeAnswer.Content))
+            Invoke-WebRequest -Uri "https://codeload.github.com/$probeRepoName/zip/$ProbeCommit" -OutFile $githubZip -UseBasicParsing -TimeoutSec 300
+            $githubArchive = Get-ArchiveFileList -Bytes ([System.IO.File]::ReadAllBytes($githubZip))
+            $githubUnpacked = Get-ToolkitFileList -Top (Expand-ToolkitArchive -Zip $githubZip -Destination (Join-Path $githubWork 'unpacked'))
+        } catch { $githubError = ConvertTo-ReviewText -Text $_.Exception.Message -Max 300 -AllowUnicode }
+        $listed = @(); if ($githubListing -and $githubListing.Files) { $listed = @($githubListing.Files) }
+        $listingWhy = ''; if ($githubListing) { $listingWhy = [string]$githubListing.Why }
+        Assert-That ($githubError -eq '' -and $listed.Count -gt 0) "GitHub's API answers git/trees/<commit id>?recursive=1 for a commit id with a list the bootstrap can use: $($listed.Count) file(s) under local-llm of commit $ProbeCommit ('$githubError' '$listingWhy')"
+        if ($githubError -eq '' -and $listed.Count -gt 0 -and $githubArchive) {
+            $githubDiff = Compare-ToolkitTree -Manifest $listed -Files $githubArchive.Files
+            $cmdFiles = @($githubArchive.Files | Where-Object { $_.Path -clike '*.cmd' }).Count
+            Assert-That ($githubDiff.Count -eq 0 -and @($githubArchive.Files).Count -eq $listed.Count) "GitHub's archive of that commit, read from its bytes, holds exactly the files its list names, by name and by git id: no difference among $(@($githubArchive.Files).Count) file(s), $cmdFiles of them a .cmd with the line-end rule (top folder '$($githubArchive.Top)'; differences: $(@($githubDiff | Select-Object -First 5) -join '; '))"
+            Assert-That ((Compare-ToolkitTree -Manifest $listed -Files $githubUnpacked).Count -eq 0 -and (Get-ToolkitDigest -Files $githubUnpacked) -ceq (Get-ToolkitDigest -Files $listed)) "and unpacked on this machine the files are the same again, with the digest of the list: what the step with administrator rights checks ($(@($githubUnpacked).Count) file(s) unpacked)"
+        } else {
+            Assert-That $false "GitHub's archive of commit $ProbeCommit could not be held against its list: the question above failed ('$githubError')"
+        }
+        if ($failures -eq 0) { Remove-Item -LiteralPath $Work -Recurse -Force -ErrorAction SilentlyContinue }
+    }
 }
 
 if ($failures -eq 0) { Write-Host "`nGET-LOCALAI TEST PASSED" -ForegroundColor Green } else { Write-Host "`nGET-LOCALAI TEST FAILED ($failures)" -ForegroundColor Red }
