@@ -11,6 +11,9 @@
     - Start-menu shortcuts: real .lnk files are written and read back; the -Command payload parses.
     - Watch-LocalAI: pause / unpause / a full run with nothing installed must not throw.
     - Uninstall-LocalAI -WhatIf and Stop-LocalAI on an empty AI root must not throw.
+    - On Windows, the installer's own Set-UserEnv, Protect-InstallFolder and Get-ModelFolderContent
+      (a real user variable, real permissions, a drive letter that is not there), and Start-LocalAI
+      against a docker stand-in that is slow to start or never comes up.
     - Scheduled tasks: the no-window launch (conhost --headless), the daily-time math, and native
       calls with a time limit (a CLI that never answers is stopped, not waited on).
     - Test-LocalAI: the judge of a preset's past-chat and code switches on canned input, a check
@@ -214,6 +217,79 @@ if ($onWindows) {
     Assert-That ($r2.ExitCode -eq 0 -and $userOnScript.Count -ge 1 -and @($userOnScript | Where-Object { $_.Rights -match 'Write|Modify|FullControl' }).Count -eq 0) "Scripts: the user can read and run but not change files ($(($userOnScript | ForEach-Object { $_.Rights }) -join '; '))"
     Assert-That (@($scriptRules | Where-Object { $_.Sid -eq 'S-1-5-32-544' -and $_.Rights -match 'FullControl' }).Count -ge 1) 'Scripts: Administrators keep full control (elevated updates still work)'
 } else { Skip 'ACL test runs on Windows only' }
+
+# ---- the installer's own functions on real Windows ---------------------------------------------
+# Taken from Install-LocalAI.ps1's source, not copied. The mock run (on Linux) can only stand in
+# for what these three do: a table for the user's variables, a recorder for icacls, and no drive
+# letters at all.
+Write-Host "`n=== installer: Set-UserEnv writes, keeps and removes a user variable ===" -ForegroundColor Cyan
+if ($onWindows) {
+    $ueAst = [System.Management.Automation.Language.Parser]::ParseFile((Join-Path $src 'Install-LocalAI.ps1'), [ref]$null, [ref]$null)
+    . ([scriptblock]::Create($ueAst.Find({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Set-UserEnv' }, $true).Extent.Text))
+    # A throwaway name, removed again whatever happens.
+    $ueName = 'LAI_UNITTEST_' + [guid]::NewGuid().ToString('N').Substring(0, 8).ToUpperInvariant()
+    try {
+        $ue1 = Set-UserEnv -Name $ueName -Value 'D:\Models A'
+        Assert-That ($ue1 -eq $true -and [Environment]::GetEnvironmentVariable($ueName, 'User') -eq 'D:\Models A' -and [Environment]::GetEnvironmentVariable($ueName, 'Process') -eq 'D:\Models A') 'Set-UserEnv writes the user variable and this process, and reports a change'
+        $ue2 = Set-UserEnv -Name $ueName -Value 'D:\Models A'
+        Assert-That ($ue2 -eq $false) 'the same value again is no change'
+        $ue3 = Set-UserEnv -Name $ueName -Value ''
+        Assert-That ($ue3 -eq $true -and $null -eq [Environment]::GetEnvironmentVariable($ueName, 'User') -and $null -eq [Environment]::GetEnvironmentVariable($ueName, 'Process')) "'' removes the variable from the user's variables and from this process (no empty variable is left)"
+        $ue4 = Set-UserEnv -Name $ueName -Value ''
+        Assert-That ($ue4 -eq $false) "'' for a variable that is not there is no change"
+    } finally {
+        [Environment]::SetEnvironmentVariable($ueName, $null, 'User')
+        Remove-Item -LiteralPath "Env:$ueName" -ErrorAction SilentlyContinue
+    }
+} else { Skip 'user environment variables are kept by Windows only' }
+
+Write-Host "`n=== installer: next to a foreign folder, Stack and Skills are made and locked down ===" -ForegroundColor Cyan
+if ($onWindows) {
+    $pfAst = [System.Management.Automation.Language.Parser]::ParseFile((Join-Path $src 'Install-LocalAI.ps1'), [ref]$null, [ref]$null)
+    foreach ($pfFn in 'Protect-Path', 'Protect-InstallFolder') {
+        . ([scriptblock]::Create($pfAst.Find({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $pfFn }, $true).Extent.Text))
+    }
+    $pfRoot = Join-Path $Work 'protect-root'
+    foreach ($pfDir in 'ComfyUI', 'Secrets', 'Logs') { New-Item -ItemType Directory -Force -Path (Join-Path $pfRoot $pfDir) | Out-Null }
+    Set-Content -LiteralPath (Join-Path $pfRoot 'install-state.json') -Value '{}'
+    $pfForeign = Join-Path $pfRoot 'ComfyUI'
+    $pfForeignBefore = (Get-Acl -LiteralPath $pfForeign).Sddl
+    $pfRootBefore = (Get-Acl -LiteralPath $pfRoot).Sddl
+    # $script: because the two functions read these three names from the script that defines them.
+    $script:P = @{ Root = $pfRoot; Scripts = (Join-Path $pfRoot 'Scripts'); Stack = (Join-Path $pfRoot 'Stack'); Secrets = (Join-Path $pfRoot 'Secrets') }
+    $script:SourceRoot = $src
+    $script:CurrentUserSid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+    $pfFirst = Protect-InstallFolder
+    Set-Content -LiteralPath (Join-Path $pfRoot 'localai-config.json') -Value '{}'   # what a later stage writes into the root
+    $pfAgain = Protect-InstallFolder -Again
+    $pfCut = { param($p) (Test-Path -LiteralPath $p) -and (Get-Acl -LiteralPath $p).AreAccessRulesProtected }
+    Assert-That ($pfFirst -eq $true -and (& $pfCut (Join-Path $pfRoot 'Stack')) -and (& $pfCut (Join-Path $pfRoot 'Skills')) -and (& $pfCut (Join-Path $pfRoot 'Logs')) -and (& $pfCut (Join-Path $pfRoot 'install-state.json'))) 'the first pass makes Stack and Skills and cuts inheritance on them, as on the folders and files that were there'
+    Assert-That (@(Get-ChildItem -LiteralPath (Join-Path $pfRoot 'Skills') -Directory).Count -eq @(Get-ChildItem -LiteralPath (Join-Path $src 'skills') -Directory).Count) 'Skills is made with the starter skills in it'
+    Assert-That ((Get-Acl -LiteralPath $pfForeign).Sddl -eq $pfForeignBefore -and (Get-Acl -LiteralPath $pfRoot).Sddl -eq $pfRootBefore) 'the foreign folder, and the root it sits in, keep their permissions'
+    Assert-That ($pfAgain -eq $true -and (& $pfCut (Join-Path $pfRoot 'localai-config.json'))) 'the pass after the stages reaches a file written since the first'
+    # A root with nothing foreign in it: its own permissions cover what is made under it, so the
+    # pass after the stages has nothing to do there.
+    $pfPlain = Join-Path $Work 'protect-plain'
+    New-Item -ItemType Directory -Force -Path (Join-Path $pfPlain 'Secrets') | Out-Null
+    $pfPlainBefore = (Get-Acl -LiteralPath $pfPlain).Sddl
+    $script:P = @{ Root = $pfPlain; Scripts = (Join-Path $pfPlain 'Scripts'); Stack = (Join-Path $pfPlain 'Stack'); Secrets = (Join-Path $pfPlain 'Secrets') }
+    $pfNone = Protect-InstallFolder -Again
+    Assert-That ($pfNone -eq $false -and (Get-Acl -LiteralPath $pfPlain).Sddl -eq $pfPlainBefore -and -not (Test-Path -LiteralPath (Join-Path $pfPlain 'Stack'))) 'in a folder with nothing foreign in it the pass after the stages changes nothing'
+    Remove-Variable -Name P, SourceRoot, CurrentUserSid -Scope Script -ErrorAction SilentlyContinue
+} else { Skip 'folder permissions next to a foreign folder: Windows only' }
+
+Write-Host "`n=== installer: what a models folder holds, also on a drive that is not there ===" -ForegroundColor Cyan
+if ($onWindows) {
+    $mfAst = [System.Management.Automation.Language.Parser]::ParseFile((Join-Path $src 'Install-LocalAI.ps1'), [ref]$null, [ref]$null)
+    . ([scriptblock]::Create($mfAst.Find({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Get-ModelFolderContent' }, $true).Extent.Text))
+    $mfRoot = Join-Path $Work 'model-folder'
+    New-Item -ItemType Directory -Force -Path (Join-Path $mfRoot 'empty'), (Join-Path $mfRoot 'full\manifests\registry.ollama.ai\library\m') | Out-Null
+    Set-Content -LiteralPath (Join-Path $mfRoot 'full\manifests\registry.ollama.ai\library\m\latest') -Value '{}'
+    # The first drive letter from Z down to D that this machine does not have.
+    $mfNoDrive = @([char[]](90..68) | Where-Object { -not (Test-Path -LiteralPath ([string]$_ + ':\')) })[0]
+    Assert-That ((Get-ModelFolderContent -Path (Join-Path $mfRoot 'full')) -eq 'models' -and (Get-ModelFolderContent -Path (Join-Path $mfRoot 'empty')) -eq 'empty' -and (Get-ModelFolderContent -Path (Join-Path $mfRoot 'gone')) -eq 'absent') 'a folder with a manifest holds models, one without is empty, one that is not there on a drive that is, is absent'
+    Assert-That ($mfNoDrive -and (Get-ModelFolderContent -Path ([string]$mfNoDrive + ":\Gone\Owner's models")) -eq 'unknown') "a folder on a drive letter that is not there ($mfNoDrive) cannot be looked at: unknown, not empty"
+} else { Skip 'a models folder on a drive letter that is not there: Windows only' }
 
 # ---- volume lock ---------------------------------------------------------------------------------
 Write-Host "`n=== volume lock ===" -ForegroundColor Cyan
@@ -433,6 +509,88 @@ if ($r.Code -ne 0 -or $failures -gt 0) { Write-Host $r.Text }
 # Refused before the setup lock or Ollama are touched (both may be in use by another suite).
 $r = Invoke-Child 'Update-Models.ps1' @('-AIRoot', $aiRoot, '-RecheckOnly', '-Rollback', 'main')
 Assert-That ($r.Code -ne 0 -and $r.Text -match 'cannot be combined' -and -not (Test-Path -LiteralPath (Join-Path $aiRoot 'model-recheck.json'))) "Update-Models -RecheckOnly -Rollback is refused, nothing recorded (exit $($r.Code))"
+
+Write-Host "`n=== Start again: a Docker Desktop that is slow to start, or never comes up ===" -ForegroundColor Cyan
+if ($onWindows) {
+    # Start-LocalAI's wait for the engine exists on Windows only (elsewhere a stopped engine ends the
+    # run before it). A docker.cmd stand-in, first on PATH, writes every call down and answers as
+    # LAI_SD_CASE says:
+    #   never-up     version: not running once, then no answer.          desktop start: done at once.
+    #   comes-up     version: not running, no answer, then a version.    desktop start: done at once.
+    #   start-waits  version: not running, every time.                   desktop start: no answer.
+    # %~1, not %1: the scripts hand every argument over in double quotes, and %1 keeps them.
+    # Not tested here: Gaming mode -QuitDocker with a 'docker desktop stop' that gets no answer. That
+    # path stops every process named 'Docker Desktop' and runs the real wsl.exe --shutdown, without a
+    # time limit, on whatever machine runs this suite (an open row in IMPROVEMENTS.md).
+    $sdRoot = Join-Path $Work 'startdocker'
+    $sdShim = Join-Path $sdRoot 'shim'
+    New-Item -ItemType Directory -Force -Path $sdShim, (Join-Path $sdRoot 'Logs') | Out-Null
+    $sdCalls = Join-Path $sdShim 'calls.txt'
+    $sdCmd = @'
+@echo off
+>>"<DIR>\calls.txt" echo %~1 %~2
+if "%~1"=="desktop" goto desktop
+if "%LAI_SD_CASE%"=="start-waits" exit /b 1
+if not exist "<DIR>\v1" goto first
+if "%LAI_SD_CASE%"=="comes-up" if exist "<DIR>\v2" goto up
+echo x>"<DIR>\v2"
+ping -n 600 127.0.0.1 >nul
+exit /b 1
+:first
+echo x>"<DIR>\v1"
+exit /b 1
+:up
+echo 27.0.0
+exit /b 0
+:desktop
+if "%LAI_SD_CASE%"=="start-waits" ping -n 600 127.0.0.1 >nul
+exit /b 0
+'@
+    # CRLF throughout: cmd.exe can miss a label in a batch file with bare line feeds.
+    Set-Content -LiteralPath (Join-Path $sdShim 'docker.cmd') -Encoding ASCII -Value (($sdCmd -replace "`r?`n", "`r`n").Replace('<DIR>', $sdShim))
+    $sdHung = [regex]::Escape('Docker Desktop is not responding. Restart it (whale icon > Restart), wait for Engine running, then run this again.')
+    $sdSaved = @{ Path = $env:Path; Case = $env:LAI_SD_CASE; Limit = $env:LOCALAI_DOCKER_TIMEOUT }
+    function Invoke-StartAgainCase([string]$Case, [int]$TimeoutSec) {
+        Remove-Item -LiteralPath (Join-Path $sdShim 'v1'), (Join-Path $sdShim 'v2'), $sdCalls -Force -ErrorAction SilentlyContinue
+        $env:LAI_SD_CASE = $Case
+        # Start-LocalAI asks Ollama one thing (its version): a listener here answers that once.
+        $st = Start-TestListener
+        ConvertTo-Json @{ OllamaUrl = "http://127.0.0.1:$($st.Port)" } | Set-Content -LiteralPath (Join-Path $sdRoot 'localai-config.json')
+        $as = $st.Listener.BeginGetContext($null, $null)
+        $out = Join-Path $sdRoot "out-$Case.txt"
+        $run = Join-Path $sdRoot "run-$Case.ps1"
+        Set-Content -LiteralPath $run -Value ("`$o = @(); `$c = 0; try {{ & '{0}' -AIRoot '{1}' -TimeoutSec {2} 6>&1 2>&1 | ForEach-Object {{ `$o += [string]`$_ }} }} catch {{ `$c = 1 }}; `$o | Set-Content -LiteralPath '{3}'; exit `$c" -f (Join-Path $src 'Start-LocalAI.ps1').Replace("'", "''"), $sdRoot.Replace("'", "''"), $TimeoutSec, $out.Replace("'", "''"))
+        $sw = [Diagnostics.Stopwatch]::StartNew()
+        $p = Start-Process -FilePath $childExe -ArgumentList ('-NoProfile -ExecutionPolicy Bypass -File "{0}"' -f $run) -WindowStyle Hidden -PassThru
+        $null = $p.Handle   # without this, Windows PowerShell 5.1 has no ExitCode after the exit
+        try {
+            if ($as.AsyncWaitHandle.WaitOne(60000)) {
+                $ctx = $st.Listener.EndGetContext($as)
+                $body = [System.Text.Encoding]::UTF8.GetBytes('{"version":"0.0.0"}')
+                $ctx.Response.ContentType = 'application/json'
+                $ctx.Response.OutputStream.Write($body, 0, $body.Length)
+                $ctx.Response.Close()
+            }
+            if (-not $p.WaitForExit(240000)) { $p.Kill() }
+        } finally { $st.Listener.Stop() }
+        $text = ''; if (Test-Path -LiteralPath $out) { $text = [string](Get-Content -LiteralPath $out -Raw) }
+        # What the run said, shown under the case: these cases have no other trace when one fails.
+        foreach ($line in @($text -split "`r?`n" | Where-Object { $_.Trim() })) { Write-Host "    | $line" -ForegroundColor DarkGray }
+        $probes = @(Get-Content -LiteralPath $sdCalls -ErrorAction SilentlyContinue | Where-Object { $_ -like 'version*' }).Count
+        return [pscustomobject]@{ Code = $p.ExitCode; Text = $text; Sec = $sw.Elapsed.TotalSeconds; Probes = $probes }
+    }
+    $env:Path = "$sdShim;$env:Path"; $env:LOCALAI_DOCKER_TIMEOUT = '3'
+    try {
+        # No answer while Docker Desktop starts is not 'stuck' yet: only the deadline ends the wait.
+        $r = Invoke-StartAgainCase 'never-up' 14
+        Assert-That ($r.Code -ne 0 -and $r.Text -match ('\[FAIL\] Local AI did not start: ' + $sdHung) -and $r.Sec -ge 14 -and $r.Probes -ge 3) ("a Docker Desktop that never comes up: Start again asks until its -TimeoutSec is over, not until the first probe without an answer, and then says it is not responding (exit {0}, {1:N0} s, {2} probes)" -f $r.Code, $r.Sec, $r.Probes)
+        $r = Invoke-StartAgainCase 'comes-up' 60
+        Assert-That ($r.Text -match 'Docker engine is running' -and $r.Text -notmatch $sdHung -and $r.Probes -eq 3) ("a probe without an answer while Docker Desktop starts does not end Start again: it goes on when the next one answers ({0} probes, {1:N0} s)" -f $r.Probes, $r.Sec)
+        # 'docker desktop start' itself gets -TimeoutSec, and using all of it is not 'not responding'.
+        $r = Invoke-StartAgainCase 'start-waits' 8
+        Assert-That ($r.Code -ne 0 -and $r.Text -match '\[FAIL\] Local AI did not start: Docker engine did not start within 8 s\. Open Docker Desktop' -and $r.Text -notmatch $sdHung -and $r.Sec -ge 8 -and $r.Sec -lt 28) ("a 'docker desktop start' that does not come back is ended after -TimeoutSec and reported as a start that did not finish (exit {0}, {1:N0} s)" -f $r.Code, $r.Sec)
+    } finally { $env:Path = $sdSaved.Path; $env:LAI_SD_CASE = $sdSaved.Case; $env:LOCALAI_DOCKER_TIMEOUT = $sdSaved.Limit }
+} else { Skip 'the wait for Docker Desktop to start runs on Windows only' }
 
 Write-Host "`n=== Enable-TailscaleAccess against a fake tailscale CLI ===" -ForegroundColor Cyan
 $shimDir = Join-Path $Work 'tsshim'

@@ -244,7 +244,10 @@ services:
     # Gaming mode against an Ollama that keeps its model listed whatever it is told (a stand-in:
     # /api/ps always names one model, an unload is answered and changes nothing). After the second
     # unload the model is named in a warning, and no line says it was unloaded.
-    $fakePort = 11498
+    # Its port is asked of the system (a TcpListener on port 0, closed again at once), as
+    # Start-TestListener in the unit tests does: a fixed number can be a port that is taken.
+    $fakeAsk = New-Object System.Net.Sockets.TcpListener([System.Net.IPAddress]::Loopback, 0)
+    $fakeAsk.Start(); $fakePort = $fakeAsk.LocalEndpoint.Port; $fakeAsk.Stop()
     $fakeOllama = Join-Path $Work 'fake_ollama.py'
     @"
 import json
