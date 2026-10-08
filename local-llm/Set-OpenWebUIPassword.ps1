@@ -55,9 +55,10 @@ catch {
         # version does not know is refused here once more: it names no e-mail to sign in with.)
         $cred = Read-LaiSecretFile -Path $credFile -NoPassword
     } else {
-        # -PromptCurrent gets past a password that cannot be opened, not past such a file.
+        # -PromptCurrent gets past a password that cannot be opened or is not in the file, not past
+        # such a file.
         $hint = ''
-        if ($readWhy -match 'Cannot read the password in|holds no protected password') { $hint = ' If you know the password Open WebUI accepts now, run this again with -PromptCurrent.' }
+        if ($readWhy -match 'Cannot read the password in|holds no protected password|holds no password') { $hint = ' If you know the password Open WebUI accepts now, run this again with -PromptCurrent.' }
         throw ($readWhy + $hint)
     }
 }
@@ -105,7 +106,9 @@ if ($ok -ne $true) { Remove-Item -LiteralPath $pending -Force -ErrorAction Silen
 try { Save-LaiSecretFile -Path $credFile -Value $updated }
 catch {
     Write-LaiLog FAIL "Password changed, but $credFile could not be updated ($($_.Exception.Message)). The new password is in $pending; copy it over."
-    if ($generated) { Write-Host "New password: $NewPassword" -ForegroundColor Green }
+    # Shown under the same two conditions as at the end: one made here, and no -Quiet. The pending
+    # file named above holds it in either case (it was written before the change was asked for).
+    if ($generated -and -not $Quiet) { Write-Host "New password: $NewPassword" -ForegroundColor Green }
     exit 1
 }
 Remove-Item -LiteralPath $pending -Force -ErrorAction SilentlyContinue

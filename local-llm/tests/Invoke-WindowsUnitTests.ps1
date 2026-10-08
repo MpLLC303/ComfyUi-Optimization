@@ -290,6 +290,23 @@ $sfM4 = 'is marked as protected but holds no protected password'
 $sfWhy = & $sfRefusal { Read-LaiSecretFile -Path $sfNoValue }
 $sfWhy2 = & $sfRefusal { Read-LaiSecretFile -Path $sfBlankValue }
 Assert-That ($sfWhy -match $sfM4 -and $sfWhy2 -match $sfM4) 'a file marked as protected without its value is refused with a message of its own, on every system'
+# A plain file (no marker) that holds no password: the field empty, null, or not there because the
+# marker of a protected file was lost in an edit by hand. Returned as it is, each would reach the
+# caller as an empty password. With -NoPassword it is returned: that caller asks for the e-mail.
+$sfNoPassword = Join-Path $sfDir 'nopassword.json'
+Set-Content -LiteralPath $sfNoPassword -Value '{"email": "admin@localhost", "password": ""}' -Encoding UTF8
+$sfNullPassword = Join-Path $sfDir 'nullpassword.json'
+Set-Content -LiteralPath $sfNullPassword -Value '{"email": "admin@localhost", "password": null}' -Encoding UTF8
+$sfLostMarker = Join-Path $sfDir 'lostmarker.json'
+Set-Content -LiteralPath $sfLostMarker -Value '{"email": "admin@localhost", "passwordProtected": "QUJD"}' -Encoding UTF8
+$sfM8 = 'holds no password\.'
+$sfWhy = & $sfRefusal { Read-LaiSecretFile -Path $sfNoPassword }
+$sfWhy2 = & $sfRefusal { Read-LaiSecretFile -Path $sfNullPassword }
+$sfWhy3 = & $sfRefusal { Read-LaiSecretFile -Path $sfLostMarker }
+Assert-That ($sfWhy -match $sfM8 -and $sfWhy -notmatch 'passwordProtected' -and $sfWhy2 -match $sfM8 -and $sfWhy3 -match ($sfM8 + " It has a 'passwordProtected' value, but not the 'protected' field")) 'a plain file whose password is empty, null or not there is refused with a message of its own, not read as an empty password'
+$sfRead = & $sfDo { Read-LaiSecretFile -Path $sfNoPassword -NoPassword }
+$sfRead2 = & $sfDo { Read-LaiSecretFile -Path $sfLostMarker -NoPassword }
+Assert-That ($sfRead.email -eq 'admin@localhost' -and $sfRead2.email -eq 'admin@localhost') '-NoPassword still returns such a file, for its e-mail'
 
 # The two writers of the admin file, each in a child process as it runs, against a listener in
 # this process that stands in for Open WebUI.
@@ -380,6 +397,25 @@ function Invoke-SecretFilePending {
     $ran = Invoke-SecretFileClient -Name $Name -ClientText $client -Replies @($sfSignIn)
     return [pscustomobject]@{ Result = ($ran.Lines -join ','); Asked = $ran.Bodies.Count }
 }
+function Invoke-SecretFileFailedSave {
+    # A rotation whose save of the admin file fails after Open WebUI took the new password: the
+    # file (plain, in an install folder of its own) is marked read-only for the run, so it can be
+    # read and not written. Returns Run (as Invoke-SecretFileRotation gives it), PendingFile,
+    # Pending (the password the pending file holds afterwards; '' when it is not there) and Same
+    # (the admin file is byte for byte what it was).
+    param([string]$Name, [string]$Arguments)
+    $root = & $sfNewRoot $Name
+    $admin = & $sfAdminOf $root
+    Set-Content -LiteralPath $admin -Value '{"email": "admin@localhost", "password": "Stored-Password-0k"}' -Encoding UTF8
+    $before = & $sfHex $admin
+    [System.IO.File]::SetAttributes($admin, [System.IO.FileAttributes]::ReadOnly)
+    try { $run = Invoke-SecretFileRotation -Name $Name -Root $root -Arguments $Arguments }
+    finally { [System.IO.File]::SetAttributes($admin, [System.IO.FileAttributes]::Normal) }
+    $held = ''
+    $kept = & $sfOnDisk (& $sfPendingOf $root)
+    if ($null -ne $kept -and $null -ne $kept.password) { $held = [string]$kept.password }
+    return [pscustomobject]@{ Run = $run; PendingFile = (& $sfPendingOf $root); Pending = $held; Same = ((& $sfHex $admin) -eq $before) }
+}
 # What a rotation said, on one line, when it did not end as the test expects.
 $sfSay = { param($Run, [bool]$AsExpected) if (-not $AsExpected) { Write-Host ('  (the script said: {0})' -f ($Run.Text -replace '\s*\r?\n\s*', ' | ')) -ForegroundColor DarkGray } }
 
@@ -424,6 +460,42 @@ $sfPair = [scriptblock]::Create('param($pa, $pb) ' + [string]$sfIf.Extent.Text)
 $sfWhy = & $sfRefusal { & $sfPair 'Typed-Password-0e' 'typed-password-0e' }
 $sfWhy2 = & $sfRefusal { & $sfPair 'Typed-Password-0e' 'Typed-Password-0e' }
 Assert-That ([string]$sfIf.Extent.Text -match '\$pa\b.+\$pb\b' -and $sfWhy -match 'The two passwords do not match' -and $sfWhy2 -eq '') "-Prompt: two entries that differ only in upper and lower case do not match, the same entry twice does ('$sfWhy')"
+# A plain admin file that holds no password: the script stops before it asks Open WebUI anything,
+# with the reader's words and the way on. That way is then taken: the password Open WebUI accepts
+# is given, the e-mail comes from the file, and the file ends with the new password.
+$sfRoot = & $sfNewRoot 'rotate-nopassword'
+Set-Content -LiteralPath (& $sfAdminOf $sfRoot) -Value '{"email": "admin@localhost", "password": ""}' -Encoding UTF8
+$sfBefore = & $sfHex (& $sfAdminOf $sfRoot)
+$sfRun = Invoke-SecretFileRotation -Name 'rotate-nopassword' -Root $sfRoot -Arguments "-NewPassword 'Typed-Password-0g' -Quiet"
+& $sfSay $sfRun ($sfRun.Code -eq 1)
+Assert-That ($sfRun.Code -eq 1 -and $sfRun.Text -match $sfM8 -and $sfRun.Text -match '-PromptCurrent' -and $sfRun.Asked -eq 0 -and (& $sfHex (& $sfAdminOf $sfRoot)) -eq $sfBefore -and -not (Test-Path -LiteralPath (& $sfPendingOf $sfRoot))) "an admin file that holds no password stops the rotation before any sign-in, names -PromptCurrent and changes nothing (exit $($sfRun.Code), requests: $($sfRun.Asked))"
+$sfRun = Invoke-SecretFileRotation -Name 'rotate-nopassword-current' -Root $sfRoot -Arguments "-NewPassword 'Typed-Password-0h' -CurrentPassword 'Live-Password-000h' -Quiet"
+& $sfSay $sfRun ($sfRun.Code -eq 0)
+$sfOld = & $sfOnDisk (& $sfAdminOf $sfRoot)
+Assert-That ($sfRun.Code -eq 0 -and $sfRun.Sent -ceq 'Live-Password-000h' -and $sfOld.password -ceq 'Typed-Password-0h' -and $sfOld.email -eq 'admin@localhost' -and (& $sfNames $sfOld) -notcontains 'protected') "with -CurrentPassword the same file is rotated and holds the new password (exit $($sfRun.Code))"
+# The save of the admin file fails after Open WebUI took the new password (Invoke-SecretFileFailedSave:
+# the file is read-only). First that such a file does refuse a write here: an account that may
+# write to anything would make the three runs below end well, and prove nothing.
+$sfProbe = Join-Path $sfDir 'readonly-probe.json'
+Set-Content -LiteralPath $sfProbe -Value '{"a": 1}' -Encoding UTF8
+[System.IO.File]::SetAttributes($sfProbe, [System.IO.FileAttributes]::ReadOnly)
+$sfWhy = & $sfRefusal { Set-Content -LiteralPath $sfProbe -Value '{"a": 2}' -Encoding UTF8 -ErrorAction Stop }
+[System.IO.File]::SetAttributes($sfProbe, [System.IO.FileAttributes]::Normal)
+Assert-That ($sfWhy -ne '' -and (& $sfTextOf $sfProbe) -match '"a": 1') 'setup: a file marked read-only refuses a write on this system'
+# A password that was given is not printed in that case either. It is in the pending file, which
+# the output names, and the admin file is what it was.
+$sfFail = Invoke-SecretFileFailedSave -Name 'nosave-given' -Arguments "-NewPassword 'Typed-Password-0i'"
+& $sfSay $sfFail.Run ($sfFail.Run.Code -eq 1)
+Assert-That ($sfFail.Run.Code -eq 1 -and $sfFail.Run.Asked -eq 2 -and $sfFail.Run.Text -match 'could not be updated' -and $sfFail.Run.Text.Contains($sfFail.PendingFile) -and -not $sfFail.Run.Text.Contains('Typed-Password-0i') -and $sfFail.Pending -ceq 'Typed-Password-0i' -and $sfFail.Same) "a save that fails after the change: exit 1, a password that was given is not printed, it stays in the pending file the output names, and the admin file is unchanged (exit $($sfFail.Run.Code), requests: $($sfFail.Run.Asked))"
+# One the script made: shown once without -Quiet, as after a save that went through, and not at
+# all with -Quiet. The pending file holds it both times.
+$sfFail = Invoke-SecretFileFailedSave -Name 'nosave-made' -Arguments ''
+& $sfSay $sfFail.Run ($sfFail.Run.Code -eq 1)
+$sfShown = @($sfFail.Run.Text -split "`n" | Where-Object { $sfFail.Pending -and $_.Contains($sfFail.Pending) })
+Assert-That ($sfFail.Run.Code -eq 1 -and $sfFail.Run.Text -match 'could not be updated' -and $sfFail.Pending -like 'Lai-*' -and $sfShown.Count -eq 1 -and $sfShown[0] -like 'New password: *' -and $sfFail.Same) "a save that fails: a password the script made is shown once, and it is the one in the pending file (exit $($sfFail.Run.Code), lines with it: $($sfShown.Count))"
+$sfFail = Invoke-SecretFileFailedSave -Name 'nosave-made-quiet' -Arguments '-Quiet'
+& $sfSay $sfFail.Run ($sfFail.Run.Code -eq 1)
+Assert-That ($sfFail.Run.Code -eq 1 -and $sfFail.Run.Text -match 'could not be updated' -and $sfFail.Pending -like 'Lai-*' -and -not $sfFail.Run.Text.Contains($sfFail.Pending) -and $sfFail.Run.Text.Contains($sfFail.PendingFile)) "a save that fails under -Quiet: a password the script made is not printed, the output names the pending file that holds it (exit $($sfFail.Run.Code))"
 
 if ($onWindows) {
     $sfSecret = 'P' + [char]0x00E9 + 'ssword-Text-10'
@@ -555,10 +627,72 @@ if ($onWindows) {
     $aclOtherGranted = $LASTEXITCODE
     $aclOtherBefore = @(& $rules $aclOther)
     Assert-That ($aclOtherGranted -eq 0 -and @($aclOtherBefore | Where-Object { $_.Sid -eq 'S-1-5-32-545' -and -not $_.Inherited }).Count -ge 1) "setup: a folder holds an entry of its own for a fourth name, Users (icacls exit $aclOtherGranted; $(($aclOtherBefore | ForEach-Object { '{0} {1}' -f $_.Sid, @('own', 'handed down')[[int][bool]$_.Inherited] }) -join ', '))"
-    $aclOtherRun = Set-LaiPrivateAcl -Path $aclOther -UserSid $sid
+    # What a call returned and what it logged, apart: the log lines go to the information stream
+    # (Write-Host), which 6>&1 puts in with the result.
+    $aclCall = {
+        param([string]$Folder)
+        $all = @(Set-LaiPrivateAcl -Path $Folder -UserSid $sid 6>&1)
+        [pscustomobject]@{
+            Result = @($all | Where-Object { $_ -isnot [System.Management.Automation.InformationRecord] })[0]
+            Log    = @($all | Where-Object { $_ -is [System.Management.Automation.InformationRecord] } | ForEach-Object { [string]$_ })
+        }
+    }
+    $ownerOf = { param($p) [string](Get-Acl -LiteralPath $p).GetOwner([Security.Principal.SecurityIdentifier]).Value }
+    $three = @($sid, 'S-1-5-18', 'S-1-5-32-544')
+    $aclOtherCall = & $aclCall $aclOther
+    $aclOtherRun = $aclOtherCall.Result
     $aclOtherAfter = @(& $rules $aclOther)
     $aclOtherSids = @($aclOtherAfter | ForEach-Object { $_.Sid } | Sort-Object)
-    Assert-That ($aclOtherRun.ExitCode -eq 0 -and $aclOtherAfter.Count -eq 3 -and ($aclOtherSids -join ' ') -eq ((@($sid, 'S-1-5-18', 'S-1-5-32-544') | Sort-Object) -join ' ')) "a folder with an entry for a fourth name ends with exactly three: the user, SYSTEM and Administrators (exit $($aclOtherRun.ExitCode); $($aclOtherAfter.Count) rules, for: $($aclOtherSids -join ' '))"
+    Assert-That ($aclOtherRun.ExitCode -eq 0 -and $aclOtherAfter.Count -eq 3 -and ($aclOtherSids -join ' ') -eq (($three | Sort-Object) -join ' ')) "a folder with an entry for a fourth name ends with exactly three: the user, SYSTEM and Administrators (exit $($aclOtherRun.ExitCode); $($aclOtherAfter.Count) rules, for: $($aclOtherSids -join ' '))"
+    # An entry nobody expected is a finding, and one the owner made on purpose is gone after the
+    # next installer run: either way the log says which account it was, on which folder.
+    $aclOtherSaid = @($aclOtherCall.Log | Where-Object { $_ -match 'the entry of .*S-1-5-32-545.* was removed' -and $_.Contains($aclOther) })
+    Assert-That ($aclOtherSaid.Count -eq 1) "the entry that was taken out is named in the log, once, with its folder (log: $($aclOtherCall.Log -join ' | '))"
+    $aclQuiet = & $aclCall $aclOther
+    Assert-That ($aclQuiet.Result.ExitCode -eq 0 -and $aclQuiet.Log.Count -eq 0 -and @(& $rules $aclOther).Count -eq 3) "the same call once more finds nothing to take out and logs nothing (log: $($aclQuiet.Log -join ' | '))"
+    # Three entries are not all of it: whoever owns a folder may rewrite its permissions whatever
+    # they say, and so put an entry of its own straight back. A folder that a fourth name owns
+    # ends with Administrators as its owner, and the log names who it was.
+    $aclOwned = Join-Path $Work 'aclowned'
+    New-Item -ItemType Directory -Force -Path $aclOwned | Out-Null
+    & icacls.exe $aclOwned '/setowner' '*S-1-5-32-545' | Out-Null
+    $aclOwnedSet = $LASTEXITCODE
+    $aclOwnerBefore = & $ownerOf $aclOwned
+    Assert-That ($aclOwnedSet -eq 0 -and $aclOwnerBefore -eq 'S-1-5-32-545') "setup: a folder is owned by a fourth name, Users (icacls exit $aclOwnedSet; owner $aclOwnerBefore)"
+    $aclOwnedCall = & $aclCall $aclOwned
+    $aclOwnerAfter = & $ownerOf $aclOwned
+    $aclOwnedSaid = @($aclOwnedCall.Log | Where-Object { $_ -match 'it was owned by .*S-1-5-32-545' -and $_.Contains($aclOwned) })
+    Assert-That ($aclOwnedCall.Result.ExitCode -eq 0 -and $aclOwnerAfter -eq 'S-1-5-32-544' -and $aclOwnedSaid.Count -eq 1 -and @(& $rules $aclOwned).Count -eq 3) "a folder that a fourth name owned is owned by Administrators afterwards, and the log names who owned it (exit $($aclOwnedCall.Result.ExitCode); owner $aclOwnerAfter; log: $($aclOwnedCall.Log -join ' | '))"
+    Assert-That ($three -contains (& $ownerOf $aclRoot) -and $three -contains (& $ownerOf $aclOther)) "the folders above are owned by one of the three as well ($(& $ownerOf $aclRoot), $(& $ownerOf $aclOther))"
+    # What could not be done is a failure in words, also where the last icacls call went through.
+    # icacls /remove cannot be made to fail on a test folder, so a stand-in answers that one call
+    # with exit code 5 and hands every other call to the program itself: a function of that name is
+    # found before the program, in the module too. The entry is then in fact still there.
+    $aclStuck = Join-Path $Work 'aclstuck'
+    New-Item -ItemType Directory -Force -Path $aclStuck | Out-Null
+    & icacls.exe $aclStuck '/grant' '*S-1-5-32-545:(OI)(CI)M' | Out-Null
+    $aclProgram = @(Get-Command icacls.exe -CommandType Application)[0].Path
+    $aclStuckCall = $null
+    Set-Item -LiteralPath 'Function:\global:icacls.exe' -Value {
+        $ErrorActionPreference = 'Continue'
+        if ($args -contains '/remove') { & cmd.exe /c 'echo stand-in: the entry stays& exit 5'; return }
+        & (@(Get-Command icacls.exe -CommandType Application)[0].Path) @args
+    }
+    try { $aclStuckCall = & $aclCall $aclStuck }
+    finally { Remove-Item -LiteralPath 'Function:\icacls.exe' -Force -ErrorAction SilentlyContinue }
+    $aclStandInGone = ($null -eq (Get-Command icacls.exe -CommandType Function -ErrorAction SilentlyContinue))
+    $aclStuckAfter = @(& $rules $aclStuck)
+    Assert-That ($aclProgram -and $aclStandInGone -and $aclStuckCall.Result.ExitCode -ne 0 -and [string]$aclStuckCall.Result.Text -match 'the entry of .*S-1-5-32-545.* could not be removed \(stand-in: the entry stays' -and @($aclStuckAfter | Where-Object { $_.Sid -eq 'S-1-5-32-545' }).Count -ge 1) "an entry that could not be taken out makes the call a failure that names it, although the three names were set (exit $($aclStuckCall.Result.ExitCode); $([string]$aclStuckCall.Result.Text -replace '\s+', ' '))"
+    Assert-That ((Get-Acl -LiteralPath $aclStuck).AreAccessRulesProtected -and @($aclStuckAfter | Where-Object { $three -contains $_.Sid }).Count -eq 3 -and @($aclStuckCall.Log | Where-Object { $_ -match 'was removed' }).Count -eq 0) 'and the three names are set all the same, with no line that says the entry was removed'
+    # The same for permissions that cannot be read at all (a stand-in for Get-Acl that throws).
+    $aclBlind = Join-Path $Work 'aclblind'
+    New-Item -ItemType Directory -Force -Path $aclBlind | Out-Null
+    $aclBlindCall = $null
+    Set-Item -LiteralPath 'Function:\global:Get-Acl' -Value { throw 'stand-in: the permissions cannot be read' }
+    try { $aclBlindCall = & $aclCall $aclBlind }
+    finally { Remove-Item -LiteralPath 'Function:\Get-Acl' -Force -ErrorAction SilentlyContinue }
+    $aclBlindGone = ($null -eq (Get-Command Get-Acl -CommandType Function -ErrorAction SilentlyContinue))
+    Assert-That ($aclBlindGone -and $aclBlindCall.Result.ExitCode -ne 0 -and [string]$aclBlindCall.Result.Text -match 'its owner and the entries other accounts hold on it could not be read \(stand-in: the permissions cannot be read\)' -and (Get-Acl -LiteralPath $aclBlind).AreAccessRulesProtected) "permissions that cannot be read make the call a failure that says so, and the three names are set all the same (exit $($aclBlindCall.Result.ExitCode))"
 } else { Skip 'ACL test runs on Windows only' }
 
 # ---- the installer's own functions on real Windows ---------------------------------------------

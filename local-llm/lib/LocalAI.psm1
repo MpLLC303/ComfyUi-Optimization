@@ -340,10 +340,14 @@ function Set-LaiPrivateAcl {
     .SYNOPSIS
         Replaces a file's or folder's permissions with: the given user, SYSTEM and Administrators
         (inheritance from the parent removed, so "Authenticated Users" from C:\ no longer applies;
-        an entry any other account was given by name on it is taken out).
+        an entry any other account was given by name on it is taken out, and when another account
+        owns it Administrators become its owner, because an owner can give itself an entry again).
+        Each entry taken out and each owner changed is logged with the account it was.
+        Only the file or folder it is given: what lies in a folder keeps the entries and the owner
+        of its own, so a caller names every one it means.
         -UserAccess ReadOnly gives the user read/execute only. Windows only; returns icacls' exit
-        code and output (a code that is not 0, with the reason first, when an entry of another
-        account could not be read or taken out).
+        code and output (a code that is not 0, with the reason first, when the owner or an entry of
+        another account could not be read, changed or taken out).
     #>
     param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][string]$UserSid, [ValidateSet('Full', 'ReadOnly')][string]$UserAccess = 'Full')
     # icacls changes what a symbolic link points at: granting the user full control there would hand
@@ -365,15 +369,43 @@ function Set-LaiPrivateAcl {
         # processes, the elevated installer included, and going by the variable alone anything
         # running as the user could switch this off.
         if ($env:OS -eq 'Windows_NT' -or [System.Environment]::OSVersion.Platform -eq [System.PlatformID]::Win32NT) {
+            $keep = @($UserSid, 'S-1-5-18', 'S-1-5-32-544')
+            # An account as the log and a reason name it: the name Windows has for it, then its SID.
+            $nameOf = {
+                param([string]$Sid)
+                $name = ''
+                try { $name = [string](New-Object System.Security.Principal.SecurityIdentifier($Sid)).Translate([System.Security.Principal.NTAccount]).Value }
+                catch { Write-Verbose "Windows has no name for $Sid" }
+                if ($name) { return "$name ($Sid)" }
+                return $Sid
+            }
+            $owner = ''
             $others = @()
+            $wasRead = $false
             try {
+                $acl = Get-Acl -LiteralPath $Path -ErrorAction Stop
+                $ownerSid = $acl.GetOwner([System.Security.Principal.SecurityIdentifier])
+                if ($null -ne $ownerSid) { $owner = [string]$ownerSid.Value }
                 # ($true, $false): the entries it holds as its own, not the ones handed down.
-                $others = @((Get-Acl -LiteralPath $Path -ErrorAction Stop).GetAccessRules($true, $false, [System.Security.Principal.SecurityIdentifier]) |
-                    ForEach-Object { [string]$_.IdentityReference.Value } | Where-Object { @($UserSid, 'S-1-5-18', 'S-1-5-32-544') -notcontains $_ } | Sort-Object -Unique)
-            } catch { $left += "the entries other accounts hold on it could not be read ($(([string]$_.Exception.Message).Trim()))" }
+                $others = @($acl.GetAccessRules($true, $false, [System.Security.Principal.SecurityIdentifier]) |
+                    ForEach-Object { [string]$_.IdentityReference.Value } | Where-Object { $keep -notcontains $_ } | Sort-Object -Unique)
+                $wasRead = $true
+            } catch { $left += "its owner and the entries other accounts hold on it could not be read ($(([string]$_.Exception.Message).Trim()))" }
+            # The owner first. Whoever owns a file or folder may rewrite its permissions whatever
+            # they say, so an owner outside the three could put its entry straight back; and with
+            # Administrators as the owner the calls after this one are allowed in any case.
+            if ($wasRead -and -not $owner) { $left += 'its owner could not be read' }
+            elseif ($owner -and $keep -notcontains $owner) {
+                $who = & $nameOf $owner
+                $said = & icacls.exe $Path '/setowner' '*S-1-5-32-544' 2>&1 | ForEach-Object { "$_" }
+                if ($LASTEXITCODE -ne 0) { $left += "its owner is $who, who can give itself access again, and that could not be changed ($($said -join ' '))" }
+                else { Write-LaiLog INFO "Permissions on ${Path}: it was owned by $who, who could have given itself access again; Administrators own it now" }
+            }
             foreach ($other in $others) {
-                $removed = & icacls.exe $Path '/remove' "*$other" 2>&1 | ForEach-Object { "$_" }
-                if ($LASTEXITCODE -ne 0) { $left += "the entry of $other could not be removed ($($removed -join ' '))" }
+                $who = & $nameOf $other
+                $said = & icacls.exe $Path '/remove' "*$other" 2>&1 | ForEach-Object { "$_" }
+                if ($LASTEXITCODE -ne 0) { $left += "the entry of $who could not be removed ($($said -join ' '))" }
+                else { Write-LaiLog INFO "Permissions on ${Path}: the entry of $who was removed (only the user, SYSTEM and Administrators are to have one)" }
             }
         }
         $out = & icacls.exe $Path '/inheritance:r' '/grant:r' "*${UserSid}:$userGrant" "*S-1-5-18:${inherit}F" "*S-1-5-32-544:${inherit}F" 2>&1 | ForEach-Object { "$_" }
@@ -488,10 +520,11 @@ function Read-LaiSecretFile {
         returned as it is. The protected form ("protected": "dpapi-user-1", the value in
         "passwordProtected") is opened with the Windows account that runs this.
         Every failure throws, each with words of its own: a file that is empty or was cut off, a form
-        this version does not know, a protected file without its value, a value this account cannot
-        open. None of them is ever read as an empty password.
-        -NoPassword opens nothing: a protected file comes back with 'password' set to '' (for a
-        caller that needs the other fields only). The two refusals of the file itself stay.
+        this version does not know, a plain file without a password, a protected file without its
+        value, a value this account cannot open. None of them is ever read as an empty password.
+        -NoPassword opens nothing and asks for no password: a protected file comes back with
+        'password' set to '', a plain one as it is, with a password or without (for a caller that
+        needs the other fields only). The two refusals of the file itself stay.
     #>
     param([Parameter(Mandatory)][string]$Path, [switch]$NoPassword)
     # Inside a module the caller's $ErrorActionPreference does not apply, and an error that only
@@ -506,7 +539,17 @@ function Read-LaiSecretFile {
     if ($o -isnot [System.Management.Automation.PSCustomObject]) { throw "$Path is empty or was cut off: it holds no stored password." }
     # The form goes by the marker being there, not by what it holds: an empty marker is no plain file.
     $marker = $o.PSObject.Properties['protected']
-    if ($null -eq $marker) { return $o }
+    if ($null -eq $marker) {
+        if ($NoPassword) { return $o }
+        # A plain file is returned as it is, when it holds a password. One that holds none (the
+        # field empty, or gone, or the marker of a protected file lost in an edit by hand) would
+        # reach the caller as an empty password, which is what this function never hands back.
+        $plain = $o.PSObject.Properties['password']
+        if ($null -ne $plain -and $null -ne $plain.Value -and [string]$plain.Value -ne '') { return $o }
+        $why = "$Path holds no password."
+        if ($null -ne $o.PSObject.Properties['passwordProtected']) { $why += " It has a 'passwordProtected' value, but not the 'protected' field that says in which form." }
+        throw $why
+    }
     if (-not ($marker.Value -is [string] -and $marker.Value -ceq 'dpapi-user-1')) { throw "$Path is protected in a form this toolkit version does not know ('$([string]$marker.Value)'). Update the toolkit." }
     if ($NoPassword) {
         Add-Member -InputObject $o -NotePropertyName 'password' -NotePropertyValue '' -Force
