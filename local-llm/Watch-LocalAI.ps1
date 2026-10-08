@@ -404,11 +404,11 @@ if ($bstate['emptied'] -is [hashtable]) {
     }
     if ($lastGoodPath) {
         $restoreCmd = '& {0} -AIRoot {1} -Archive {2}' -f (ConvertTo-LaiPsQuoted (Join-Path $PSScriptRoot 'Restore-OpenWebUI.ps1')), (ConvertTo-LaiPsQuoted $AIRoot), (ConvertTo-LaiPsQuoted $lastGoodPath)
-        $backupWhy += "$onDate Open WebUI had no chats; the last backup with chats is $lastGood, put back with: $restoreCmd (nothing is deleted meanwhile)"
+        $backupWhy += "$onDate Open WebUI had no chats; the last backup with chats is $lastGood, put back with: $restoreCmd (no older backup is deleted meanwhile)"
     } elseif ($lastGood) {
-        $backupWhy += "$onDate Open WebUI had no chats; the backup on record as the last one with chats, $lastGood, is not in $backupDir (nothing is deleted meanwhile)"
+        $backupWhy += "$onDate Open WebUI had no chats; the backup on record as the last one with chats, $lastGood, is not in $backupDir (no older backup is deleted meanwhile)"
     } else {
-        $backupWhy += "$onDate Open WebUI had no chats, and no earlier backup with chats is on record (nothing is deleted meanwhile)"
+        $backupWhy += "$onDate Open WebUI had no chats, and no earlier backup with chats is on record (no older backup is deleted meanwhile)"
     }
 }
 # The plain reasons from above (no nightly backup, the newest one damaged) come next. Alone they stay

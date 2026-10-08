@@ -277,7 +277,7 @@ services:
     Assert-That ($drReported -and @((Read-LaiState -Path $statePath)['notified']) -notcontains 'Deep research') "a reported check that is no longer part of the install is dropped, not carried as not checked (reported before: $drReported; now: $(@((Read-LaiState -Path $statePath)['notified']) -join ', '))"
     # (f) The nightly backup found Open WebUI without chats and recorded it ('emptied'). From a state
     # with no failures the very first run tells: the date, the last backup with chats, the command that
-    # puts it back, and that nothing is deleted. Once: the second run sends nothing.
+    # puts it back, and that no older backup is deleted. Once: the second run sends nothing.
     # LOCALAI_TEST_TOAST_SETTING is set for the first run. It used to make the watch act as if Windows
     # had notifications off (and record that for the health check); alone it changes nothing now.
     $emAt = (Get-Date).AddDays(-1)
@@ -293,8 +293,8 @@ services:
     $em = @(& $emNotices)
     $emLine = ''; if ($em.Count) { $emLine = [string]$em[-1] }
     $emSays = $emLine -match [regex]::Escape('on ' + $emAt.ToString('yyyy-MM-dd') + ' Open WebUI had no chats; the last backup with chats is ' + $emGood) -and
-        $emLine -match ('Restore-OpenWebUI\.ps1[^\n]* -Archive ' + [regex]::Escape("'" + (Join-Path $bdir $emGood) + "'")) -and $emLine -match 'nothing is deleted meanwhile'
-    Assert-That ($em.Count -eq $em0 + 1 -and $emSays) "an emptied Open WebUI is announced by the first run that sees it: the date, the last backup with chats, the restore command with that file, and that nothing is deleted ($($em.Count - $em0) notice(s): $emLine)"
+        $emLine -match ('Restore-OpenWebUI\.ps1[^\n]* -Archive ' + [regex]::Escape("'" + (Join-Path $bdir $emGood) + "'")) -and $emLine -match 'no older backup is deleted meanwhile'
+    Assert-That ($em.Count -eq $em0 + 1 -and $emSays) "an emptied Open WebUI is announced by the first run that sees it: the date, the last backup with chats, the restore command with that file, and that no older backup is deleted ($($em.Count - $em0) notice(s): $emLine)"
     $ws5 = Read-LaiState -Path $statePath
     $emTold = [string]$ws5['emptiedTold']
     Assert-That ($emTold -and @($ws5['notified']) -contains 'Backups' -and -not $ws5.ContainsKey('toastSetting')) "it is recorded as told, and LOCALAI_TEST_TOAST_SETTING alone neither drops the toast nor records a notification switch (toastSetting '$([string]$ws5['toastSetting'])')"
