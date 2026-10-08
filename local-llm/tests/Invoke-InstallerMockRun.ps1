@@ -10,8 +10,9 @@
             local groups, scheduled tasks, Start-Process/explorer, docker compose, docker exec probe.
     A patched copy of the installer replaces four Windows-only expressions (admin check, user
     name/SID, OS build, drive free space) and, only in a phase that asks for it, the user's
-    environment variables ($global:MockUserEnv) and a system-wide OLLAMA_MODELS
-    ($global:MockMachineModels). Nothing else in the installer is changed.
+    environment variables ($global:MockUserEnv), a system-wide OLLAMA_MODELS
+    ($global:MockMachineModels) and what Preflight is told of the running Ollama's list of models
+    ($global:MockOllamaListed). Nothing else in the installer is changed.
 
     Prerequisites: same as Invoke-IntegrationTest.ps1, plus a running SearXNG container is optional.
 #>
@@ -141,7 +142,13 @@ $patches = @(
     @('[Environment]::GetEnvironmentVariable(''OLLAMA_MODELS'', ''User'')', '$(if ($null -ne $global:MockUserEnv) { $global:MockUserEnv[''OLLAMA_MODELS''] } else { [Environment]::GetEnvironmentVariable(''OLLAMA_MODELS'', ''User'') })'),
     # The same for a system-wide OLLAMA_MODELS, which the installer only reads: a phase that sets
     # $global:MockMachineModels to a folder has one; while it is $null the installer's own code runs.
-    @('[Environment]::GetEnvironmentVariable(''OLLAMA_MODELS'', ''Machine'')', '$(if ($null -ne $global:MockMachineModels) { $global:MockMachineModels } else { [Environment]::GetEnvironmentVariable(''OLLAMA_MODELS'', ''Machine'') })')
+    @('[Environment]::GetEnvironmentVariable(''OLLAMA_MODELS'', ''Machine'')', '$(if ($null -ne $global:MockMachineModels) { $global:MockMachineModels } else { [Environment]::GetEnvironmentVariable(''OLLAMA_MODELS'', ''Machine'') })'),
+    # What Preflight is told when it asks the running Ollama whether it has models (it asks for a
+    # folder in use that it does not look at). The sandbox's real Ollama always answers, and always
+    # with models: a phase that sets $global:MockOllamaListed to an answer (Content and Listed, as
+    # Get-OllamaListedContent gives them) has an Ollama that lists none, or does not answer. While
+    # it is $null the installer's own code asks the real one.
+    @('$byList = Get-OllamaListedContent -OllamaUrl $OllamaUrl', '$byList = $(if ($null -ne $global:MockOllamaListed) { $global:MockOllamaListed } else { Get-OllamaListedContent -OllamaUrl $OllamaUrl })')
 )
 foreach ($p in $patches) {
     if (-not $text.Contains($p[0])) { throw "patch target not found: $($p[0])" }
@@ -260,10 +267,12 @@ $global:MockCopyFail = $false
 # And the backup taken before that copy ($global:MockBackupFail = the name of the volume it is taken
 # of): the archive cannot be written, as on a Backups drive that is full.
 $global:MockBackupFail = ''
-# The user's environment variables, for a phase that sets a hashtable here, and a system-wide
-# OLLAMA_MODELS, for a phase that sets a folder here (see $patches).
+# The user's environment variables, for a phase that sets a hashtable here, a system-wide
+# OLLAMA_MODELS, for a phase that sets a folder here, and the running Ollama's list of models as
+# Preflight hears of it, for a phase that sets an answer here (see $patches).
 $global:MockUserEnv = $null
 $global:MockMachineModels = $null
+$global:MockOllamaListed = $null
 function global:docker {
     $a = @($args)
     if ($a[0] -eq 'compose') { Record "docker $($a -join ' ')"; $global:LASTEXITCODE = 0; return }
@@ -571,6 +580,45 @@ $mcfg = Invoke-LaiApi -Uri 'http://127.0.0.1:3000/api/v1/configs/models' -Token 
 $st4 = Get-Content -Encoding UTF8 -Raw (Join-Path $aiRoot 'install-state.json') | ConvertFrom-Json
 Assert-That (@($st4.flags.selectedModels) -notcontains 'official-ok' -and $op -and $op.meta.hidden -eq $true -and [string]$mcfg.DEFAULT_MODELS -eq 'local-main') "-OfficialModels none hides the official preset and new chats start on Local Main again (default '$($mcfg.DEFAULT_MODELS)')"
 
+Write-Host "`n=== PHASE 4a: a preset that is no longer selected is held safe too, and the health check says when it is not ===" -ForegroundColor Cyan
+# The trial was dropped in phase 4: its preset is still in Open WebUI, hidden, and a chat can still be
+# started on it. Here it is given the switches an install from before the writing tools were switched
+# off wrote: seven, none of them for notes, tasks, automations, calendar, notifications, channels or
+# sub-agents, and Open WebUI takes a missing switch for on. The installer wrote only the selected
+# presets and the health check judged only those, so this preset stayed open and no row said so.
+$owui = 'http://127.0.0.1:3000'
+$writing4a = 'use its notes, tasks, automations, calendar, notifications, channels, subagents tools'
+$trialOld = ConvertTo-LaiHashtable (Get-LaiWebUIModel -BaseUrl $owui -Token $tok4 -Id 'trial-standin')
+$trialOld['meta']['builtinTools'] = @{ memory = $true; web_search = $true; knowledge = $true; chats = $false; time = $true; image_generation = $false; code_interpreter = $false }
+if ($null -eq $trialOld['params']) { $trialOld['params'] = @{} }
+Invoke-LaiApi -Method POST -Uri "$owui/api/v1/models/model/update" -Body $trialOld -Token $tok4 | Out-Null
+$switchNames = { param($Preset) if ($Preset -and $Preset.meta -and $Preset.meta.builtinTools) { @($Preset.meta.builtinTools.PSObject.Properties | ForEach-Object { [string]$_.Name }) } }
+$tpOld = Get-LaiWebUIModel -BaseUrl $owui -Token $tok4 -Id 'trial-standin'
+$oldNames = @(& $switchNames $tpOld)
+Assert-That ($oldNames.Count -eq 7 -and $oldNames -cnotcontains 'notes' -and $oldNames -cnotcontains 'subagents' -and $tpOld.meta.hidden -eq $true) "setup: the trial preset, not selected and hidden, has the seven old switches and none for the writing tools ($($oldNames -join ', '))"
+# Asked without writing anything first (-ReadOnly): the catalog's presets that are in Open WebUI, the
+# open one named with what the assistant can do there, and the preset left as it was.
+$every4a = @((Get-LaiCatalog -Path $env:LOCALAI_TEST_CATALOG -IncludeTrials).Models)
+$asked4a = @(Invoke-LaiPresetSafety -BaseUrl $owui -Token $tok4 -Entries $every4a -ReadOnly)
+$askedTrial = @($asked4a | Where-Object { $_.Preset -eq 'trial-standin' })
+$askedOn = ''; if ($askedTrial.Count -eq 1) { $askedOn = @($askedTrial[0].On) -join ' and ' }
+Assert-That ($askedTrial.Count -eq 1 -and $askedOn -ceq $writing4a -and -not $askedTrial[0].Written -and @($asked4a | Where-Object { $_.Preset -like '*-missing' }).Count -eq 0 -and @(& $switchNames (Get-LaiWebUIModel -BaseUrl $owui -Token $tok4 -Id 'trial-standin')).Count -eq 7) "asked with -ReadOnly, the real Open WebUI's unselected trial preset is found open (the assistant can $askedOn), presets that were never set up are not listed, and nothing is written"
+# The health check itself, the copy in AI\Scripts, in a process of its own; only the row of this
+# preset is read (this simulated PC has no GPU and no containers of its own, so other rows fail).
+$healthRow = { param([string]$Check)
+    $prevPref = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
+    $hcLines = @(& pwsh -NoProfile -File (Join-Path $aiRoot 'Scripts/Test-LocalAI.ps1') -AIRoot $aiRoot -Quick -NoContainers 2>&1 | ForEach-Object { "$_" })
+    $ErrorActionPreference = $prevPref
+    $hcRow = @($hcLines | Where-Object { $_ -match (' (PASS|WARN|FAIL|SKIP) ' + [regex]::Escape($Check) + ': ') } | Select-Object -Last 1)
+    if ($hcRow.Count -eq 1) { return [string]$hcRow[0] }
+    return ('no such row; the health check ended with: ' + (@($hcLines | Select-Object -Last 3) -join ' / '))
+}
+$trialRow = 'Preset Trial: stand-in (not selected)'
+$rowOpen = & $healthRow $trialRow
+Assert-That ($rowOpen -match (' FAIL ' + [regex]::Escape("${trialRow}: the assistant can $writing4a in this preset")) -and $rowOpen -match 'run Start menu > Local AI - Update toolkit to switch that off') "the health check fails a toolkit preset that is in Open WebUI without being selected and has the writing tools on, and names Update toolkit as the step ($rowOpen)"
+# The next installer run is the first one of phase 4b, in which the trial is asked for again and
+# left out for the busy GPU: still not selected. What that run did to this preset is checked there.
+
 Write-Host "`n=== PHASE 4b: the official models come back while the GPU is busy ===" -ForegroundColor Cyan
 # Forget official-ok's GPU check, so this run has to wait for an idle GPU before checking it again.
 # The same for the trial, which this run asks for again: it is skipped for the busy GPU as well.
@@ -586,6 +634,18 @@ $st4b = Get-Content -Encoding UTF8 -Raw (Join-Path $aiRoot 'install-state.json')
 Assert-That ($c4b -eq 0 -and $log4b -match 'Official: stand-in is set up on the next run: the GPU was busy') "a busy GPU skips the official model for now and the install completes (exit $c4b)"
 Assert-That (-not $st4b.flags.officialFailed.PSObject.Properties['official-ok'] -and [string]$st4b.flags.officialFailed.'official-missing'.Source) 'a busy GPU is not recorded as the model failing (a missing tag is)'
 Assert-That ($log4b -match 'Trial: stand-in is set up on the next run: the GPU was busy' -and @($st4b.flags.selectedModels) -notcontains 'trial-ok' -and @($st4b.flags.trialChoice) -contains 'trial-ok') "a trial skipped for the busy GPU is left out of this run and stays the choice (selected: $(@($st4b.flags.selectedModels) -join ', '); trialChoice: $(@($st4b.flags.trialChoice) -join ', '))"
+# The preset of phase 4a, open and not selected in that run either: one installer run (what Update
+# toolkit runs) has switched the writing tools off on it and says so, the rest of the preset is as
+# it was, nothing was created, and the health check row that failed passes.
+$tpSafe = Get-LaiWebUIModel -BaseUrl $owui -Token $tok4 -Id 'trial-standin'
+$safeNames = @(& $switchNames $tpSafe)
+$notOff4a = @('chats', 'code_interpreter', 'notes', 'tasks', 'automations', 'calendar', 'notifications', 'channels', 'subagents' | Where-Object { -not ($safeNames -ccontains $_ -and $tpSafe.meta.builtinTools.$_ -is [bool] -and $tpSafe.meta.builtinTools.$_ -eq $false) })
+Assert-That ($c4b -eq 0 -and @($st4b.flags.selectedModels) -notcontains 'trial-ok' -and $log4b.Contains("Preset 'Trial: stand-in' made safe again: the assistant could $writing4a there, which is switched off now")) "the next installer run, with the trial still not selected, says in its log what it switched off on that preset (exit $c4b)"
+Assert-That ($notOff4a.Count -eq 0 -and @(Get-LaiPresetToolRisk $tpSafe.meta).Count -eq 0 -and $tpSafe.meta.capabilities.code_interpreter -eq $false) "past chats, code and the seven writing tools are written out as off on the unselected preset in the real Open WebUI (not off: $($notOff4a -join ', '); switches: $($safeNames -join ', '))"
+Assert-That ($tpSafe.meta.hidden -eq $true -and $tpSafe.meta.builtinTools.memory -eq $true -and $tpSafe.meta.builtinTools.time -eq $true -and [string]$tpSafe.name -eq [string]$tpOld.name -and [string]$tpSafe.params.system -eq [string]$tpOld.params.system -and [string]$tpSafe.base_model_id -eq [string]$tpOld.base_model_id) 'and the rest of it is as it was: still hidden, the switches the toolkit leaves on, its name, base model and system prompt'
+Assert-That (-not (Get-LaiWebUIModel -BaseUrl $owui -Token $tok4 -Id 'trial-missing') -and -not (Get-LaiWebUIModel -BaseUrl $owui -Token $tok4 -Id 'official-missing')) 'a catalog preset that was never set up is not created by it'
+$rowSafe = & $healthRow $trialRow
+Assert-That ($rowSafe -match (' PASS ' + [regex]::Escape("${trialRow}: "))) "and after that one run the same health check row passes ($rowSafe)"
 # No -TrialModels on this run: the trial comes from the recorded choice, not from what was set up.
 & (Join-Path $aiRoot 'Scripts/Install-LocalAI.ps1') -AIRoot $aiRoot -SkipTests -GpuWaitMinutes 10
 $st4c = Get-Content -Encoding UTF8 -Raw (Join-Path $aiRoot 'install-state.json') | ConvertFrom-Json
@@ -1112,12 +1172,25 @@ try {
     $c7gA = $LASTEXITCODE
     $log7gA = Get-NewestLog
     $flags7gA = (Read-LaiState -Path $statePath)['flags']
-    Assert-That ($c7gA -ne 0 -and $log7gA -notmatch '=+ Ollama =+' -and $log7gA.Contains("they are in $plannedModels (about 3 MB)") -and $log7gA -match 'Nothing was changed') "another -ModelDir while the folder in use holds models: refused in Preflight, naming that folder and its size (exit $c7gA)"
+    # (The refusal gave the size of that folder's blobs as well, added up by listing every file
+    # under it with administrator rights, through whatever link lay there. No size is given now.)
+    $refusal7g = { param([string]$Log) @($Log -split "`n" | Where-Object { $_ -match '-ModelDir .* is not the folder Ollama keeps its models in now' }) -join ' ' }
+    $sized7g = '\(about |\d (MB|GB)\b'
+    $said7gA = & $refusal7g $log7gA
+    Assert-That ($c7gA -ne 0 -and $log7gA -notmatch '=+ Ollama =+' -and $said7gA.Contains("is not the folder Ollama keeps its models in now: they are in $plannedModels. Going on would download every model again") -and $said7gA -notmatch $sized7g -and $log7gA -match 'Nothing was changed') "another -ModelDir while the folder in use holds models: refused in Preflight, naming that folder, which was looked at, and no size (exit ${c7gA}: $said7gA)"
     Assert-That ($log7gA -match 'run the installer again without -ModelDir' -and $log7gA.Contains("move everything in $plannedModels into $otherModels") -and $log7gA -notmatch 'remove the OLLAMA_MODELS variable') 'and both ways on: keep the folder (no -ModelDir), or quit Ollama, move the models and run again (no variable is in the way, and none is named)'
     Assert-That ((Test-LaiSamePath ([string]$flags7gA['modelDir']) $plannedModels) -and -not $flags7gA.ContainsKey('ollamaModelsEnv') -and -not (Test-Path -LiteralPath $otherModels) -and -not $global:MockUserEnv.ContainsKey('OLLAMA_MODELS')) "nothing changed: the state still plans the folder in use, the new folder was not created, no variable was set (state: $($flags7gA['modelDir']))"
     # The same refusal with apostrophes in both names, and with a folder in use that is not the plan
     # either (the Ollama app's own Model location names it, as in 7b): keeping it takes -ModelDir
     # with that folder. Both commands the message gives must be typed as it writes them.
+    # That folder is named by Ollama's log and by nothing the installer chose itself: not its
+    # state, not a value it wrote into OLLAMA_MODELS, and it is not Ollama's default. Any program
+    # of this user can write that log, and the installer, which has administrator rights, opened
+    # the folder it named, listed it, and put its size into the refusal. It is not looked at any
+    # more: the running Ollama's own list says that there are models, and the refusal says who
+    # names the folder and that it was not looked at, with no size.
+    $notLooked7g = { param([string]$Folder) "and $Folder, the folder they should be in, was not looked at (Ollama's start-up log names it, and the installer did not choose it itself). Going on would download every model again" }
+    $listed7g = { param([string]$Refusal) [regex]::Match($Refusal, 'the running Ollama lists ([1-9]\d*) model\(s\), ').Groups[1].Value }
     & $moveModels7g $plannedModels $aposModels
     Set-Content -LiteralPath $serverLog -Value $srvApos7g
     & (Join-Path $aiRoot 'Scripts/Install-LocalAI.ps1') -AIRoot $aiRoot -SkipTests -TrialModels none -ModelDir $aposTarget
@@ -1126,8 +1199,136 @@ try {
     & $moveModels7g $aposModels $plannedModels
     Remove-Item -LiteralPath $aposModels -Recurse -Force
     Set-Content -LiteralPath $serverLog -Value $srv7g
-    Assert-That ($c7gA2 -ne 0 -and $log7gA2 -notmatch '=+ Ollama =+' -and $log7gA2.Contains("they are in $aposModels (about 3 MB)") -and -not (Test-Path -LiteralPath $aposTarget)) "the folder in use named by the Ollama app's own setting, with an apostrophe in its name: refused in the same way (exit $c7gA2)"
-    Assert-That ($log7gA2.Contains("Either run the installer again with -ModelDir $(& $asTyped7g $aposModels) (the models stay in $aposModels)") -and $log7gA2.Contains("and run the installer again with -ModelDir $(& $asTyped7g $aposTarget).")) "and both commands write their folder as PowerShell reads one folder, the apostrophe doubled (to keep: -ModelDir $(& $asTyped7g $aposModels); after the move: -ModelDir $(& $asTyped7g $aposTarget))"
+    $said7gA2 = & $refusal7g $log7gA2
+    Assert-That ($c7gA2 -ne 0 -and $log7gA2 -notmatch '=+ Ollama =+' -and (& $listed7g $said7gA2) -and $said7gA2.Contains((& $notLooked7g $aposModels)) -and -not (Test-Path -LiteralPath $aposTarget)) "the folder in use named by the Ollama app's own setting, with an apostrophe in its name: refused all the same, on the running Ollama's own list of models, and the message says that the folder Ollama's log names was not looked at (exit ${c7gA2}: $said7gA2)"
+    $notSeen7g = 'now: they are in |the models stay in |' + $sized7g
+    Assert-That ($said7gA2 -and $said7gA2 -notmatch $notSeen7g) "and that refusal carries no size, and says neither that the models are in that folder nor that they stay there: nobody has looked ($said7gA2)"
+    # Both ways on, each with its folder as PowerShell reads one folder. The way that keeps the
+    # models is given on a condition and says where to check it: the folder is named by the log
+    # alone, and a run that planned it would create it with administrator rights and keep it as
+    # the installer's own. After a move Ollama is started again: the next run asks its list too.
+    Assert-That ($said7gA2.Contains("If your models are in $aposModels (the Ollama app shows the folder it uses under Settings > Model location), run the installer again with -ModelDir $(& $asTyped7g $aposModels) to keep them there. To move them instead: quit Ollama from its tray icon, move everything in $aposModels into $aposTarget, start Ollama again, and run the installer again with -ModelDir $(& $asTyped7g $aposTarget).")) "and both commands write their folder as PowerShell reads one folder, the apostrophe doubled; keeping the folder is given on the condition that the models are in it, and the move ends with Ollama started again (to keep: -ModelDir $(& $asTyped7g $aposModels); after the move: -ModelDir $(& $asTyped7g $aposTarget))"
+    # What is in such a folder plays no part, because it is never opened: here the log names a
+    # folder that is there and empty. Looked at, it read 'holds no models' and the run went on into
+    # the download this check is there for. It is refused as above, with the same count of models
+    # and no size.
+    $emptyNamed = Join-Path $Work 'Log Named Empty'
+    New-Item -ItemType Directory -Force -Path $emptyNamed | Out-Null
+    Set-Content -LiteralPath $serverLog -Value ($srv7g -replace 'OLLAMA_MODELS:[^ \]]*', ('OLLAMA_MODELS:' + $emptyNamed.Replace('\', '\\')))
+    & (Join-Path $aiRoot 'Scripts/Install-LocalAI.ps1') -AIRoot $aiRoot -SkipTests -TrialModels none -ModelDir $aposTarget
+    $c7gA3 = $LASTEXITCODE
+    $log7gA3 = Get-NewestLog
+    Set-Content -LiteralPath $serverLog -Value $srv7g
+    $said7gA3 = & $refusal7g $log7gA3
+    $notRead7g = $notSeen7g + '|holds no models|a folder that is not there|cannot be looked at'
+    Assert-That ($c7gA3 -ne 0 -and $log7gA3 -notmatch '=+ Ollama =+' -and $said7gA3.Contains((& $notLooked7g $emptyNamed)) -and (& $listed7g $said7gA3) -and (& $listed7g $said7gA3) -eq (& $listed7g $said7gA2) -and $said7gA3 -notmatch $notRead7g -and
+        @(Get-ChildItem -LiteralPath $emptyNamed -Force).Count -eq 0 -and -not (Test-Path -LiteralPath $aposTarget)) "a folder that only Ollama's log names and that is empty: still refused in Preflight while the running Ollama lists models, with the same count and no size (exit ${c7gA3}: $said7gA3)"
+    Remove-Item -LiteralPath $emptyNamed -Recurse -Force
+    # And the other way round: the log names a folder that does hold the models, and the running
+    # Ollama lists none (this phase gives the answer, see $patches). Only that list is asked, so
+    # Preflight has nothing to refuse and says what it went by: had the folder been opened, the
+    # manifest in it would have refused the run with 'they are in'. Then the same with an Ollama
+    # that does not answer: the installer cannot tell, says so with the reason, and what it gives
+    # to do is to start Ollama and run the same command again, not to pass a folder nobody has
+    # looked at as -ModelDir (that run would create it and keep it as the installer's own). Both
+    # runs pass Preflight and stop at the next stage; the state is put back after each.
+    $fullNamed = Join-Path $Work 'Log Named Full'
+    $stateAside7gA = Join-Path $Work 'install-state-before-7g-list.json'
+    Copy-Item -LiteralPath $statePath -Destination $stateAside7gA -Force
+    & $moveModels7g $plannedModels $fullNamed
+    Set-Content -LiteralPath $serverLog -Value ($srv7g -replace 'OLLAMA_MODELS:[^ \]]*', ('OLLAMA_MODELS:' + $fullNamed.Replace('\', '\\')))
+    $log7gA4 = ''; $log7gA5 = ''
+    try {
+        $global:MockOllamaListed = @{ Content = 'empty'; Listed = 0 }
+        & (Join-Path $aiRoot 'Scripts/Install-LocalAI.ps1') -AIRoot $aiRoot -SkipTests -TrialModels none -ModelDir $aposTarget
+        $log7gA4 = Get-NewestLog
+        Copy-Item -LiteralPath $stateAside7gA -Destination $statePath -Force
+        $global:MockOllamaListed = @{ Content = 'unknown'; Listed = -1 }
+        & (Join-Path $aiRoot 'Scripts/Install-LocalAI.ps1') -AIRoot $aiRoot -SkipTests -TrialModels none -ModelDir $aposTarget
+        $log7gA5 = Get-NewestLog
+    } finally {
+        $global:MockOllamaListed = $null
+        Copy-Item -LiteralPath $stateAside7gA -Destination $statePath -Force
+        Set-Content -LiteralPath $serverLog -Value $srv7g
+    }
+    $manifestStill7g = Test-Path -LiteralPath (Get-LaiModelManifestPath -ModelDir $fullNamed -Name $modelName7g)
+    & $moveModels7g $fullNamed $plannedModels
+    Remove-Item -LiteralPath $fullNamed -Recurse -Force
+    if (Test-Path -LiteralPath $aposTarget) { Remove-Item -LiteralPath $aposTarget -Recurse -Force }
+    $wasRead7g = 'now: they are in |which holds no models|a folder that is not there|cannot be looked at|could not be looked at'
+    $info7gA4 = @($log7gA4 -split "`n" | Where-Object { $_ -match 'is not the folder Ollama uses now' }) -join ' '
+    Assert-That ($manifestStill7g -and $log7gA4 -match 'Test hook: stage Ollama failed' -and -not (& $refusal7g $log7gA4) -and $info7gA4.Contains("($fullNamed, which was not looked at; the running Ollama lists no models)") -and $log7gA4 -notmatch $wasRead7g) "a folder that only Ollama's log names and that holds a manifest, while the running Ollama lists no models: the folder is not opened, Preflight goes by the list and says so ($info7gA4)"
+    $warn7gA5 = @($log7gA5 -split "`n" | Where-Object { $_ -match 'The folder Ollama uses now, ' }) -join ' '
+    Assert-That ($log7gA5 -match 'Test hook: stage Ollama failed' -and -not (& $refusal7g $log7gA5) -and $warn7gA5.Contains("The folder Ollama uses now, $fullNamed, was not looked at (Ollama's start-up log names it, and the installer did not choose it itself), and Ollama, whose list of models would tell, did not answer, so the installer cannot tell whether models are in it.") -and
+        $log7gA5.Contains("($fullNamed, which was not looked at, and Ollama did not answer)") -and $log7gA5 -notmatch $wasRead7g) "the same folder with an Ollama that does not answer: the run warns that it cannot tell, with the reason, and nowhere says that the folder cannot be read or holds nothing ($warn7gA5)"
+    Assert-That ($warn7gA5.Contains('Not wanted? Close this window now, start Ollama, and run the installer again in the same way: it then goes by the models Ollama lists. Continuing in 20 seconds.') -and -not $warn7gA5.Contains('-ModelDir ' + (& $asTyped7g $fullNamed)) -and $warn7gA5 -notmatch 'connect the drive') 'and what that warning gives to do is to start Ollama and run the same command again: it does not tell the owner to pass the folder nobody looked at as -ModelDir, or to connect a drive'
+    # The two judges that refusal rests on, from the installer's own text. A folder is the
+    # installer's own when it is one of those it chose (spelling apart), and no other; and for a
+    # folder that is not, the running Ollama's list is all that is asked.
+    $ownFn7g = [regex]::Match($text, '(?s)function Test-OwnModelFolder \{.*?\r?\n\}').Value
+    $listFn7g = [regex]::Match($text, '(?s)function Get-OllamaListedContent \{.*?\r?\n\}').Value
+    $judges7g = @{ Own = @(); Models = @{}; None = @{}; Down = @{} }
+    if ($ownFn7g -and $listFn7g) {
+        $judges7g = & {
+            . ([scriptblock]::Create($ownFn7g)); . ([scriptblock]::Create($listFn7g))
+            $answer7g = 'models'
+            function Get-LaiOllamaModelNames { param($BaseUrl) $null = $BaseUrl; if ($answer7g -eq 'down') { throw 'no answer' }; if ($answer7g -eq 'none') { return @() }; return @('one:latest', 'two:latest') }
+            $r7g = @{ Own = @((Test-OwnModelFolder -Path 'D:\Models' -Own @('C:\Users\testuser\.ollama\models', '', 'd:/models/')), (Test-OwnModelFolder -Path 'E:\Other' -Own @('C:\Users\testuser\.ollama\models', 'D:\Models', '')), (Test-OwnModelFolder -Path 'E:\Other' -Own @('', '')), (Test-OwnModelFolder -Path 'E:\Other')) }
+            $r7g['Models'] = Get-OllamaListedContent -OllamaUrl 'http://stand-in'
+            $answer7g = 'none'; $r7g['None'] = Get-OllamaListedContent -OllamaUrl 'http://stand-in'
+            $answer7g = 'down'; $r7g['Down'] = Get-OllamaListedContent -OllamaUrl 'http://stand-in'
+            $r7g
+        }
+    }
+    Assert-That ($judges7g['Own'].Count -eq 4 -and $judges7g['Own'][0] -eq $true -and $judges7g['Own'][1] -eq $false -and $judges7g['Own'][2] -eq $false -and $judges7g['Own'][3] -eq $false) "a folder is the installer's own when it is one of the folders it chose (letter case, slashes and a closing separator apart), and not when it is another folder or when nothing was chosen ($($judges7g['Own'] -join ', '))"
+    Assert-That ([string]$judges7g['Models']['Content'] -eq 'models' -and [int]$judges7g['Models']['Listed'] -eq 2 -and [string]$judges7g['None']['Content'] -eq 'empty' -and [int]$judges7g['None']['Listed'] -eq 0 -and [string]$judges7g['Down']['Content'] -eq 'unknown' -and [int]$judges7g['Down']['Listed'] -eq -1) "for a folder that is not its own the installer goes by the running Ollama's list: models when it lists some, empty when it lists none, unknown when it does not answer ($($judges7g['Models']['Content']) / $($judges7g['None']['Content']) / $($judges7g['Down']['Content']))"
+    # And where the installer does look: the one listing of the folder in use is behind 'the
+    # installer chose this folder itself', a look that met a link counts as no look, and no size
+    # is taken from any folder (the function that added one up is gone).
+    $looks7g = [regex]::Matches($text, 'Get-ModelFolderContent -Path \$inUse').Count
+    Assert-That ($looks7g -eq 1 -and $text -match '(?s)if \(\$otherModelDir -and \$inUseOwn\) \{\s+\$inUseContent = Get-ModelFolderContent -Path \$inUse\s+\$lookedAt = \(\$inUseContent -ne ''link''\)' -and $text -notmatch 'Get-FolderSizeText|\(about \{' -and
+        $text.Contains('$inUseOwn = Test-OwnModelFolder -Path $inUse -Own @($defaultModels, [string]$State.flags[''modelDir''], $ownModelsVar)')) "the installer lists the folder in use in one place, only when that folder is Ollama's default, the folder of its last plan or the value it wrote into OLLAMA_MODELS, takes a look that met a link for no look, and takes no size from any folder ($looks7g listing(s))"
+    # A link in the folder the installer chose itself. Ollama's default folder lies in the user's
+    # profile, where any program of the user's can put a link in place of a folder. Here manifests
+    # is a symbolic link to a folder elsewhere that holds a manifest (it stands in for a folder
+    # only administrators can read). The installer, which has administrator rights, listed
+    # through the link, said 'they are in', and added up the size of what lay behind a linked
+    # blobs. It follows no link now: with a link on the way the folder counts as not looked at and
+    # the running Ollama's list decides, as for a folder the installer did not choose. First with
+    # the sandbox's Ollama, which lists models (refused, with the reason), then with one that
+    # lists none: the run goes on, which it could not if the manifest behind the link were read.
+    $behindLink = Join-Path $Work 'Behind A Link'
+    $link7g = (Join-Path $plannedModels 'manifests').Replace('\', '/')
+    $stateAside7gL = Join-Path $Work 'install-state-before-7g-link.json'
+    Copy-Item -LiteralPath $statePath -Destination $stateAside7gL -Force
+    & $moveModels7g $plannedModels $behindLink
+    $c7gL = -1; $log7gL = ''; $log7gL2 = ''; $linkMade7g = $false
+    try {
+        New-Item -ItemType SymbolicLink -Path $link7g -Target (Join-Path $behindLink 'manifests') | Out-Null
+        $linkMade7g = [bool]((Get-Item -LiteralPath $link7g -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) -and (Test-Path -LiteralPath (Get-LaiModelManifestPath -ModelDir $plannedModels -Name $modelName7g))
+        & (Join-Path $aiRoot 'Scripts/Install-LocalAI.ps1') -AIRoot $aiRoot -SkipTests -TrialModels none -ModelDir $otherModels
+        $c7gL = $LASTEXITCODE
+        $log7gL = Get-NewestLog
+        Copy-Item -LiteralPath $stateAside7gL -Destination $statePath -Force
+        $global:MockOllamaListed = @{ Content = 'empty'; Listed = 0 }
+        & (Join-Path $aiRoot 'Scripts/Install-LocalAI.ps1') -AIRoot $aiRoot -SkipTests -TrialModels none -ModelDir $otherModels
+        $log7gL2 = Get-NewestLog
+    } finally {
+        $global:MockOllamaListed = $null
+        Copy-Item -LiteralPath $stateAside7gL -Destination $statePath -Force
+        # The link itself, not what it points at (unlink; the folder behind it is moved back below).
+        if ($linkMade7g) { try { [System.IO.File]::Delete($link7g) } catch { & /bin/rm -f $link7g } }
+    }
+    $linkGone7g = -not (Test-Path -LiteralPath $link7g)
+    if ($linkGone7g) { & $moveModels7g $behindLink $plannedModels; Remove-Item -LiteralPath $behindLink -Recurse -Force }
+    if (Test-Path -LiteralPath $otherModels) { Remove-Item -LiteralPath $otherModels -Recurse -Force }
+    $said7gL = & $refusal7g $log7gL
+    $byLink7g = 'it is, or lies behind, a junction or symbolic link, which the installer does not follow with administrator rights'
+    Assert-That ($linkMade7g -and $linkGone7g -and (Test-Path -LiteralPath $manifest7g)) "setup: manifests in the folder the installer chose was a symbolic link to a folder that holds a manifest, and is the folder itself again afterwards (made: $linkMade7g, taken away: $linkGone7g)"
+    Assert-That ($c7gL -ne 0 -and $log7gL -notmatch '=+ Ollama =+' -and (& $listed7g $said7gL) -and $said7gL.Contains("and $plannedModels, the folder they should be in, was not looked at ($byLink7g). Going on would download every model again") -and $said7gL -notmatch $notSeen7g) "the installer's own folder with a link in place of manifests: refused on the running Ollama's list, and the message says that the folder was not looked at because of the link, with no size and no 'they are in' (exit ${c7gL}: $said7gL)"
+    Assert-That ($said7gL.Contains("If your models are in $plannedModels (the Ollama app shows the folder it uses under Settings > Model location), run the installer again without -ModelDir to keep them there. To move them instead: quit Ollama from its tray icon, move everything in $plannedModels into $otherModels, start Ollama again, and run the installer again with -ModelDir $(& $asTyped7g $otherModels).")) 'and its two ways on are those for a folder nobody looked at: keeping it on the condition that the models are in it, and a move that ends with Ollama started again'
+    $info7gL2 = @($log7gL2 -split "`n" | Where-Object { $_ -match 'is not the folder Ollama uses now' }) -join ' '
+    Assert-That ($log7gL2 -match 'Test hook: stage Ollama failed' -and -not (& $refusal7g $log7gL2) -and $info7gL2.Contains("($plannedModels, which was not looked at; the running Ollama lists no models)") -and $log7gL2 -notmatch $wasRead7g) "with an Ollama that lists no models the same run goes on: the manifest behind the link was not read (read, it refuses the run with 'they are in'), and the log says what the installer went by ($info7gL2)"
 
     # B: the models moved by hand, as the message says. The folder in use is empty now, so the run
     # goes on, and it reads what is installed from the new folder's manifests (the running Ollama
@@ -1173,7 +1374,8 @@ try {
     $log7gD = Get-NewestLog
     $removeAt7gD = $log7gD.IndexOf("first remove the OLLAMA_MODELS variable from your user variables (Start menu > 'Edit environment variables for your account'): it names $otherModels and is not the installer's own setting")
     $moveAt7gD = $log7gD.IndexOf("move everything in $otherModels into $plannedModels")
-    Assert-That ($c7gD -ne 0 -and $log7gD -notmatch '=+ Ollama =+' -and $log7gD.Contains("they are in $otherModels (about 3 MB)") -and $log7gD -match 'run the installer again without -ModelDir') "back to the default folder while the owner's own OLLAMA_MODELS names the folder in use, which holds the models: refused in Preflight (exit $c7gD)"
+    $said7gD = & $refusal7g $log7gD
+    Assert-That ($c7gD -ne 0 -and $log7gD -notmatch '=+ Ollama =+' -and $said7gD.Contains("is not the folder Ollama keeps its models in now: they are in $otherModels. Going on would download every model again") -and $said7gD -notmatch $sized7g -and $log7gD -match 'run the installer again without -ModelDir') "back to the default folder while the owner's own OLLAMA_MODELS names the folder in use, which holds the models: refused in Preflight, naming that folder and no size (exit ${c7gD}: $said7gD)"
     Assert-That ($removeAt7gD -ge 0 -and $moveAt7gD -gt $removeAt7gD) "and the way to the default folder starts with removing that variable, named with where Windows shows it, before the move (removal at $removeAt7gD, move at $moveAt7gD)"
     Assert-That ((Test-LaiSamePath ([string]$global:MockUserEnv['OLLAMA_MODELS']) $otherModels) -and (Test-LaiSamePath ([string](Read-LaiState -Path $statePath)['flags']['modelDir']) $otherModels)) "nothing changed: the variable is there, the state still plans the folder in use (variable: $($global:MockUserEnv['OLLAMA_MODELS']))"
     # The owner moves the models all the same. Preflight has nothing to refuse (the folder in use
@@ -1209,8 +1411,12 @@ try {
     # not plugged in now. It no longer holds the value the installer wrote, so it is not the
     # installer's to remove, and the state forgets that value. And the folder Ollama uses cannot be
     # looked at: said in a warning before anything is planned (with the folder as it has to be
-    # typed), not passed off as a folder that holds no models.
-    & $setState7g @{ modelDir = $otherModels; ollamaModelsEnv = $otherModels } ''
+    # typed), not passed off as a folder that holds no models. The state is written by hand here to
+    # plan that folder: only that makes it a folder the installer chose and may look at (no run of
+    # the installer leaves this state: with a plan recorded, a run without -ModelDir keeps the plan
+    # and does not take the variable). Named by the log and the variable alone it is not looked
+    # at, and the running Ollama's list decides: that is F2, below.
+    & $setState7g @{ modelDir = $goneModels; ollamaModelsEnv = $otherModels } ''
     $global:MockUserEnv['OLLAMA_MODELS'] = $goneModels
     Set-Content -LiteralPath $serverLog -Value $srvGone7g
     $global:MockOllamaLog = @{ User = $srvGone7g; Session = $srvGone7g }
@@ -1221,15 +1427,37 @@ try {
     Assert-That ($log7gF -match 'Test hook: stage Models failed' -and [string]$global:MockUserEnv['OLLAMA_MODELS'] -ceq $goneModels -and $log7gF -notmatch 'removed OLLAMA_MODELS' -and $log7gF.Contains("OLLAMA_MODELS=$goneModels is not the installer's own setting and is left as it is") -and -not $flags7gF.ContainsKey('ollamaModelsEnv')) "a value the owner set by hand after the install (not the one the installer wrote) is left alone, and the state no longer keeps a value as the installer's own (variable: $($global:MockUserEnv['OLLAMA_MODELS']))"
     Assert-That ($log7gF.Contains("The folder Ollama uses now, $goneModels, cannot be looked at") -and $log7gF.Contains("run the installer again with -ModelDir $goneTyped7g. Continuing in 20 seconds") -and $log7gF.Contains("($goneModels, which could not be looked at)") -and $log7gF -notmatch 'which holds no models') 'a folder in use on a drive that is not there: the run warns that it cannot tell whether models are in it and what follows, and nowhere says that it holds none'
     Assert-That ($log7gF.Contains('the OLLAMA_MODELS variable in your user variables names that folder') -and $log7gF.Contains("(or re-run the installer with -ModelDir $goneTyped7g)") -and $log7gF -notmatch 'Settings > Model location') "with every model there the Ollama stage only warns: it names the variable as the cause, and writes the folder to pass as PowerShell reads one folder (-ModelDir $goneTyped7g)"
+
+    # F2: the state an install does leave when the owner changes OLLAMA_MODELS by hand afterwards.
+    # The plan and the value the installer wrote name the other folder; the variable and Ollama's
+    # log name the folder on the drive that is not there. That folder is nothing the installer
+    # chose, so it is not looked at (not even to find its drive missing), and the running Ollama,
+    # which lists models, decides: refused in Preflight, with the count, who names the folder and
+    # no size. The variable is not the installer's to remove, so the way to the default folder
+    # starts with removing it, and it ends with Ollama started again.
+    & $setState7g @{ modelDir = $otherModels; ollamaModelsEnv = $otherModels } ''
+    $global:MockUserEnv['OLLAMA_MODELS'] = $goneModels
+    Set-Content -LiteralPath $serverLog -Value $srvGone7g
+    $global:MockOllamaLog = @{ User = $srvGone7g; Session = $srvGone7g }
+    & (Join-Path $aiRoot 'Scripts/Install-LocalAI.ps1') -AIRoot $aiRoot -SkipTests -TrialModels none -ModelDir $plannedModels
+    $c7gF2 = $LASTEXITCODE
+    $log7gF2 = Get-NewestLog
+    $flags7gF2 = (Read-LaiState -Path $statePath)['flags']
+    $said7gF2 = & $refusal7g $log7gF2
+    Assert-That ($c7gF2 -ne 0 -and $log7gF2 -notmatch '=+ Ollama =+' -and (& $listed7g $said7gF2) -and $said7gF2.Contains((& $notLooked7g $goneModels)) -and $said7gF2 -notmatch $notRead7g -and $log7gF2 -notmatch 'The folder Ollama uses now, ') "a folder on a drive that is not there, named by the variable and Ollama's log alone: not looked at, and refused in Preflight on the running Ollama's list of models, with no warning about a drive (exit ${c7gF2}: $said7gF2)"
+    Assert-That ($said7gF2.Contains("If your models are in $goneModels (the Ollama app shows the folder it uses under Settings > Model location), run the installer again with -ModelDir $goneTyped7g to keep them there. To move them instead: first remove the OLLAMA_MODELS variable from your user variables (Start menu > 'Edit environment variables for your account'): it names $goneModels and is not the installer's own setting") -and
+        $said7gF2.Contains("Then quit Ollama from its tray icon, move everything in $goneModels into $plannedModels, start Ollama again, and run the installer again with -ModelDir $(& $asTyped7g $plannedModels).")) 'and its two ways on: keeping that folder on the condition that the models are in it, or removing the variable first, moving the models and starting Ollama again'
+    Assert-That ((Test-LaiSamePath ([string]$flags7gF2['modelDir']) $otherModels) -and (Test-LaiSamePath ([string]$flags7gF2['ollamaModelsEnv']) $otherModels) -and [string]$global:MockUserEnv['OLLAMA_MODELS'] -ceq $goneModels) "nothing changed: the state still plans the other folder and keeps the installer's own value, and the variable is as the owner set it (state: $($flags7gF2['modelDir']))"
 } finally {
     $env:LOCALAI_TEST_FAIL_STAGE = ''
     $global:MockOllamaLog = $null
     $global:MockUserEnv = $null
     $global:MockMachineModels = $null
+    $global:MockOllamaListed = $null
     Remove-Item -LiteralPath Env:OLLAMA_MODELS -ErrorAction SilentlyContinue
     Set-Content -LiteralPath $serverLog -Value $srv7g
     Copy-Item -LiteralPath $stateAside7g -Destination $statePath -Force
-    foreach ($made7g in @((Join-Path $plannedModels 'manifests'), (Join-Path $plannedModels 'blobs'), $otherModels, $aposModels, $aposTarget)) {
+    foreach ($made7g in @((Join-Path $plannedModels 'manifests'), (Join-Path $plannedModels 'blobs'), $otherModels, $aposModels, $aposTarget, (Join-Path $Work 'Log Named Empty'), (Join-Path $Work 'Log Named Full'), (Join-Path $Work 'Behind A Link'))) {
         if (Test-Path -LiteralPath $made7g) { Remove-Item -LiteralPath $made7g -Recurse -Force }
     }
 }
