@@ -16,6 +16,10 @@
     delete its files right after the pull), so -Rollback can bring it back if the new upload is
     worse. That costs the old model's size on disk until the next update or -DropPrevious.
 
+    -Rollback also pins the model: later runs download nothing for it until -Unpin. They still rebuild
+    its preset when the alias is missing, when it was built from other content than the tag holds now
+    (a rollback whose re-tune did not finish: the GPU stayed busy, the load failed) or with -Retune.
+
     -RecheckOnly downloads nothing. It loads, on the Ollama installed now, only the presets measured
     on another Ollama version (the Ollama app updates itself) or left partly on the CPU by an earlier
     check, re-tunes any that no longer fit fully on the GPU, and records the result in
@@ -228,47 +232,61 @@ if ($Rollback.Count -gt 0) {
         $pn = Get-PrevName $m.Source
         if (-not (Test-LaiOllamaModel -BaseUrl $ollamaUrl -Name $pn)) { Write-LaiLog WARN "$($m.Display): no previous version kept ($pn)"; continue }
         Copy-Model $pn (Resolve-LaiModelName $m.Source)
-        Remove-Model $pn
-        Write-LaiLog OK "$($m.Display): back to the previous version ($((Get-LaiOllamaDigest -BaseUrl $ollamaUrl -Name $m.Source).Substring(0, 12))); pinned so the next update leaves it alone (Update-Models.ps1 -Unpin $($m.Key) to undo)"
+        # Pinned and saved right here, before the preset is rebuilt: if the re-tune below does not
+        # happen (GPU busy, a failed load, the window closed), the next plain run must rebuild the
+        # preset on this tag, not pull the new upload over it again.
         if ($pinned -notcontains $m.Key) { $script:pinned = @($pinned) + $m.Key }
+        Save-Pins
+        Remove-Model $pn
+        # Not an OK yet: the preset still runs the newer upload until it is rebuilt (Write-RollbackResult).
+        Write-LaiLog INFO "$($m.Display): the previous version ($((Get-LaiOllamaDigest -BaseUrl $ollamaUrl -Name $m.Source).Substring(0, 12))) is back under $($m.Source) and pinned; rebuilding its preset now (if this run stops before that is done, run Update-Models.ps1 without the rollback option to finish it)"
         $changed += $m
     }
     if ($changed.Count -eq 0) { throw "Nothing to roll back for: $($Rollback -join ', ')" }
-    Save-Pins
 } elseif (-not $RecheckOnly) {
     # (-RecheckOnly: no downloads, so no model counts as changed; only the re-check below runs.)
     $offline = $false
     foreach ($m in $catalog.Models) {
-        if ($pinned -contains $m.Key) { Write-LaiLog WARN "$($m.Display): pinned after a rollback, not updated (Update-Models.ps1 -Unpin $($m.Key) to allow it)"; continue }
-        if ($offline) { Write-LaiLog WARN "  $($m.Display): skipped, no connection to the model registry"; $failedPulls += $m.Display; continue }
-        $old = Get-LaiOllamaDigest -BaseUrl $ollamaUrl -Name $m.Source
-        Write-LaiLog STEP "Checking $($m.Source)"
-        # Keep a reference to the current version first: a pull deletes files no tag points to.
-        $candidate = "$(Resolve-LaiModelName $m.Source)-prevnew"
-        try {
-            if ($old -and -not $NoKeepPrevious) { Copy-Model (Resolve-LaiModelName $m.Source) $candidate }
+        if ($pinned -contains $m.Key) {
+            # Pinned: only the download is skipped. The check below still runs, or a preset that a
+            # rollback could not rebuild (GPU busy, a failed load), a deleted alias and -Retune would
+            # be passed over by every later run.
+            Write-LaiLog WARN "$($m.Display): pinned after a rollback, not updated (Update-Models.ps1 -Unpin $($m.Key) to allow it)"
+            $old = Get-LaiOllamaDigest -BaseUrl $ollamaUrl -Name $m.Source
+            $new = $old
+            # The tag itself was deleted by hand: nothing to build a preset from, and nothing is pulled.
+            if (-not $new) { Write-LaiLog WARN "  $($m.Display): $($m.Source) is not in Ollama any more, so its preset is left as it is (Update-Models.ps1 -Unpin $($m.Key) lets the next update download it again)"; continue }
+        } else {
+            if ($offline) { Write-LaiLog WARN "  $($m.Display): skipped, no connection to the model registry"; $failedPulls += $m.Display; continue }
+            $old = Get-LaiOllamaDigest -BaseUrl $ollamaUrl -Name $m.Source
+            Write-LaiLog STEP "Checking $($m.Source)"
+            # Keep a reference to the current version first: a pull deletes files no tag points to.
+            $candidate = "$(Resolve-LaiModelName $m.Source)-prevnew"
             try {
-                if ($env:LOCALAI_TEST_PULL_FROM) { Copy-Model $env:LOCALAI_TEST_PULL_FROM (Resolve-LaiModelName $m.Source) }   # test hook: simulated re-publish
-                else { Invoke-LaiOllamaPull -BaseUrl $ollamaUrl -Name $m.Source }
-            } catch {
-                # Keep going: the models already updated in this run still get re-tuned below.
-                Write-LaiLog WARN "  $($m.Display): download failed, kept the current version ($((Get-LaiHttpErrorText $_)))"
-                $failedPulls += $m.Display
-                # Offline: the remaining models would each spend ~30 s in retries for nothing.
-                $probeUrl = 'https://registry.ollama.ai/v2/'
-                if ($env:LOCALAI_TEST_REGISTRY_URL) { $probeUrl = $env:LOCALAI_TEST_REGISTRY_URL }
-                if (-not (Test-LaiRegistryReachable -Url $probeUrl)) { $offline = $true; Write-LaiLog WARN '  The model registry is unreachable (offline?); skipping the remaining downloads.' }
-                continue
-            }
-            $new = Get-LaiOllamaDigest -BaseUrl $ollamaUrl -Name $m.Source
-            if ($old -and $old -ne $new -and -not $NoKeepPrevious) {
-                $pn = Get-PrevName $m.Source
-                Remove-Model $pn
-                Copy-Model $candidate $pn
-                Hide-InWebUI $pn
-                Write-LaiLog INFO ("  previous version kept as {0} (~{1} GB until the next update; Update-Models.ps1 -Rollback {2} brings it back, -DropPrevious frees it)" -f $pn, (Get-ModelGB $pn), $m.Key)
-            }
-        } finally { try { Remove-Model $candidate } catch { Write-Verbose "could not remove $candidate" } }
+                if ($old -and -not $NoKeepPrevious) { Copy-Model (Resolve-LaiModelName $m.Source) $candidate }
+                try {
+                    if ($env:LOCALAI_TEST_PULL_FROM) { Copy-Model $env:LOCALAI_TEST_PULL_FROM (Resolve-LaiModelName $m.Source) }   # test hook: simulated re-publish
+                    else { Invoke-LaiOllamaPull -BaseUrl $ollamaUrl -Name $m.Source }
+                } catch {
+                    # Keep going: the models already updated in this run still get re-tuned below.
+                    Write-LaiLog WARN "  $($m.Display): download failed, kept the current version ($((Get-LaiHttpErrorText $_)))"
+                    $failedPulls += $m.Display
+                    # Offline: the remaining models would each spend ~30 s in retries for nothing.
+                    $probeUrl = 'https://registry.ollama.ai/v2/'
+                    if ($env:LOCALAI_TEST_REGISTRY_URL) { $probeUrl = $env:LOCALAI_TEST_REGISTRY_URL }
+                    if (-not (Test-LaiRegistryReachable -Url $probeUrl)) { $offline = $true; Write-LaiLog WARN '  The model registry is unreachable (offline?); skipping the remaining downloads.' }
+                    continue
+                }
+                $new = Get-LaiOllamaDigest -BaseUrl $ollamaUrl -Name $m.Source
+                if ($old -and $old -ne $new -and -not $NoKeepPrevious) {
+                    $pn = Get-PrevName $m.Source
+                    Remove-Model $pn
+                    Copy-Model $candidate $pn
+                    Hide-InWebUI $pn
+                    Write-LaiLog INFO ("  previous version kept as {0} (~{1} GB until the next update; Update-Models.ps1 -Rollback {2} brings it back, -DropPrevious frees it)" -f $pn, (Get-ModelGB $pn), $m.Key)
+                }
+            } finally { try { Remove-Model $candidate } catch { Write-Verbose "could not remove $candidate" } }
+        }
         # Also when the tuned alias was built from other content than the tag holds now: a run cut off
         # after the download but before the re-tune would otherwise report "unchanged" for good.
         $tunedDigest = ''
@@ -309,20 +327,43 @@ function Invoke-ModelSetup {
         return $false
     }
 }
+function Write-RollbackResult {
+    # The last word of a -Rollback run on one model. Its tag is back and pinned either way; "back to
+    # the previous version" is only true once the preset (the alias Open WebUI chats with) was rebuilt
+    # on it, so the OK is printed after the re-tune and never before.
+    param([object]$Model, [switch]$Rebuilt)
+    if ($Rebuilt) {
+        Write-LaiLog OK "$($Model.Display): back to the previous version ($((Get-LaiOllamaDigest -BaseUrl $ollamaUrl -Name $Model.Source).Substring(0, 12))); pinned so the next update leaves it alone (Update-Models.ps1 -Unpin $($Model.Key) to undo)"
+    } else {
+        Write-LaiLog WARN "$($Model.Display): its tag is back on the previous version and pinned, but its preset is not rebuilt yet, so chats still get the version you rolled back from. Once the cause above is fixed, run Update-Models.ps1 without the rollback option: it downloads nothing for a pinned model and rebuilds the preset."
+    }
+}
 function Wait-GpuIdle {
     # A run someone started waits for a quiet card; one that stays busy ends the run with a plain
-    # message instead of an error trace.
+    # message instead of an error trace. -RolledBack: the models a -Rollback run just put back; their
+    # presets are not rebuilt when the run ends here, and the run says so.
+    param([object[]]$RolledBack = @())
     try { return (Wait-LaiGpuIdle -MaxUsedMiB $maxBusy -TimeoutSec 600) }
-    catch { Write-LaiLog FAIL $_.Exception.Message; Stop-Run 1 }
+    catch {
+        Write-LaiLog FAIL $_.Exception.Message
+        foreach ($rb in $RolledBack) { Write-RollbackResult -Model $rb }
+        Stop-Run 1
+    }
 }
 
 if ($changed.Count -gt 0) {
+    $isRollback = ($Rollback.Count -gt 0)
     Stop-LaiOllamaModels -BaseUrl $ollamaUrl
-    $gpu = Wait-GpuIdle
+    if ($isRollback) { $gpu = Wait-GpuIdle -RolledBack $changed } else { $gpu = Wait-GpuIdle }
     $fingerprint = Get-CurrentFingerprint $gpu
     $done = @()
     foreach ($m in $changed) {
-        if (Invoke-ModelSetup -Model $m -SetupArgs @{ Fingerprint = $fingerprint; Retune = $true } -Changed) { $done += $m.Display }
+        # -Changed only for a model whose tag this run pulled: not after a rollback (nothing was
+        # downloaded, and its -prev is used up), and not for a pinned model a plain run only rebuilds.
+        $pulled = (-not $isRollback) -and ($pinned -notcontains $m.Key)
+        $rebuilt = $false
+        if (Invoke-ModelSetup -Model $m -SetupArgs @{ Fingerprint = $fingerprint; Retune = $true } -Changed:$pulled) { $rebuilt = $true; $done += $m.Display }
+        if ($isRollback) { Write-RollbackResult -Model $m -Rebuilt:$rebuilt }
     }
     if ($done.Count) { Write-LaiLog OK "Re-tuned: $($done -join ', ')" }
 } elseif (-not $RecheckOnly) {

@@ -223,12 +223,60 @@ try {
     Assert-That ($r.Code -eq 0) "rollback exits 0 (got $($r.Code))"
     Assert-That ((Get-Digest $tag) -eq $original) 'tag is back to the original content'
     Assert-That (-not (Test-LaiOllamaModel -BaseUrl $OllamaUrl -Name $prev)) '-prev consumed by the rollback'
+    # "Back to the previous version" is only true once the preset was rebuilt on it: the OK comes
+    # after the re-tune, not before it.
+    $tuneAt = $r.Text.IndexOf('Tuning Update test', [StringComparison]::Ordinal)
+    $okAt = $r.Text.IndexOf('pinned so the next update', [StringComparison]::Ordinal)
+    Assert-That ($tuneAt -ge 0 -and $okAt -gt $tuneAt) "the rollback's OK line is printed after the re-tune, not before it (re-tune at $tuneAt, OK at $okAt)"
+    Assert-That ($r.Text -match 'Re-tuned:' -and $r.Text -notmatch 'preset is not rebuilt yet' -and [string](Read-LaiState -Path $stPath)['tuning']['main']['Digest'] -eq $original) 'and the preset was rebuilt on the restored version'
     $r = Invoke-Update @('-Rollback', 'main') ''
     Assert-That ($r.Code -ne 0 -and $r.Text -match 'Nothing to roll back') 'second rollback refuses clearly'
     $r = Invoke-Update @() $variant
     Assert-That ((Get-Digest $tag) -eq $original -and $r.Text -match 'pinned after a rollback') 'rolled-back model is pinned: the next update leaves it alone'
+    Assert-That ($r.Code -eq 0 -and $r.Text -notmatch 'Re-tuned:') "and its preset, already built on the restored version, is not re-tuned again (exit $($r.Code))"
     $r = Invoke-Update @('-Unpin', 'main') ''
     Assert-That ($r.Code -eq 0) 'unpin'
+
+    # A rollback whose re-tune fails (here the restored version does not load; a GPU that stays busy
+    # ends the same way). The tag is back and pinned, the preset is not rebuilt, and the run says
+    # exactly that instead of OK.
+    $r = Invoke-Update @() $variant
+    $variantDigest = Get-Digest $variant
+    Assert-That ($r.Code -eq 0 -and (Get-Digest $tag) -eq $variantDigest -and (Get-Digest $prev) -eq $original) "setup: re-published once more, the original kept as -prev (exit $($r.Code))"
+    $env:LOCALAI_TEST_LOAD_FAIL = $tag
+    try { $r = Invoke-Update @('-Rollback', 'main') '' } finally { $env:LOCALAI_TEST_LOAD_FAIL = '' }
+    Assert-That ($r.Code -ne 0) "a rollback whose re-tune fails exits non-zero (exit $($r.Code))"
+    Assert-That ((Get-Digest $tag) -eq $original -and -not (Test-LaiOllamaModel -BaseUrl $OllamaUrl -Name $prev)) 'its tag is back on the original all the same, and -prev is used up'
+    Assert-That ($r.Text -match 'preset is not rebuilt yet' -and $r.Text -notmatch 'pinned so the next update') 'it says the tag is back but the preset is not rebuilt yet, and prints no OK for the rollback'
+    Assert-That ($r.Text -match "cannot load Update test's files" -and $r.Text -notmatch 'the new download') 'and it does not call the restored version a new download'
+    Assert-That ([string](Read-LaiState -Path $stPath)['tuning']['main']['Digest'] -eq $variantDigest) 'install-state still records the upload the preset was really built on'
+    $r = Invoke-Update @('-Rollback', 'main') ''
+    Assert-That ($r.Code -ne 0 -and $r.Text -match 'Nothing to roll back') 'a second rollback has nothing to roll back: it cannot be what repairs the preset'
+    # While the cause lasts, a plain run tries the pinned model again and fails the same honest way.
+    $env:LOCALAI_TEST_LOAD_FAIL = $tag
+    try { $r = Invoke-Update @() $variant } finally { $env:LOCALAI_TEST_LOAD_FAIL = '' }
+    Assert-That ($r.Code -ne 0 -and $r.Text -match 'pinned after a rollback' -and $r.Text -match 'not set up' -and $r.Text -notmatch 'the new download' -and (Get-Digest $tag) -eq $original) "a plain run retries the pinned model's preset while the cause lasts, downloads nothing and exits non-zero (exit $($r.Code))"
+    # The cause gone: the next plain run finishes the rollback, still without downloading anything.
+    $r = Invoke-Update @() $variant
+    $tunedNow = [string](Read-LaiState -Path $stPath)['tuning']['main']['Digest']
+    Assert-That ($r.Code -eq 0 -and (Get-Digest $tag) -eq $original -and $r.Text -match 'pinned after a rollback') "the next plain run still downloads nothing for the pinned model (exit $($r.Code))"
+    Assert-That ($r.Text -match 'Re-tuned:' -and $tunedNow -eq $original) "but it finishes the rollback: the preset is rebuilt on the restored version ($tunedNow)"
+    $r = Invoke-Update @() $variant
+    Assert-That ($r.Code -eq 0 -and $r.Text -notmatch 'Re-tuned:' -and (Get-Digest $tag) -eq $original) "and the run after that has nothing left to rebuild (exit $($r.Code))"
+    # Pinned means no download, not no upkeep: -Retune and a deleted alias are still handled.
+    $r = Invoke-Update @('-Retune') $variant
+    Assert-That ($r.Code -eq 0 -and $r.Text -match 'Re-tuned:' -and (Get-Digest $tag) -eq $original) "-Retune measures a pinned model again without downloading it (exit $($r.Code))"
+    Remove-IfThere $alias
+    $r = Invoke-Update @() $variant
+    Assert-That ($r.Code -eq 0 -and (Test-LaiOllamaModel -BaseUrl $OllamaUrl -Name $alias) -and (Get-Digest $tag) -eq $original) "a pinned model's deleted alias is rebuilt, again without a download (exit $($r.Code))"
+    # The tag itself deleted by hand: nothing to build from, so a warning and no error trace.
+    Remove-IfThere $tag
+    $r = Invoke-Update @() $variant
+    Assert-That ($r.Code -eq 0 -and $r.Text -match 'is not in Ollama any more' -and $r.Text -notmatch 'Re-tuned:' -and -not (Test-LaiOllamaModel -BaseUrl $OllamaUrl -Name $tag)) "a pinned model whose tag was deleted is warned about, not downloaded and not an error (exit $($r.Code))"
+    Invoke-LaiApi -Method POST -Uri "$OllamaUrl/api/copy" -Body @{ source = $BaseModel; destination = $tag } | Out-Null
+    Assert-That ((Get-Digest $tag) -eq $original) 'setup for the next steps: the tag is back on the original'
+    $r = Invoke-Update @('-Unpin', 'main') ''
+    Assert-That ($r.Code -eq 0) 'unpin again: the steps below update this model'
 
     Write-Host "`n=== 3b. a failed download keeps the current version, no leftovers ===" -ForegroundColor Cyan
     $before = Get-Digest $tag
