@@ -50,12 +50,33 @@ function Invoke-Update([string[]]$Arguments) {
     $out | Where-Object { $_ -match 'OK|WARN|FAIL|roll|pull' } | Select-Object -Last 3 | ForEach-Object { Write-Host "    | $_" }
     return [pscustomobject]@{ Code = $code; Text = ($out -join "`n") }
 }
+function Join-Wrapped([string]$Text) {
+    # pwsh breaks the message of an error that ended a script at the window width, starts each
+    # further line with '     | ' and may colour it. Both are taken out, so that a phrase of a long
+    # message is found wherever the break fell.
+    return (($Text -replace '\x1b\[[0-9;]*m', '') -replace '\r?\n\s*\|\s+', ' ')
+}
+function Set-WebUIPort([int]$Port) {
+    # The port the scripts under test look for Open WebUI on: 3000 is the sandbox's real one, 3999
+    # is dead (Open WebUI 'does not answer'). Set by key, never by putting an earlier copy of the
+    # file back: an update saves its own keys to it in between (the rollback point, UpdatePending).
+    $path = Join-Path $aiRoot 'localai-config.json'
+    $state = Read-LaiState -Path $path
+    $state['WebUIPort'] = $Port
+    Save-LaiState -State $state -Path $path
+}
 
 # ---- throwaway stack -------------------------------------------------------------------------------
 if (Test-Path -LiteralPath $Work) { Remove-Item -LiteralPath $Work -Recurse -Force }
 $aiRoot = Join-Path $Work 'AI'
 $stack = Join-Path $aiRoot 'Stack'
 foreach ($d in $stack, (Join-Path $aiRoot 'Backups'), (Join-Path $aiRoot 'Secrets'), (Join-Path $aiRoot 'Logs')) { New-Item -ItemType Directory -Force -Path $d | Out-Null }
+# stop_signal: 'sleep' as the container's first process never sees the SIGTERM of a 'docker stop'
+# (Linux delivers it to a first process only when that has a handler for it). So every backup and
+# restore here (stop -t 30) waited the full 30 seconds, and every change of version 10, before
+# Docker killed the container: minutes of waiting in a suite that Invoke-AllTests.ps1 cuts off at
+# 30, with the updates and restores of parts 4b, 4c and 5h still to fit in. Killed at once, the
+# container ends the way it ended before, only without the wait.
 @'
 name: lai-update-test
 services:
@@ -63,6 +84,7 @@ services:
     image: alpine:${OPEN_WEBUI_VERSION}
     container_name: open-webui
     restart: always
+    stop_signal: SIGKILL
     command: ["sleep", "3600"]
     volumes: ["open-webui:/app/backend/data"]
 volumes:
@@ -255,7 +277,114 @@ exec 'REALDOCKER' "$@"
     Assert-That (-not $cfg.ContainsKey('RollbackArchive') -and $cfg['OpenWebUIVersion'] -eq '3.19') 'rollback point consumed, version recorded'
     $r = Invoke-Update @('-Rollback', '-Force')
     Assert-That ($r.Code -ne 0 -and $r.Text -match 'Nothing to roll back') 'second rollback refuses clearly'
+    # By hand the old image comes first, then the old data. The other way round, the new version
+    # starts on the restored data and migrates it again before the old image is there.
+    Assert-That ((Join-Wrapped $r.Text) -match '(?s)-Version <old> -SkipBackup.*Restore-OpenWebUI\.ps1 -Archive <file>') 'and its advice for doing it by hand is in the order that works: Update -Version <old> -SkipBackup, then Restore -Archive <file>'
     Assert-That ((Get-Content -LiteralPath (Join-Path (Join-Path $aiRoot 'Logs') 'update.log') -Raw) -match 'Rolled back') 'update.log has the history'
+
+    Write-Host "`n=== 4b. an update that never answered: not 'Already on', and no other update on top of it ===" -ForegroundColor Cyan
+    # 3.19 runs and no rollback point is recorded (part 4). The health wait at the end of an update
+    # is cut to a few seconds and pointed at a dead port: the new version 'never comes up'.
+    $beforeCount = { @(Get-ChildItem -LiteralPath (Join-Path $aiRoot 'Backups') -Filter 'open-webui-*-before-*.tar.gz').Count }
+    # @{} for a marker that is not there: a missing key is then a failed assertion, not an error.
+    $pendingNow = { $p = (Read-LaiState -Path $cfgFile)['UpdatePending']; if ($p -is [hashtable]) { $p } else { @{} } }
+    # Open WebUI 'does not answer' (a dead port, waits of seconds) or answers (the sandbox's real one).
+    $noAnswer = { Set-WebUIPort 3999; $env:LOCALAI_TEST_WEBUI_WAIT_SEC = '6' }
+    $answersNow = { $env:LOCALAI_TEST_WEBUI_WAIT_SEC = ''; Set-WebUIPort 3000 }
+    $containerState = { Invoke-DockerText @('inspect', '-f', '{{.State.Status}}', 'open-webui') }
+    & $noAnswer
+    try {
+        $r = Invoke-Update @('-Version', '3.20')
+        $cfg = Read-LaiState -Path $cfgFile
+        $pend = & $pendingNow
+        $rbArchive = [string]$cfg['RollbackArchive']
+        Assert-That ($r.Code -ne 0 -and (Join-Wrapped $r.Text) -match 'Open WebUI 3\.20 did not come up' -and (Get-Image) -eq 'alpine:3.20') "setup: the update to 3.20 ends with 'did not come up' (exit $($r.Code), $(Get-Image))"
+        Assert-That ([string]$pend['Version'] -eq '3.20' -and [string]$pend['Previous'] -eq '3.19' -and $rbArchive -and [string]$pend['Archive'] -eq $rbArchive -and (Test-Path -LiteralPath $rbArchive)) "it is recorded as an update that never came up, with its rollback point (UpdatePending: version '$($pend['Version'])', previous '$($pend['Previous'])', archive '$($pend['Archive'])')"
+        $beforeWas = & $beforeCount
+
+        # The same update again: it used to print 'Already on 3.20' and exit 0 without a look at Open WebUI.
+        $r = Invoke-Update @('-Version', '3.20')
+        $cfg = Read-LaiState -Path $cfgFile
+        Assert-That ($r.Code -ne 0 -and $r.Text -notmatch 'Already on' -and (Join-Wrapped $r.Text) -match '(?s)Open WebUI 3\.20 did not come up.*Update-OpenWebUI\.ps1 -Rollback') "the same update again waits for Open WebUI and says it did not come up, with the way back; never 'Already on' (exit $($r.Code))"
+        Assert-That ([string]$cfg['RollbackArchive'] -eq $rbArchive -and (& $beforeCount) -eq $beforeWas -and [string](& $pendingNow)['Version'] -eq '3.20') "and it changes nothing: the rollback point, the before-<version> archives ($(& $beforeCount) of $beforeWas) and the mark stay"
+
+        # Another version: it used to back up the broken state as before-3.19 and make that the rollback point.
+        # The container runs and nothing answers: said as what is known, waiting first, -Rollback last.
+        $r = Invoke-Update @('-Version', '3.19')
+        $cfg = Read-LaiState -Path $cfgFile
+        Assert-That ($r.Code -ne 0 -and (Join-Wrapped $r.Text) -match '(?s)The last update, to Open WebUI 3\.20, had not answered when it ended, and Open WebUI does not answer now.*give it a few minutes.*Update-OpenWebUI\.ps1 -Rollback') "an update to another version is refused: the last one had not answered and Open WebUI does not answer now; wait first, -Rollback if it stays down (exit $($r.Code))"
+        Assert-That ((Get-Image) -eq 'alpine:3.20' -and [string]$cfg['RollbackArchive'] -eq $rbArchive -and (& $beforeCount) -eq $beforeWas) "and nothing was changed: $(Get-Image) runs, the rollback point is the archive from the working state, no new before-<version> archive ($(& $beforeCount) of $beforeWas)"
+
+        # Open WebUI merely stopped (Stop-LocalAI.ps1, Docker Desktop not up yet). The mark may be weeks
+        # old on an install that came up a minute after the wait ended: no answer says nothing then,
+        # and -Rollback would swap those weeks of chats for the backup from before the update.
+        Invoke-DockerText @('stop', '-t', '1', 'open-webui') | Out-Null
+        Assert-That ((& $containerState) -eq 'exited') "setup: the Open WebUI container is stopped ($(& $containerState))"
+        $r = Invoke-Update @('-Version', '3.19')
+        $cfg = Read-LaiState -Path $cfgFile
+        $said = Join-Wrapped $r.Text
+        Assert-That ($r.Code -ne 0 -and $said -match 'Open WebUI is not running.*Start it .*run this again' -and $said -notmatch '(?s)Open WebUI is not running.*-Rollback' -and $said -notmatch 'does not answer now') "with Open WebUI stopped, an update to another version says to start it and run again, and gives no -Rollback advice (exit $($r.Code))"
+        Assert-That ((Get-Image) -eq 'alpine:3.20' -and (& $containerState) -eq 'exited' -and [string]$cfg['RollbackArchive'] -eq $rbArchive -and (& $beforeCount) -eq $beforeWas -and [string](& $pendingNow)['Version'] -eq '3.20') "and nothing was changed: the container stays stopped ($(& $containerState)), the rollback point and the mark stay"
+        $r = Invoke-Update @('-Version', '3.20')
+        $said = Join-Wrapped $r.Text
+        Assert-That ($r.Code -ne 0 -and $said -notmatch 'Already on' -and $said -match 'Open WebUI is not running.*Start it .*run this again' -and $said -notmatch '(?s)Open WebUI is not running.*-Rollback' -and $said -notmatch 'Waiting for it again') "with Open WebUI stopped, the same update again says so at once: no wait for a stopped container that ends on -Rollback (exit $($r.Code))"
+        Invoke-DockerText @('start', 'open-webui') | Out-Null
+        Assert-That ((& $containerState) -eq 'running' -and [string](& $pendingNow)['Version'] -eq '3.20') "setup: the container runs again and the mark is still there ($(& $containerState))"
+
+        # -Force goes on all the same (here back to 3.19).
+        $r = Invoke-Update @('-Version', '3.19', '-Force', '-SkipBackup')
+        $cfg = Read-LaiState -Path $cfgFile
+        Assert-That ((Get-Image) -eq 'alpine:3.19' -and (Join-Wrapped $r.Text) -notmatch 'had not answered' -and [string](& $pendingNow)['Version'] -eq '3.19' -and -not $cfg.ContainsKey('RollbackArchive')) "-Force updates all the same, and that update is marked in its turn while nothing answers (exit $($r.Code), $(Get-Image))"
+
+        # The mark without a rollback point (that update ran with -SkipBackup): there is nothing to
+        # protect and nothing to go back to (-Rollback says 'Nothing to roll back'), so a refusal
+        # would leave no way on at all. It warns and goes on.
+        $r = Invoke-Update @('-Version', '3.20', '-SkipBackup')
+        $pend = & $pendingNow
+        Assert-That ($r.Text -match 'had not answered when it ended, Open WebUI does not answer now, and no backup from before it is recorded to roll back to\. Updating to 3\.20 on top of it' -and (Join-Wrapped $r.Text) -notmatch 'nothing was changed') "an update on top of one that had not answered and has no rollback point warns and goes on: it is not refused (exit $($r.Code))"
+        Assert-That ((Get-Image) -eq 'alpine:3.20' -and [string]$pend['Version'] -eq '3.20' -and [string]$pend['Previous'] -eq '3.19') "and it did update: $(Get-Image) runs, marked in its turn (version '$($pend['Version'])', previous '$($pend['Previous'])')"
+
+        # Open WebUI answers now (the sandbox's real one on port 3000): the mark goes, once.
+        & $answersNow
+        $r = Invoke-Update @('-Version', '3.20')
+        Assert-That ($r.Code -eq 0 -and $r.Text -notmatch 'Already on' -and $r.Text -match 'Open WebUI \S+ is up on' -and -not (Read-LaiState -Path $cfgFile).ContainsKey('UpdatePending')) "once Open WebUI answers, the same update again says it is up and the mark is gone (exit $($r.Code))"
+        $r = Invoke-Update @('-Version', '3.20')
+        Assert-That ($r.Code -eq 0 -and $r.Text -match 'Already on 3\.20') "and only then is the next run 'Already on' (exit $($r.Code))"
+
+        Write-Host "`n=== 4c. the marked update answers after all when another one is asked for; a rollback that gets no answer ===" -ForegroundColor Cyan
+        # An update with a backup that 'never comes up': the mark, and a rollback point (3.20, its archive).
+        & $noAnswer
+        $r = Invoke-Update @('-Version', '3.19')
+        $cfg = Read-LaiState -Path $cfgFile
+        $rbOld = [string]$cfg['RollbackArchive']
+        Assert-That ($r.Code -ne 0 -and (Get-Image) -eq 'alpine:3.19' -and [string](& $pendingNow)['Version'] -eq '3.19' -and [string]$cfg['PreviousOpenWebUIVersion'] -eq '3.20' -and $rbOld -and (Test-Path -LiteralPath $rbOld)) "setup: the update to 3.19 ends without an answer, marked, with a rollback point (exit $($r.Code), $(Get-Image))"
+        # Open WebUI answers by now (in real life: a first start that took longer than the wait). The
+        # short look sees that, takes the mark off and updates. Had it not, this would be the refusal.
+        & $answersNow
+        $r = Invoke-Update @('-Version', '3.20')
+        $cfg = Read-LaiState -Path $cfgFile
+        $rbNew = [string]$cfg['RollbackArchive']
+        Assert-That ($r.Code -eq 0 -and (Join-Wrapped $r.Text) -notmatch 'had not answered' -and $r.Text -match 'is up on .*\(was 3\.19\)' -and (Get-Image) -eq 'alpine:3.20') "an update to another version goes through when the marked one answers after all: no refusal, no warning (exit $($r.Code), $(Get-Image))"
+        Assert-That (-not $cfg.ContainsKey('UpdatePending') -and [string]$cfg['PreviousOpenWebUIVersion'] -eq '3.19' -and $rbNew -like '*before-3.20*' -and $rbNew -ne $rbOld -and $rbNew -ne $rbArchive -and (Test-Path -LiteralPath $rbNew)) "and the mark is gone, with this update's own backup as the rollback point ($rbNew)"
+
+        # -Rollback, and the old version does not answer. The restore's own safety backup holds the
+        # data 3.20 had: put back alone (the one hint that was on screen) it lands under 3.19. The
+        # way back is the version first, then that archive; the rollback used to end on a bare timeout.
+        Set-Marker 'DATA-v3'
+        & $noAnswer
+        $r = Invoke-Update @('-Rollback', '-Force')
+        $cfg = Read-LaiState -Path $cfgFile
+        $safetyMade = Get-ChildItem -LiteralPath (Join-Path $aiRoot 'Backups') -Filter 'open-webui-*-pre-restore.tar.gz' | Sort-Object LastWriteTime -Descending | Select-Object -First 1  # lai-ok: objects
+        $safetyName = 'none'; if ($safetyMade) { $safetyName = $safetyMade.Name }
+        # Without any white space: the message is broken at the window width, a long path anywhere.
+        $packed = (Join-Wrapped $r.Text) -replace '\s+', ''
+        Assert-That ($r.Code -ne 0 -and (Join-Wrapped $r.Text) -match 'Open WebUI 3\.19 did not come up after the rollback' -and (Get-Image) -eq 'alpine:3.19' -and (Get-Marker) -eq 'DATA-v1') "setup: the rollback is in place (3.19, the data from before the update) and Open WebUI does not answer (exit $($r.Code), $(Get-Image), $(Get-Marker))"
+        Assert-That ($packed -match ("Update-OpenWebUI\.ps1-Version3\.20-SkipBackupfirst,thenRestore-OpenWebUI\.ps1-Archive'[^']*" + [regex]::Escape($safetyName) + "'")) "a rollback that gets no answer ends on the way back in the order that works: Update -Version 3.20 -SkipBackup first, then Restore -Archive with this rollback's safety backup ($safetyName)"
+        $safetyData = if ($safetyMade) { Invoke-DockerText @('run', '--rm', '-v', "$($safetyMade.DirectoryName):/b:ro", 'alpine:3.20', 'tar', 'xzOf', "/b/$safetyName", './marker') } else { '' }
+        Assert-That ($safetyData -eq 'DATA-v3') "and the archive it names holds the data from just before the rollback ($safetyData)"
+        Assert-That ($r.Text -match 'It goes with the Open WebUI version that was running before this restore.*Update-OpenWebUI\.ps1 -Rollback does that.*switch it back first') "the restore's own hint for that archive says which version it goes with, so it is not put back under the older image"
+        Assert-That (-not $cfg.ContainsKey('RollbackArchive') -and -not $cfg.ContainsKey('UpdatePending') -and [string]$cfg['OpenWebUIVersion'] -eq '3.19') 'the rollback point is used up and nothing is marked; 3.19 runs, as before part 4b'
+    } finally { & $answersNow }
 
     Write-Host "`n=== 5. a failed restore keeps Open WebUI down until a good restore ===" -ForegroundColor Cyan
     # The newest real archive (a stand-in or a corrupt one would make every restore below fail early).
@@ -431,6 +560,62 @@ exec 'REALDOCKER' "$@"
             } catch { Write-Host "  could not put the sandbox preset and sign-up back: $($_.Exception.Message)" -ForegroundColor Yellow }
         }
     }
+
+    Write-Host "`n=== 5h. a restore keeps the downloaded document-search and speech models ===" -ForegroundColor Cyan
+    # A backup leaves the two folders out (part 7 shows that), and the swap deletes all the volume
+    # holds: they were gone after every restore, and after the rollback of a failed one.
+    Invoke-DockerText @('run', '--rm', '-v', 'open-webui:/d', 'alpine:3.20', 'sh', '-c', 'mkdir -p /d/cache/embedding/models/BAAI /d/cache/whisper/models && echo m > /d/cache/embedding/models/BAAI/weights && echo w > /d/cache/whisper/models/small') | Out-Null
+    # 'm w' when both files are there; else what cat said about the missing one.
+    $modelFiles = { (Invoke-DockerText @('run', '--rm', '-v', 'open-webui:/d', 'alpine:3.20', 'cat', '/d/cache/embedding/models/BAAI/weights', '/d/cache/whisper/models/small')) -replace '\s+', ' ' }
+    Assert-That ((& $modelFiles) -eq 'm w') "setup: the volume holds a document-search model and a speech model ($(& $modelFiles))"
+    # The swap fails and the safety backup goes back in. That archive has neither folder: without
+    # the move in the swap, the rollback 'to how it was' came back without the models.
+    $env:LOCALAI_TEST_FAIL_SWAP_ONCE = '1'
+    try { $r = & $runScript 'Restore-OpenWebUI.ps1' @('-Archive', $good.FullName, '-Force') } finally { $env:LOCALAI_TEST_FAIL_SWAP_ONCE = '' }
+    Assert-That ($r.Code -ne 0 -and $r.Text -match 'Rollback complete' -and (& $modelFiles) -eq 'm w') "a failed restore that is rolled back keeps both model folders (exit $($r.Code); found: $(& $modelFiles))"
+    # A restore that works, of an archive from before there was any cache folder. Open WebUI is
+    # looked for on a dead port, for a few seconds: it 'does not answer' (as in part 4b).
+    # With the mark of an update that had not answered when it ended, as part 4b shows
+    # Update-OpenWebUI.ps1 leaving it: only a restore that Open WebUI answers after may take it off.
+    $marked = Read-LaiState -Path $cfgFile
+    $marked['UpdatePending'] = @{ Version = ((Get-Image) -replace '^.*:', ''); Previous = '3.20'; Archive = '' }
+    Save-LaiState -State $marked -Path $cfgFile
+    # What a shell command in the volume prints, on one line.
+    $inVolume = { param([string]$Shell) (Invoke-DockerText @('run', '--rm', '-v', 'open-webui:/d', 'alpine:3.20', 'sh', '-c', $Shell)) -replace '\s+', ' ' }
+    & $noAnswer
+    try { $r = & $runScript 'Restore-OpenWebUI.ps1' @('-Archive', $good.FullName, '-Force') }
+    finally { & $answersNow }
+    $leftStaging = Invoke-DockerText @('run', '--rm', '-v', 'open-webui:/d', 'alpine:3.20', 'ls', '-a', '/d')
+    Assert-That ($r.Code -eq 0 -and $r.Text -match "now holds $([regex]::Escape($good.Name))" -and (& $modelFiles) -eq 'm w' -and $leftStaging -notmatch '\.restore-') "a restore keeps both model folders, and leaves no staging folder (exit $($r.Code); found: $(& $modelFiles))"
+    Assert-That ($r.Text -match 'did not answer within .*may still be fetching its document-search models') 'when Open WebUI does not answer after a restore, it says the models may still be downloading'
+    Assert-That ($r.Text -match "to go back to that data: .*Restore-OpenWebUI\.ps1' .*-Archive '[^']*-pre-restore\.tar\.gz'" -and $r.Text -notmatch 'to go back to that data: .*-SkipSafetyBackup') 'and prints the command that goes back to the copy from before the restore (one that takes a safety backup itself)'
+    Assert-That ($r.Text -match 'It goes with the Open WebUI version that was running before this restore.*switch it back first.*to go back to that data') 'and says before that command which Open WebUI version the copy goes with (a rollback switches the version too)'
+    Assert-That ((Read-LaiState -Path $cfgFile).ContainsKey('UpdatePending')) 'a restore that Open WebUI does not answer after leaves the mark of an update that had not answered'
+
+    # An archive that brings its own models (backups from before the two folders were left out do):
+    # its folder wins, and the one in the volume is not moved inside it. Open WebUI answers this time.
+    $ownDir = Join-Path $Work 'own-models'
+    New-Item -ItemType Directory -Force -Path $ownDir | Out-Null
+    Invoke-DockerText @('run', '--rm', '-v', 'open-webui:/d:ro', '-v', "${ownDir}:/o", 'alpine:3.20', 'sh', '-c', 'mkdir -p /t/cache/embedding/models/BAAI && cp /d/webui.db /t/ && echo a > /t/cache/embedding/models/BAAI/weights && tar czf /o/with-models.tar.gz -C /t .') | Out-Null
+    $r = & $runScript 'Restore-OpenWebUI.ps1' @('-Archive', (Join-Path $ownDir 'with-models.tar.gz'), '-Force', '-SkipSafetyBackup')
+    $nested = & $inVolume 'ls -d /d/cache/embedding/models/models /d/cache/whisper/models/models 2>/dev/null; true'
+    Assert-That ($r.Code -eq 0 -and (& $modelFiles) -eq 'a w' -and -not $nested) "an archive with its own document-search models: its folder is the one in the volume afterwards, the old one is not moved inside it, and the speech models it lacks are kept (exit $($r.Code); found: $(& $modelFiles); nested: '$nested')"
+    Assert-That ($r.Text -match 'Open WebUI is back on' -and -not (Read-LaiState -Path $cfgFile).ContainsKey('UpdatePending')) 'a restore that Open WebUI answers after takes the mark of an update that had not answered off (it would outlive a recovery by hand)'
+
+    # A swap that failed or was cut off after the models had moved into the staging tree (here the
+    # speech models): the next swap begins by clearing that tree, and they went with it. And an
+    # unpacking that was cut off (.restore-partial, with the document-search models standing in for
+    # the first part of an older archive's folder): nothing is ever taken back from that.
+    & $inVolume 'mkdir -p /d/.restore-staging/cache/whisper /d/.restore-partial/cache/embedding && mv /d/cache/whisper/models /d/.restore-staging/cache/whisper/models && mv /d/cache/embedding/models /d/.restore-partial/cache/embedding/models && echo x > /d/.restore-staging/webui.db' | Out-Null
+    $planted = & $inVolume 'for f in /d/.restore-staging/cache/whisper/models/small /d/.restore-partial/cache/embedding/models/BAAI /d/cache/whisper/models /d/cache/embedding/models; do if [ -e $f ]; then echo $f; fi; done'
+    Assert-That ($planted -eq '/d/.restore-staging/cache/whisper/models/small /d/.restore-partial/cache/embedding/models/BAAI') "setup: the speech models sit in a staging tree a swap left behind, the document-search models in a cut-off unpacking ($planted)"
+    & $noAnswer
+    try { $r = & $runScript 'Restore-OpenWebUI.ps1' @('-Archive', $good.FullName, '-Force', '-SkipSafetyBackup') }
+    finally { & $answersNow }
+    $speech = & $inVolume 'cat /d/cache/whisper/models/small'
+    Assert-That ($r.Code -eq 0 -and $speech -eq 'w') "the next swap takes the models back out of a staging tree an earlier one left behind, before it clears that tree (exit $($r.Code); speech model: '$speech')"
+    $strays = & $inVolume 'ls -d /d/cache/embedding/models /d/.restore-staging /d/.restore-partial 2>/dev/null; true'
+    Assert-That (-not $strays) "and takes nothing from a cut-off unpacking, which may be half a folder; neither tree is left in the volume ('$strays')"
 
     Write-Host "`n=== 6. admin password rotation (real Open WebUI) ===" -ForegroundColor Cyan
     $credPath = Join-Path (Join-Path $aiRoot 'Secrets') 'openwebui-admin.json'

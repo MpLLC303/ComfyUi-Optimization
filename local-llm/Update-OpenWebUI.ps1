@@ -9,6 +9,13 @@
     in <AIRoot>\Stack\.env, so nothing changes until you run this. Data lives in the "open-webui"
     volume and survives the container being recreated.
 
+    An update whose new version does not answer within 10 minutes is remembered as one that had not
+    answered when it ended. Running the same update again then waits for Open WebUI once more and
+    says how it went (it never says 'Already on'). An update to another version first looks whether
+    Open WebUI answers by now; while it runs and still does not, that update is refused (-Rollback
+    goes back first), because its backup would hold the broken state and replace the rollback
+    point. While Open WebUI is stopped nothing can be seen, so both say to start it first.
+
 .EXAMPLE
     .\Update-OpenWebUI.ps1 -Latest              # newest GitHub release of Open WebUI
 .EXAMPLE
@@ -33,7 +40,8 @@ param(
     # right before it (Open WebUI migrates its database on upgrade, so the old image needs old data).
     # SearXNG is not changed by it; a SearXNG update prints its own way back (-SearxngVersion <old tag>).
     [switch]$Rollback,
-    # Skip the "type YES" confirmation of -Rollback.
+    # Skip the "type YES" confirmation of -Rollback. With -Version or -Latest: update all the same
+    # when the last update had not answered and Open WebUI still does not (without it that is refused).
     [switch]$Force
 )
 $ErrorActionPreference = 'Stop'
@@ -80,6 +88,25 @@ function Get-DockerResult {
 $config = Read-LaiState -Path $configPath
 $port = 3000; if ($config.ContainsKey('WebUIPort')) { $port = [int]$config['WebUIPort'] }
 $base = @('compose', '--project-directory', $stack, '-f', $compose)
+# How long a new version gets to answer. LOCALAI_TEST_WEBUI_WAIT_SEC: test hook, a shorter wait. It
+# counts only as a positive whole number: anything else keeps the 10 minutes.
+$waitSec = 600; $askedWait = 0
+if ($env:LOCALAI_TEST_WEBUI_WAIT_SEC -and [int]::TryParse([string]$env:LOCALAI_TEST_WEBUI_WAIT_SEC, [ref]$askedWait) -and $askedWait -gt 0) { $waitSec = $askedWait }
+
+function Clear-UpdatePending {
+    # Open WebUI answered: the last update is no longer one that had not answered (see UpdatePending below).
+    if (-not $config.ContainsKey('UpdatePending')) { return }
+    [void]$config.Remove('UpdatePending')
+    Save-LaiState -State $config -Path $configPath
+}
+function Test-WebUIContainerRunning {
+    # Is there an Open WebUI to wait for? $true while its container runs (one that keeps restarting
+    # counts as running). $false when it is stopped (Stop-LocalAI.ps1, 'docker stop'), gone, or
+    # Docker does not answer (Docker Desktop quit, or still starting): no answer then says nothing
+    # about the last update, and going back to the backup from before it is no advice to give.
+    $state = Get-DockerResult -Arguments @('inspect', '-f', '{{.State.Running}}', 'open-webui')
+    return [bool]($state.ExitCode -eq 0 -and $state.Text -match '(?m)^\s*true\s*$')
+}
 
 function Invoke-PullFirst {
     # Downloads the images for the new versions WITHOUT touching .env: docker compose takes a
@@ -138,16 +165,28 @@ $hold = Get-LaiWebUIHold -AIRoot $AIRoot
 if ($hold) { throw "Open WebUI is kept stopped after a failed restore ($($hold['Reason'])); updating now would start it on damaged data. Recover first: $($hold['Recover'])" }
 Repair-EnvFromRunning
 
+# The rollback point of the last update: the version before it and the backup taken right before it.
+# -Rollback works only with both, and with that archive still there.
+$prevVer = ''; $archive = ''
+if ($config.ContainsKey('PreviousOpenWebUIVersion')) { $prevVer = [string]$config['PreviousOpenWebUIVersion'] }
+if ($config.ContainsKey('RollbackArchive')) { $archive = [string]$config['RollbackArchive'] }
+$rbOk = [bool]($prevVer -and $archive -and (Test-Path -LiteralPath $archive))
+$archiveName = ''; if ($archive) { $archiveName = Split-Path -Leaf $archive }
+
 if ($Rollback) {
-    $prevVer = ''; $archive = ''
-    if ($config.ContainsKey('PreviousOpenWebUIVersion')) { $prevVer = [string]$config['PreviousOpenWebUIVersion'] }
-    if ($config.ContainsKey('RollbackArchive')) { $archive = [string]$config['RollbackArchive'] }
-    if (-not $prevVer -or -not $archive -or -not (Test-Path -LiteralPath $archive)) {
-        throw 'Nothing to roll back: no update with a backup is recorded (or its before-<version> backup is gone). Use Restore-OpenWebUI.ps1 -Archive <file> and Update-OpenWebUI.ps1 -Version <old> by hand.'
+    if (-not $rbOk) {
+        # The old image first, then the old data: restored first, the new version would start on the
+        # old data and migrate it again before the old image is there.
+        throw 'Nothing to roll back: no update with a backup is recorded (or its before-<version> backup is gone). By hand: Update-OpenWebUI.ps1 -Version <old> -SkipBackup first, then Restore-OpenWebUI.ps1 -Archive <file>.'
     }
     $cur = ((Get-Content -Encoding UTF8 -LiteralPath $envPath | Where-Object { $_ -like 'OPEN_WEBUI_VERSION=*' } | Select-Object -First 1) -replace '^OPEN_WEBUI_VERSION=', '')
-    Write-UpdateLog WARN "Rollback: Open WebUI $cur -> $prevVer, and the data from $(Split-Path -Leaf $archive) (chats since that update are lost; a safety backup of the current data is taken first)."
+    Write-UpdateLog WARN "Rollback: Open WebUI $cur -> $prevVer, and the data from $archiveName (chats since that update are lost; a safety backup of the current data is taken first)."
     if (-not $Force -and (Read-Host 'Type YES to roll back') -cne 'YES') { Write-UpdateLog INFO 'Nothing changed.'; exit 1 }
+    # The restore below takes a safety backup of its own (the data $cur migrated, from just before
+    # this rollback). It is the newest pre-restore archive that was not there before.
+    $backupDir = Join-Path $AIRoot 'Backups'
+    $safetyWere = @(Get-ChildItem -LiteralPath $backupDir -Filter 'open-webui-*-pre-restore.tar.gz' -ErrorAction SilentlyContinue | ForEach-Object { $_.FullName })
+    $safetyNew = $null
     $lock = Enter-LaiVolumeLock -TimeoutSec 900
     try {
         # Again under the lock: a restore that held it while this waited may have failed meanwhile.
@@ -174,11 +213,22 @@ if ($Rollback) {
             Invoke-Docker -Arguments ($base + @('up', '-d', 'open-webui'))
             throw "The restore step failed and was undone; Open WebUI $cur is running again on its current data."
         }
+        $safetyNew = Get-ChildItem -LiteralPath $backupDir -Filter 'open-webui-*-pre-restore.tar.gz' -ErrorAction SilentlyContinue | Where-Object { $safetyWere -notcontains $_.FullName } |
+            Sort-Object LastWriteTime -Descending | Select-Object -First 1  # lai-ok: objects
     } finally { Exit-LaiVolumeLock $lock }
     $config['OpenWebUIVersion'] = $prevVer
-    $config.Remove('PreviousOpenWebUIVersion'); $config.Remove('RollbackArchive')
+    # The update that was rolled back is no longer one to wait for (UpdatePending).
+    $config.Remove('PreviousOpenWebUIVersion'); $config.Remove('RollbackArchive'); $config.Remove('UpdatePending')
     Save-LaiState -State $config -Path $configPath
-    Wait-LaiWebUI -BaseUrl "http://127.0.0.1:$port" -TimeoutSec 600
+    try { Wait-LaiWebUI -BaseUrl "http://127.0.0.1:$port" -TimeoutSec $waitSec }
+    catch {
+        # Not a bare timeout: the only way back on screen would be the hint the restore printed for
+        # its safety backup, and that archive alone puts the data $cur migrated under $prevVer. The
+        # way back from here is the one of the by-hand advice above: the version first, then its data.
+        $why = "Open WebUI $prevVer did not come up after the rollback ($($_.Exception.Message)). It may still be starting: check 'docker logs --tail 80 open-webui'"
+        if (-not $safetyNew) { throw "$why." }
+        throw "$why. To return to Open WebUI $cur and the data from just before this rollback: Update-OpenWebUI.ps1 -Version $cur -SkipBackup first, then Restore-OpenWebUI.ps1 -Archive $(ConvertTo-LaiPsQuoted $safetyNew.FullName)"
+    }
     Write-UpdateLog OK "Rolled back to Open WebUI $((Invoke-LaiApi -Uri "http://127.0.0.1:$port/api/version").version)"
     & (Join-Path $PSScriptRoot 'Test-LocalAI.ps1') -AIRoot $AIRoot -Quick
     exit $LASTEXITCODE
@@ -198,9 +248,58 @@ $lines = @(Get-Content -Encoding UTF8 -LiteralPath $envPath)
 $currentSx = [string](($lines | Where-Object { $_ -like 'SEARXNG_VERSION=*' } | Select-Object -First 1) -replace '^SEARXNG_VERSION=', '')
 if ($SearxngVersion -and $SearxngVersion -eq $currentSx) { $SearxngVersion = '' }
 if (-not $Version -and -not $SearxngVersion) { Write-UpdateLog INFO 'Nothing to do: pass -Latest, -Version <tag> or -SearxngVersion <tag> (or -Rollback).'; exit 0 }
+# UpdatePending is saved with the rollback point, before .env is switched, and removed once Open
+# WebUI answers. Still there for the version .env names: that update had not answered when it ended
+# (its health wait timed out, or the run ended before it). 'Already on' would then say nothing about
+# Open WebUI, and an update to another version would back up the broken state and record that as
+# the rollback point, so the one archive from the working state is pruned later.
+# The mark says what was seen then, not what is true now: nothing takes it off between two runs of
+# this script (a restore that Open WebUI answers after does), so the update may have come up a
+# minute later and been in use for weeks. Hence the look at Open WebUI before anything is said,
+# and no word of -Rollback while Open WebUI is merely stopped: that swaps those weeks of chats for
+# the backup from before the update.
+$pendingNow = [bool]($current -and $config['UpdatePending'] -is [hashtable] -and [string]$config['UpdatePending']['Version'] -eq $current)
+$notRunning = "Open WebUI is not running (its container is stopped, or Docker Desktop is not up), so nothing was changed. The last update, to Open WebUI $current, had not answered when it ended; whether it has come up since shows only while it runs. Start it (Start menu > Local AI - Start again), then run this again."
 if ($Version -and $Version -eq $current) {
-    if (-not $SearxngVersion) { Write-UpdateLog OK "Already on $current"; exit 0 }
+    if ($pendingNow) {
+        # The same update again: look at Open WebUI, for as long as the update itself would. A
+        # container that is not running is not waited for (10 minutes, to end on -Rollback).
+        if (-not (Test-WebUIContainerRunning)) { throw $notRunning }
+        Write-UpdateLog INFO "The update to Open WebUI $current had not answered when it ended. Waiting for it again (up to $waitSec s)."
+        try { Wait-LaiWebUI -BaseUrl "http://127.0.0.1:$port" -TimeoutSec $waitSec }
+        catch {
+            $why = "Open WebUI $current did not come up ($($_.Exception.Message)). Check 'docker logs --tail 80 open-webui'"
+            if ($rbOk) { throw "$why, or undo with: Update-OpenWebUI.ps1 -Rollback" }
+            throw "$why. No backup from before that update is recorded, so there is nothing to roll back to."
+        }
+        Clear-UpdatePending
+        $running = (Invoke-LaiApi -Uri "http://127.0.0.1:$port/api/version").version
+        Write-UpdateLog OK "Open WebUI $running is up on http://localhost:$port (the update to $current came up after all)"
+        if ($rbOk) { Write-UpdateLog INFO "If this version misbehaves: Update-OpenWebUI.ps1 -Rollback (back to $prevVer with the data from $archiveName)" }
+        if (-not $SearxngVersion) { exit 0 }
+    } elseif (-not $SearxngVersion) { Write-UpdateLog OK "Already on $current"; exit 0 }
     $Version = ''   # SearXNG-only: leave Open WebUI and its rollback point alone
+} elseif ($Version -and $pendingNow -and -not $Force) {
+    # Another version on top of an update that had not answered. A short look first: it may have
+    # come up since (a first start that took longer than the wait). Before the lock, the backup and
+    # the download: a refusal changes nothing.
+    $containerUp = Test-WebUIContainerRunning
+    $answers = $false
+    if ($containerUp) {
+        try { Wait-LaiWebUI -BaseUrl "http://127.0.0.1:$port" -TimeoutSec ([Math]::Min(30, $waitSec)); $answers = $true }
+        catch { Write-Verbose "Open WebUI $current does not answer" }
+    }
+    if ($answers) { Clear-UpdatePending }
+    elseif (-not $rbOk) {
+        # No rollback point to protect and none to go back to: a refusal would leave no way on at
+        # all (-Rollback says 'Nothing to roll back').
+        $seenNow = 'is not running'; if ($containerUp) { $seenNow = 'does not answer now' }
+        Write-UpdateLog WARN "The last update, to Open WebUI $current, had not answered when it ended, Open WebUI $seenNow, and no backup from before it is recorded to roll back to. Updating to $Version on top of it."
+    }
+    elseif (-not $containerUp) { throw $notRunning }
+    else {
+        throw "The last update, to Open WebUI $current, had not answered when it ended, and Open WebUI does not answer now, so nothing was changed. The backup before an update to $Version would hold that state and take the place of the rollback point ($archiveName, from $prevVer). If it was started only just now, give it a few minutes and run this again ('docker logs --tail 80 open-webui' shows what it is doing). If it does not come up, go back first with Update-OpenWebUI.ps1 -Rollback and then update again. Add -Force to update all the same."
+    }
 }
 $pre = $null
 
@@ -224,8 +323,12 @@ try {
     if ($Version) {
         # Record the rollback point before the switch, not after success: if starting the new version
         # fails, -Rollback must work.
-        if ($pre) { $config['PreviousOpenWebUIVersion'] = $current; $config['RollbackArchive'] = $pre.FullName }
+        $preArchive = ''
+        if ($pre) { $preArchive = [string]$pre.FullName; $config['PreviousOpenWebUIVersion'] = $current; $config['RollbackArchive'] = $preArchive }
         else { [void]$config.Remove('PreviousOpenWebUIVersion'); [void]$config.Remove('RollbackArchive') }
+        # With it, the update as one that has not been seen to answer yet (also without a backup):
+        # removed after the health wait below, read by the next run when that wait never passed.
+        $config['UpdatePending'] = @{ Version = [string]$Version; Previous = [string]$current; Archive = $preArchive }
         Save-LaiState -State $config -Path $configPath
     }
     # The images are on disk now: from here a cut-off run only means the next Start again starts
@@ -252,11 +355,13 @@ if ($Version) {
     $config['OpenWebUIVersion'] = $Version
     Save-LaiState -State $config -Path $configPath
 }
-try { Wait-LaiWebUI -BaseUrl "http://127.0.0.1:$port" -TimeoutSec 600 }
+try { Wait-LaiWebUI -BaseUrl "http://127.0.0.1:$port" -TimeoutSec $waitSec }
 catch {
     if ($pre -and $Version) { throw "Open WebUI $Version did not come up ($($_.Exception.Message)). Check 'docker logs --tail 80 open-webui', or undo with: Update-OpenWebUI.ps1 -Rollback" }
     throw
 }
+# It answers: this update came up (and so did an earlier one that a SearXNG-only run found marked).
+Clear-UpdatePending
 $running = (Invoke-LaiApi -Uri "http://127.0.0.1:$port/api/version").version
 Write-UpdateLog OK "Open WebUI $running is up on http://localhost:$port (was $current)"
 if ($pre -and $Version) { Write-UpdateLog INFO "If this version misbehaves: Update-OpenWebUI.ps1 -Rollback (back to $current with the data from $($pre.Name))" }

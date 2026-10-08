@@ -17,6 +17,11 @@
          fails, the container is left stopped and the exact recovery command is printed.
     A machine-wide lock stops the scheduled backup from running at the same time.
 
+    A backup leaves out the document-search and speech models Open WebUI downloaded (about 7 GB).
+    The ones in the volume are kept through the swap, so Open WebUI does not fetch them again; only
+    a volume that had none (a new PC, a wiped volume) downloads them at the first start, which can
+    take longer than the 5 minutes this script waits for an answer.
+
     A backup carries the settings of its day, so once Open WebUI is back this install's own are
     applied again: its Ollama connection, sign-up off, and on the toolkit's presets no past-chat
     search, no code execution and (uncensored ones) no web search without being asked. An archive
@@ -69,8 +74,26 @@ function Invoke-Docker {
 
 # The archive is always mounted as /restore.tar.gz, so its file name never reaches the shell.
 # No double quotes anywhere in this script: Windows PowerShell 5.1 mangles them in native arguments.
-$swapScript = 'set -e; rm -rf /data/.restore-staging; mkdir /data/.restore-staging; ' +
-    'tar xzf /restore.tar.gz -C /data/.restore-staging; test -f /data/.restore-staging/webui.db; ' +
+# The second 'for' line: a backup leaves out the document-search and speech models Open WebUI
+# downloaded (cache/embedding/models and cache/whisper/models, about 7 GB), and the delete after it
+# takes all the volume holds. So the two folders move into the staging tree first and come back
+# with it, unless the archive brings its own. Every restore, and every rollback to a safety backup,
+# used to end with Open WebUI downloading them again.
+# The first 'for' line: a swap that failed or was cut off after that move left the two folders in
+# the staging tree, and this swap (the rollback to the safety backup, or the restore run again)
+# starts by clearing that tree. They go back to their place first, where the second line finds
+# them. Best effort (|| true): it only saves a download, and must never stop a restore.
+# The archive is unpacked next to the staging tree (.restore-partial) and renamed, so the staging
+# tree only ever holds a complete one: a models folder taken back from it is whole, never the
+# first part of one from an older archive (those still carry the models) whose unpacking was cut off.
+$swapScript = 'set -e; ' +
+    'for m in cache/embedding/models cache/whisper/models; do if [ -d /data/.restore-staging/$m ]; then if [ ! -e /data/$m ]; then ' +
+    'mkdir -p /data/${m%/*} && mv /data/.restore-staging/$m /data/$m || true; fi; fi; done; ' +
+    'rm -rf /data/.restore-staging /data/.restore-partial; mkdir /data/.restore-partial; ' +
+    'tar xzf /restore.tar.gz -C /data/.restore-partial; mv /data/.restore-partial /data/.restore-staging; ' +
+    'test -f /data/.restore-staging/webui.db; ' +
+    'for m in cache/embedding/models cache/whisper/models; do if [ -d /data/$m ]; then if [ ! -e /data/.restore-staging/$m ]; then ' +
+    'mkdir -p /data/.restore-staging/${m%/*}; mv /data/$m /data/.restore-staging/$m; fi; fi; done; ' +
     'find /data -mindepth 1 -maxdepth 1 ! -name .restore-staging -exec rm -rf {} +; ' +
     'cd /data/.restore-staging; find . -mindepth 1 -maxdepth 1 -exec mv {} /data/ \; ; ' +
     'cd /; rmdir /data/.restore-staging'
@@ -427,14 +450,42 @@ Clear-Hold 'Earlier failed restore cleared: Open WebUI may run again'
 # Why step 5 did not put this install's safety settings back; '' once it has.
 $notReapplied = 'Open WebUI was not running, so its settings could not be reached'
 if ($stoppedContainers.Count -gt 0) {
-    $config = Read-LaiState -Path (Join-Path $AIRoot 'localai-config.json')
+    $configPath = Join-Path $AIRoot 'localai-config.json'
+    $config = Read-LaiState -Path $configPath
     $port = 3000
     if ($config.ContainsKey('WebUIPort')) { $port = [int]$config['WebUIPort'] }
     $up = $false
-    try { Wait-LaiWebUI -BaseUrl "http://127.0.0.1:$port" -TimeoutSec 300; Write-LaiLog OK "Open WebUI is back on http://localhost:$port"; $up = $true }
+    # LOCALAI_TEST_WEBUI_WAIT_SEC: test hook, a shorter wait. It counts only as a positive whole
+    # number: anything else keeps the 5 minutes.
+    $waitSec = 300; $askedWait = 0
+    if ($env:LOCALAI_TEST_WEBUI_WAIT_SEC -and [int]::TryParse([string]$env:LOCALAI_TEST_WEBUI_WAIT_SEC, [ref]$askedWait) -and $askedWait -gt 0) { $waitSec = $askedWait }
+    try { Wait-LaiWebUI -BaseUrl "http://127.0.0.1:$port" -TimeoutSec $waitSec; Write-LaiLog OK "Open WebUI is back on http://localhost:$port"; $up = $true }
     catch {
-        Write-LaiLog WARN "Data restored, but Open WebUI did not answer within 5 minutes: check 'docker logs --tail 100 $Container'."
+        # The models a backup leaves out came along in the swap if the volume had them. A volume that
+        # had none (a new one, or the models were deleted) makes Open WebUI download them at this start.
+        Write-LaiLog WARN "Data restored, but Open WebUI did not answer within $([math]::Round($waitSec / 60, 1)) minutes. It may still be fetching its document-search models (several GB, when the volume had none): give it some minutes, and check 'docker logs --tail 100 $Container'."
+        if ($safety) {
+            # That copy fits the version that ran before this restore. Update-OpenWebUI.ps1 -Rollback
+            # switches the version right before it calls this script: put back by itself there, the
+            # copy would land the data the newer version migrated under the older image.
+            Write-LaiLog INFO ("If it does not come up, the data from before this restore is in $($safety.Name). It goes with the Open WebUI version that was running before this restore: where the version was switched as well (Update-OpenWebUI.ps1 -Rollback does that), switch it back first. " +
+                "Then, to go back to that data: & $(ConvertTo-LaiPsQuoted (Join-Path $PSScriptRoot 'Restore-OpenWebUI.ps1')) -AIRoot $(ConvertTo-LaiPsQuoted $AIRoot) -Archive $(ConvertTo-LaiPsQuoted $safety.FullName)")
+        }
         $notReapplied = 'Open WebUI did not answer'
+    }
+    if ($up) {
+        # Update-OpenWebUI.ps1 marks an update whose new version had not answered when it ended
+        # (UpdatePending) and takes the mark off in a later run of its own. Open WebUI answers now,
+        # so the mark goes here as well: after a recovery by hand (the old version, then this
+        # restore) it would sit on a healthy install, and the next update would speak of an update
+        # that had not answered. Read again first: the wait above can take minutes.
+        try {
+            $configNow = Read-LaiState -Path $configPath
+            if ($configNow.ContainsKey('UpdatePending')) {
+                [void]$configNow.Remove('UpdatePending')
+                Save-LaiState -State $configNow -Path $configPath
+            }
+        } catch { Write-Verbose "the update mark stays: $($_.Exception.Message)" }
     }
 
     # 5. The restored database carries the settings from when the backup was taken, including the
