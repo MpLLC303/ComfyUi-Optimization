@@ -96,8 +96,10 @@ $files = Get-ChildItem -Path $Root -Recurse -File -Include *.ps1, *.psm1, *.psd1
 #            that hands it all back or that this check cannot read (privileged, ALL under cap_add,
 #            a '<<' merge or 'extends' at the service's own level, a key not written plainly).
 #   TESTHOOK a script outside tests (.ps1, .psm1) that takes something from a test and is not on the
-#            pinned list ($testHookPins: what main held when this rule came, one entry per file and
-#            name). Two things count. A read of a test variable from the environment: a name that
+#            pinned list ($testHookPins: what main held when this rule came, less what has gone
+#            since, plus the test parameters that took the place of reads from the environment,
+#            each with its reason above it; one entry per file and name). Two things count. A
+#            read of a test variable from the environment: a name that
 #            begins LOCALAI_TEST_, or LOCALAI_DOCKER_TIMEOUT, or LOCALAI_TS_TIMEOUT, read as
 #            $env:NAME, as [Environment]::GetEnvironmentVariable('NAME'), or through Get-Item,
 #            Get-Content, Get-ChildItem or Test-Path (or an alias of one) on Env:NAME. And a
@@ -718,7 +720,8 @@ function Find-TestHookProblem($Hits, [string[]]$Pins = @()) {
     return $out.ToArray()
 }
 
-# Rule TESTHOOK: what main held when the rule came. One entry per file, kind and name, each
+# Rule TESTHOOK: what main held when the rule came, less what has gone since, plus the two test
+# parameters named further down in this comment. One entry per file, kind and name, each
 # written out (Find-TestHookProblem compares whole entries). Nothing is added here for a new read
 # from the environment; an entry whose read or parameter is gone must go too. Gone, not moved: a
 # read that went into a helper, into a name put together at run time or into text for another

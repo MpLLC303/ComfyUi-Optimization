@@ -4228,6 +4228,12 @@ function Get-LaiPresetToolRisk {
     # preset safe that is not. A switch that is missing, null, true, a text or spelt another way
     # counts as on, and so does every switch of a set (builtinTools, capabilities) that is not
     # there under its exact name. Code execution has two switches and counts as on when either does.
+    # Exact means character for character. The names are held against a pattern that begins with
+    # \A and ends with \z (-cmatch, -cnotmatch), never with -ceq, -cne or -ccontains: those go by
+    # the rules of a language, for which 'chats' followed by a soft hyphen (U+00AD), by a
+    # zero-width joiner or by a NUL is the same word as 'chats'. Open WebUI reads the exact key,
+    # finds none under such a name and takes the switch for on. (The names of the shared list are
+    # letters and underscores, so they are their own pattern.)
     param($Meta)
     # For each of the two sets, the names in it that are written out as false.
     $off = @{ builtinTools = @(); capabilities = @() }
@@ -4236,7 +4242,7 @@ function Get-LaiPresetToolRisk {
     elseif ($null -ne $Meta) { foreach ($p in $Meta.PSObject.Properties) { $sets += , @([string]$p.Name, $p.Value) } }
     foreach ($set in $sets) {
         $setName = $set[0]; $switches = $set[1]
-        if ($setName -cne 'builtinTools' -and $setName -cne 'capabilities') { continue }
+        if ($setName -cnotmatch '\A(builtinTools|capabilities)\z') { continue }
         $names = @()
         if ($switches -is [System.Collections.IDictionary]) {
             foreach ($k in @($switches.PSBase.Keys)) { if ($switches[$k] -is [bool] -and -not $switches[$k]) { $names += [string]$k } }
@@ -4246,12 +4252,12 @@ function Get-LaiPresetToolRisk {
         $off[$setName] = $names
     }
     $risks = @()
-    if ($off['builtinTools'] -cnotcontains 'chats') { $risks += 'read past chats' }
-    if ($off['builtinTools'] -cnotcontains 'code_interpreter' -or $off['capabilities'] -cnotcontains 'code_interpreter') { $risks += 'run code' }
+    if (@(@($off['builtinTools']) -cmatch '\Achats\z').Count -eq 0) { $risks += 'read past chats' }
+    if (@(@($off['builtinTools']) -cmatch '\Acode_interpreter\z').Count -eq 0 -or @(@($off['capabilities']) -cmatch '\Acode_interpreter\z').Count -eq 0) { $risks += 'run code' }
     $writing = @()
     foreach ($name in $script:LaiPresetToolsOff) {
         if ($name -ceq 'chats' -or $name -ceq 'code_interpreter') { continue }
-        if ($off['builtinTools'] -cnotcontains $name) { $writing += $name }
+        if (@(@($off['builtinTools']) -cmatch ('\A' + $name + '\z')).Count -eq 0) { $writing += $name }
     }
     if ($writing.Count -gt 0) { $risks += ('use its ' + ($writing -join ', ') + ' tools') }
     return $risks
@@ -4308,7 +4314,10 @@ function Invoke-LaiPresetSafety {
     $found = @(); $seen = @()
     foreach ($m in $Entries) {
         $id = [string]$m.Preset
-        if (-not $id -or $seen -ccontains $id) { continue }
+        # Each id once, held against the ones before it character for character (IndexOf), not
+        # with -ccontains: for that an id with a soft hyphen in it is the id without, and an entry
+        # under such a name, listed first, would take the real preset out of this walk.
+        if (-not $id -or [array]::IndexOf($seen, $id) -ge 0) { continue }
         $seen += $id
         $existing = Get-LaiWebUIModel -BaseUrl $BaseUrl -Token $Token -Id $id
         if (-not $existing) { continue }

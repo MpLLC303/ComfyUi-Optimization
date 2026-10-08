@@ -27,8 +27,11 @@
       against a docker stand-in that is slow to start or never comes up.
     - Scheduled tasks: the no-window launch (conhost --headless), the daily-time math, and native
       calls with a time limit (a CLI that never answers is stopped, not waited on).
+    - Reset-Sandbox.ps1: a restore's helper container that is still there counts as a leftover
+      (the rule, taken from the script's own text).
     - Test-LocalAI: the module's judge of a preset's switches (past chats, code and the seven
-      writing tools, by their exact names) on canned input; the row for a toolkit preset that is
+      writing tools, by their exact names, character for character: a name with a soft hyphen or
+      a NUL behind it is another name) on canned input; the row for a toolkit preset that is
       in Open WebUI without being selected; the wait for a held volume lock (-LockWaitSec), after
       which a stopped Open WebUI is a failure, with the two rows that can meet it run from their
       own text and one whole health check in a child process under a lock another process holds;
@@ -36,7 +39,9 @@
       verdict (SKIP with words in both check scripts, never a PASS), every row ending in a
       verdict, and on Windows a port listening beyond localhost (the research agent's too).
     - Presets in Open WebUI: Protect-LaiPresetForm and Invoke-LaiPresetSafety, which hold every
-      catalog preset safe, selected or not, against an Open WebUI that is a table in memory.
+      catalog preset safe, selected or not, against an Open WebUI that is a table in memory (a
+      switch under a look-alike name and a preset id with a soft hyphen behind it included); and
+      that the installer's walk reads the catalog in use and the toolkit's own.
     - The installer's look at a models folder follows no link: a junction on Windows, a symbolic
       link on Linux.
     - Test-PCSecurity: its helpers (driver matcher, redaction, ACL/port verdicts, ComfyUI scan), the
@@ -98,6 +103,24 @@ if ($PSVersionTable.PSEdition -eq 'Desktop') { $childExe = 'powershell.exe' }
 
 Import-Module (Join-Path (Join-Path $src 'lib') 'LocalAI.psm1') -Force
 Assert-That ($null -ne (Get-Command Get-LaiShortcutSpecs -ErrorAction SilentlyContinue)) 'module imports and exports its functions'
+
+# ---- the sandbox's leftover check ---------------------------------------------------------------
+Write-Host "`n=== Reset-Sandbox: which containers count as a test's ===" -ForegroundColor Cyan
+# A restore runs its swap in two helper containers, localai-restore-<volume>-unpack and -move, and
+# ends them itself. One that is still there after a suite matched none of the rules of
+# tests/Reset-Sandbox.ps1, so the check said 'clean' with a container writing into the volume the
+# next suite starts on. The rule ($isTest) is taken from the script's own text and asked about
+# names; the label lookup at its end is answered by an engine that knows no label.
+$sbxAst = [System.Management.Automation.Language.Parser]::ParseFile((Join-Path $PSScriptRoot 'Reset-Sandbox.ps1'), [ref]$null, [ref]$null)
+$sbxRule = @($sbxAst.FindAll({ param($n) $n -is [System.Management.Automation.Language.AssignmentStatementAst] -and [string]$n.Left.Extent.Text -eq '$isTest' }, $true))
+$sbxWant = @{ 'localai-restore-open-webui-unpack' = $true; 'localai-restore-open-webui-move' = $true; 'localai-restore-lai-deep-test-unpack' = $true; 'searxng' = $false; 'ollama-test' = $false; 'my-localai-restore-x' = $false }
+$sbxIs = @{}
+if ($sbxRule.Count -eq 1) {
+    $sbxAsk = [scriptblock]::Create('param($name, $image, $project) $testProjects = @(''lai-update-test''); $standInNames = @(''open-webui''); function Invoke-DockerCli { [pscustomobject]@{ Code = 0; Out = @('''') } }; ' + $sbxRule[0].Right.Extent.Text)
+    foreach ($sbxName in @($sbxWant.Keys)) { $sbxIs[$sbxName] = [bool](& $sbxAsk $sbxName 'alpine:3.20' '') }
+}
+$sbxWrong = @($sbxWant.Keys | Where-Object { -not $sbxIs.ContainsKey($_) -or $sbxIs[$_] -ne $sbxWant[$_] })
+Assert-That ($sbxRule.Count -eq 1 -and $sbxWrong.Count -eq 0) "the sandbox's leftover check takes a helper container of a restore that is still there (localai-restore-<volume>-unpack or -move) for a leftover, and none of the sandbox's own services (not so: $($sbxWrong -join ', '))"
 
 # ---- state round trip -------------------------------------------------------------------------
 Write-Host "`n=== state files ===" -ForegroundColor Cyan
@@ -1312,7 +1335,11 @@ $riskOf = { param([string]$Json, [switch]$AsTable)
 $writingNames = @('notes', 'tasks', 'automations', 'calendar', 'notifications', 'channels', 'subagents')
 $sevenOff = @($writingNames | ForEach-Object { '"' + $_ + '":false' }) -join ','
 $allOn = '[read past chats and run code and use its ' + ($writingNames -join ', ') + ' tools]'
-$chatsOn = @(); $nothingOff = @(); $switchesOff = ''; $codeOn = @(); $codeUnread = @(); $bothOn = ''; $oldSeven = ''; $notBool = @(); $setCased = @(); $asTable = @()
+$chatsOn = @(); $nothingOff = @(); $switchesOff = ''; $codeOn = @(); $codeUnread = @(); $bothOn = ''; $oldSeven = ''; $notBool = @(); $setCased = @(); $setUnseen = @(); $asTable = @()
+# A soft hyphen (U+00AD) and a NUL the way JSON writes them in a name. Each is put together from two
+# pieces: written out in one piece, a tool that resolves such escapes can put the character itself
+# into this file, which is ASCII.
+$jsonShy = '\u' + '00ad'; $jsonNul = '\u' + '0000'
 if ($judgeThere) {
     $chatsOn = @((& $riskOf ('{"builtinTools":{"chats":true,"code_interpreter":false,' + $sevenOff + '},"capabilities":{"code_interpreter":false}}')),
         (& $riskOf ('{"builtinTools":{"code_interpreter":false,' + $sevenOff + '},"capabilities":{"code_interpreter":false}}')))
@@ -1340,6 +1367,13 @@ if ($judgeThere) {
     # A set under a look-alike name is not the set Open WebUI reads: every switch in it counts as on.
     $setCased = @((& $riskOf ('{"BuiltinTools":{"chats":false,"code_interpreter":false,' + $sevenOff + '},"capabilities":{"code_interpreter":false}}')),
         (& $riskOf ('{"builtinTools":{"chats":false,"code_interpreter":false,' + $sevenOff + '},"Capabilities":{"code_interpreter":false}}')))
+    # The same goes for a set whose name has a character in or behind it that does not show (a soft
+    # hyphen inside builtinTools, a NUL behind capabilities), read as an object and held as a table.
+    # PowerShell's -cne and -ccontains take such a name for the exact one; Open WebUI does not.
+    $setUnseen = @((& $riskOf ('{"builtin' + $jsonShy + 'Tools":{"chats":false,"code_interpreter":false,' + $sevenOff + '},"capabilities":{"code_interpreter":false}}')),
+        (& $riskOf ('{"builtin' + $jsonShy + 'Tools":{"chats":false,"code_interpreter":false,' + $sevenOff + '},"capabilities":{"code_interpreter":false}}') -AsTable),
+        (& $riskOf ('{"builtinTools":{"chats":false,"code_interpreter":false,' + $sevenOff + '},"capabilities' + $jsonNul + '":{"code_interpreter":false}}')),
+        (& $riskOf ('{"builtinTools":{"chats":false,"code_interpreter":false,' + $sevenOff + '},"capabilities' + $jsonNul + '":{"code_interpreter":false}}') -AsTable))
     # The same meta as a table gets the same word: all off, the old seven, and a look-alike key.
     $asTable = @((& $riskOf ('{"builtinTools":{"chats":false,"code_interpreter":false,' + $sevenOff + '},"capabilities":{"code_interpreter":false}}') -AsTable),
         (& $riskOf '{"builtinTools":{"chats":false,"code_interpreter":false},"capabilities":{"code_interpreter":false}}' -AsTable),
@@ -1353,17 +1387,23 @@ Assert-That ($codeUnread.Count -eq 6 -and @($codeUnread | Where-Object { $_ -ceq
 Assert-That ($oldSeven -ceq ('[use its ' + ($writingNames -join ', ') + ' tools]')) "a preset with the seven switches of an install from before the writing tools were switched off is not safe: past chats and code are off in it, and the writing tools, whose switches are missing, are named as on ($oldSeven)"
 Assert-That ($notBool.Count -eq 3 -and @($notBool | Where-Object { $_ -ceq '[read past chats]' }).Count -eq 3) "off is the boolean false only: a 0, the text 'false' and an empty text count as on ($($notBool -join ' | '))"
 Assert-That ($setCased.Count -eq 2 -and $setCased[0] -ceq $allOn -and $setCased[1] -ceq '[run code]') "a set of switches under a look-alike name (BuiltinTools, Capabilities) is not the one Open WebUI reads, so what it would switch off counts as on ($($setCased -join ' | '))"
+Assert-That ($setUnseen.Count -eq 4 -and $setUnseen[0] -ceq $allOn -and $setUnseen[1] -ceq $allOn -and $setUnseen[2] -ceq '[run code]' -and $setUnseen[3] -ceq '[run code]') "a set of switches under a name with a character that does not show (a soft hyphen inside builtinTools, a NUL behind capabilities) is not the one Open WebUI reads either, read as an object or held as a table: what it would switch off counts as on ($($setUnseen -join ' | '))"
 Assert-That ($asTable.Count -eq 3 -and $asTable[0] -ceq '[]' -and $asTable[1] -ceq ('[use its ' + ($writingNames -join ', ') + ' tools]') -and $asTable[2] -ceq '[read past chats]') "the same meta held as a table gets the same word as the object Open WebUI returns, a look-alike key included ($($asTable -join ' | '))"
-# Each switch by itself, in each of the four ways it can fail to be off: missing, null, true, and
-# false under a look-alike name ('Chats' for 'chats': PowerShell's own $tools.chats reads that as
-# off, Open WebUI does not read it at all). The nine switches under builtinTools and the code switch
-# under capabilities, every other switch off: the judge names exactly the one.
+# Each switch by itself, in each of the ways it can fail to be off: missing, null, true, and false
+# under a look-alike name ('Chats' for 'chats': PowerShell's own $tools.chats reads that as off,
+# Open WebUI does not read it at all; and the name with a soft hyphen or a NUL behind it, which
+# PowerShell's -ceq and -ccontains take for the name itself: the judge compared with those, and
+# called a preset safe whose switch Open WebUI did not find). The nine switches under builtinTools
+# and the code switch under capabilities, every other switch off: the judge names exactly the one.
 $rkTools = @('chats', 'code_interpreter') + $writingNames
 $rkSwitch = { param([string]$Name, [string]$Shape)
     if ($Shape -eq 'missing') { return '' }
     if ($Shape -eq 'null') { return ('"' + $Name + '":null') }
     if ($Shape -eq 'true') { return ('"' + $Name + '":true') }
     if ($Shape -eq 'mis-cased') { return ('"' + $Name.Substring(0, 1).ToUpperInvariant() + $Name.Substring(1) + '":false') }
+    # The name with a character behind it that does not show: a soft hyphen, a NUL.
+    if ($Shape -eq 'soft-hyphen') { return ('"' + $Name + $jsonShy + '":false') }
+    if ($Shape -eq 'trailing-nul') { return ('"' + $Name + $jsonNul + '":false') }
     return ('"' + $Name + '":false')
 }
 $rkMetaWith = { param([string]$Set, [string]$Name, [string]$Shape)
@@ -1373,23 +1413,29 @@ $rkMetaWith = { param([string]$Set, [string]$Name, [string]$Shape)
     '{"builtinTools":{' + ($rkT -join ',') + '},"capabilities":{' + $rkC + '}}'
 }
 $rkBad = @{}
-foreach ($rkShape in 'missing', 'null', 'true', 'mis-cased') {
+foreach ($rkShape in 'missing', 'null', 'true', 'mis-cased', 'soft-hyphen', 'trailing-nul') {
     $rkBad[$rkShape] = @('the judge is not there')
     if (-not $judgeThere) { continue }
     $rkBad[$rkShape] = @()
-    foreach ($rkName in $rkTools) {
-        $rkWant = "[use its $rkName tools]"
-        if ($rkName -eq 'chats') { $rkWant = '[read past chats]' } elseif ($rkName -eq 'code_interpreter') { $rkWant = '[run code]' }
-        $rkGot = & $riskOf (& $rkMetaWith 'builtinTools' $rkName $rkShape)
-        if ($rkGot -cne $rkWant) { $rkBad[$rkShape] += "builtinTools.$rkName gave $rkGot" }
+    # A name with a character that does not show is also judged as a table, which is how a form is held.
+    $rkAsTable = @($false); if ($rkShape -eq 'soft-hyphen' -or $rkShape -eq 'trailing-nul') { $rkAsTable = @($false, $true) }
+    foreach ($rkTable in $rkAsTable) {
+        foreach ($rkName in $rkTools) {
+            $rkWant = "[use its $rkName tools]"
+            if ($rkName -eq 'chats') { $rkWant = '[read past chats]' } elseif ($rkName -eq 'code_interpreter') { $rkWant = '[run code]' }
+            $rkGot = & $riskOf (& $rkMetaWith 'builtinTools' $rkName $rkShape) -AsTable:$rkTable
+            if ($rkGot -cne $rkWant) { $rkBad[$rkShape] += "builtinTools.$rkName gave $rkGot (as a table: $rkTable)" }
+        }
+        $rkGot = & $riskOf (& $rkMetaWith 'capabilities' 'code_interpreter' $rkShape) -AsTable:$rkTable
+        if ($rkGot -cne '[run code]') { $rkBad[$rkShape] += "capabilities.code_interpreter gave $rkGot (as a table: $rkTable)" }
     }
-    $rkGot = & $riskOf (& $rkMetaWith 'capabilities' 'code_interpreter' $rkShape)
-    if ($rkGot -cne '[run code]') { $rkBad[$rkShape] += "capabilities.code_interpreter gave $rkGot" }
 }
 Assert-That ($rkBad['missing'].Count -eq 0) "a switch that is missing counts as on, each of the ten by itself: past chats, the two code switches and the seven writing tools (not so: $($rkBad['missing'] -join '; '))"
 Assert-That ($rkBad['null'].Count -eq 0) "a switch that is null counts as on, each of the ten by itself (not so: $($rkBad['null'] -join '; '))"
 Assert-That ($rkBad['true'].Count -eq 0) "a switch that is true counts as on, each of the ten by itself (not so: $($rkBad['true'] -join '; '))"
 Assert-That ($rkBad['mis-cased'].Count -eq 0) "a switch that is false under a look-alike name ('Chats', 'Notes', 'Code_interpreter') counts as on: Open WebUI reads the exact name only (not so: $($rkBad['mis-cased'] -join '; '))"
+Assert-That ($rkBad['soft-hyphen'].Count -eq 0) "a switch that is false under its name with a soft hyphen behind it (U+00AD: it does not show, and PowerShell's -ceq and -ccontains do not see it) counts as on, each of the ten by itself, read as an object and held as a table: Open WebUI reads the exact name only (not so: $($rkBad['soft-hyphen'] -join '; '))"
+Assert-That ($rkBad['trailing-nul'].Count -eq 0) "and so does a switch that is false under its name with a NUL behind it (not so: $($rkBad['trailing-nul'] -join '; '))"
 # The Preset row asks that judge before the image switch and before any warning (either would otherwise
 # be all the row says), and its sentence, taken from the row's source, is word for word the one below.
 $presetRow = $hcAst.Find({ param($n) $n -is [System.Management.Automation.Language.CommandAst] -and $n.GetCommandName() -eq 'Add-Check' -and $n.CommandElements.Count -eq 3 -and [string]$n.CommandElements[1].Extent.Text -ceq '"Preset $($m.Display)"' }, $true)
@@ -1476,8 +1522,11 @@ $ukShort = Join-Path $Work 'short-catalog.psd1'
 $ukBroken = Join-Path $Work 'broken-catalog.psd1'
 Set-Content -LiteralPath $ukShort -Encoding UTF8 -Value "@{ DefaultPreset = 'local-main'; ContextCandidates = @(8192); Models = @(@{ Key = 'main'; Display = 'Only Main'; Preset = 'local-main' }) }"
 Set-Content -LiteralPath $ukBroken -Encoding UTF8 -Value '@{ Models = @( this is not a data file'
-$ukBoth = @(); $ukShortIds = @(); $ukTwice = @(); $ukGone = @(); $ukBrokenIds = @(); $ukBrokenUnread = @()
+$ukBoth = @(); $ukShortIds = @(); $ukTwice = @(); $ukGone = @(); $ukBrokenIds = @(); $ukBrokenUnread = @(); $ukLook = @()
+# 'local-main' with a soft hyphen (U+00AD) behind it: for -ccontains the same id, for Open WebUI another.
+$ukLookId = 'local-main' + [char]0x00AD
 if ($unselDefs.Count -eq 1) {
+    $ukLook = @((& $unselOf @($ukShort) @($ukLookId)).Entries | ForEach-Object { [string]$_.Preset })
     $ukBoth = @((& $unselOf @($ukTest, $ukOwn) @('local-main', 'local-fast')).Entries | ForEach-Object { [string]$_.Preset })
     $ukShortIds = @((& $unselOf @($ukShort, $ukOwn) @('local-main')).Entries | ForEach-Object { [string]$_.Preset })
     $ukTwice = @((& $unselOf @($ukOwn, $ukOwn) @()).Entries | ForEach-Object { [string]$_.Preset })
@@ -1492,6 +1541,16 @@ Assert-That ($ukShortIds.Count -eq ($ukOwnIds.Count - 1) -and $ukShortIds -ccont
 Assert-That ($ukTwice.Count -eq $ukOwnIds.Count -and $ukOwnIds.Count -ge 7) "the same catalog given twice lists each preset once, and with nothing selected all of them ($($ukTwice.Count) of $($ukOwnIds.Count))"
 Assert-That ($ukGone.Count -eq 1 -and $ukGone[0] -ceq 'local-main') "a catalog file that is not there, or no file name at all, is passed over and the others are read ($($ukGone -join ', '))"
 Assert-That ($ukBrokenIds.Count -eq 1 -and $ukBrokenIds[0] -ceq 'local-main' -and $ukBrokenUnread.Count -eq 1 -and ([string]$ukBrokenUnread[0]).StartsWith("$ukBroken (")) "a catalog that cannot be read is named as unread, which the health check fails, and the others are still listed ($($ukBrokenIds -join ', '); unread: $($ukBrokenUnread -join ' | '))"
+Assert-That ($ukLook.Count -eq 1 -and [string]::Equals([string]$ukLook[0], 'local-main', [System.StringComparison]::Ordinal)) "a selected id that only looks like a catalog preset's (the same letters with a soft hyphen behind them, which -ccontains takes for the same id) does not take that preset out of the check: ids are held against each other character for character ($($ukLook.Count) listed)"
+# The installer's walk reads the same two lists as the health check: the catalog its run uses, which
+# a variable of the user's can replace with another file, and always the toolkit's own next to the
+# script. With the first alone, a preset left out of that file was never made safe, and the health
+# check, which read both, failed it and named Update toolkit as the fix, run after run.
+$walkAst = [System.Management.Automation.Language.Parser]::ParseFile((Join-Path $src 'Install-LocalAI.ps1'), [ref]$null, [ref]$null)
+$walkSet = @($walkAst.FindAll({ param($n) $n -is [System.Management.Automation.Language.AssignmentStatementAst] -and [string]$n.Left.Extent.Text -eq '$presetSafety' }, $true))
+$walkFrom = ''; if ($walkSet.Count -eq 1) { $walkFrom = [string]$walkSet[0].Right.Extent.Text }
+Assert-That ($walkSet.Count -eq 1 -and $walkFrom -cmatch '^@\(Invoke-LaiPresetSafety ' -and $walkFrom -cnotmatch '-ReadOnly' -and $walkFrom.Contains('@((Get-LaiCatalog -Path $CatalogPath -IncludeTrials).Models)') -and
+    $walkFrom.Contains("@((Get-LaiCatalog -Path (Join-Path (Join-Path `$SourceRoot 'config') 'models.psd1') -IncludeTrials).Models)")) "the installer's walk over the toolkit's presets takes its entries from the catalog in use and, always, from config\models.psd1 next to the script, so that a variable naming another catalog takes no preset out of it ($walkFrom)"
 # Open WebUI found down while the volume lock is held. A backup, restore or update holds that lock and
 # stops Open WebUI for a few minutes, and the health check took any held lock for one of them: the row
 # was a warning, the rows behind it skipped, and the run ended '0 failures' with exit code 0 for as
@@ -2611,6 +2670,7 @@ $psEntries = @(@{ Key = 'trial-x'; Preset = 'trial-x'; Display = 'Trial X'; Tria
 $psSeed = { & $psMod { param($Old, $Clean, $Official) $script:PsStore = @{ 'trial-x' = $Old; 'local-fast' = $Clean; 'official-main' = $Official }; $script:PsPosts.Clear(); $script:PsKeeps = $true; $script:PsRefuses = $false } $pfJson $psCleanJson $psOfficialJson }
 $psRead = @(); $psReadPosts = @('not run'); $psReadKept = ''; $psDone = @(); $psDonePosts = @(); $psAfter = @{ Kept = ''; Official = ''; Ids = @() }; $psAgain = @(); $psAgainPosts = @('not run'); $psNotKept = ''; $psRefused = ''; $psRefusedKept = ''
 $psAuto = @(); $psAutoKept = ''; $psAutoJson = $psCleanJson.Replace('"defaultFeatureIds":[]', '"defaultFeatureIds":["web_search"]')
+$psLook = @(); $psLookPosts = @('not run'); $psLookKept = ''; $psLookJson = $psCleanJson.Replace('"chats":false', ('"chats' + $jsonShy + '":false'))
 if ($psThere) {
     & $psSeed
     $psRead = @(Invoke-LaiPresetSafety -Token 't' -Entries $psEntries -ReadOnly)
@@ -2636,6 +2696,17 @@ if ($psThere) {
     & $psMod { param($Auto) $script:PsStore['local-fast'] = $Auto } $psAutoJson
     $psAuto = @(Invoke-LaiPresetSafety -Token 't' -Entries @($psEntries[1]))
     $psAutoKept = [string](& $psMod { $script:PsStore['local-fast'] })
+    # A preset whose past-chat switch is false under a look-alike name (chats with a soft hyphen,
+    # U+00AD, behind it): Open WebUI finds no 'chats' there, which is on. Before it in the list, an
+    # entry whose preset id is that preset's id with a soft hyphen behind it, with a safe preset
+    # of its own. The store keeps its names character for character here, as Open WebUI does (a
+    # PowerShell table takes the two ids for one).
+    $psLookId = 'local-fast' + [char]0x00AD
+    & $psSeed
+    & $psMod { param($LookId, $Decoy, $Open) $script:PsStore = New-Object 'System.Collections.Generic.Dictionary[string,string]' -ArgumentList ([System.StringComparer]::Ordinal); $script:PsStore[$LookId] = $Decoy; $script:PsStore['local-fast'] = $Open } $psLookId $psCleanJson $psLookJson
+    $psLook = @(Invoke-LaiPresetSafety -Token 't' -Entries @(@{ Key = 'look'; Preset = $psLookId; Display = 'Look-alike' }, $psEntries[1]))
+    $psLookPosts = @(& $psMod { $script:PsPosts.ToArray() })
+    $psLookKept = [string](& $psMod { $script:PsStore['local-fast'] })
 }
 $psReadOn = ''; if ($psRead.Count -gt 0) { $psReadOn = @($psRead[0].On) -join ' and ' }
 Assert-That ($psRead.Count -eq 3 -and (@($psRead | ForEach-Object { [string]$_.Preset }) -join ',') -ceq 'trial-x,local-fast,official-main' -and $psReadOn -ceq ('read past chats and run code and use its notes, tasks, automations, calendar, notifications, channels, subagents tools and use web_search in every chat without being asked') -and
@@ -2650,6 +2721,10 @@ Assert-That ($psNotKept -match "^Open WebUI did not keep the safety settings of 
 Assert-That ($psRefused -match "^The safety settings of the preset 'Trial X' could not be written to Open WebUI \(HTTP 500 from the stand-in\): the assistant can still read past chats" -and $psRefusedKept -ceq $pfJson) "a write that Open WebUI refuses is an error with its reason ($psRefused)"
 $psAutoOn = ''; if ($psAuto.Count -eq 1) { $psAutoOn = @($psAuto[0].On) -join ' and ' }
 Assert-That ($psAutoJson -cne $psCleanJson -and $psAuto.Count -eq 1 -and $psAuto[0].Written -eq $true -and $psAutoOn -ceq 'use web_search in every chat without being asked' -and $psAutoKept -cmatch '"defaultFeatureIds":\[\]' -and $psAutoKept -cmatch '"web_search":true') "a preset that is not an official one and has web search on for every chat is written for that alone: nothing is on by default afterwards, and web search stays there to be switched on in a chat ($psAutoOn)"
+$psLookReal = @($psLook | Where-Object { [string]::Equals([string]$_.Preset, 'local-fast', [System.StringComparison]::Ordinal) })
+$psLookOn = 'not found'; if ($psLookReal.Count -eq 1) { $psLookOn = @($psLookReal[0].On) -join ' and ' }
+$psLookNow = 'not read'; if ($psLookKept) { $psLookNow = @(Get-LaiPresetToolRisk ($psLookKept | ConvertFrom-Json).meta) -join ' and ' }
+Assert-That ($psLookJson -cne $psCleanJson -and $psLook.Count -eq 2 -and $psLookReal.Count -eq 1 -and $psLookOn -ceq 'read past chats' -and $psLookReal[0].Written -eq $true -and $psLookPosts.Count -eq 1 -and $psLookKept -cmatch '"chats":false' -and $psLookNow -eq '') "a preset whose past-chat switch is false under a look-alike name (chats with a soft hyphen behind it, which PowerShell's -ccontains takes for chats) is found open and written with the exact name, and an entry listed before it under the preset's id with a soft hyphen behind it does not take the preset out of the walk (found: $($psLook.Count); the preset: $psLookOn; requests: $($psLookPosts -join ' | '); still on: $psLookNow)"
 Import-Module (Join-Path (Join-Path $src 'lib') 'LocalAI.psm1') -Force
 # A moved endpoint: Open WebUI answers any unknown path with its web page (status 200).
 $started = Start-TestListener

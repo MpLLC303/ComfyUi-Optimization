@@ -155,7 +155,11 @@ function Get-UnselectedPresetEntry {
         catch { $unread += "$file ($($_.Exception.Message))"; continue }
         foreach ($entry in $all) {
             $id = [string]$entry.Preset
-            if (-not $id -or $SelectedPresets -ccontains $id -or $seen -ccontains $id) { continue }
+            # Held against the selected ids and the ones before it character for character
+            # (IndexOf), not with -ccontains: for that an id with a soft hyphen in it is the id
+            # without, and a catalog entry under such a name would take the real preset out of
+            # this walk.
+            if (-not $id -or [array]::IndexOf(@($SelectedPresets), $id) -ge 0 -or [array]::IndexOf($seen, $id) -ge 0) { continue }
             $seen += $id
             $entries += $entry
         }

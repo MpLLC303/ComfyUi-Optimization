@@ -6,7 +6,8 @@
 # One job used to run every suite in a row and took about 57 of its 60 minutes. The suites share one
 # Ollama, one Open WebUI and one Docker engine, so they cannot run side by side on one machine; here
 # each job is its own machine with only the services its suites need, and the jobs run in parallel
-# (none should take more than about 25 minutes; the sandbox jobs are cut off at 40):
+# (the sandbox jobs are cut off at 40 minutes; the longest, installer, took 27 of them before batch 6
+# and has gained cases since; local-llm/tests/README.md has the times of the other jobs):
 #   gate          Static checks, runner self-test, render guard behaviour, cross-platform unit tests,
 #                 bootstrap update review (the five suites Invoke-AllTests.ps1 runs without a sandbox)
 #   integration   Integration test, then the health watch test

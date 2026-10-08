@@ -2278,7 +2278,13 @@ Invoke-Stage 'Configure' {
     # on it. So every catalog preset that exists is judged here, selected or not, and one that lets
     # the assistant do more than the toolkit allows gets its switches set (none is created). A
     # preset that cannot be made safe stops the stage, as an open sign-up does.
-    $presetSafety = @(Invoke-LaiPresetSafety -BaseUrl $WebUIUrl -Token $token -Entries @((Get-LaiCatalog -Path $CatalogPath -IncludeTrials).Models))
+    # Two lists, as the health check reads them: the catalog this run uses and, always, the
+    # toolkit's own catalog next to the script. $CatalogPath can be another file (a variable of
+    # the user's names it, see the test hook above, and any program of the user's can set that
+    # variable for good): a preset left out of that file would never be made safe here, while the
+    # health check, which always reads the toolkit's own catalog, failed it and named this run
+    # as the fix. Each preset id is taken once, from the first list that has it.
+    $presetSafety = @(Invoke-LaiPresetSafety -BaseUrl $WebUIUrl -Token $token -Entries (@((Get-LaiCatalog -Path $CatalogPath -IncludeTrials).Models) + @((Get-LaiCatalog -Path (Join-Path (Join-Path $SourceRoot 'config') 'models.psd1') -IncludeTrials).Models)))
     foreach ($ps in @($presetSafety | Where-Object { $_.Written })) {
         Write-LaiLog OK "Preset '$($ps.Display)' made safe again: the assistant could $($ps.On -join ' and ') there, which is switched off now"
     }

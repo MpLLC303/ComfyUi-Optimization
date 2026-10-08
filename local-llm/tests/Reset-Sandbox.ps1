@@ -118,7 +118,11 @@ $rows = @((Invoke-DockerCli @('ps', '-a', '--format', '{{.Names}}|{{.Image}}|{{.
 $names = @($rows | ForEach-Object { ($_ -split '\|')[0] })
 foreach ($row in $rows) {
     $name, $image, $state, $project = $row -split '\|'
-    $isTest = ($testProjects -contains $project) -or ($name -match '^open-webui-legacy-') -or
+    # localai-restore-<volume>-unpack and -move: the two helper runs of a restore's swap. A restore
+    # ends them itself; one that is still there after a suite writes into the volume the next
+    # suite starts on, and while it uses the volume the 'open-webui' rule below does not see that
+    # volume as unused either.
+    $isTest = ($testProjects -contains $project) -or ($name -match '^open-webui-legacy-') -or ($name -match '^localai-restore-') -or
         (($standInNames -contains $name) -and $image -like 'alpine:*') -or
         ((Invoke-DockerCli @('inspect', '-f', '{{index .Config.Labels `lai-test`}}', $name)).Out -join '') -eq '1'
     if ($isTest) {
