@@ -376,6 +376,11 @@ function Stop-Install {
     # The relaunched window stays open after the script ends (-NoExit), and a mutex stays owned as
     # long as its thread lives: release it, or a re-run would be refused until that window closes.
     if ($script:SetupLock) { Exit-LaiVolumeLock $script:SetupLock; $script:SetupLock = $null }
+    # Enable-LaiKeepAwake's request lasts as long as its thread, and that thread lives on with the
+    # window: left open, it would keep the PC from sleeping for good. ES_CONTINUOUS alone clears it.
+    if ('LaiPower' -as [type]) {
+        try { [LaiPower]::SetThreadExecutionState([uint32]2147483648) | Out-Null } catch { Write-Verbose 'Keep-awake request not cleared' }
+    }
     exit $Code
 }
 
@@ -418,6 +423,35 @@ function Start-OllamaAsUser {
     # sign-in start (hidden, no --fast-startup) and installs a pending update right then, swapping
     # Ollama in the middle of the install (the presets would be measured on the old version).
     Start-AsUser (Join-Path $OllamaDir 'ollama app.exe')  # lai-ok: hidden
+}
+
+$OllamaElevatedNotice = 'Ollama is running with administrator rights: quit it from its tray icon and start it from the Start menu'
+function Restore-OllamaAsUser {
+    # The Ollama stage starts Ollama from this elevated session when a start through Explorer did not
+    # take (flags.ollamaElevated): it and its model runners then run as administrator. Once the
+    # presets are measured it is started as the signed-in user again. The flag is in the state file,
+    # so a run that stopped in between is put right by the next one.
+    if (-not $State.flags['ollamaElevated']) { return }
+    Write-LaiLog INFO 'Restarting Ollama without administrator rights'
+    $stop = {
+        Get-Process -Name 'ollama app', 'ollama', 'llama-server' -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+        Start-Sleep -Seconds 3
+    }
+    try {
+        & $stop
+        Start-OllamaAsUser
+        if ($env:LOCALAI_TEST_OLLAMA_USER_FAIL) { throw 'Test hook: Ollama did not start as the user' }
+        Wait-LaiHttp -Uri "$OllamaUrl/api/version" -TimeoutSec 60 | Out-Null
+        $State.flags.Remove('ollamaElevated')
+    } catch {
+        # Running with too many rights is better than not running: the stages that follow need it.
+        # The flag stays, for the end screen, the report and the next run.
+        Write-Verbose "Ollama did not start as the user: $($_.Exception.Message)"
+        & $stop
+        Start-LaiOllamaApp -Path (Join-Path $OllamaDir 'ollama app.exe')
+        Wait-LaiHttp -Uri "$OllamaUrl/api/version" -TimeoutSec 90 | Out-Null
+        Write-LaiLog WARN $OllamaElevatedNotice
+    }
 }
 
 function Set-UserEnv {
@@ -1018,11 +1052,18 @@ Invoke-Stage 'Preflight' {
     $trialWanted = @()
     if ($script:BoundParams.ContainsKey('TrialModels')) {
         $trialWanted = @($TrialModels | Where-Object { $_ -and $_ -ne 'none' })
+    } elseif ($State.flags.ContainsKey('trialChoice')) {
+        $trialWanted = @($State.flags['trialChoice'] | Where-Object { $_ })
     } elseif ($State.flags.ContainsKey('selectedModels')) {
+        # An install from before the choice was kept on its own: what it has set up is the choice.
         $trialWanted = @($State.flags['selectedModels'] | Where-Object { $_ -like 'trial-*' })
     }
     $trialKeys = @($catalogAll.Models | Where-Object { $_.Trial } | ForEach-Object { $_.Key })
     foreach ($t in $trialWanted) { if ($trialKeys -notcontains $t) { Write-LaiLog WARN "Unknown trial model '$t' (known: $($trialKeys -join ', '))" } }
+    # The choice, kept apart from selectedModels (as officialChoice is): a trial left out of one run,
+    # for a busy GPU or a dropped connection, is still wanted on the next. Known keys only, so the
+    # warning above is not repeated on every later run.
+    $State.flags['trialChoice'] = @($trialWanted | Where-Object { $trialKeys -contains $_ })
     # Official releases: all of them unless a choice was made (now, or remembered from an earlier run).
     $officialKeys = @($catalogAll.Models | Where-Object { $_.Official } | ForEach-Object { $_.Key })
     if (-not $State.flags.ContainsKey('officialFailed') -or -not $State.flags['officialFailed']) { $State.flags['officialFailed'] = @{} }
@@ -1039,13 +1080,17 @@ Invoke-Stage 'Preflight' {
         if ($officialWanted -contains 'all') { $officialWanted = $officialKeys }
     } else {
         $officialWanted = $officialKeys
-        if ($script:PrevSelected.Count) {
-            # An update of an install from before the official models: say what is coming and how to
-            # skip it before the downloads start (the choice is then remembered).
+        # An update of an install from before the official models: say what is coming and how to
+        # skip it before the downloads start. Once: an install that has one of them, or has one
+        # recorded as failed, was told before, and the choice recorded below keeps later runs out of
+        # this branch (a window closed during the wait saves nothing: the next run says it again).
+        $hadOfficial = @($script:PrevSelected | Where-Object { $officialKeys -contains $_ }).Count -gt 0
+        if ($script:PrevSelected.Count -and -not $hadOfficial -and $State.flags['officialFailed'].Count -eq 0) {
             $offGB = 0; foreach ($om in @($catalogAll.Models | Where-Object { $_.Official })) { $offGB += [double]$om.DownloadGB }
             Write-LaiLog WARN ("This update adds the official models (Official Main, Deep and Fast): about {0} GB to download next to the uncensored ones, which stay. Not wanted? Close this window now and run it again with -OfficialModels none (one-line update: first `$env:LOCALAI_ARGS = '-OfficialModels none'). Continuing in 20 seconds." -f [Math]::Round($offGB))
             if (-not $env:LOCALAI_TEST_CATALOG) { Start-Sleep -Seconds 20 }
         }
+        $State.flags['officialChoice'] = @('all')
     }
     if ($Retune) { $State.flags['officialFailed'] = @{} }
     $ollamaNow = ''; try { $ollamaNow = [string](Get-LaiOllamaVersion -BaseUrl $OllamaUrl) } catch { Write-Verbose 'Ollama version unknown' }
@@ -1233,7 +1278,10 @@ Invoke-Stage 'Ollama' {
         try { Wait-LaiHttp -Uri "$OllamaUrl/api/version" -TimeoutSec 60 | Out-Null }
         catch {
             Write-LaiLog WARN 'Ollama did not start via Explorer; starting it directly.'
+            # From this elevated session, here and twice below: Ollama then runs as administrator
+            # until Restore-OllamaAsUser, at the end of the Tuning stage, starts it as the user again.
             Start-LaiOllamaApp -Path (Join-Path $OllamaDir 'ollama app.exe')
+            $State.flags['ollamaElevated'] = $true
             Wait-LaiHttp -Uri "$OllamaUrl/api/version" -TimeoutSec 90 | Out-Null
         }
     }
@@ -1253,6 +1301,7 @@ Invoke-Stage 'Ollama' {
                 Get-Process -Name 'ollama app', 'ollama', 'llama-server' -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
                 Start-Sleep -Seconds 3
                 Start-LaiOllamaApp -Path (Join-Path $OllamaDir 'ollama app.exe')
+                $State.flags['ollamaElevated'] = $true
                 Wait-LaiHttp -Uri "$OllamaUrl/api/version" -TimeoutSec 90 | Out-Null
                 Start-Sleep -Seconds 2
                 $cfgLine = Select-String -LiteralPath $log -Pattern 'msg="server config"' -Encoding UTF8 | Select-Object -Last 1
@@ -1286,7 +1335,7 @@ Invoke-Stage 'Ollama' {
         # Explorer cannot pass 'hidden', so the user start may show the Ollama window once (the user is
         # at the installer anyway); the direct start hides it.
         if ($how -eq 'user') { Start-AsUser (Join-Path $OllamaDir 'ollama app.exe') }   # lai-ok: hidden
-        else { Start-LaiOllamaApp -Path (Join-Path $OllamaDir 'ollama app.exe') }
+        else { Start-LaiOllamaApp -Path (Join-Path $OllamaDir 'ollama app.exe'); $State.flags['ollamaElevated'] = $true }
         try { Wait-LaiHttp -Uri "$OllamaUrl/api/version" -TimeoutSec 90 | Out-Null }
         catch {
             if ($how -eq 'session') { throw }
@@ -1415,6 +1464,7 @@ Invoke-Stage 'Tuning' {
         }
     }
     Remove-DroppedOptIn
+    Restore-OllamaAsUser
 }
 #endregion
 
@@ -1565,10 +1615,14 @@ Invoke-Stage 'Stack' {
     }
 
     # Before this update changes containers, presets and settings: a backup of the chats as they are,
-    # once per toolkit version (the newest nightly one may be days old). Tagged, so it never counts as
-    # a nightly backup; pruned by age like the other tagged ones. A failure is a warning: the nightly
-    # backups are still there.
-    $preTag = 'before-toolkit-' + ($ToolkitVersion -replace '[^0-9A-Za-z.-]', '')
+    # once per toolkit version and commit (the newest nightly one may be days old; VERSION alone stays
+    # the same over many updates, so every one after the first went without). Without a COMMIT file
+    # (a ZIP unpacked by hand) the day stands in for it. Tagged, so it never counts as a nightly
+    # backup; pruned by age like the other tagged ones. A failure is a warning: the nightly backups
+    # are still there.
+    $preKey = $ToolkitCommit -replace '[^0-9A-Za-z.-]', ''
+    if ($preKey) { $preKey = $preKey.Substring(0, [Math]::Min(7, $preKey.Length)) } else { $preKey = Get-Date -Format 'yyyyMMdd' }
+    $preTag = 'before-toolkit-' + ($ToolkitVersion -replace '[^0-9A-Za-z.-]', '') + '-' + $preKey
     if ($script:PrevSelected.Count -and [string]$State.flags['preUpdateBackup'] -ne $preTag -and
         (Invoke-Native -File 'docker' -Arguments @('volume', 'inspect', 'open-webui') -Capture -AllowFail).ExitCode -eq 0) {
         Write-LaiLog STEP 'Backing up the chats before the update changes anything'
@@ -2058,6 +2112,8 @@ $report = @(
 )
 $attention = @()
 if ($State.flags.ContainsKey('configureWarnings')) { $attention = @($State.flags['configureWarnings'] | Where-Object { $_ }) }
+# Restore-OllamaAsUser could not start Ollama as the signed-in user: it still runs from this session.
+if ($State.flags['ollamaElevated']) { $attention += $OllamaElevatedNotice }
 # One line each, and '<' escaped: Markdown would hide '<query>' as a tag.
 if ($attention.Count -gt 0) { $report += @('', '## Settings that need attention', '') + @($attention | ForEach-Object { '- ' + (($_ -replace '\s+', ' ') -replace '<', '\<') }) }
 Set-Content -LiteralPath $P.Report -Value $report -Encoding UTF8

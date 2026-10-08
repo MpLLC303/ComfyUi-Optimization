@@ -111,6 +111,13 @@ foreach ($p in $patches) {
     $text = $text.Replace($p[0], $p[1])
 }
 Set-Content -Path $inst -Value $text
+# The window stays open after the installer ends (-NoExit), and with it the thread that asked Windows
+# not to sleep: Stop-Install has to take that request back. kernel32 is Windows only, so what is
+# checked here is the function's own text: the guard, the call and its value, all before the exit.
+$stopFn = [regex]::Match($text, '(?s)function Stop-Install \{.*?\r?\n\}').Value
+$awakeGuardAt = $stopFn.IndexOf("if ('LaiPower' -as [type])")
+$awakeClearAt = $stopFn.IndexOf('[LaiPower]::SetThreadExecutionState([uint32]2147483648)')
+Assert-That ($awakeGuardAt -ge 0 -and $awakeClearAt -gt $awakeGuardAt -and $awakeClearAt -lt $stopFn.IndexOf('exit $Code') -and $stopFn -match '(?s)try \{[^{}]*SetThreadExecutionState\(\[uint32\]2147483648\)[^{}]*\} catch \{') 'Stop-Install clears the keep-awake request before it exits (ES_CONTINUOUS alone, only when the LaiPower type is loaded, inside try/catch)'
 
 # ---- mocks ----------------------------------------------------------------------------------
 $global:Calls = New-Object System.Collections.ArrayList
@@ -337,7 +344,7 @@ Assert-That ($tp -and -not $tp.meta.hidden) 'trial preset created in Open WebUI 
 Assert-That ($sel -contains 'official-ok' -and $sel -notcontains 'official-missing') "official models are installed by default; one whose tag cannot be pulled is skipped, not fatal ($($sel -join ', '))"
 $allLogs = (Get-ChildItem (Join-Path $aiRoot 'Logs') -Filter 'install-*.log' | ForEach-Object { Get-Content -Raw $_.FullName }) -join "`n"
 Assert-That ($allLogs -match 'Official model Official: missing tag \(testorg/official-does-not-exist:1b\) skipped: .*The uncensored presets are unaffected') 'the official skip came from the Models stage and says the uncensored presets are unaffected'
-Assert-That ($allLogs -match 'This update adds the official models .* -OfficialModels none') 'an existing install that never chose is told about the official models and how to skip them before the downloads'
+Assert-That ($allLogs -notmatch 'This update adds the official models') 'a first install is not told that an update adds the official models, also not where it goes on after its reboot (its first pass recorded the choice)'
 Assert-That ($allLogs -match 'Open WebUI admin sign-in checked') 'an existing install checks the stored admin login before the downloads'
 Assert-That ($state.flags.officialFailed.PSObject.Properties['official-missing'] -and [string]$state.flags.officialFailed.'official-missing'.Source -eq 'testorg/official-does-not-exist:1b') 'the failed official model is recorded, so later runs do not download and load it again'
 $op = Get-TestPreset 'official-standin'
@@ -486,20 +493,25 @@ Assert-That (@($st4.flags.selectedModels) -notcontains 'official-ok' -and $op -a
 
 Write-Host "`n=== PHASE 4b: the official models come back while the GPU is busy ===" -ForegroundColor Cyan
 # Forget official-ok's GPU check, so this run has to wait for an idle GPU before checking it again.
+# The same for the trial, which this run asks for again: it is skipped for the busy GPU as well.
 $st = Get-Content -Encoding UTF8 -Raw (Join-Path $aiRoot 'install-state.json') | ConvertFrom-Json
 $st.tuning.PSObject.Properties.Remove('official-ok')
+$st.tuning.PSObject.Properties.Remove('trial-ok')
 $st | ConvertTo-Json -Depth 20 | Set-Content (Join-Path $aiRoot 'install-state.json')
 $global:MockGpu = 'NVIDIA GeForce RTX 3090, 566.36, 24576, 20000, 4576'
-try { & (Join-Path $aiRoot 'Scripts/Install-LocalAI.ps1') -AIRoot $aiRoot -SkipTests -TrialModels none -OfficialModels all -GpuWaitMinutes 0 } finally { $global:MockGpu = $null }
+try { & (Join-Path $aiRoot 'Scripts/Install-LocalAI.ps1') -AIRoot $aiRoot -SkipTests -TrialModels trial-ok -OfficialModels all -GpuWaitMinutes 0 } finally { $global:MockGpu = $null }
 $c4b = $LASTEXITCODE
 $log4b = Get-Content -Raw (Get-ChildItem (Join-Path $aiRoot 'Logs') -Filter 'install-*.log' | Sort-Object LastWriteTime | Select-Object -Last 1).FullName  # lai-ok: objects
 $st4b = Get-Content -Encoding UTF8 -Raw (Join-Path $aiRoot 'install-state.json') | ConvertFrom-Json
 Assert-That ($c4b -eq 0 -and $log4b -match 'Official: stand-in is set up on the next run: the GPU was busy') "a busy GPU skips the official model for now and the install completes (exit $c4b)"
 Assert-That (-not $st4b.flags.officialFailed.PSObject.Properties['official-ok'] -and [string]$st4b.flags.officialFailed.'official-missing'.Source) 'a busy GPU is not recorded as the model failing (a missing tag is)'
-& (Join-Path $aiRoot 'Scripts/Install-LocalAI.ps1') -AIRoot $aiRoot -SkipTests -TrialModels none -GpuWaitMinutes 10
+Assert-That ($log4b -match 'Trial: stand-in is set up on the next run: the GPU was busy' -and @($st4b.flags.selectedModels) -notcontains 'trial-ok' -and @($st4b.flags.trialChoice) -contains 'trial-ok') "a trial skipped for the busy GPU is left out of this run and stays the choice (selected: $(@($st4b.flags.selectedModels) -join ', '); trialChoice: $(@($st4b.flags.trialChoice) -join ', '))"
+# No -TrialModels on this run: the trial comes from the recorded choice, not from what was set up.
+& (Join-Path $aiRoot 'Scripts/Install-LocalAI.ps1') -AIRoot $aiRoot -SkipTests -GpuWaitMinutes 10
 $st4c = Get-Content -Encoding UTF8 -Raw (Join-Path $aiRoot 'install-state.json') | ConvertFrom-Json
 $op = Get-TestPreset 'official-standin'
 Assert-That ($LASTEXITCODE -eq 0 -and @($st4c.flags.selectedModels) -contains 'official-ok' -and $op -and -not $op.meta.hidden) "the next run with an idle GPU sets it up and shows its preset again (exit $LASTEXITCODE)"
+Assert-That (@($st4c.flags.selectedModels) -contains 'trial-ok' -and $null -ne $st4c.tuning.'trial-ok' -and @($st4c.flags.trialChoice) -contains 'trial-ok') "and it sets up the trial skipped before, though this run was given no -TrialModels: selected and tuned (selected: $(@($st4c.flags.selectedModels) -join ', '))"
 
 Write-Host "`n=== PHASE 4d: an official model whose tuned alias fails to load: left out, the update completes ===" -ForegroundColor Cyan
 # The 8K check (on the source) passes; tuning loads the alias, which this hook makes fail like a
@@ -515,21 +527,53 @@ $st4d = Get-Content -Encoding UTF8 -Raw (Join-Path $aiRoot 'install-state.json')
 Assert-That ($c4d -eq 0 -and $log4d -match 'Official model Official: stand-in \(testorg/qwen3-abliterated:1\.7b\) skipped: .*incompatible' -and $log4d -match '=+ Backup =+') "a tuning failure of an official model skips it and the run goes on to the Backup stage (exit $c4d)"
 Assert-That (@($st4d.flags.selectedModels) -notcontains 'official-ok' -and [string]$st4d.flags.officialFailed.'official-ok'.Why -match 'incompatible' -and $null -ne $st4d.tuning.main) 'it is recorded as the model''s own failure; the uncensored presets stay tuned'
 Assert-That ($log4d -notmatch 'download \([\d.]+ GB\) was removed') 'a model this run did not download is not deleted (its files are shared with Uncensored Main here)'
-& (Join-Path $aiRoot 'Scripts/Install-LocalAI.ps1') -AIRoot $aiRoot -SkipTests -TrialModels none -OfficialModels all
+# On the same run, Ollama's start-up log shows a setting other than the one just written (Explorer had
+# not taken the new environment over yet): the installer starts Ollama from its own elevated session
+# to measure with the right settings, and must not leave it running as administrator afterwards.
+$srvLog4 = Join-Path $env:LOCALAPPDATA 'Ollama/server.log'
+$srvGood4 = (Get-Content -Raw -Encoding UTF8 -LiteralPath $srvLog4).TrimEnd()
+$srvWrong4 = $srvGood4 -replace 'OLLAMA_FLASH_ATTENTION:[^ \]]*', 'OLLAMA_FLASH_ATTENTION:false'
+# An Ollama that does not log the key: put it in, so the line reads as a wrong value all the same.
+if ($srvWrong4 -ceq $srvGood4) { $srvWrong4 = ([regex]'map\[').Replace($srvGood4, 'map[OLLAMA_FLASH_ATTENTION:false ', 1) }
+$ollamaStarts = { param([int]$From) @($global:Calls | Select-Object -Skip $From | Where-Object { $_ -like 'Start-Process *ollama app.exe*' }) }
+Set-Content -LiteralPath $srvLog4 -Value $srvWrong4
+$calls4e = $global:Calls.Count
+try { & (Join-Path $aiRoot 'Scripts/Install-LocalAI.ps1') -AIRoot $aiRoot -SkipTests -TrialModels none -OfficialModels all } finally { Set-Content -LiteralPath $srvLog4 -Value $srvGood4 }
 $st4e = Get-Content -Encoding UTF8 -Raw (Join-Path $aiRoot 'install-state.json') | ConvertFrom-Json
 Assert-That ($LASTEXITCODE -eq 0 -and @($st4e.flags.selectedModels) -contains 'official-ok' -and -not $st4e.flags.officialFailed.PSObject.Properties['official-ok']) "naming the choice again (-OfficialModels all) retries it (exit $LASTEXITCODE)"
+$log4e = Get-Content -Raw -Encoding UTF8 (Get-ChildItem (Join-Path $aiRoot 'Logs') -Filter 'install-*.log' | Sort-Object LastWriteTime | Select-Object -Last 1).FullName  # lai-ok: objects
+$starts4e = @(& $ollamaStarts $calls4e)
+$asUser4e = @($starts4e | Where-Object { $_ -like '*explorer.exe*' }).Count
+$mainRestarts4e = [regex]::Matches($log4e, 'Restarting Ollama so it picks up the settings').Count
+Assert-That ($log4e -match 'Ollama did not pick up the new settings \(OLLAMA_FLASH_ATTENTION=false' -and ($starts4e.Count - $asUser4e) -ge 1) "wrong settings in server.log: Ollama is restarted from the installer's own session for the measuring ($($starts4e.Count) starts, $asUser4e via Explorer)"
+# One start through Explorer more than the settings restart(s): the one that ends the Tuning stage.
+Assert-That ($asUser4e -eq $mainRestarts4e + 1 -and $starts4e.Count -ge 2 -and $starts4e[-1] -like '*explorer.exe*' -and $log4e -match 'Restarting Ollama without administrator rights' -and -not $st4e.flags.PSObject.Properties['ollamaElevated']) "and once the presets are measured it is started as the signed-in user again: the last start is through Explorer, nothing is left to remember ($asUser4e via Explorer, $mainRestarts4e settings restart(s))"
 
 Write-Host "`n=== PHASE 4f: the owner's own default model and hidden presets survive an update ===" -ForegroundColor Cyan
 $tokF = Connect-LaiWebUI -BaseUrl 'http://127.0.0.1:3000' -Email $Email -Password $Password
 Set-LaiWebUIModelsConfig -BaseUrl 'http://127.0.0.1:3000' -Token $tokF -DefaultModel 'local-fast' | Out-Null
 Hide-LaiWebUIModel -BaseUrl 'http://127.0.0.1:3000' -Token $tokF -Id 'official-standin' | Out-Null
-& (Join-Path $aiRoot 'Scripts/Install-LocalAI.ps1') -AIRoot $aiRoot -SkipTests -TrialModels none
-$c4f = $LASTEXITCODE
+# On the same run, the wrong settings in server.log again, and this time the start as the signed-in
+# user does not take either (test hook): Ollama stays up from the installer's session, and the owner
+# is told so. The end screen is captured (and still shown), as in phase 3.
+$elevatedNotice = 'Ollama is running with administrator rights: quit it from its tray icon and start it from the Start menu'
+Set-Content -LiteralPath $srvLog4 -Value $srvWrong4
+$env:LOCALAI_TEST_OLLAMA_USER_FAIL = '1'
+$calls4f = $global:Calls.Count
+try {
+    $screen4f = @(& (Join-Path $aiRoot 'Scripts/Install-LocalAI.ps1') -AIRoot $aiRoot -SkipTests -TrialModels none 6>&1 | ForEach-Object { $l = "$_"; Write-Host $l; $l })
+    $c4f = $LASTEXITCODE
+} finally { $env:LOCALAI_TEST_OLLAMA_USER_FAIL = ''; Set-Content -LiteralPath $srvLog4 -Value $srvGood4 }
 $tokF = Connect-LaiWebUI -BaseUrl 'http://127.0.0.1:3000' -Email $Email -Password $Password
 $mcfgF = Invoke-LaiApi -Uri 'http://127.0.0.1:3000/api/v1/configs/models' -Token $tokF
 $opF = Get-TestPreset 'official-standin'
 Assert-That ($c4f -eq 0 -and [string]$mcfgF.DEFAULT_MODELS -eq 'local-fast') "a default model the owner picked is kept by an update (default '$($mcfgF.DEFAULT_MODELS)', exit $c4f)"
 Assert-That ($opF -and $opF.meta.hidden -eq $true) 'a selected preset the owner hid stays hidden'
+$st4f = Get-Content -Encoding UTF8 -Raw (Join-Path $aiRoot 'install-state.json') | ConvertFrom-Json
+$rep4f = Get-Content -Encoding UTF8 -Raw (Join-Path $aiRoot 'install-report.md')
+$starts4f = @(& $ollamaStarts $calls4f)
+Assert-That (@($screen4f | Where-Object { $_ -like "*Needs attention: $elevatedNotice*" }).Count -eq 1 -and $rep4f -match '## Settings that need attention' -and $rep4f.Contains("- $elevatedNotice")) 'Ollama could not be started as the signed-in user: the end screen says once, under Needs attention, that it runs with administrator rights and what to do, and so does the report'
+Assert-That (@($screen4f | Where-Object { $_ -like "*WARN*$elevatedNotice*" }).Count -eq 1 -and $st4f.flags.ollamaElevated -eq $true -and $starts4f.Count -ge 1 -and $starts4f[-1] -notlike '*explorer.exe*') "it is said where it happens too, remembered for the next run, and Ollama was started again, from the installer's session, so the run could go on ($($starts4f.Count) starts)"
 Write-Host "`n=== PHASE 4g: an older toolkit over a newer install; a folder in AI that is not ours ===" -ForegroundColor Cyan
 $cfgPathG = Join-Path $aiRoot 'localai-config.json'
 $cfgG = Read-LaiState -Path $cfgPathG; $cfgG['ToolkitVersion'] = '2099.01.01'; Save-LaiState -State $cfgG -Path $cfgPathG
@@ -542,6 +586,9 @@ Assert-That ($c4g -eq 1 -and $log4g -match 'older than the installed 2099\.01\.0
 $c4h = $LASTEXITCODE
 $log4h = Get-Content -Raw (Get-ChildItem (Join-Path $aiRoot 'Logs') -Filter 'install-*.log' | Sort-Object LastWriteTime | Select-Object -Last 1).FullName  # lai-ok: objects
 Assert-That ($c4h -eq 0 -and $log4h -match 'also holds ComfyUI: their permissions are left alone') "-AllowDowngrade runs it; a folder in AI that is not the toolkit's keeps its permissions (exit $c4h)"
+# The first run to complete after the one that left Ollama running as administrator puts that right.
+$st4h = Get-Content -Encoding UTF8 -Raw (Join-Path $aiRoot 'install-state.json') | ConvertFrom-Json
+Assert-That ($log4h -match 'Restarting Ollama without administrator rights' -and $log4h -notmatch [regex]::Escape($elevatedNotice) -and -not $st4h.flags.PSObject.Properties['ollamaElevated']) 'the next run that reaches the end of Tuning starts Ollama as the signed-in user and forgets the notice'
 Remove-Item -LiteralPath $foreignDir -Recurse -Force
 # Back to the toolkit's own default for the later phases.
 Set-LaiWebUIModelsConfig -BaseUrl 'http://127.0.0.1:3000' -Token $tokF -DefaultModel 'official-standin' | Out-Null
@@ -775,12 +822,27 @@ Assert-That ((Get-FileHash -LiteralPath $theirRulesFile).Hash -eq $theirRulesHas
 Assert-That ($log7f -match 'already exists: left as it is' -and $log7f -notmatch 'Rules for an AI agent opened in this folder placed') 'and the log says it was left, not placed'
 # An install made before the installer placed this file has none: the update places it.
 Remove-Item -LiteralPath $agentFile -Force
+# The same update, and one more after it, on an install that is also from before the official models
+# (no choice recorded, none of them set up or failed): the first says what the update adds and how to
+# skip it, the second does not say it again. The state of the other phases is set aside meanwhile.
+$stateAside = Join-Path $Work 'install-state-before-7f.json'
+Copy-Item -LiteralPath $statePath -Destination $stateAside -Force
+$st7f = Read-LaiState -Path $statePath
+$st7f['flags'].Remove('officialChoice'); $st7f['flags'].Remove('officialFailed')
+$st7f['flags']['selectedModels'] = @($st7f['flags']['selectedModels'] | Where-Object { $_ -notlike 'official-*' })
+Save-LaiState -State $st7f -Path $statePath
 $env:LOCALAI_TEST_FAIL_STAGE = 'Ollama'
 & (Join-Path $aiRoot 'Scripts/Install-LocalAI.ps1') -AIRoot $aiRoot -SkipTests -TrialModels none
-$env:LOCALAI_TEST_FAIL_STAGE = ''
 $log7fb = Get-NewestLog
+& (Join-Path $aiRoot 'Scripts/Install-LocalAI.ps1') -AIRoot $aiRoot -SkipTests -TrialModels none
+$env:LOCALAI_TEST_FAIL_STAGE = ''
+$log7fc = Get-NewestLog
+$choice7f = @((Read-LaiState -Path $statePath)['flags']['officialChoice'])
+Copy-Item -LiteralPath $stateAside -Destination $statePath -Force
 Assert-That ((Test-Path -LiteralPath $agentFile -PathType Leaf) -and (Get-FileHash -LiteralPath $agentFile).Hash -eq (Get-FileHash -LiteralPath $agentTemplate).Hash) 'an update of an install without the file places the template, byte for byte'
 Assert-That ($log7fb -match 'Rules for an AI agent opened in this folder placed' -and $log7fb -notmatch 'already exists: left as it is') 'and the log says it was placed'
+$told7f = [regex]::Matches($log7fb + "`n" + $log7fc, 'This update adds the official models').Count
+Assert-That ($log7fb -match 'This update adds the official models .* -OfficialModels none' -and $told7f -eq 1 -and $log7fc -match 'Test hook: stage Ollama failed' -and $choice7f.Count -eq 1 -and [string]$choice7f[0] -eq 'all') "an install from before the official models is told once what the update adds and how to skip it, not again on the next update; the choice is recorded as all (said $told7f time(s) in two runs; choice: $($choice7f -join ', '))"
 
 Write-Host "`n=== PHASE 8: -DeepResearch (Local Deep Research), then -NoDeepResearch ===" -ForegroundColor Cyan
 # compose is mocked: a real Local Deep Research container stands in for the one compose would start
@@ -798,9 +860,13 @@ if ((& /usr/bin/docker image inspect $ldrImage 2>$null) -and $LASTEXITCODE -eq 0
     $before8 = @($global:Calls).Count
     & (Join-Path $aiRoot 'Scripts/Install-LocalAI.ps1') -AIRoot $aiRoot -SkipTests -TrialModels none -DeepResearch
     $c8 = $LASTEXITCODE
-    # Before the update changed anything, the chats were backed up once for this toolkit version.
-    $pre8 = @(Get-ChildItem -LiteralPath (Join-Path $aiRoot 'Backups') -Filter 'open-webui-*-before-toolkit-*.tar.gz' -ErrorAction SilentlyContinue)
-    Assert-That ($pre8.Count -eq 1 -and [string](Read-LaiState -Path (Join-Path $aiRoot 'install-state.json'))['flags']['preUpdateBackup'] -like 'before-toolkit-*') "an update of an existing install backs the chats up first, once per toolkit version ($($pre8.Count) archive(s))"
+    # Before the update changed anything, the chats were backed up, once per toolkit version and commit.
+    # This copy has no COMMIT file (as a ZIP unpacked by hand), so the day stands in for the commit; no
+    # fixed number of archives is asked for, because the phases before this one may have crossed midnight.
+    $preFilter8 = 'open-webui-*-before-toolkit-*.tar.gz'
+    $pre8 = @(Get-ChildItem -LiteralPath (Join-Path $aiRoot 'Backups') -Filter $preFilter8 -ErrorAction SilentlyContinue)
+    $preFlag8 = [string](Read-LaiState -Path $statePath)['flags']['preUpdateBackup']
+    Assert-That ($pre8.Count -ge 1 -and $preFlag8 -match '^before-toolkit-.+-\d{8}$' -and @($pre8 | Where-Object { $_.Name -like "*-$preFlag8.tar.gz" }).Count -ge 1) "an update of an existing install backs the chats up first; without a COMMIT file the backup is keyed on the version and the day ($preFlag8; $($pre8.Count) archive(s))"
     $env8 = @(Get-Content -Encoding UTF8 (Join-Path $aiRoot 'Stack/.env'))
     $st8 = Read-LaiState -Path (Join-Path $aiRoot 'install-state.json')
     $cfg8 = Read-LaiState -Path (Join-Path $aiRoot 'localai-config.json')
@@ -817,12 +883,25 @@ if ((& /usr/bin/docker image inspect $ldrImage 2>$null) -and $LASTEXITCODE -eq 0
     Assert-That ($login8 -eq 'ok') "the stored research account signs in to the real Local Deep Research ($login8)"
     Assert-That ([int]$cfg8['DeepResearchPort'] -eq 5055 -and @(Get-ChildItem -Path (Join-Path $Work 'ProgramData') -Recurse -Filter 'Local AI - Deep Research.url' -ErrorAction SilentlyContinue).Count -eq 1) 'the config records the port and the Start menu has a Deep Research shortcut'
     Assert-That ((Get-Content -Raw -Encoding UTF8 (Join-Path $aiRoot 'install-report.md')) -match 'Deep research: http://localhost:5055') 'the install report names the research address'
+    # The same VERSION at another commit than the one the last backup was taken for (Get-LocalAI.ps1
+    # writes COMMIT next to the scripts): the next two runs must take one new backup, then none.
+    $commitFile8 = Join-Path $aiRoot 'Scripts/COMMIT'
+    Set-Content -LiteralPath $commitFile8 -Value ('a' * 40)
+    $st8p = Read-LaiState -Path $statePath
+    $st8p['flags']['preUpdateBackup'] = $preFlag8 -replace '-\d{8}$', '-bbbbbbb'
+    Save-LaiState -State $st8p -Path $statePath
     # A re-run with the account in place signs in instead of making another one.
     & (Join-Path $aiRoot 'Scripts/Install-LocalAI.ps1') -AIRoot $aiRoot -SkipTests
     $rc8b = Get-Content -Raw -Encoding UTF8 -LiteralPath $rcFile | ConvertFrom-Json
     Assert-That ($LASTEXITCODE -eq 0 -and $rc8b.password -eq $rc8.password -and @((Read-LaiState -Path (Join-Path $aiRoot 'install-state.json'))['flags']['configureWarnings']).Count -eq 0) 're-run without the switch keeps deep research on and reuses the account'
+    $pre8b = @(Get-ChildItem -LiteralPath (Join-Path $aiRoot 'Backups') -Filter $preFilter8 -ErrorAction SilentlyContinue)
+    $preFlag8b = [string](Read-LaiState -Path $statePath)['flags']['preUpdateBackup']
+    Assert-That ($pre8b.Count -eq $pre8.Count + 1 -and $preFlag8b -match '^before-toolkit-.+-aaaaaaa$' -and @($pre8b | Where-Object { $_.Name -like "*-$preFlag8b.tar.gz" }).Count -ge 1) "the same VERSION at another commit: one new backup before the update, tagged with the version and the short commit ($preFlag8b; $($pre8.Count) archive(s) before, $($pre8b.Count) after)"
     & /usr/bin/docker volume create localai-deep-research 2>$null | Out-Null
     & (Join-Path $aiRoot 'Scripts/Install-LocalAI.ps1') -AIRoot $aiRoot -SkipTests -NoDeepResearch
+    $pre8c = @(Get-ChildItem -LiteralPath (Join-Path $aiRoot 'Backups') -Filter $preFilter8 -ErrorAction SilentlyContinue)
+    Remove-Item -LiteralPath $commitFile8 -Force
+    Assert-That ($pre8c.Count -eq $pre8b.Count -and [string](Read-LaiState -Path $statePath)['flags']['preUpdateBackup'] -eq $preFlag8b) "and the next run of that commit takes none ($($pre8c.Count) archive(s))"
     $env8c = @(Get-Content -Encoding UTF8 (Join-Path $aiRoot 'Stack/.env'))
     $gone = -not ((& /usr/bin/docker container inspect deep-research 2>$null) -and $LASTEXITCODE -eq 0)
     $volKept = [bool](& /usr/bin/docker volume inspect localai-deep-research 2>$null) -and $LASTEXITCODE -eq 0
