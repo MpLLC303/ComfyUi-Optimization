@@ -33,14 +33,18 @@
     loss of the container and its volume, and a restore (Backup-OpenWebUI.ps1 and Restore-OpenWebUI.ps1
     run as a real install runs them, in a sandbox install folder, -Work; the stack is started again
     on the restored volume and the same chat is read back by its id); after all of that no container
-    was ended by its memory limit or restarted. Last, the stack is taken down with its volumes and
-    nothing of it may remain.
+    was ended by its memory limit or restarted (Open WebUI is also asked before the backup, which
+    starts it again by hand, and before the wipe removes it: each of the two erases that record).
+    Last, the stack is taken down with its volumes and nothing of it may remain.
 
-    The .env does not repeat the compose file's fallbacks: the ports are the ones passed to this
-    script (CI passes others than the defaults), the guard's size cap is 300 MiB and its ComfyUI
-    address another one, and the checks read each back from the running containers (published
-    ports, WEBUI_URL and SEARXNG_BASE_URL in the environment, the guard's status page), so a
-    variable the compose file misnames or hard-codes fails here and is not covered by a fallback.
+    Five values in the .env are not the compose file's fallbacks: the three ports are the ones
+    passed to this script (CI passes others than the defaults), the guard's size cap is 300 MiB and
+    its ComfyUI address another one. The checks read each back from the running containers at every
+    place the compose file uses it (the published ports; WEBUI_URL, CORS_ALLOW_ORIGIN and
+    SEARXNG_BASE_URL in the environment; the guard's status page), so a compose edit that misnames
+    or hard-codes WEBUI_PORT, SEARXNG_PORT, DEEP_RESEARCH_PORT, RENDER_GUARD_MAX_BODY_MIB or
+    COMFYUI_URLS fails here. Every other value in the .env still equals its fallback, so the same
+    mistake with one of those stays unseen.
 
     The containers have fixed names (open-webui, searxng, render-guard, deep-research), so this
     cannot share a Docker engine with the other suites or with a real install: it refuses to start
@@ -427,11 +431,15 @@ try {
     }
     # The ports above only prove the ports mapping. Open WebUI and SearXNG also build the address
     # they call themselves from the same two .env values, in the environment the engine gave them
-    # (from the inspect output read above: the fallback would be 3000 and 8888).
+    # (from the inspect output read above: the fallback would be 3000 and 8888). Open WebUI's list
+    # of the pages that may call its API is the third place the compose file uses WEBUI_PORT, twice;
+    # this .env has no WEBUI_EXTRA_ORIGINS, so the list is exactly its own two addresses.
     $owuiEnv = @($owui.Config.Env | ForEach-Object { [string]$_ })
     $sxContainer = @($containers | Where-Object { (Get-ServiceName $_) -eq 'searxng' }) | Select-Object -First 1
     $sxEnv = @(); if ($sxContainer) { $sxEnv = @($sxContainer.Config.Env | ForEach-Object { [string]$_ }) }
     Assert-That ($owuiEnv -ccontains "WEBUI_URL=http://localhost:$WebUIPort") "Open WebUI knows its own address from .env: WEBUI_URL=http://localhost:$WebUIPort (its WEBUI_URL: $(@($owuiEnv | Where-Object { $_ -like 'WEBUI_URL=*' }) -join ', '))"
+    $corsWant = "CORS_ALLOW_ORIGIN=http://localhost:$WebUIPort;http://127.0.0.1:$WebUIPort"
+    Assert-That ($owuiEnv -ccontains $corsWant) "Open WebUI lets only its own pages call its API, on the port from .env: $corsWant (its CORS_ALLOW_ORIGIN: $(@($owuiEnv | Where-Object { $_ -like 'CORS_ALLOW_ORIGIN=*' }) -join ', '))"
     Assert-That ($sxEnv -ccontains "SEARXNG_BASE_URL=http://localhost:$SearxngPort/") "SearXNG knows its own address from .env: SEARXNG_BASE_URL=http://localhost:$SearxngPort/ (its SEARXNG_BASE_URL: $(@($sxEnv | Where-Object { $_ -like 'SEARXNG_BASE_URL=*' }) -join ', '))"
 
     # ---- Open WebUI --------------------------------------------------------------------------------
@@ -563,6 +571,15 @@ try {
     Assert-That ($chatId -and $chatRead -and [string]$chatRead.id -eq $chatId -and [string]$chatRead.title -eq $chatTitle) "a chat made through Open WebUI's API is read back by its id with its title (id '$chatId', title '$($chatRead.title)', wanted '$chatTitle'; $chatErr)"
     if (-not $chatId -or -not $chatRead) { throw 'there is no chat to carry through the backup' }
 
+    # Open WebUI's record is read here, before the backup. The backup stops the container and starts
+    # it again by hand, and a start by hand sets the engine's restart count back to 0 and clears its
+    # out-of-memory mark; the wipe below then replaces the container. So this is the last reading
+    # that can say what happened to it from 'compose up' through every check above and the chat just
+    # made: a crash that 'restart: always' covered up shows here as a restart, and nowhere later.
+    $r = Invoke-DockerCli @('inspect', '--format', '{{.State.Status}}|{{.State.OOMKilled}}|{{.RestartCount}}', 'open-webui')
+    $state = [string](@($r.Out) | Select-Object -Last 1)
+    Assert-That ($r.Code -eq 0 -and $state -eq 'running|false|0') "through every check up to the backup open-webui is still running, was never ended for exceeding its memory limit and never restarted (state|out of memory|restarts: $state)"
+
     $backupDir = Join-Path $Work 'Backups'
     $backup = Invoke-ToolkitScript 'Backup-OpenWebUI.ps1' @()
     Assert-ScriptExit 'Backup-OpenWebUI.ps1' $backup
@@ -577,11 +594,12 @@ try {
     $archive = [string]$archives[0]
     $archiveName = Split-Path -Leaf $archive
 
-    # Judged before the container is removed: removing it erases whether the memory limit or a
-    # restart ever touched it. The backup stopped it and started it again.
+    # The backup has to leave Open WebUI running. This reading says that and no more than what
+    # happened since the backup started it (the time before is in the reading above the backup); it
+    # is taken before the container is removed, which erases this record too.
     $r = Invoke-DockerCli @('inspect', '--format', '{{.State.Status}}|{{.State.OOMKilled}}|{{.RestartCount}}', 'open-webui')
     $state = [string](@($r.Out) | Select-Object -Last 1)
-    Assert-That ($r.Code -eq 0 -and $state -eq 'running|false|0') "after the backup stopped and started it, open-webui is running, was not ended for exceeding its memory limit and never restarted (state|out of memory|restarts: $state)"
+    Assert-That ($r.Code -eq 0 -and $state -eq 'running|false|0') "the backup left open-webui running, and since the backup started it again it was not ended for exceeding its memory limit and did not restart (state|out of memory|restarts: $state)"
 
     # The wipe: the container and the volume with everything in it.
     $rm = Invoke-DockerCli @('rm', '-f', 'open-webui')
@@ -610,6 +628,8 @@ try {
     Assert-That ($chatBack -and [string]$chatBack.id -eq $chatId -and [string]$chatBack.title -eq $chatTitle) "the chat is back after the restore: read by id '$chatId' with the title '$chatTitle' (got '$($chatBack.title)'; $backErr)"
 
     # ---- after all of the above: no limit ended a container --------------------------------------
+    # open-webui is by now the container made after the restore, so for it this covers the time since
+    # then; the one the checks above ran on was judged before the backup and before its removal.
     Write-Host "`n=== after the checks ===" -ForegroundColor Cyan
     foreach ($svc in $expected) {
         $r = Invoke-DockerCli @('inspect', '--format', '{{.State.Status}}|{{.State.OOMKilled}}|{{.RestartCount}}', $svc)
