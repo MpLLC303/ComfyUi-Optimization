@@ -6,6 +6,17 @@
 .DESCRIPTION
     - The module imports and its state helpers round-trip through 5.1's ConvertFrom-Json.
     - Invoke-LaiApi sends UTF-8 bodies (5.1 would otherwise send ISO-8859-1).
+    - Secret files (Read-LaiSecretFile, Save-LaiSecretFile): the plain form, and each refusal in
+      words of its own (a marker this version does not know, a file marked as protected without
+      its value, an empty or cut-off file, a plain file without a password). The two writers of
+      the admin file in child processes: a pending password that is promoted, and
+      Set-OpenWebUIPassword.ps1, also when its save fails (a password that was given is never
+      printed back). On Windows the DPAPI round trips, a protected file through both writers and
+      a value this account cannot open.
+    - Private ACLs, on Windows: the AI folder and read-only Scripts end with the user, SYSTEM and
+      Administrators; an entry of a fourth name is taken out and a fourth name that owns the folder
+      is replaced by Administrators, each with a log line; what cannot be removed or read is a
+      failure in words (stand-ins for icacls /remove and for Get-Acl).
     - The volume lock: the mutex gets the Authenticated Users ACL, and a second process sees it busy
       while held and free after release.
     - Start-menu shortcuts: real .lnk files are written and read back; the -Command payload parses.
@@ -16,9 +27,18 @@
       against a docker stand-in that is slow to start or never comes up.
     - Scheduled tasks: the no-window launch (conhost --headless), the daily-time math, and native
       calls with a time limit (a CLI that never answers is stopped, not waited on).
-    - Test-LocalAI: the judge of a preset's past-chat and code switches on canned input, a check
-      that gives no verdict (SKIP with words in both check scripts, never a PASS), every row ending
-      in a verdict, and on Windows a port listening beyond localhost (the research agent's too).
+    - Test-LocalAI: the module's judge of a preset's switches (past chats, code and the seven
+      writing tools, by their exact names) on canned input; the row for a toolkit preset that is
+      in Open WebUI without being selected; the wait for a held volume lock (-LockWaitSec), after
+      which a stopped Open WebUI is a failure, with the two rows that can meet it run from their
+      own text and one whole health check in a child process under a lock another process holds;
+      a run in which Open WebUI did not answer never ends with 0 failures; a check that gives no
+      verdict (SKIP with words in both check scripts, never a PASS), every row ending in a
+      verdict, and on Windows a port listening beyond localhost (the research agent's too).
+    - Presets in Open WebUI: Protect-LaiPresetForm and Invoke-LaiPresetSafety, which hold every
+      catalog preset safe, selected or not, against an Open WebUI that is a table in memory.
+    - The installer's look at a models folder follows no link: a junction on Windows, a symbolic
+      link on Linux.
     - Test-PCSecurity: its helpers (driver matcher, redaction, ACL/port verdicts, ComfyUI scan), the
       judges for what a real PC audit found (a snoozed or expired antivirus behind a passive Defender,
       a hardware-access driver any program can open, firewall openings for script runners, a stopped

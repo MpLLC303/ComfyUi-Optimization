@@ -57,8 +57,11 @@ jobs:
       # declares no skip at all) runs it. One line per skip, exactly the message the suite prints
       # after SKIP. A new skip, or a reworded one, fails this job until it is added here: leaving a
       # block out on Linux is then a decision, not an accident.
-      # Twenty-three lines. The first eleven are from Invoke-WindowsUnitTests.ps1, the next three
+      # Twenty-four lines. The first twelve are from Invoke-WindowsUnitTests.ps1, the next three
       # from Invoke-GetLocalAITest.ps1, and the last nine from Invoke-WindowsUnitTests.ps1 again.
+      # The first of the twelve came with batch 6: protecting a stored password and opening it
+      # again is done by Windows (DPAPI), so those round trips run on the Windows job only. What
+      # the suite shows here instead: every such call says that it works on Windows only.
       # Five of those nine: three checks that Linux used to leave out without a word and now prints
       # as SKIP (no New-NetFirewallRule, no COMPUTERNAME, no USERPROFILE), the readers of the PC
       # security check, which ask Windows itself, and the health check's Integrity watch line for
@@ -66,6 +69,7 @@ jobs:
       # batch 5: three of the installer's own functions on real Windows (a user variable, folder
       # permissions, a drive letter that is not there) and Start again's wait for Docker Desktop.
       LAI_DECLARED_SKIPS: |
+        DPAPI round trips need Windows
         ACL test runs on Windows only
         mutex ACL exists only on Windows PowerShell
         .lnk creation needs WScript.Shell
