@@ -1301,12 +1301,14 @@ Add-Check 'AI ports reachable only from this PC' {
         # nothing) and judges it, and one answer only keeps this a warning: a rule that is on and
         # blocks by address. One that is switched off or was changed, the older one on the network
         # adapters (a VPN and Tailscale get past it), no rule, and a firewall that could not be
-        # asked are failures, each in its own words and with one step.
+        # asked are failures, each in its own words and with the step that goes with it (the
+        # answer's Fix). That step is not Update toolkit alone: the installer makes the rule only
+        # where it opened the port itself, so with no rule the Ollama app's own setting comes first.
         $fw = Get-LaiOllamaBlockState
         if ($fw.State -eq 'blocked') {
             return (Warn "Ollama listens on all network adapters ($($exp.Critical -join ', ')), but the toolkit's firewall rule blocks other computers" ($fixes -join '. '))
         }
-        return (Fail "Ollama listens beyond this PC itself ($($exp.Critical -join ', ')), and $($fw.Text)" 'run Start menu > Local AI - Update toolkit')
+        return (Fail "Ollama listens beyond this PC itself ($($exp.Critical -join ', ')), and $($fw.Text)" ([string]$fw.Fix))
     }
     Fail "reachable from your network: $($exp.Critical -join ', ') - anyone on the same Wi-Fi or LAN can use them without a password" ($fixes -join '. ')
 }

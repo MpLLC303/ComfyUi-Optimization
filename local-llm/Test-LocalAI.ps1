@@ -859,12 +859,14 @@ Add-Check 'Nothing exposed beyond localhost' {
         # one answer only keeps this a warning: a rule that is on and blocks by address. One that is
         # switched off or was changed, the older one on the network adapters (a VPN and Tailscale
         # get past it), no rule, and a firewall that could not be asked are failures, each in its
-        # own words and with one step.
+        # own words and with the step that goes with it (the answer's Fix). That step is not Update
+        # toolkit alone: the installer makes the rule only where it opened the port itself, so with
+        # no rule the Ollama app's own setting comes first, as in the closing failure below.
         $fw = Get-LaiOllamaBlockState
         if ($fw.State -eq 'blocked') {
             return (Warn "Ollama listens on all interfaces (Docker fallback) but the LAN block rule is in place: $($bad -join ', ')")
         }
-        return (Fail "Ollama listens beyond loopback ($($bad -join ', ')) and $($fw.Text); run Start menu > Local AI - Update toolkit")
+        return (Fail "Ollama listens beyond loopback ($($bad -join ', ')) and $($fw.Text); $($fw.Fix)")
     }
     Fail "listening beyond loopback: $($bad -join ', ') - reachable from your network; run Start menu > Local AI - Update toolkit to restore the localhost-only settings (for 11434 also turn off 'Expose Ollama to the network' in the Ollama app's Settings, which overrides them)"
 }
