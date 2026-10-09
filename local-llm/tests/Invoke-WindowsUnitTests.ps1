@@ -20,6 +20,8 @@
     - The volume lock: the mutex gets the Authenticated Users ACL, and a second process sees it busy
       while held and free after release.
     - Start-menu shortcuts: real .lnk files are written and read back; the -Command payload parses.
+    - The Ollama firewall block: the judge of the installer's rule on canned rules, its reader with
+      stand-ins and on real rules on Windows, and both check rows run from their own text.
     - Watch-LocalAI: pause / unpause / a full run with nothing installed must not throw.
     - Uninstall-LocalAI -WhatIf and Stop-LocalAI on an empty AI root must not throw.
     - On Windows, the installer's own Set-UserEnv, Protect-InstallFolder and Get-ModelFolderContent
@@ -47,9 +49,12 @@
     - Test-PCSecurity: its helpers (driver matcher, redaction, ACL/port verdicts, ComfyUI scan), the
       judges for what a real PC audit found (a snoozed or expired antivirus behind a passive Defender,
       a hardware-access driver any program can open, firewall openings for script runners, a stopped
-      cloud-sync program the backups lie in) on canned input, their readers on Windows, that it runs
-      no changing command and compiles no code that does more than open and close a device, and a
-      full read-only run in a child process.
+      cloud-sync program the backups lie in) on canned input, their readers on Windows, held to what
+      that Windows has; the Security Center reader also runs on both jobs against a stand-in for
+      Get-CimInstance; the script may call only what is on three exact lists (commands, variables
+      it calls through, static .NET members), with four calls held to one place and three forms
+      reported; it compiles no code that does more than open and close a device; and a full
+      read-only run in a child process.
     Exit code = number of failed assertions.
 #>
 param([string]$Work = (Join-Path ([System.IO.Path]::GetTempPath()) 'lai-wintest'))
@@ -784,6 +789,27 @@ if ($onWindows) {
         Remove-Item -LiteralPath "Env:$ueName" -ErrorAction SilentlyContinue
     }
 } else { Skip 'user environment variables are kept by Windows only' }
+
+Write-Host "`n=== installer: Get-TrimmedFileText gives '' for a key file that holds nothing ===" -ForegroundColor Cyan
+# Taken from Install-LocalAI.ps1's source, as Set-UserEnv above. The mock run asks this of it under
+# PowerShell 7 only; the installer runs under Windows PowerShell 5.1, where this file runs too.
+$tfAst = [System.Management.Automation.Language.Parser]::ParseFile((Join-Path $src 'Install-LocalAI.ps1'), [ref]$null, [ref]$null)
+. ([scriptblock]::Create($tfAst.Find({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Get-TrimmedFileText' }, $true).Extent.Text))
+$tfDir = Join-Path $Work 'trimmed-text'
+New-Item -ItemType Directory -Force -Path $tfDir | Out-Null
+$tfCases = @(
+    @{ Name = 'empty.txt'; Bytes = [byte[]]@(); Want = ''; What = 'a file of 0 bytes' },
+    @{ Name = 'bom.txt'; Bytes = [byte[]]@(0xEF, 0xBB, 0xBF); Want = ''; What = 'a byte order mark and nothing else' },
+    @{ Name = 'crlf.txt'; Bytes = [byte[]]@(13, 10); Want = ''; What = 'a line break and nothing else' },
+    @{ Name = 'key.txt'; Bytes = [System.Text.Encoding]::ASCII.GetBytes('0a1b2c3d' + [char]13 + [char]10); Want = '0a1b2c3d'; What = 'a key followed by a line break' }
+)
+foreach ($tfCase in $tfCases) {
+    $tfFile = Join-Path $tfDir $tfCase.Name
+    [System.IO.File]::WriteAllBytes($tfFile, $tfCase.Bytes)
+    $tfGot = $null; $tfWhy = ''
+    try { $tfGot = Get-TrimmedFileText -Path $tfFile } catch { $tfWhy = $_.Exception.Message }
+    Assert-That ($tfGot -is [string] -and $tfGot -ceq $tfCase.Want -and -not $tfWhy) "Get-TrimmedFileText of $($tfCase.What) is '$($tfCase.Want)', a string and not nothing ($tfWhy)"
+}
 
 Write-Host "`n=== installer: next to a foreign folder, Stack and Skills are made and locked down ===" -ForegroundColor Cyan
 if ($onWindows) {
@@ -1868,15 +1894,16 @@ Assert-That ($ukTwice.Count -eq $ukOwnIds.Count -and $ukOwnIds.Count -ge 7) "the
 Assert-That ($ukGone.Count -eq 1 -and $ukGone[0] -ceq 'local-main') "a catalog file that is not there, or no file name at all, is passed over and the others are read ($($ukGone -join ', '))"
 Assert-That ($ukBrokenIds.Count -eq 1 -and $ukBrokenIds[0] -ceq 'local-main' -and $ukBrokenUnread.Count -eq 1 -and ([string]$ukBrokenUnread[0]).StartsWith("$ukBroken (")) "a catalog that cannot be read is named as unread, which the health check fails, and the others are still listed ($($ukBrokenIds -join ', '); unread: $($ukBrokenUnread -join ' | '))"
 Assert-That ($ukLook.Count -eq 1 -and [string]::Equals([string]$ukLook[0], 'local-main', [System.StringComparison]::Ordinal)) "a selected id that only looks like a catalog preset's (the same letters with a soft hyphen behind them, which -ccontains takes for the same id) does not take that preset out of the check: ids are held against each other character for character ($($ukLook.Count) listed)"
-# The installer's walk reads the same two lists as the health check: the catalog its run uses, which
-# a variable of the user's can replace with another file, and always the toolkit's own next to the
-# script. With the first alone, a preset left out of that file was never made safe, and the health
+# The installer's walk reads the same two lists as the health check: the catalog its run uses and,
+# always, the toolkit's own next to the script. In the installer as it ships the two are one file
+# (no variable replaces the first any more; only the copy tests/Invoke-InstallerMockRun.ps1 runs has
+# another). With the first alone, a preset left out of that file was never made safe, and the health
 # check, which read both, failed it and named Update toolkit as the fix, run after run.
 $walkAst = [System.Management.Automation.Language.Parser]::ParseFile((Join-Path $src 'Install-LocalAI.ps1'), [ref]$null, [ref]$null)
 $walkSet = @($walkAst.FindAll({ param($n) $n -is [System.Management.Automation.Language.AssignmentStatementAst] -and [string]$n.Left.Extent.Text -eq '$presetSafety' }, $true))
 $walkFrom = ''; if ($walkSet.Count -eq 1) { $walkFrom = [string]$walkSet[0].Right.Extent.Text }
 Assert-That ($walkSet.Count -eq 1 -and $walkFrom -cmatch '^@\(Invoke-LaiPresetSafety ' -and $walkFrom -cnotmatch '-ReadOnly' -and $walkFrom.Contains('@((Get-LaiCatalog -Path $CatalogPath -IncludeTrials).Models)') -and
-    $walkFrom.Contains("@((Get-LaiCatalog -Path (Join-Path (Join-Path `$SourceRoot 'config') 'models.psd1') -IncludeTrials).Models)")) "the installer's walk over the toolkit's presets takes its entries from the catalog in use and, always, from config\models.psd1 next to the script, so that a variable naming another catalog takes no preset out of it ($walkFrom)"
+    $walkFrom.Contains("@((Get-LaiCatalog -Path (Join-Path (Join-Path `$SourceRoot 'config') 'models.psd1') -IncludeTrials).Models)")) "the installer's walk over the toolkit's presets takes its entries from the catalog in use and, always, from config\models.psd1 next to the script, so that a run with another catalog takes no preset out of it ($walkFrom)"
 # Open WebUI found down while the volume lock is held. A backup, restore or update holds that lock and
 # stops Open WebUI for a few minutes, and the health check took any held lock for one of them: the row
 # was a warning, the rows behind it skipped, and the run ended '0 failures' with exit code 0 for as
@@ -3086,6 +3113,46 @@ foreach ($c in 'de-DE', 'tr-TR', 'ja-JP') {
 }
 [System.Globalization.CultureInfo]::CurrentCulture = $savedCulture
 Assert-That ($null -eq (ConvertTo-WatchDate 'not a date') -and $null -eq (ConvertTo-WatchDate '')) 'a damaged value reads as no date (no crash)'
+# Since when the watch has found Open WebUI (or deep research) down under a held volume lock, and
+# when it last found it so, are two times in watch-state.json, written as UTC text with a Z. Windows
+# PowerShell 5.1 hands them back as that text, so this is the path of every real run; the Linux job
+# gets the watch's own stamps back as dates. A stamp that is there and is no time that has passed
+# counts as overdue, whatever it holds and whatever stands next to it.
+. ([scriptblock]::Create($wAst.Find({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'ConvertTo-WatchUtc' }, $true).Extent.Text))
+. ([scriptblock]::Create($wAst.Find({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Get-WatchLockSeen' }, $true).Extent.Text))
+$wlNow = [datetime]::UtcNow
+$wlText = { param([double]$MinutesAgo) $wlNow.AddMinutes(-$MinutesAgo).ToString('s') + 'Z' }
+$wlAsk = { param([hashtable]$State) Get-WatchLockSeen -State $State -Key 'webuiLockedSince' -SeenKey 'webuiLockedSeen' -Now $wlNow -BoundMinutes 45 -GapMinutes 35 }
+$wl = & $wlAsk @{}
+Assert-That ($wl.First -and -not $wl.Overdue -and $null -eq $wl.Since) 'no stamp: this run is the first sighting, and nothing is overdue'
+$wl = & $wlAsk @{ webuiLockedSince = (& $wlText 44) }
+Assert-That (-not $wl.First -and -not $wl.Overdue -and $wl.Since -is [datetime] -and $wl.Since.Kind -eq 'Utc' -and [math]::Abs(($wlNow - $wl.Since).TotalMinutes - 44) -lt 0.1) "a stamp 44 minutes old, as the text Windows PowerShell 5.1 reads back, is the time it says, in UTC, and is not overdue ($($wl.Since))"
+$wl = & $wlAsk @{ webuiLockedSince = (& $wlText 50) }
+Assert-That (-not $wl.First -and $wl.Overdue -and $null -ne $wl.Since -and [math]::Abs(($wlNow - $wl.Since).TotalMinutes - 50) -lt 0.1) 'the same 50 minutes old is overdue, with its time to print'
+$wl = & $wlAsk @{ webuiLockedSince = $wlNow.ToLocalTime().AddMinutes(-50).ToString('s') }
+Assert-That ($wl.Overdue -and $null -ne $wl.Since -and [math]::Abs(($wlNow - $wl.Since).TotalMinutes - 50) -lt 0.1) 'a time that names no zone is taken as local time'
+$wl = & $wlAsk @{ webuiLockedSince = $wlNow.AddMinutes(-44) }
+$wlOld = & $wlAsk @{ webuiLockedSince = $wlNow.AddMinutes(-50) }
+Assert-That (-not $wl.First -and -not $wl.Overdue -and $wlOld.Overdue -and $null -ne $wlOld.Since) 'and so is a date, which is what PowerShell 7 reads back'
+$wlBad = @('', $null, 'no time', @{ at = (& $wlText 5) }, @((& $wlText 5)), 7, $true, (& $wlText (-600)), $wlNow.AddMinutes(600))
+$wlWrong = @()
+for ($i = 0; $i -lt $wlBad.Count; $i++) {
+    foreach ($st in @(@{ webuiLockedSince = $wlBad[$i] }, @{ webuiLockedSince = $wlBad[$i]; webuiLockedSeen = (& $wlText 60) })) {
+        $wl = & $wlAsk $st
+        if ($wl.First -or -not $wl.Overdue -or $null -ne $wl.Since) { $wlWrong += $i }
+    }
+}
+Assert-That ($wlWrong.Count -eq 0) "an empty stamp, none, text that is no time, a table, a list, a number, a switch, and a time in the future as text and as a date all count as overdue with no time to print, whatever the last sighting says (wrong: $($wlWrong -join ', '))"
+$wl = & $wlAsk @{ webuiLockedSince = (& $wlText 50); webuiLockedSeen = (& $wlText 40) }
+Assert-That ($wl.First -and -not $wl.Overdue -and $null -eq $wl.Since) 'a stamp 50 minutes old that was last seen 40 minutes ago starts the count over: a first sighting, not overdue'
+$wl = & $wlAsk @{ webuiLockedSince = (& $wlText 50); webuiLockedSeen = (& $wlText 30) }
+Assert-That (-not $wl.First -and $wl.Overdue -and $null -ne $wl.Since) 'last seen 30 minutes ago is no break: the 50 minutes count'
+$wlWrong = @()
+foreach ($s in @('', $null, 'no time', 7, (& $wlText (-600)))) {
+    $wl = & $wlAsk @{ webuiLockedSince = (& $wlText 50); webuiLockedSeen = $s }
+    if ($wl.First -or -not $wl.Overdue) { $wlWrong += [string]$s }
+}
+Assert-That ($wlWrong.Count -eq 0) "a last sighting that is empty, none, no time, a number or in the future shows no break, and the stamp is judged by its age (wrong: $($wlWrong -join ', '))"
 # The counts the watch's notice for an emptied Open WebUI prints come from backup-state.json, a file
 # any program of the owner can write: a whole number from 0 up is a count, anything else is none.
 . ([scriptblock]::Create($wAst.Find({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'ConvertTo-WatchCount' }, $true).Extent.Text))
@@ -4625,7 +4692,7 @@ foreach ($pcsCanary in $pcsCanaries) {
     if ($pcsCanaryGot -cne $pcsCanaryWant) { $pcsCanaryWrong += "'$($pcsCanary.Code)' -> $pcsCanaryGot" }
 }
 Assert-That ($pcsCanaries.Count -eq 17 -and $pcsCanaryWrong.Count -eq 0) "the same reader on parsed snippets names what is on no list (Remove-Item, Out-File, a call through `$cmd, a dot-call of a path, [System.IO.File]::Delete), a second place for New-Item, WriteAllText, Import-Module or Read-LaiState, and each form no list holds (ForEach-Object given a word or a variable, a file and an alias set as variables of their drives, a using line, a #Requires -Modules line), and reports nothing on a snippet of listed calls; a listed name that is not called is only said ($($pcsCanaries.Count) snippets; wrong: $($pcsCanaryWrong -join ' | '))"
-# That list sees command names only, not what the script's one piece of compiled code calls in Windows
+# Those lists see the calls the script writes, not what its one piece of compiled code calls in Windows
 # itself (the C# in Test-PcsDeviceOpen). So what that code may do is pinned here: one Add-Type, given
 # $members; two imports under their own names, NtOpenFile from ntdll.dll and CloseHandle from
 # kernel32.dll, and no CreateFile of any kind; one NtOpenFile call, asking for neither read nor write

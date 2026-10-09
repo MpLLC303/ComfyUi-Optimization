@@ -703,10 +703,11 @@ exec sleep 30
     $pol = Invoke-DockerText @('inspect', '-f', '{{.State.Status}} {{.HostConfig.RestartPolicy.Name}}', 'open-webui')
     Assert-That (-not (Test-Path -LiteralPath $holdFile) -and $pol -eq 'running always') "and none of the three left a hold or stopped Open WebUI (container '$pol')"
     # An update that names no catalog (every update the owner runs). Its health check,
-    # Test-LocalAI.ps1, picks one itself then and looks in the environment first: with the variable
-    # naming a file that is not there, the check could not start, and every update and rollback
-    # ended as failed. The update now hands it the toolkit's own catalog, so the variable is never
-    # asked. (That catalog's models are not in this sandbox: the check has failures to report, and
+    # Test-LocalAI.ps1, used to pick one itself then and looked in the environment first: with the
+    # variable naming a file that is not there, the check could not start, and every update and
+    # rollback ended as failed. The update hands it the toolkit's own catalog, and since batch 7 the
+    # health check takes no catalog from the environment at all, so the variable is never asked.
+    # (That catalog's models are not in this sandbox: the check has failures to report, and
     # what counts is that it ran to its verdict. SearXNG only, without a backup: Open WebUI's
     # version and its rollback point stay as they are.)
     $envCatalog = Join-Path $aiRoot 'catalog-from-the-environment.psd1'

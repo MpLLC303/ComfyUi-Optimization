@@ -517,9 +517,9 @@ if ($script:token) {
     # The toolkit's presets that are in Open WebUI without being selected, each with a row of its
     # own and the same judge: such a preset keeps the switches it had when it was last written, and
     # a chat can be started on it. The entries come from the catalog this run reads and, always,
-    # from the toolkit's own catalog next to this script: a -CatalogPath (or the test variable
-    # above) that names a shorter list cannot take a preset out of this check. A preset that is not
-    # in Open WebUI gets no row; one that cannot be read gets a failed one.
+    # from the toolkit's own catalog next to this script: a -CatalogPath that names a shorter list
+    # cannot take a preset out of this check. A preset that is not in Open WebUI gets no row; one
+    # that cannot be read gets a failed one.
     $unselected = Get-UnselectedPresetEntry -CatalogFiles @($CatalogPath, (Join-Path (Join-Path $PSScriptRoot 'config') 'models.psd1')) -SelectedPresets @($catalog.Models | ForEach-Object { [string]$_.Preset })
     foreach ($unreadCatalog in @($unselected.Unread)) {
         Add-Check 'Presets that are not selected' { Fail "the catalog $unreadCatalog could not be read, so the presets it lists were not checked; run Start menu > Local AI - Update toolkit to put the toolkit's files back" }
