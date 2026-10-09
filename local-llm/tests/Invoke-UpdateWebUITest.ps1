@@ -755,6 +755,22 @@ exec sleep 30
         $clearScreen = [string][char]27 + '[2J'
         $nastyFeature = 'img' + $clearScreen + "`n" + 'gen' + [char]0x202E
         $shown = { param([string]$Text) ($Text -replace '[^\x20-\x7e]', '?') }
+        # What a run logged last, for the message of an assertion on it that did not hold. In CI the
+        # last restore of this part once ended with exit 1 within two seconds, before it had asked
+        # Open WebUI anything, and the three assertions on its warnings failed without one word of
+        # the run's own: the log could not say why. $lastLines: the last 12 lines that are not
+        # blank, the lines of an error that ended the script joined again (Join-Wrapped), on one
+        # line, the last 2000 characters of that at most, through $shown. $orLastLines: that text
+        # as the end of an assertion's message, and nothing when the assertion holds.
+        $lastLines = {
+            param([string]$Text)
+            $kept = @((Join-Wrapped $Text) -split "`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ } | Select-Object -Last 12)
+            if ($kept.Count -eq 0) { return 'none, the run wrote nothing' }
+            $joined = $kept -join ' | '
+            if ($joined.Length -gt 2000) { $joined = '...' + $joined.Substring($joined.Length - 2000) }
+            & $shown $joined
+        }
+        $orLastLines = { param([bool]$Holds, [string]$Text) if ($Holds) { '' } else { "; the run's last lines: $(& $lastLines $Text)" } }
         try {
             $old = ConvertTo-LaiHashtable $presetRaw
             foreach ($set in 'builtinTools', 'capabilities') { if ($old['meta'][$set] -isnot [hashtable]) { $old['meta'][$set] = @{} } }
@@ -861,16 +877,21 @@ exec sleep 30
             try { $r = & $runScript 'Restore-OpenWebUI.ps1' @('-Archive', $good.FullName, '-Force', '-SkipSafetyBackup', '-CatalogPath', $mainCatalog) } finally { Remove-Item -LiteralPath $mainCatalog -Force -ErrorAction SilentlyContinue }
             $fastNow = & $getFast
             $fastChats = $fastNow.meta.builtinTools.chats
-            Assert-That ($r.Code -eq 0 -and $r.Text -match $fastNamedNasty) "a preset in Open WebUI that the run's catalog does not name and that lets the assistant read past chats is named in a warning, by its name (on one line, cut, what does not show written out) and its id, with where to switch it off, and the restore still ends well (exit $($r.Code); its warnings on presets: $(& $shown (& $presetWarnings $r.Text)))"
+            # Each of the three assertions on what this run logged ends, when it does not hold, with
+            # the run's last lines ($orLastLines): what is asserted is as before.
+            $holds = ($r.Code -eq 0 -and $r.Text -match $fastNamedNasty)
+            Assert-That $holds "a preset in Open WebUI that the run's catalog does not name and that lets the assistant read past chats is named in a warning, by its name (on one line, cut, what does not show written out) and its id, with where to switch it off, and the restore still ends well (exit $($r.Code); its warnings on presets: $(& $shown (& $presetWarnings $r.Text))$(& $orLastLines $holds $r.Text))"
             Assert-That (-not $r.Text.Contains($clearScreen) -and -not $r.Text.Contains([string][char]0x200B)) 'and nothing of that name reaches the window as it came: no escape sequence that clears it, no character that shows as nothing'
             # That one and no other: local-main is the walk's and is not named a second time.
             $named = @(& $othersNamed $r.Text)
-            Assert-That ($named.Count -eq 1) "and the run names that preset only ($($named.Count) named: $(& $shown ($named -join ' | ')))"
+            $holds = ($named.Count -eq 1)
+            Assert-That $holds "and the run names that preset only ($($named.Count) named: $(& $shown ($named -join ' | '))$(& $orLastLines $holds $r.Text))"
             Assert-That ($fastChats -is [bool] -and $fastChats -eq $true -and [string]::Equals([string]$fastNow.name, $nastyName, [System.StringComparison]::Ordinal)) "and that preset is not changed: it is not one of the run's own (chats '$fastChats', its name: $(& $shown ([string]$fastNow.name)))"
             # The run's last line: the catalog's preset as before, and that another preset was named
             # further up. Without that, the last thing the owner reads is a line that all is well.
             $reappliedLine = [regex]::Match($r.Text, "Re-applied this install's safety settings[^\n]*").Value
-            Assert-That ($r.Text -match "Re-applied this install's safety settings[^\n]*sign-up off; 1 toolkit preset\(s\) checked, all had [^\n]*the writing tools off already; 1 other preset\(s\) in the restored data, named in the warning\(s\) above" -and $r.Text -notmatch 'were not put back') "the one preset of that catalog is counted as checked, a preset that needed nothing is reported with the writing tools among what was off already, and the line says that one other preset was named above (the line: $(& $shown $reappliedLine))"
+            $holds = ($r.Text -match "Re-applied this install's safety settings[^\n]*sign-up off; 1 toolkit preset\(s\) checked, all had [^\n]*the writing tools off already; 1 other preset\(s\) in the restored data, named in the warning\(s\) above" -and $r.Text -notmatch 'were not put back')
+            Assert-That $holds "the one preset of that catalog is counted as checked, a preset that needed nothing is reported with the writing tools among what was off already, and the line says that one other preset was named above (the line: $(& $shown $reappliedLine)$(& $orLastLines $holds $r.Text))"
             Assert-That ($r.Text -notmatch $startWarning) 'and this run, without -TestFailOllamaUrl, has no test warning either'
         } finally {
             # Never leave the shared sandbox Open WebUI with these on. Each by itself: one that could
