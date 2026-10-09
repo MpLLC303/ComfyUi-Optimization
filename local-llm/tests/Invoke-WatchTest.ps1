@@ -32,13 +32,23 @@ function Invoke-Watch([string[]]$Arguments = @()) {
     return ($out -join "`n")
 }
 function Get-WatchLog { $f = Join-Path (Join-Path $aiRoot 'Logs') 'watch.log'; if (Test-Path -LiteralPath $f) { return (Get-Content -Raw -LiteralPath $f) } return '' }
-# A time the watch keeps in its state file, as the text that was written ('' when it is not there):
-# PowerShell 7 hands an ISO time in a JSON file back as a date.
+# A time the watch keeps in its state file, in UTC and in the sortable spelling ('' when it is not
+# there). PowerShell 7 hands an ISO time in a JSON file back as a date: in UTC when it was written
+# with a Z, as the watch writes the two it keeps for a service down under the volume lock, and
+# without a zone when it was written without one, which the watch takes as local time. What is no
+# date comes back as the text it is.
 function Get-WatchStateTime([string]$Key) {
     $st = Read-LaiState -Path (Join-Path $aiRoot 'watch-state.json')
     if (-not $st.ContainsKey($Key)) { return '' }
-    if ($st[$Key] -is [datetime]) { return $st[$Key].ToString('s') }
+    if ($st[$Key] -is [datetime]) { return $st[$Key].ToUniversalTime().ToString('s') }
     return [string]$st[$Key]
+}
+# A time the test holds, in the same spelling.
+function Get-UtcText([datetime]$Time) { return $Time.ToUniversalTime().ToString('s') }
+# How many minutes ago a time in that spelling was (-1 when the text is none).
+function Get-UtcAge([string]$Text) {
+    if ($Text -notmatch '^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d$') { return -1 }
+    return ([datetime]::UtcNow - [datetime]::ParseExact($Text, 's', [Globalization.CultureInfo]::InvariantCulture)).TotalMinutes
 }
 # One of the toolkit's scripts in a child process, as a Start-menu shortcut runs it: what it printed
 # (errors included), its exit code and how long it took.
@@ -88,7 +98,8 @@ try {
     Invoke-DockerText @('rm', '-f', 'open-webui') | Out-Null
     Invoke-DockerText @('create', '--name', 'open-webui', 'alpine:3.20', 'sleep', '3600') | Out-Null
     $holdScript = Join-Path $Work 'hold-lock.ps1'
-    Set-Content -LiteralPath $holdScript -Value ("Import-Module '{0}' -Force; `$l = Enter-LaiVolumeLock; Start-Sleep -Seconds 600; Exit-LaiVolumeLock `$l" -f (Join-Path (Join-Path $src 'lib') 'LocalAI.psm1'))
+    # Held through this section and 3b, which ends it: a dozen runs of the watch, long before the 900 s.
+    Set-Content -LiteralPath $holdScript -Value ("Import-Module '{0}' -Force; `$l = Enter-LaiVolumeLock; Start-Sleep -Seconds 900; Exit-LaiVolumeLock `$l" -f (Join-Path (Join-Path $src 'lib') 'LocalAI.psm1'))
     $holder = Start-Process -FilePath 'pwsh' -ArgumentList @('-NoProfile', '-File', $holdScript) -PassThru
     $deadline = (Get-Date).AddSeconds(30)
     while (-not (Test-LaiVolumeLockBusy) -and (Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 300 }
@@ -110,11 +121,18 @@ try {
     Assert-That ((Get-State 'open-webui') -eq 'created') 'Open WebUI is not started mid-backup/restore'
     Assert-That ((Get-WatchLog) -match 'left alone') 'watch.log says it was left alone on purpose'
     # Left alone is counted from the first run that finds it so: that run writes down when, one stamp
-    # for Open WebUI (webuiLockedSince) and one for deep research (3b), in the watch's state file.
+    # for Open WebUI (webuiLockedSince) and one for deep research (3b), in the watch's state file,
+    # and next to it the time of the last run that saw it so (webuiLockedSeen), here the same one.
     $seen3 = Get-WatchStateTime 'webuiLockedSince'
-    $seenAge = -1
-    if ($seen3 -match '^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d$') { $seenAge = ((Get-Date) - [datetime]::ParseExact($seen3, 's', [Globalization.CultureInfo]::InvariantCulture)).TotalMinutes }
-    Assert-That ($seenAge -ge 0 -and $seenAge -lt 10) "the first run that finds Open WebUI down under the lock records since when (webuiLockedSince: '$seen3', $([math]::Round($seenAge, 1)) min ago)"
+    $seenAge = Get-UtcAge $seen3
+    Assert-That ($seenAge -ge 0 -and $seenAge -lt 10 -and (Get-WatchStateTime 'webuiLockedSeen') -eq $seen3) "the first run that finds Open WebUI down under the lock records since when, and itself as the last run that saw it (webuiLockedSince: '$seen3', $([math]::Round($seenAge, 1)) min ago; webuiLockedSeen: '$(Get-WatchStateTime 'webuiLockedSeen')')"
+    # Both are written in UTC, with a Z. Local time is an hour off on the two nights a year the
+    # clocks change: an honest stamp would read as 75 minutes old after 15, or as lying in the
+    # future, and either counts as overdue. (The age above is counted in UTC as well.)
+    $raw3 = [string](Get-Content -Raw -Encoding UTF8 -LiteralPath $state3)
+    $zSaid = @([regex]::Matches($raw3, '"webuiLocked(Since|Seen)":\s*"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ"')).Count
+    $inFile3 = @([regex]::Matches($raw3, '"webuiLocked(Since|Seen)":\s*"[^"\n]*"') | ForEach-Object { $_.Value }) -join ', '
+    Assert-That ($zSaid -eq 2) "both times are in the state file as UTC, in the sortable spelling with a Z ($zSaid of 2: $inFile3)"
     # Two were reported. SearXNG answers again while Open WebUI is still left alone: that is not 'back
     # to normal', which would be the last word although Open WebUI has not been looked at. The notice
     # says what recovered and what was not checked. (A fresh backup and no disk limit, so that nothing
@@ -143,7 +161,8 @@ try {
     Invoke-Watch | Out-Null
     $line3 = & $statusLine
     Assert-That ($line3 -match (' FAIL [^\n]*Open WebUI \(down, and by the watch''s record the volume lock was held each time it looked since ' + [regex]::Escape($old3.ToString('yyyy-MM-dd HH:mm')) + ', longer than ') -and $line3 -match $lockSaid -and $line3 -notmatch 'left alone' -and @((Read-LaiState -Path $state3)['failed']) -contains 'Open WebUI') "an Open WebUI found down under the lock for 50 minutes is failed, naming the lock and since when, and is not called left alone ($line3)"
-    Assert-That ((Get-State 'open-webui') -eq 'created' -and (Get-WatchStateTime 'webuiLockedSince') -eq $old3.ToString('s') -and @(& $problems3).Count -eq $toldBefore) "it is still not started under the lock, its stamp keeps its time, and one such run sends no notice (the container is $(Get-State 'open-webui'); stamp '$(Get-WatchStateTime 'webuiLockedSince')', written '$($old3.ToString('s'))'; $(@(& $problems3).Count - $toldBefore) notice(s))"
+    $lastSeen3 = Get-UtcAge (Get-WatchStateTime 'webuiLockedSeen')
+    Assert-That ((Get-State 'open-webui') -eq 'created' -and (Get-WatchStateTime 'webuiLockedSince') -eq (Get-UtcText $old3) -and $lastSeen3 -ge 0 -and $lastSeen3 -lt 10 -and @(& $problems3).Count -eq $toldBefore) "it is still not started under the lock, its stamp keeps its time, the run is on record as the last that saw it, and one such run sends no notice (the container is $(Get-State 'open-webui'); stamp '$(Get-WatchStateTime 'webuiLockedSince')', written '$(Get-UtcText $old3)'; last seen $([math]::Round($lastSeen3, 1)) min ago; $(@(& $problems3).Count - $toldBefore) notice(s))"
     # The second such run in a row tells, as for every failed check. The next step is the health
     # check's (let a window that is still at work finish, else restart the PC), not Start again, which
     # waits for the same lock.
@@ -158,13 +177,52 @@ try {
     Save-LaiState -State @{ webuiLockedSince = $ahead3.ToString('s') } -Path $state3
     Invoke-Watch | Out-Null
     $line3 = & $statusLine
-    Assert-That ($line3 -match $noTimeSaid -and $line3 -match $lockSaid -and $line3 -notmatch 'left alone' -and $line3 -notmatch [regex]::Escape($ahead3.ToString('yyyy-MM-dd')) -and (Get-State 'open-webui') -eq 'created' -and (Get-WatchStateTime 'webuiLockedSince') -like ($ahead3.ToString('yyyy-MM-dd') + '*')) "a stamp 400 days ahead counts as overdue: Open WebUI is failed without a time, not started, and the stamp stays ($line3; stamp '$(Get-WatchStateTime 'webuiLockedSince')')"
+    Assert-That ($line3 -match $noTimeSaid -and $line3 -match $lockSaid -and $line3 -notmatch 'left alone' -and $line3 -notmatch [regex]::Escape($ahead3.ToString('yyyy-MM-dd')) -and (Get-State 'open-webui') -eq 'created' -and (Get-WatchStateTime 'webuiLockedSince') -like ((Get-UtcText $ahead3).Substring(0, 10) + '*')) "a stamp 400 days ahead counts as overdue: Open WebUI is failed without a time, not started, and the stamp stays ($line3; stamp '$(Get-WatchStateTime 'webuiLockedSince')')"
     # And so does one that is no time at all. What the file held is never printed.
     $junk3 = 'no-time-planted-by-the-test'
     Save-LaiState -State @{ webuiLockedSince = $junk3 } -Path $state3
     Invoke-Watch | Out-Null
     $line3 = & $statusLine
     Assert-That ($line3 -match $noTimeSaid -and $line3 -match $lockSaid -and $line3 -notmatch 'left alone' -and $line3 -notmatch [regex]::Escape($junk3) -and (Get-State 'open-webui') -eq 'created' -and (Get-WatchStateTime 'webuiLockedSince') -eq $junk3) "a stamp that is no time counts as overdue: Open WebUI is failed and not started, the stamp's text is not printed, and the stamp stays ($line3; stamp '$(Get-WatchStateTime 'webuiLockedSince')')"
+    # And an empty one: a stamp that is there is a stamp, whatever it holds. It is asked for by its
+    # name and never by its value, or an empty stamp would be a first sighting on every run.
+    Save-LaiState -State @{ webuiLockedSince = '' } -Path $state3
+    Invoke-Watch | Out-Null
+    $line3 = & $statusLine
+    $empty3 = Read-LaiState -Path $state3
+    Assert-That ($line3 -match $noTimeSaid -and $line3 -match $lockSaid -and $line3 -notmatch 'left alone' -and (Get-State 'open-webui') -eq 'created' -and $empty3.ContainsKey('webuiLockedSince') -and [string]$empty3['webuiLockedSince'] -eq '') "an empty stamp counts as overdue: Open WebUI is failed and not started, and the stamp stays as it is ($line3; in the state file: $($empty3.ContainsKey('webuiLockedSince')), '$($empty3['webuiLockedSince'])')"
+    # A stamp that is a time and comes back from the state file as text. That is every stamp of a real
+    # run: Windows PowerShell 5.1 hands the watch its own stamps back as text, and PowerShell 7, which
+    # runs this test, as dates. Spelled with a blank where the watch writes a T, a time stays text here
+    # too. It has to be read as the time it is: 40 minutes are inside the 45, so Open WebUI is left
+    # alone, and the stamp keeps its time, in the watch's spelling from then on.
+    $leftSaid = '\(Open WebUI stopped for a backup/restore/update; left alone\)'
+    $text3 = (Get-Date).AddMinutes(-40)
+    Save-LaiState -State @{ webuiLockedSince = $text3.ToUniversalTime().ToString('u') } -Path $state3
+    $asRead3 = (Read-LaiState -Path $state3)['webuiLockedSince']
+    Assert-That ($asRead3 -is [string] -and $asRead3 -eq $text3.ToUniversalTime().ToString('u')) "setup: a time spelled with a blank comes back from the state file as text, as every stamp does under Windows PowerShell 5.1 ('$asRead3')"
+    Invoke-Watch | Out-Null
+    $line3 = & $statusLine
+    Assert-That ($line3 -match $leftSaid -and $line3 -notmatch 'Open WebUI \(down' -and @((Read-LaiState -Path $state3)['failed']) -notcontains 'Open WebUI' -and (Get-WatchStateTime 'webuiLockedSince') -eq (Get-UtcText $text3)) "a stamp that comes back as text is read as the time it is: found so 40 minutes ago, Open WebUI is left alone and the stamp keeps its time ($line3; stamp '$(Get-WatchStateTime 'webuiLockedSince')', written '$(Get-UtcText $text3)')"
+    # The 45 minutes are counted over runs that follow one another. A stamp 50 minutes old whose last
+    # sighting lies 40 minutes back is two looks with nothing in between: the PC was off or asleep,
+    # the watch paused, Docker down. What holds the lock now may be another program than the one seen
+    # then, and a backup that began a minute ago must not be called longer than a backup takes, with
+    # a notice to restart the PC one run later. The count starts over: left alone, and both times are
+    # this run's. Written here as the watch writes them, UTC with a Z.
+    $gapSince = (Get-Date).AddMinutes(-50)
+    Save-LaiState -State @{ webuiLockedSince = (Get-UtcText $gapSince) + 'Z'; webuiLockedSeen = (Get-UtcText (Get-Date).AddMinutes(-40)) + 'Z' } -Path $state3
+    Invoke-Watch | Out-Null
+    $line3 = & $statusLine
+    $gapAge = Get-UtcAge (Get-WatchStateTime 'webuiLockedSince')
+    Assert-That ($line3 -match $leftSaid -and $line3 -notmatch 'Open WebUI \(down' -and @((Read-LaiState -Path $state3)['failed']) -notcontains 'Open WebUI' -and $gapAge -ge 0 -and $gapAge -lt 10 -and (Get-WatchStateTime 'webuiLockedSeen') -eq (Get-WatchStateTime 'webuiLockedSince') -and (Get-State 'open-webui') -eq 'created') "a stamp 50 minutes old that was last seen 40 minutes ago is no lock held for 50 minutes: the count starts over, Open WebUI is left alone, and both times are this run's ($line3; stamp '$(Get-WatchStateTime 'webuiLockedSince')', $([math]::Round($gapAge, 1)) min ago; last seen '$(Get-WatchStateTime 'webuiLockedSeen')')"
+    # Last seen 20 minutes ago is the run before this one, or one missed between them: no break. The
+    # 50 minutes count, the stamp keeps its time and this run is the last that saw it.
+    Save-LaiState -State @{ webuiLockedSince = (Get-UtcText $gapSince) + 'Z'; webuiLockedSeen = (Get-UtcText (Get-Date).AddMinutes(-20)) + 'Z' } -Path $state3
+    Invoke-Watch | Out-Null
+    $line3 = & $statusLine
+    $lastSeen3 = Get-UtcAge (Get-WatchStateTime 'webuiLockedSeen')
+    Assert-That ($line3 -match (' FAIL [^\n]*Open WebUI \(down, and by the watch''s record the volume lock was held each time it looked since ' + [regex]::Escape($gapSince.ToString('yyyy-MM-dd HH:mm')) + ', longer than ') -and $line3 -notmatch 'left alone' -and (Get-WatchStateTime 'webuiLockedSince') -eq (Get-UtcText $gapSince) -and $lastSeen3 -ge 0 -and $lastSeen3 -lt 10 -and (Get-State 'open-webui') -eq 'created') "a stamp 50 minutes old that was last seen 20 minutes ago is failed, naming since when in local time, and is not started ($line3; stamp '$(Get-WatchStateTime 'webuiLockedSince')', written '$(Get-UtcText $gapSince)'; last seen $([math]::Round($lastSeen3, 1)) min ago)"
     # 3b starts without a stamp, so that its first run is the first sighting for both.
     Save-LaiState -State @{ failed = @() } -Path $state3
 
@@ -190,24 +248,26 @@ try {
         # failed in the lock's words and stays paused (nothing wakes it under the lock), while Open
         # WebUI, found so two minutes ago, is still left alone and named as that.
         $st3b = Read-LaiState -Path $state3
-        Assert-That ($st3b.ContainsKey('webuiLockedSince') -and $st3b.ContainsKey('researchLockedSince')) "the first run that finds both down under the lock records a stamp for each (in the state file: $(@($st3b.Keys | Sort-Object) -join ', '))"
+        $lockTimes3b = @('webuiLockedSince', 'webuiLockedSeen', 'researchLockedSince', 'researchLockedSeen')
+        Assert-That (@($lockTimes3b | Where-Object { $st3b.ContainsKey($_) }).Count -eq 4) "the first run that finds both down under the lock records a stamp for each, and the last sighting next to it (in the state file: $(@($st3b.Keys | Sort-Object) -join ', '))"
         $old3b = (Get-Date).AddMinutes(-50); $new3b = (Get-Date).AddMinutes(-2)
         Save-LaiState -State @{ webuiLockedSince = $new3b.ToString('s'); researchLockedSince = $old3b.ToString('s') } -Path $state3
         Invoke-Watch | Out-Null
         $line3b = & $statusLine
         $failed3b = @((Read-LaiState -Path $state3)['failed'])
         Assert-That ($line3b -match (' FAIL [^\n]*Deep research \(down, and by the watch''s record the volume lock was held each time it looked since ' + [regex]::Escape($old3b.ToString('yyyy-MM-dd HH:mm')) + ', longer than a backup, restore or update normally takes; not started while the lock is held\)') -and $line3b -match '\(Open WebUI stopped for a backup/restore/update; left alone\)' -and $failed3b -contains 'Deep research' -and $failed3b -notcontains 'Open WebUI' -and (Get-State 'deep-research') -eq 'paused') "deep research found paused under the lock for 50 minutes is failed, naming the lock, and stays paused; Open WebUI, found so 2 minutes ago, is left alone (deep research is $(Get-State 'deep-research'); failed: $($failed3b -join ', '); $line3b)"
-        Assert-That ((Get-WatchStateTime 'webuiLockedSince') -eq $new3b.ToString('s') -and (Get-WatchStateTime 'researchLockedSince') -eq $old3b.ToString('s')) "while the lock stays held a run keeps both stamps at their times: the count does not start over (Open WebUI '$(Get-WatchStateTime 'webuiLockedSince')', written '$($new3b.ToString('s'))'; deep research '$(Get-WatchStateTime 'researchLockedSince')', written '$($old3b.ToString('s'))')"
+        Assert-That ((Get-WatchStateTime 'webuiLockedSince') -eq (Get-UtcText $new3b) -and (Get-WatchStateTime 'researchLockedSince') -eq (Get-UtcText $old3b)) "while the lock stays held a run keeps both stamps at their times: the count does not start over (Open WebUI '$(Get-WatchStateTime 'webuiLockedSince')', written '$(Get-UtcText $new3b)'; deep research '$(Get-WatchStateTime 'researchLockedSince')', written '$(Get-UtcText $old3b)')"
         if ($holder -and -not $holder.HasExited) { $holder.Kill() }
         $deadline = (Get-Date).AddSeconds(30)
         while ((Test-LaiVolumeLockBusy) -and (Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 300 }
         Invoke-DockerText @('rm', '-f', 'open-webui') | Out-Null   # the stand-in from 3. would be started and waited for
         Invoke-Watch | Out-Null
         Assert-That ((Get-State 'deep-research') -eq 'running' -and (Get-WatchLog) -match 'restarted: [^)]*Deep research') 'a deep research container left paused (a backup killed mid-copy) is woken once the lock is free'
-        # The lock is free: the run that finds it so removes both stamps (deep research answers again,
-        # and Open WebUI, whose stand-in is gone, is down with nothing held over it).
+        # The lock is free: the run that finds it so removes both stamps, and the last sighting that
+        # stands next to each (deep research answers again, and Open WebUI, whose stand-in is gone, is
+        # down with nothing held over it).
         $st3b = Read-LaiState -Path $state3
-        Assert-That (-not $st3b.ContainsKey('webuiLockedSince') -and -not $st3b.ContainsKey('researchLockedSince')) "once the lock is let go the next run removes both stamps (in the state file: $(@($st3b.Keys | Sort-Object) -join ', '))"
+        Assert-That (@($lockTimes3b | Where-Object { $st3b.ContainsKey($_) }).Count -eq 0) "once the lock is let go the next run removes both stamps and both last sightings (in the state file: $(@($st3b.Keys | Sort-Object) -join ', '))"
     } finally {
         Invoke-DockerText @('rm', '-f', 'deep-research') | Out-Null
         $cfg = Read-LaiState -Path $cfgPath; $cfg.Remove('DeepResearchPort'); Save-LaiState -State $cfg -Path $cfgPath

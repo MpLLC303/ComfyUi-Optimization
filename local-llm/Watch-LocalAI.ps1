@@ -22,7 +22,9 @@
     notification either way. Open WebUI or deep research found down while the volume lock is held (a
     backup, restore or update at work) is left alone and not judged for 45 minutes, longer than any
     of them normally takes. Found so on every run after that, it is reported as not working like
-    any other check, and is still never started while the lock is held.
+    any other check, and is still never started while the lock is held. The 45 minutes are counted
+    over runs that follow one another: after more than 35 minutes in which the watch did not look
+    (the PC off or asleep, the watch paused, Docker stopped) they start over.
     Log: <AIRoot>\Logs\watch.log.
     When Ollama has updated itself since the presets were tuned, the nightly LocalAI-Recheck-Models task
     (Update-Models.ps1 -RecheckOnly -Scheduled) measures them again; the watch notifies only when a
@@ -111,11 +113,28 @@ $remindHours = 24
 # and stop the container, and the watch would otherwise stay quiet about it for good. Since when is
 # a stamp for each of the two in watch-state.json (webuiLockedSince, researchLockedSince), written
 # by the first run that sees it and removed by the first one that finds the lock free or the service
-# answering. A stamp that is no time, or lies in the future, counts as overdue.
+# answering. A stamp that is no time, or lies in the future, counts as overdue. Next to each stamp
+# stands the time of the last run that saw it so (webuiLockedSeen, researchLockedSeen; see
+# $lockGapMinutes), written and removed with it.
+# Both are UTC, written with a Z, and only a time that is printed is turned into local time. Local
+# time is an hour off on the two nights a year the clocks change: an honest stamp would read as 75
+# minutes old after 15 in spring, and as lying in the future, which counts as overdue, in autumn.
 # Not closed, and it ships open: that file is one any program of this user can write as well. One
-# that removes the stamp, or sets it to a time less than this many minutes ago, before each run
-# keeps the watch quiet as before.
+# that, before each run, removes the stamp, sets it to a time less than this many minutes ago, or
+# sets the time of the last sighting more than $lockGapMinutes minutes back keeps the watch quiet
+# as before.
 $lockBoundMinutes = 45
+# The count is of runs that found it so one after the other. A last sighting more than this many
+# minutes back (two of the 15-minute runs, and what a run does before it gets here) says that the
+# watch did not look in between: the PC was off or asleep, nobody was signed in, the watch was
+# paused, or Docker was down. What holds the lock now may be another program than the one seen then
+# (the backup that is caught up after sign-in, hours after an update the evening before), and two
+# looks hours apart do not show a lock held for longer than a backup takes. The count starts over,
+# as on a first sighting.
+# This ships open as well: on a PC that is never up, signed in and unpaused for $lockBoundMinutes
+# minutes at a stretch the count never gets there, and the watch does not report a lock that stays
+# held (the health check still fails Open WebUI in the lock's words).
+$lockGapMinutes = 35
 # The integrity comparison (hash every installed file, read the tasks and the listeners) runs when
 # the last one is this old: on every 15-minute run it would be the slowest thing the watch does.
 $integrityMinutes = 60
@@ -150,21 +169,43 @@ function Get-WatchStamp($Value) {
     if ($d) { return $d.ToString('s') }
     return ([string]$Value -replace '\s+', ' ').Trim()
 }
+function ConvertTo-WatchUtc($Value) {
+    # One of the times the watch keeps for a service found down under a held volume lock (see
+    # $lockBoundMinutes), in UTC, or $null when the value is none. The watch writes them as text
+    # that ends in Z: Windows PowerShell 5.1 reads that back as the text, so this is the path of
+    # every real run, and PowerShell 7 reads it back as a date. Both are taken and nothing else is
+    # (a list, a table, a number, a switch). The text is read as UTC at once, not by way of local
+    # time. A time that names no zone is not in the watch's spelling and is taken as local time,
+    # as every other time in the state file is.
+    if ($Value -is [datetime]) { return $Value.ToUniversalTime() }
+    if (-not ($Value -is [string]) -or $Value -eq '') { return $null }
+    $styles = [Globalization.DateTimeStyles]::AdjustToUniversal -bor [Globalization.DateTimeStyles]::AssumeLocal
+    try { return [datetime]::Parse($Value, [Globalization.CultureInfo]::InvariantCulture, $styles) } catch { return $null }
+}
 function Get-WatchLockSeen {
-    # What the stamp says that the watch keeps for a service found down under a held volume lock (see
-    # $lockBoundMinutes). First: no stamp, this is the first run that sees it. Since: the stamp when
-    # it is a time not after -Now. Overdue: that time is -BoundMinutes or more ago, or the stamp is
-    # anything else (empty, no text, not a time, a time in the future). The state file is one any
-    # program of this user can write, and a stamp the watch cannot read must not keep it quiet. Asked
-    # with ContainsKey, never by the value: an empty stamp is a stamp. Only Since, the parsed time, is
-    # ever printed; what the file held is not.
-    param([hashtable]$State, [string]$Key, [datetime]$Now, [int]$BoundMinutes)
-    if (-not $State.ContainsKey($Key)) { return @{ First = $true; Overdue = $false; Since = $null } }
-    $since = $null
-    # The watch writes text, and PowerShell 7 reads that back as a date. A list or a table is neither.
-    if ($State[$Key] -is [string] -or $State[$Key] -is [datetime]) { $since = ConvertTo-WatchDate $State[$Key] }
-    if ($null -ne $since -and $since -le $Now) { return @{ First = $false; Overdue = (($Now - $since).TotalMinutes -ge $BoundMinutes); Since = $since } }
-    return @{ First = $false; Overdue = $true; Since = $null }
+    # What the watch has on record for a service found down under a held volume lock (see
+    # $lockBoundMinutes), from the two times it keeps for it: the stamp, since when (-Key), and the
+    # last run that saw it so (-SeenKey). Every time here is UTC.
+    #   First    this run starts the count: there is no stamp, or the last sighting is more than
+    #            -GapMinutes back, so the watch did not look in between (see $lockGapMinutes).
+    #   Since    the stamp, when it is a time not after -Now and the count goes on.
+    #   Overdue  that time is -BoundMinutes or more ago, or the stamp is there and is anything else
+    #            (empty, no text, not a time, a time in the future).
+    # The state file is one any program of this user can write, and a stamp the watch cannot read
+    # must not keep it quiet: such a stamp is overdue whatever the last sighting says. Asked with
+    # ContainsKey, never by the value: an empty stamp is a stamp. The count starts over only on a
+    # last sighting that reads as a time that has passed: one that is missing, cannot be read or
+    # lies in the future shows no break, and the stamp is judged by its age. Only Since, the parsed
+    # time, is ever printed; what the file held is not.
+    param([hashtable]$State, [string]$Key, [string]$SeenKey, [datetime]$Now, [int]$BoundMinutes, [int]$GapMinutes)
+    $start = @{ First = $true; Overdue = $false; Since = $null }
+    if (-not $State.ContainsKey($Key)) { return $start }
+    $nowUtc = $Now.ToUniversalTime()
+    $since = ConvertTo-WatchUtc $State[$Key]
+    if ($null -eq $since -or $since -gt $nowUtc) { return @{ First = $false; Overdue = $true; Since = $null } }
+    $seen = ConvertTo-WatchUtc $State[$SeenKey]
+    if ($null -ne $seen -and $seen -le $nowUtc -and ($nowUtc - $seen).TotalMinutes -gt $GapMinutes) { return $start }
+    return @{ First = $false; Overdue = (($nowUtc - $since).TotalMinutes -ge $BoundMinutes); Since = $since }
 }
 
 # Every docker call has a time limit: a Docker Desktop that stopped answering (it can after sleep)
@@ -316,8 +357,8 @@ $healed = @()
 $maintenance = $false
 # Open WebUI and deep research down under a held volume lock ($lockBoundMinutes): which of them this
 # run left alone and did not judge, which it counts as failed because that has lasted too long, and
-# what becomes of the stamp each has in watch-state.json when this run is saved (no entry: it stays
-# as it is, '': it is removed, else the time to keep).
+# what becomes of the two times each has in watch-state.json when this run is saved (no entry: it
+# stays as it is, '': it is removed, else the time to keep).
 $leftAlone = @()
 $lockOverdue = @()
 $lockStamps = @{}
@@ -344,13 +385,14 @@ if ($engine -eq 'down' -or $engine -eq 'hung') {
     # CLI ('missing') it was not looked at, and nothing is recorded.
     if ($engine -eq 'ok') { $results['Docker'] = $true }
     # LockKey: the two that a backup, restore or update stops (or pauses) under the volume lock, and
-    # the name of the stamp each has in watch-state.json for it.
-    $watched = @(@{ Name = 'open-webui'; Url = "http://127.0.0.1:$webPort/health"; Key = 'Open WebUI'; LockKey = 'webuiLockedSince' },
+    # the name of the stamp each has in watch-state.json for it. SeenKey: the name of the time of
+    # the last run that saw it so.
+    $watched = @(@{ Name = 'open-webui'; Url = "http://127.0.0.1:$webPort/health"; Key = 'Open WebUI'; LockKey = 'webuiLockedSince'; SeenKey = 'webuiLockedSeen' },
                  @{ Name = 'searxng'; Url = "http://127.0.0.1:$searxPort/healthz"; Key = 'SearXNG' })
     # The optional research agent, healed like the others. Where it is no part of this install, a
     # stamp it once left is owed nothing: it would count against a later install of it.
-    $research = @{ Name = 'deep-research'; Url = "http://127.0.0.1:$researchPort/api/v1/health"; Key = 'Deep research'; LockKey = 'researchLockedSince' }
-    if ($researchPort -gt 0) { $watched += $research } else { $lockStamps[$research.LockKey] = '' }
+    $research = @{ Name = 'deep-research'; Url = "http://127.0.0.1:$researchPort/api/v1/health"; Key = 'Deep research'; LockKey = 'researchLockedSince'; SeenKey = 'researchLockedSeen' }
+    if ($researchPort -gt 0) { $watched += $research } else { $lockStamps[$research.LockKey] = ''; $lockStamps[$research.SeenKey] = '' }
     # The stamps as the run before this one left them. Read once, here: nothing above needs the file.
     $lockState = Read-LaiState -Path $statePath
     foreach ($c in $watched) {
@@ -361,29 +403,34 @@ if ($engine -eq 'down' -or $engine -eq 'hung') {
             # before the hold: a restore in progress has written its hold already, but has not failed).
             # That is 'not checked', not 'working': no result is recorded, so nothing is reported as
             # failed and nothing as recovered, and what was reported before stays as it was.
-            # For $lockBoundMinutes, counted from the first run that saw it so. Found so on every run
-            # after that, it is a failure like any other, with two differences: it is still not
-            # started (whatever holds the lock may be at work on the volume), and no docker command
-            # is run for it. In either case this is maintenance for the rest of the run: the chat
-            # path is not tried and the banner is not written.
+            # For $lockBoundMinutes, counted from the first of the runs that saw it so one after the
+            # other ($lockGapMinutes). Found so on every run after that, it is a failure like any
+            # other, with two differences: it is still not started (whatever holds the lock may be
+            # at work on the volume), and no docker command is run for it. In either case this is
+            # maintenance for the rest of the run: the chat path is not tried and the banner is not
+            # written.
             $maintenance = $true
-            $lookedAt = Get-Date
-            $lockSeen = Get-WatchLockSeen -State $lockState -Key $c.LockKey -Now $lookedAt -BoundMinutes $lockBoundMinutes
-            # The stamp to save: this run's time on a first sighting, the time on record (in the
-            # watch's own spelling) while that reads as one. A stamp that does not is left as it is,
-            # so that it counts as overdue on the next run too.
-            if ($lockSeen.First) { $lockStamps[$c.LockKey] = $lookedAt.ToString('s') }
-            elseif ($null -ne $lockSeen.Since) { $lockStamps[$c.LockKey] = $lockSeen.Since.ToString('s') }
+            # In UTC, as the two times on record are (see $lockBoundMinutes).
+            $lookedAt = [datetime]::UtcNow
+            $lockSeen = Get-WatchLockSeen -State $lockState -Key $c.LockKey -SeenKey $c.SeenKey -Now $lookedAt -BoundMinutes $lockBoundMinutes -GapMinutes $lockGapMinutes
+            # What to save. The stamp: this run's time where the count starts (a first sighting, or
+            # the first one after the watch did not look for more than $lockGapMinutes minutes), the
+            # time on record (in the watch's own spelling) while that reads as one. The last
+            # sighting: this run's time in both cases. A stamp that does not read as a time is left
+            # as it is, with what stands next to it, so that it counts as overdue on the next run too.
+            $lookedStamp = $lookedAt.ToString('s') + 'Z'
+            if ($lockSeen.First) { $lockStamps[$c.LockKey] = $lookedStamp; $lockStamps[$c.SeenKey] = $lookedStamp }
+            elseif ($null -ne $lockSeen.Since) { $lockStamps[$c.LockKey] = $lockSeen.Since.ToString('s') + 'Z'; $lockStamps[$c.SeenKey] = $lookedStamp }
             if ($lockSeen.Overdue) {
                 # The words claim what the watch has on record and no more. Who holds the lock is not
                 # known, and the watch looks every 15 minutes: held each time it looked, not held
                 # throughout. 'By the watch's record', because the stamp is in a file another program
                 # can write, and a run that is ended early leaves it as it was. The time printed is
-                # the parsed one, never what the file held.
+                # the parsed one, in local time, never what the file held.
                 $results[$c.Key] = $false
                 $lockOverdue += $c.Key
                 if ($null -ne $lockSeen.Since) {
-                    $details[$c.Key] = "down, and by the watch's record the volume lock was held each time it looked since $($lockSeen.Since.ToString('yyyy-MM-dd HH:mm')), longer than a backup, restore or update normally takes; not started while the lock is held"
+                    $details[$c.Key] = "down, and by the watch's record the volume lock was held each time it looked since $($lockSeen.Since.ToLocalTime().ToString('yyyy-MM-dd HH:mm')), longer than a backup, restore or update normally takes; not started while the lock is held"
                 } else {
                     $details[$c.Key] = "down with the volume lock held, and the watch's record of since when cannot be read as a time that has passed, which counts as longer than a backup, restore or update normally takes; not started while the lock is held"
                 }
@@ -408,7 +455,7 @@ if ($engine -eq 'down' -or $engine -eq 'hung') {
         }
         $results[$c.Key] = $ok
         # Looked at, and it answers or the lock is free: the count of $lockBoundMinutes starts over.
-        if ($c.ContainsKey('LockKey')) { $lockStamps[$c.LockKey] = '' }
+        if ($c.ContainsKey('LockKey')) { $lockStamps[$c.LockKey] = ''; $lockStamps[$c.SeenKey] = '' }
     }
 
     # The render guard has no host port (only Open WebUI talks to it); if it is down, chats fail.
@@ -1078,9 +1125,9 @@ if ($script:toastSetting) { if ($script:toastSetting -ne 'Enabled') { $final['to
 if ($null -ne $ollamaNotice) { if ($ollamaNotice) { $final['ollamaNotifiedFor'] = $ollamaNotice } else { $final.Remove('ollamaNotifiedFor') } }
 if ($null -ne $driftSince) { if ($driftSince) { $final['ollamaDriftSince'] = $driftSince } else { $final.Remove('ollamaDriftSince') } }
 if ($recheckNotice) { $final['recheckNotifiedFor'] = $recheckNotice }
-# Since when Open WebUI and deep research have been seen down under a held volume lock
-# ($lockBoundMinutes): written and removed here and nowhere else. A stamp without an entry stays as
-# it is: its service was not looked at (Docker down), or the stamp is one this run could not read.
+# Since when Open WebUI and deep research have been seen down under a held volume lock, and when
+# last ($lockBoundMinutes): written and removed here and nowhere else. A time without an entry stays
+# as it is: its service was not looked at (Docker down), or the stamp is one this run could not read.
 foreach ($k in @($lockStamps.Keys)) { if ($lockStamps[$k]) { $final[$k] = $lockStamps[$k] } else { $final.Remove($k) } }
 # (A baseline accepted while this run was busy has another id: the next run starts over with it.)
 if ($null -ne $integrityState) { $final['integrity'] = $integrityState }
