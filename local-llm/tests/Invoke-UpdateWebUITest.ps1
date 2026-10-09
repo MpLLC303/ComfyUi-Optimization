@@ -722,25 +722,55 @@ exec sleep 30
     $sb = 'http://127.0.0.1:3000'
     $tok = Connect-LaiWebUI -BaseUrl $sb -Email 'admin@localhost' -Password 'Test-Password-123'
     $presetRaw = Get-LaiWebUIModel -BaseUrl $sb -Token $tok -Id 'local-main'
-    Assert-That ([bool]$presetRaw) 'setup: the sandbox Open WebUI has the local-main preset'
-    if ($presetRaw) {
+    # The sandbox's second preset: further down it stands for a preset no entry of the catalog names.
+    $fastRaw = Get-LaiWebUIModel -BaseUrl $sb -Token $tok -Id 'local-fast'
+    Assert-That ([bool]$presetRaw -and [bool]$fastRaw) "setup: the sandbox Open WebUI has the local-main and local-fast presets (local-main: $([bool]$presetRaw), local-fast: $([bool]$fastRaw))"
+    if ($presetRaw -and $fastRaw) {
         $getPreset = { Get-LaiWebUIModel -BaseUrl $sb -Token $tok -Id 'local-main' }
+        $getFast = { Get-LaiWebUIModel -BaseUrl $sb -Token $tok -Id 'local-fast' }
         $getSignup = { (Invoke-LaiApi -Uri "$sb/api/v1/auths/admin/config" -Token $tok).ENABLE_SIGNUP }
         $presetWas = ConvertTo-LaiHashtable $presetRaw
+        $fastWas = ConvertTo-LaiHashtable $fastRaw
         $signupWas = [bool](& $getSignup)
         $otherWas = [bool](Get-LaiWebUIModel -BaseUrl $sb -Token $tok -Id 'official-standin')
+        # The start warning of a run that got -TestFailOllamaUrl, and the warning that names a preset
+        # the catalog of a run does not hold: its name, what the assistant can do there and where
+        # to switch that off, on one line of the log. $presetWarnings: what a run said of presets
+        # in its warnings, for the message of an assertion.
+        $startWarning = 'Test run: -TestFailOllamaUrl was passed'
+        # The preset is named with its id, and by name again where it is switched off. The name
+        # alone tells nothing apart: Open WebUI lets two presets carry the same one.
+        $fastNamed = "\[WARN\] The restored data holds the preset 'Local Fast' \(id local-fast\)[^\n]*read past chats[^\n]*Workspace > Models > 'Local Fast'"
+        $presetWarnings = { param([string]$Text) @($Text -split "`n" | Where-Object { $_ -match '\[WARN\]' -and $_ -match 'preset' }) -join ' | ' }
+        # The lines of a run that name a preset the walk did not cover, each with what it says. One
+        # for a preset that is open, and none for any other: a warning on every restore, for
+        # presets that are safe, is the warning nobody reads.
+        $othersNamed = { param([string]$Text) @($Text -split "`n" | Where-Object { $_ -match 'The restored data holds the preset' }) }
+        # Text as a tampered or foreign archive can hold it, in the two places the restore prints
+        # from the restored data: the name of what a preset has on by default, and (further down) a
+        # preset's name. An escape sequence that clears the window and what scrolled by, a line
+        # break, which starts a log line of its own, and a character that shows as nothing (U+200B)
+        # or turns the rest of the line around (U+202E). $shown: on one line, text kept from before.
+        $clearScreen = [string][char]27 + '[2J'
+        $nastyFeature = 'img' + $clearScreen + "`n" + 'gen' + [char]0x202E
+        $shown = { param([string]$Text) ($Text -replace '[^\x20-\x7e]', '?') }
         try {
             $old = ConvertTo-LaiHashtable $presetRaw
             foreach ($set in 'builtinTools', 'capabilities') { if ($old['meta'][$set] -isnot [hashtable]) { $old['meta'][$set] = @{} } }
             $old['meta']['builtinTools']['chats'] = $true
             $old['meta']['builtinTools']['code_interpreter'] = $true
             $old['meta']['capabilities']['code_interpreter'] = $true
-            $old['meta']['defaultFeatureIds'] = @('web_search')
-            foreach ($form in $old, $presetWas) { if ($null -eq $form['params']) { $form['params'] = @{} } }
+            # One of the seven writing tools, as in a backup from before they were switched off.
+            $old['meta']['builtinTools']['notes'] = $true
+            $old['meta']['defaultFeatureIds'] = @('web_search', $nastyFeature)
+            foreach ($form in $old, $presetWas, $fastWas) { if ($null -eq $form['params']) { $form['params'] = @{} } }
             Set-LaiWebUIModel -BaseUrl $sb -Token $tok -Model $old | Out-Null
             Set-LaiWebUIAdminConfig -BaseUrl $sb -Token $tok -Changes @{ ENABLE_SIGNUP = $true } | Out-Null
             $pm = (& $getPreset).meta
-            Assert-That ($pm.builtinTools.chats -eq $true -and $pm.builtinTools.code_interpreter -eq $true -and $pm.capabilities.code_interpreter -eq $true -and @($pm.defaultFeatureIds) -contains 'web_search' -and (& $getSignup) -eq $true) 'setup: as in an old backup, the preset has past-chat search, code execution and unasked web search on, and sign-up is on'
+            Assert-That ($pm.builtinTools.chats -eq $true -and $pm.builtinTools.code_interpreter -eq $true -and $pm.capabilities.code_interpreter -eq $true -and $pm.builtinTools.notes -eq $true -and @($pm.defaultFeatureIds) -contains 'web_search' -and (& $getSignup) -eq $true) "setup: as in an old backup, the preset has past-chat search, code execution, the note tools and unasked web search on, and sign-up is on (notes '$($pm.builtinTools.notes)')"
+            # (Character for character: for -contains a text with U+202E in it is the text without.)
+            $keptFeature = @($pm.defaultFeatureIds | Where-Object { [string]::Equals([string]$_, $nastyFeature, [System.StringComparison]::Ordinal) })
+            Assert-That ($keptFeature.Count -eq 1) "setup: and Open WebUI holds, among what the preset has on by default, a name with an escape sequence, a line break and U+202E in it, as it was sent (on by default: $(& $shown (@($pm.defaultFeatureIds) -join ' | ')))"
             # On this run the Ollama connection cannot be set (in real life: an error from Open WebUI
             # after a good sign-in). That is no reason to leave the safety settings as they came.
             # -TestFailOllamaUrl stands in for that error: it comes from the sandbox's Open WebUI, where
@@ -757,24 +787,99 @@ exec sleep 30
             Assert-That ($r.Code -eq 0 -and $r.Text -match "now holds $([regex]::Escape($good.Name))" -and $r.Text -match 'Open WebUI is back on' -and $r.Text -notmatch 'Test hook') "the names the restore used to read from the environment are set and change nothing: the swap goes through and Open WebUI is waited for as ever (exit $($r.Code))"
             Assert-That ($r.Code -eq 0 -and $pm.builtinTools.chats -eq $false) "after a restore the preset's model can no longer search and read past chats (exit $($r.Code), chats '$($pm.builtinTools.chats)')"
             Assert-That ($pm.builtinTools.code_interpreter -eq $false -and $pm.capabilities.code_interpreter -eq $false) "code execution is off again on the preset (tool '$($pm.builtinTools.code_interpreter)', capability '$($pm.capabilities.code_interpreter)')"
+            # The restore's own loop knew past chats and code only: a writing tool the backup brought
+            # back stayed on, and the log said the settings were put back. The module's walk, which
+            # the restore now runs, knows the seven.
+            Assert-That ($pm.builtinTools.notes -is [bool] -and $pm.builtinTools.notes -eq $false) "a writing tool the backup brought back (notes) is off again on the preset (notes '$($pm.builtinTools.notes)')"
             Assert-That (@($pm.defaultFeatureIds | Where-Object { $_ }).Count -eq 0) "an uncensored preset searches the web only when asked again (on by default: '$(@($pm.defaultFeatureIds) -join ',')')"
             Assert-That ((& $getSignup) -eq $false) 'sign-up is off again'
-            Assert-That ($r.Text -match "Re-applied this install's safety settings.*sign-up off; \d+ toolkit preset\(s\) checked.*Local Main \(past-chat search, code execution, on by default: web_search\)" -and $r.Text -notmatch 'were not put back') 'the restore says what it re-applied, preset by preset, and how many presets it checked'
+            # What was on by default is text out of the restored data, and the line quotes it: on one
+            # line, the escape character and the line break a blank each, U+202E written out.
+            $reappliedLine = [regex]::Match($r.Text, "Re-applied this install's safety settings[^\n]*").Value
+            Assert-That ($r.Text -match "Re-applied this install's safety settings.*sign-up off; \d+ toolkit preset\(s\) checked.*turned off on the restored presets: [^\n]*Local Main \(read past chats and run code and use its notes tools and use web_search, img \[2J gen<U\+202E> in every chat without being asked\)" -and $r.Text -notmatch 'were not put back') "the restore says what it re-applied, preset by preset in the words of the walk that wrote it (the note tools among them), and how many presets it checked (the line: $(& $shown $reappliedLine))"
+            Assert-That (-not $r.Text.Contains($clearScreen) -and -not $r.Text.Contains([string][char]0x202E)) 'and nothing of that text reaches the window as it came: no escape sequence that clears it, no character that turns a line around'
+            # Every preset this Open WebUI holds is in that run's catalog and was checked or made
+            # safe: no preset is named as another one, in a warning or in the run's last line.
+            $named = @(& $othersNamed $r.Text)
+            Assert-That ($named.Count -eq 0 -and $reappliedLine -notmatch 'other preset') "a restore whose catalog names every preset in Open WebUI names none as another preset that is still open ($($named.Count) named: $(& $shown ($named -join ' | ')); its last line on presets: $(& $shown $reappliedLine))"
             Assert-That ($r.Text -match "Could not re-apply this install's Ollama connection .*-TestFailOllamaUrl" -and $r.Text -notmatch 'Could not sign in') 'an Ollama connection that could not be set is reported as that, not as a failed sign-in (and the safety settings above were still put back); the warning names the test parameter that made it fail'
+            # The test parameter used to be named only there, in the failure it causes. A run that
+            # gets it now says so once, before anything else it logs. (Colour codes, should a
+            # PowerShell ever write them into redirected output, are taken out first.)
+            $startCount = [regex]::Matches($r.Text, $startWarning).Count
+            $firstLog = [regex]::Match(($r.Text -replace '\x1b\[[0-9;]*m', ''), '(?m)^\d\d:\d\d:\d\d \[[A-Z ]{4}\] [^\n]*').Value
+            Assert-That ($startCount -eq 1 -and $firstLog -match "\[WARN\] $startWarning") "a restore that gets -TestFailOllamaUrl says so in one warning at its start, ahead of every other line it logs (said $startCount time(s); its first line: '$firstLog')"
             Assert-That ([string]$after.name -eq [string]$presetWas['name'] -and [string]$pm.description -eq [string]$presetWas['meta']['description'] -and [string]$after.params.system -eq [string]$presetWas['params']['system']) 'everything else on the preset is kept (name, description, system prompt)'
             Assert-That ([bool](Get-LaiWebUIModel -BaseUrl $sb -Token $tok -Id 'official-standin') -eq $otherWas) 'a catalog preset the restored data does not have is not created'
+            # A preset the catalog of a run does not name. local-fast is set to read past chats only
+            # now: the run above read the stand-in catalog, which names it, and would have switched
+            # that off. The two runs below get a catalog without it.
+            $fastOpen = ConvertTo-LaiHashtable $fastRaw
+            if ($fastOpen['meta'] -isnot [hashtable]) { $fastOpen['meta'] = @{} }
+            if ($fastOpen['meta']['builtinTools'] -isnot [hashtable]) { $fastOpen['meta']['builtinTools'] = @{} }
+            $fastOpen['meta']['builtinTools']['chats'] = $true
+            if ($null -eq $fastOpen['params']) { $fastOpen['params'] = @{} }
+            Set-LaiWebUIModel -BaseUrl $sb -Token $tok -Model $fastOpen | Out-Null
+            $fastChats = (& $getFast).meta.builtinTools.chats
+            Assert-That ($fastChats -is [bool] -and $fastChats -eq $true) "setup: the local-fast preset lets the assistant read past chats (chats '$fastChats')"
             # None of the toolkit's presets in the restored data (here: a catalog of one preset this
             # Open WebUI does not have). No preset was looked at, so nothing may say they are fine.
             $goneCatalog = Join-Path $aiRoot 'gone-catalog.psd1'
             Set-Content -LiteralPath $goneCatalog -Encoding UTF8 -Value "@{ DefaultPreset = 'lai-gone'; ContextCandidates = @(8192); Models = @(@{ Key = 'gone'; Display = 'Gone'; Preset = 'lai-gone' }) }"
             try { $r = & $runScript 'Restore-OpenWebUI.ps1' @('-Archive', $good.FullName, '-Force', '-SkipSafetyBackup', '-CatalogPath', $goneCatalog) } finally { Remove-Item -LiteralPath $goneCatalog -Force -ErrorAction SilentlyContinue }
             Assert-That ($r.Code -eq 0 -and $r.Text -match "were not put back: sign-up is off again, but none of the toolkit's presets is in the restored data.*run Start menu > Local AI - Update toolkit" -and $r.Text -notmatch "Re-applied this install's safety settings") "restored data with none of the toolkit's presets: the restore says no preset was checked and how to set them up, not that all is well (exit $($r.Code))"
+            # What Open WebUI holds is listed all the same: the walk found none, and the preset that
+            # lets the assistant read past chats is still named, with where to switch that off.
+            Assert-That ($r.Text -match $fastNamed) "and that run still names the preset in Open WebUI that lets the assistant read past chats, by its name and its id, with where to switch it off (its warnings on presets: $(& $presetWarnings $r.Text))"
+            # That one and no other. With no preset covered by the walk, local-main is judged here
+            # too: it is safe since the first run, and a safe preset is not named. Neither is one of
+            # Open WebUI's entries for Ollama's own models, which have no base model.
+            $named = @(& $othersNamed $r.Text)
+            Assert-That ($named.Count -eq 1 -and $named[0] -match 'which is not one of the presets of the catalog given with -CatalogPath') "and it names that preset only, as one the run's catalog does not hold: a preset that is safe gets no warning ($($named.Count) named: $(& $shown ($named -join ' | ')))"
+            # Open WebUI was asked for its presets in this run, and the lines above say what came of
+            # it: the closing warning adds nothing on presets that were not looked at.
+            Assert-That ($r.Text -notmatch 'was looked at either') 'and its closing warning does not say that the other presets were not looked at: they were'
+            Assert-That ($r.Text -notmatch $startWarning) 'a restore that does not get -TestFailOllamaUrl has no test warning at its start'
+            # A catalog that names local-main only, as a -CatalogPath can. The walk makes that one
+            # preset safe (it is, since the first run). local-fast is in Open WebUI and in no entry:
+            # it is named in a warning of its own, with what the assistant can do there and where to
+            # switch it off, and it is not changed. That is a warning, not a failed restore.
+            # For this run the preset also gets a name as a tampered or foreign archive can hold it:
+            # a character that shows as nothing, the escape sequence that clears the window, a line
+            # break, and more letters than a log line should take from a name. The warning has it on
+            # one line, U+200B written out, a blank for the escape character and for the line break,
+            # cut after 80 characters: the 23 up to the letters, and 57 of the 90.
+            $nastyName = 'Local Fast' + [char]0x200B + $clearScreen + "`n" + ('x' * 90)
+            $fastOpen['name'] = $nastyName
+            Set-LaiWebUIModel -BaseUrl $sb -Token $tok -Model $fastOpen | Out-Null
+            Assert-That ([string]::Equals([string](& $getFast).name, $nastyName, [System.StringComparison]::Ordinal)) "setup: the local-fast preset has a name with U+200B, an escape sequence, a line break and 90 letters in it, as it was sent (its name: $(& $shown ([string](& $getFast).name)))"
+            $nastyShown = "'Local Fast<U\+200B> \[2J x{57}\.\.\.'"
+            $fastNamedNasty = "\[WARN\] The restored data holds the preset $nastyShown \(id local-fast\)[^\n]*read past chats[^\n]*Workspace > Models > $nastyShown"
+            $mainCatalog = Join-Path $aiRoot 'main-only-catalog.psd1'
+            Set-Content -LiteralPath $mainCatalog -Encoding UTF8 -Value "@{ DefaultPreset = 'local-main'; ContextCandidates = @(8192); Models = @(@{ Key = 'main'; Display = 'Local Main'; Preset = 'local-main' }) }"
+            try { $r = & $runScript 'Restore-OpenWebUI.ps1' @('-Archive', $good.FullName, '-Force', '-SkipSafetyBackup', '-CatalogPath', $mainCatalog) } finally { Remove-Item -LiteralPath $mainCatalog -Force -ErrorAction SilentlyContinue }
+            $fastNow = & $getFast
+            $fastChats = $fastNow.meta.builtinTools.chats
+            Assert-That ($r.Code -eq 0 -and $r.Text -match $fastNamedNasty) "a preset in Open WebUI that the run's catalog does not name and that lets the assistant read past chats is named in a warning, by its name (on one line, cut, what does not show written out) and its id, with where to switch it off, and the restore still ends well (exit $($r.Code); its warnings on presets: $(& $shown (& $presetWarnings $r.Text)))"
+            Assert-That (-not $r.Text.Contains($clearScreen) -and -not $r.Text.Contains([string][char]0x200B)) 'and nothing of that name reaches the window as it came: no escape sequence that clears it, no character that shows as nothing'
+            # That one and no other: local-main is the walk's and is not named a second time.
+            $named = @(& $othersNamed $r.Text)
+            Assert-That ($named.Count -eq 1) "and the run names that preset only ($($named.Count) named: $(& $shown ($named -join ' | ')))"
+            Assert-That ($fastChats -is [bool] -and $fastChats -eq $true -and [string]::Equals([string]$fastNow.name, $nastyName, [System.StringComparison]::Ordinal)) "and that preset is not changed: it is not one of the run's own (chats '$fastChats', its name: $(& $shown ([string]$fastNow.name)))"
+            # The run's last line: the catalog's preset as before, and that another preset was named
+            # further up. Without that, the last thing the owner reads is a line that all is well.
+            $reappliedLine = [regex]::Match($r.Text, "Re-applied this install's safety settings[^\n]*").Value
+            Assert-That ($r.Text -match "Re-applied this install's safety settings[^\n]*sign-up off; 1 toolkit preset\(s\) checked, all had [^\n]*the writing tools off already; 1 other preset\(s\) in the restored data, named in the warning\(s\) above" -and $r.Text -notmatch 'were not put back') "the one preset of that catalog is counted as checked, a preset that needed nothing is reported with the writing tools among what was off already, and the line says that one other preset was named above (the line: $(& $shown $reappliedLine))"
+            Assert-That ($r.Text -notmatch $startWarning) 'and this run, without -TestFailOllamaUrl, has no test warning either'
         } finally {
-            # Never leave the shared sandbox Open WebUI with these on.
-            try {
-                Set-LaiWebUIModel -BaseUrl $sb -Token $tok -Model $presetWas | Out-Null
-                Set-LaiWebUIAdminConfig -BaseUrl $sb -Token $tok -Changes @{ ENABLE_SIGNUP = $signupWas } | Out-Null
-            } catch { Write-Host "  could not put the sandbox preset and sign-up back: $($_.Exception.Message)" -ForegroundColor Yellow }
+            # Never leave the shared sandbox Open WebUI with these on. Each by itself: one that could
+            # not be put back must not keep the others as this part set them.
+            foreach ($form in $presetWas, $fastWas) {
+                try { Set-LaiWebUIModel -BaseUrl $sb -Token $tok -Model $form | Out-Null }
+                catch { Write-Host "  could not put the sandbox preset '$($form['id'])' back: $($_.Exception.Message)" -ForegroundColor Yellow }
+            }
+            try { Set-LaiWebUIAdminConfig -BaseUrl $sb -Token $tok -Changes @{ ENABLE_SIGNUP = $signupWas } | Out-Null }
+            catch { Write-Host "  could not put the sandbox sign-up back: $($_.Exception.Message)" -ForegroundColor Yellow }
         }
     }
 
@@ -1051,6 +1156,10 @@ exec sleep 30
         $live = & $liveSize
         Assert-That ($r.Code -eq 0 -and $r.Text -match ('Restoring ' + [regex]::Escape($rowsName)) -and $live -eq $rowsSize) "a restore without -Archive takes the last good backup, the one with the rows: never an -EMPTY one, and not the newer night that could not tell (exit $($r.Code), webui.db $live bytes, with rows $rowsSize)"
         Assert-That ($r.Text -match 'were not put back: Open WebUI was not running.*run Start menu > Local AI - Update toolkit') 'a restore that could not reach Open WebUI says the safety settings were not re-applied, and how to'
+        # Open WebUI was never asked for its presets in that run, and the run the warning sends the
+        # owner to looks at the toolkit's own only: the same warning says that no other preset was
+        # looked at, and where to go through them.
+        Assert-That ($r.Text -match 'were not put back: Open WebUI was not running[^\n]*Update toolkit[^\n]*no other preset in the restored data[^\n]*was looked at either[^\n]*Workspace > Models') "and the same warning says that the presets the toolkit does not know were not looked at either, and where to go through them (the warning: $([regex]::Match($r.Text, 'were not put back[^\n]*').Value))"
         # (Out of the way: it would be one of the newest three when pruning is on again below.)
         foreach ($dir in $wipeBk, $wipeMirror) { $blind | ForEach-Object { Remove-Item -LiteralPath (Join-Path $dir $_.Name) -Force -ErrorAction SilentlyContinue } }
         $emptyArchive = Join-Path $wipeBk 'none-EMPTY.tar.gz'; if ($e3['archive']) { $emptyArchive = [string]$e3['archive'] }
