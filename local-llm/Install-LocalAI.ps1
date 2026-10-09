@@ -371,7 +371,6 @@ function Invoke-Stage {
     param([Parameter(Mandatory)][string]$Name, [Parameter(Mandatory)][scriptblock]$Body)
     Write-Host ''
     Write-LaiLog STEP ('=' * 12 + " $Name " + '=' * 12)
-    if ($env:LOCALAI_TEST_FAIL_STAGE -and $env:LOCALAI_TEST_FAIL_STAGE -eq $Name) { throw "Test hook: stage $Name failed" }
     & $Body
     $State.stages[$Name] = (Get-Date).ToString('s')
     Save-State
@@ -1033,9 +1032,12 @@ function Invoke-DeepResearchSetup {
 
 $SystemPrompt = (Get-Content -Encoding UTF8 -LiteralPath (Join-Path $SourceRoot 'config\system-prompt.txt') -Raw).Trim()
 $CatalogPath = Join-Path $SourceRoot 'config\models.psd1'
-# Test hooks for tests/Invoke-InstallerMockRun.ps1 only (small stand-in model on a CPU-only box).
-if ($env:LOCALAI_TEST_CATALOG) { $CatalogPath = $env:LOCALAI_TEST_CATALOG }
-$AllowCpu = ($env:LOCALAI_TEST_ALLOW_CPU -eq '1')
+# Off in the installer as it ships: a model that does not load fully on the GPU is not accepted
+# (the guide's checkpoint). Neither this nor the catalog above is taken from anything a program of
+# the owner's can set for a test's sake, and nothing else in this script is: the installer runs as
+# administrator, and such a setting would stay for every later run. The test of the installer
+# (tests/Invoke-InstallerMockRun.ps1) writes what it needs into its own copy of this file instead.
+$AllowCpu = $false
 $script:WebUIPortEffective = $WebUIPort
 if ($State.flags.ContainsKey('webuiPort')) { $script:WebUIPortEffective = [int]$State.flags['webuiPort'] }
 $script:SearxngPortEffective = $SearxngPort
@@ -1083,6 +1085,20 @@ if (-not $Resume -and $SourceRoot.TrimEnd('\') -eq $P.Scripts.TrimEnd('\')) {
 }
 if ($Resume) { Write-LaiLog INFO 'Resuming after reboot/sign-in.' }
 
+function Get-TrimmedFileText {
+    # The text of a file without the white space around it; '' for a file that holds nothing.
+    # A file of 0 bytes (or of a byte order mark and nothing else) is read as no output at all, and
+    # a cast of no output to [string] gives null, not '' (only a cast of $null gives ''; tried under
+    # Windows PowerShell 5.1): the Trim() that followed ended the run with "You cannot call a method
+    # on a null-valued expression", which names no file. So the text is '' unless something was read
+    # (as Read-LaiSecretFile does it), and what an empty text means is for the caller to say.
+    param([Parameter(Mandatory)][string]$Path)
+    $text = ''
+    $read = Get-Content -LiteralPath $Path -Raw -Encoding UTF8
+    if ($null -ne $read) { $text = [string]$read }
+    return $text.Trim()
+}
+
 function Repair-LegacyInstall {
     # Leftovers of earlier versions that must not wait until a stage near the end (which a failed or
     # interrupted run never reaches).
@@ -1124,10 +1140,12 @@ function Repair-LegacyInstall {
         catch { Write-LaiLog WARN "Could not remove the outdated toolkit copy in ${oldInstaller}: $($_.Exception.Message)" }
     }
     # 3. Early versions copied the guide's secret key into Secrets instead of moving it.
+    #    Only a copy that holds the same key goes. With either file empty there is no second copy
+    #    of a key: both are left as they are (the Stack stage is where an empty key file is refused).
     $rootSecret = Join-Path $P.Root 'openwebui-secret.txt'
     $managedSecret = Join-Path $P.Secrets 'openwebui-secret.txt'
     if ((Test-Path -LiteralPath $rootSecret) -and (Test-Path -LiteralPath $managedSecret)) {
-        $a = ([string](Get-Content -LiteralPath $rootSecret -Raw -Encoding UTF8)).Trim(); $b = ([string](Get-Content -LiteralPath $managedSecret -Raw -Encoding UTF8)).Trim()
+        $a = Get-TrimmedFileText -Path $rootSecret; $b = Get-TrimmedFileText -Path $managedSecret
         if ($a -and $a -eq $b) {
             Remove-Item -LiteralPath $rootSecret -Force
             Write-LaiLog OK "Removed a second copy of the Open WebUI secret key outside $($P.Secrets)"
@@ -1287,7 +1305,7 @@ Invoke-Stage 'Preflight' {
         if ($script:PrevSelected.Count -and -not $hadOfficial -and $State.flags['officialFailed'].Count -eq 0) {
             $offGB = 0; foreach ($om in @($catalogAll.Models | Where-Object { $_.Official })) { $offGB += [double]$om.DownloadGB }
             Write-LaiLog WARN ("This update adds the official models (Official Main, Deep and Fast): about {0} GB to download next to the uncensored ones, which stay. Not wanted? Close this window now and run it again with -OfficialModels none (one-line update: first `$env:LOCALAI_ARGS = '-OfficialModels none'). Continuing in 20 seconds." -f [Math]::Round($offGB))
-            if (-not $env:LOCALAI_TEST_CATALOG) { Start-Sleep -Seconds 20 }
+            Start-Sleep -Seconds 20
         }
         $State.flags['officialChoice'] = @('all')
     }
@@ -1978,7 +1996,15 @@ Invoke-Stage 'Stack' {
         Write-LaiLog WARN 'Found an existing open-webui container from a manual install; migrating its data into the managed stack.'
         $envDump = Invoke-Native -File 'docker' -Arguments @('inspect', '--format', '{{range .Config.Env}}{{println .}}{{end}}', 'open-webui') -Capture -AllowFail
         $oldKey = ($envDump.Output | Where-Object { $_ -like 'WEBUI_SECRET_KEY=*' } | Select-Object -First 1)
-        if ($oldKey -and -not (Test-Path -LiteralPath $secretFile)) { Set-Content -LiteralPath $secretFile -Value $oldKey.Substring(17) -NoNewline -Encoding ascii }
+        # Its key is taken over only when it has one. A container started with the variable and
+        # nothing behind it (docker run -e WEBUI_SECRET_KEY=) used to leave a key file of 0 bytes
+        # here, which the check further down refuses: by then the old container was stopped and
+        # renamed, and the run ended over a file it had written itself a moment before.
+        if ($oldKey -and -not (Test-Path -LiteralPath $secretFile)) {
+            $oldKeyText = $oldKey.Substring(17)
+            if ($oldKeyText.Trim()) { Set-Content -LiteralPath $secretFile -Value $oldKeyText -NoNewline -Encoding ascii }
+            else { Write-LaiLog INFO 'The old container has WEBUI_SECRET_KEY with nothing behind it: no key is taken over from it.' }
+        }
         # Where did that container keep /app/backend/data? (No double quotes in the template: PS 5.1 mangles them for native args.)
         $mounts = Invoke-Native -File 'docker' -Arguments @('inspect', '--format', '{{range .Mounts}}{{.Type}}|{{.Name}}|{{.Source}}|{{.Destination}}{{println}}{{end}}', 'open-webui') -Capture -AllowFail
         $data = $mounts.Output | Where-Object { $_ -like '*|/app/backend/data' } | Select-Object -First 1
@@ -2043,11 +2069,31 @@ Invoke-Stage 'Stack' {
     $guideSecret = Join-Path $P.Root 'openwebui-secret.txt'
     if (-not (Test-Path -LiteralPath $secretFile)) {
         # Moved, not copied: the old file sits outside Secrets where other accounts could read it,
-        # and that key signs Open WebUI logins.
-        if (Test-Path -LiteralPath $guideSecret) { Move-Item -LiteralPath $guideSecret -Destination $secretFile }
-        else { Set-Content -LiteralPath $secretFile -Value (New-LaiSecret) -NoNewline -Encoding ascii }
+        # and that key signs Open WebUI logins. Only a file that holds a key is moved in: one of
+        # 0 bytes or of white space only has no key in it to keep, and moved in it would be the
+        # key file that is refused below. It is left where it is, a new key is written as on a PC
+        # that has no such file, and the run says so (a new key ends every session).
+        $guideThere = Test-Path -LiteralPath $guideSecret
+        if ($guideThere -and (Get-TrimmedFileText -Path $guideSecret)) { Move-Item -LiteralPath $guideSecret -Destination $secretFile }
+        else {
+            Set-Content -LiteralPath $secretFile -Value (New-LaiSecret) -NoNewline -Encoding ascii
+            if ($guideThere) { Write-LaiLog WARN "$guideSecret holds no key (0 bytes or white space only): it was left as it is, and a new key was written to $secretFile. With a new key everybody signs in to Open WebUI again." }
+        }
     }
     Protect-Path -Path $secretFile
+    # A key file that holds no key: 0 bytes or white space only. The lines above no longer make
+    # one (they used to: the guide's own file moved in as it was, an old container that had the
+    # variable with nothing behind it), so it is a file of an earlier version, of a run cut off
+    # between making the file and writing the key, or of the owner's own doing. Stopped here,
+    # before .env is written: an empty key in .env makes compose refuse to start the stack with a
+    # message that points at .env, a file this installer writes itself, and the next run would
+    # write the same again. A key file that is there is not replaced without a word either: a new
+    # key ends every session, so the owner is told and does it.
+    # What the message promises is what the lines above do on the next run, once the file is gone.
+    $secretKey = Get-TrimmedFileText -Path $secretFile
+    if (-not $secretKey) {
+        throw "$secretFile is empty or holds white space only, and Open WebUI signs logins with the key in it. Delete that file and run the installer again: a new key is written (or $guideSecret is moved in, when that file holds a key), and with a new key everybody signs in to Open WebUI again."
+    }
     $cred = Get-AdminCredential
     if (-not $cred) {
         Save-AdminCredential -Email $AdminEmail -Password (New-LaiPassword) -Generated
@@ -2068,7 +2114,7 @@ Invoke-Stage 'Stack' {
         SEARXNG_VERSION    = $SearxngVersion
         WEBUI_PORT         = $script:WebUIPortEffective
         SEARXNG_PORT       = $script:SearxngPortEffective
-        WEBUI_SECRET_KEY   = (Get-Content -Encoding UTF8 -LiteralPath $secretFile -Raw).Trim()
+        WEBUI_SECRET_KEY   = $secretKey
         WEBUI_ADMIN_EMAIL  = $cred.email
         WEBUI_ADMIN_PASSWORD = ''
         OLLAMA_BASE_URL    = 'http://render-guard:11434'
@@ -2173,7 +2219,6 @@ Invoke-Stage 'Stack' {
         Write-LaiLog WARN "Render guard is not answering; Open WebUI will talk to Ollama directly. See: docker logs render-guard"
         $script:WebUIOllamaUrl = 'http://host.docker.internal:11434'
     }
-    if ($env:LOCALAI_TEST_WEBUI_OLLAMA_URL) { $script:WebUIOllamaUrl = $env:LOCALAI_TEST_WEBUI_OLLAMA_URL }
 }
 $WebUIUrl = "http://127.0.0.1:$($script:WebUIPortEffective)"
 #endregion
@@ -2279,11 +2324,12 @@ Invoke-Stage 'Configure' {
     # the assistant do more than the toolkit allows gets its switches set (none is created). A
     # preset that cannot be made safe stops the stage, as an open sign-up does.
     # Two lists, as the health check reads them: the catalog this run uses and, always, the
-    # toolkit's own catalog next to the script. $CatalogPath can be another file (a variable of
-    # the user's names it, see the test hook above, and any program of the user's can set that
-    # variable for good): a preset left out of that file would never be made safe here, while the
-    # health check, which always reads the toolkit's own catalog, failed it and named this run
-    # as the fix. Each preset id is taken once, from the first list that has it.
+    # toolkit's own catalog next to the script. In the installer as it ships the two are the same
+    # file. Both are read all the same, so that the walk does not rest on that: where $CatalogPath
+    # is another file (in the copy that tests/Invoke-InstallerMockRun.ps1 runs it is), a preset
+    # left out of that file would never be made safe here, while the health check, which always
+    # reads the toolkit's own catalog, failed it and named this run as the fix. Each preset id is
+    # taken once, from the first list that has it.
     $presetSafety = @(Invoke-LaiPresetSafety -BaseUrl $WebUIUrl -Token $token -Entries (@((Get-LaiCatalog -Path $CatalogPath -IncludeTrials).Models) + @((Get-LaiCatalog -Path (Join-Path (Join-Path $SourceRoot 'config') 'models.psd1') -IncludeTrials).Models)))
     foreach ($ps in @($presetSafety | Where-Object { $_.Written })) {
         Write-LaiLog OK "Preset '$($ps.Display)' made safe again: the assistant could $($ps.On -join ' and ') there, which is switched off now"
@@ -2428,7 +2474,7 @@ if (-not $SkipTests) {
     Invoke-Stage 'Verify' {
         # From the installer's own copy, never AI\Scripts: this runs elevated (approved for the
         # installer, not for whatever sits in AI\Scripts), and the user can swap folders inside C:\AI.
-        & (Join-Path $SourceRoot 'Test-LocalAI.ps1') -AIRoot $AIRoot
+        & (Join-Path $SourceRoot 'Test-LocalAI.ps1') -AIRoot $AIRoot -CatalogPath $CatalogPath
         $script:testExit = $LASTEXITCODE
     }
     $testExit = $script:testExit
