@@ -734,16 +734,11 @@ function Find-TestHookProblem($Hits, [string[]]$Pins = @()) {
 $testHookPins = @(
     'Backup-OpenWebUI.ps1 env LOCALAI_TEST_CHAT_POLL_SEC'
     'Enable-TailscaleAccess.ps1 env LOCALAI_TS_TIMEOUT'
-    'Install-LocalAI.ps1 env LOCALAI_TEST_ALLOW_CPU'
-    'Install-LocalAI.ps1 env LOCALAI_TEST_CATALOG'
-    'Install-LocalAI.ps1 env LOCALAI_TEST_FAIL_STAGE'
-    'Install-LocalAI.ps1 env LOCALAI_TEST_WEBUI_OLLAMA_URL'
     # -TestFailOllamaUrl came in place of the variable LOCALAI_TEST_FAIL_OLLAMA_URL. It does one
     # thing: the step that sets the Ollama connection after a restore counts as failed, and the
-    # message of that failure names the parameter. It is not said at the start of the run
-    # (IMPROVEMENTS.md has the row). Only tests/Invoke-UpdateWebUITest.ps1 passes it.
+    # message of that failure names the parameter. A run that gets it says so in a warning at its
+    # start. Only tests/Invoke-UpdateWebUITest.ps1 passes it.
     'Restore-OpenWebUI.ps1 param TestFailOllamaUrl'
-    'Test-LocalAI.ps1 env LOCALAI_TEST_CATALOG'
     # -TestAllowCpu came in place of the variable LOCALAI_TEST_ALLOW_CPU. A run that gets it says
     # so in a warning at its start. Only tests/Invoke-ModelUpdateTest.ps1 passes it.
     'Update-Models.ps1 param TestAllowCpu'
