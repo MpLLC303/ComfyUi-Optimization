@@ -948,6 +948,280 @@ $toN = { param($ip) $o = @($ip.Split('.') | ForEach-Object { [long]$_ }); $o[0] 
 $isBlocked = { param($ip) $n = & $toN $ip; @($ranges | Where-Object { $a, $b = $_.Split('-'); (& $toN $a) -le $n -and $n -le (& $toN $b) }).Count -gt 0 }
 foreach ($ip in '127.0.0.1', '172.17.0.2', '172.31.255.254', '192.168.48.1', '192.168.63.255') { Assert-That (-not (& $isBlocked $ip)) "not blocked: $ip (loopback / Docker / WSL)" }
 foreach ($ip in '192.168.1.20', '192.168.47.255', '192.168.64.0', '10.0.0.5', '100.101.102.103', '8.8.8.8', '0.0.0.0', '255.255.255.255', '172.15.255.255', '172.32.0.0') { Assert-That (& $isBlocked $ip) "blocked: $ip (LAN / Tailscale / internet)" }
+# What the two checks make of the installer's block rule (Get-LaiOllamaBlockVerdict). Ollama listens
+# beyond 127.0.0.1 only where Docker cannot reach it otherwise, and the installer then blocks its
+# port: by address, or on the network adapters alone where Docker does not get through the address
+# rule. The health check and the security check asked only whether a rule of that name existed, so
+# a rule that was switched off, and the adapter rule (a VPN and Tailscale get past it), both read
+# as blocked. A rule is a block only when it is on, says Block and Inbound, for TCP on a port list
+# that holds 11434, with a list of remote addresses and no adapter named. The address list of
+# these cases is the module's own: every address but loopback.
+$obAddr = @(Get-LaiBlockRange -Allowed @('127.0.0.0/8'))
+$obNic = 'Unit Adapter 7'
+$obRule = { param([hashtable]$With = @{}, [string[]]$Without = @())
+    $obField = @{ Enabled = 'True'; Action = 'Block'; Direction = 'Inbound'; Protocol = 'TCP'; LocalPort = '11434'; RemoteAddress = $obAddr; InterfaceAlias = 'Any' }
+    foreach ($obKey in @($With.Keys)) { $obField[$obKey] = $With[$obKey] }
+    foreach ($obKey in $Without) { $obField.Remove($obKey) }
+    [pscustomobject]$obField
+}
+$obCases = @(
+    @{ Name = 'the address rule as the installer makes it'; Want = 'blocked'; Rules = @((& $obRule)) }
+    @{ Name = 'the same rule switched off (its Enabled reads False, a text that is true in an if)'; Want = 'off'; Rules = @((& $obRule @{ Enabled = 'False' })) }
+    @{ Name = 'a rule that says Allow'; Want = 'off'; Rules = @((& $obRule @{ Action = 'Allow' })) }
+    @{ Name = 'an Outbound rule'; Want = 'off'; Rules = @((& $obRule @{ Direction = 'Outbound' })) }
+    @{ Name = 'a rule for UDP'; Want = 'off'; Rules = @((& $obRule @{ Protocol = 'UDP' })) }
+    @{ Name = 'a rule for port 11435'; Want = 'off'; Rules = @((& $obRule @{ LocalPort = '11435' })) }
+    @{ Name = 'a port range around 11434'; Want = 'blocked'; Rules = @((& $obRule @{ LocalPort = '11000-12000' })) }
+    @{ Name = 'a port range beside 11434'; Want = 'off'; Rules = @((& $obRule @{ LocalPort = '11435-11500' })) }
+    @{ Name = 'every remote address (Any) and no adapter named'; Want = 'off'; Rules = @((& $obRule @{ RemoteAddress = 'Any' })) }
+    @{ Name = 'the adapter rule the installer falls back to'; Want = 'adapters'; Rules = @((& $obRule @{ RemoteAddress = 'Any'; InterfaceAlias = @($obNic, 'Unit Adapter 8') })) }
+    @{ Name = 'two rules, the first switched off and the second good'; Want = 'blocked'; Rules = @((& $obRule @{ Enabled = 'False' }), (& $obRule)) }
+    @{ Name = 'no rule'; Want = 'none'; Rules = @() }
+    @{ Name = 'rules that could not be read, with a good one among what was handed over'; Want = 'unread'; Rules = @((& $obRule)); Unread = $true }
+    @{ Name = 'an address list and an adapter named'; Want = 'adapters'; Rules = @((& $obRule @{ InterfaceAlias = $obNic })) }
+    @{ Name = 'the adapter rule switched off'; Want = 'off'; Rules = @((& $obRule @{ Enabled = 'False'; RemoteAddress = 'Any'; InterfaceAlias = $obNic })) }
+    @{ Name = 'the adapter rule beside a rule that is switched off'; Want = 'adapters'; Rules = @((& $obRule @{ Enabled = 'False' }), (& $obRule @{ RemoteAddress = 'Any'; InterfaceAlias = $obNic })) }
+    @{ Name = 'a rule without its adapter field'; Want = 'off'; Rules = @((& $obRule @{} @('InterfaceAlias'))) }
+    @{ Name = 'a rule without its address field'; Want = 'off'; Rules = @((& $obRule @{} @('RemoteAddress'))) }
+    @{ Name = 'a rule for every protocol and every port'; Want = 'blocked'; Rules = @((& $obRule @{ Protocol = 'Any'; LocalPort = 'Any' })) }
+    # A field that is missing never counts for a block, whichever it is: the judge asks each one
+    # for the value a block has, never for the absence of the value that is none. The same for a
+    # value the toolkit does not set.
+    @{ Name = 'a rule without its Enabled field'; Want = 'off'; Rules = @((& $obRule @{} @('Enabled'))) }
+    @{ Name = 'a rule without its Action field'; Want = 'off'; Rules = @((& $obRule @{} @('Action'))) }
+    @{ Name = 'a rule without its Direction field'; Want = 'off'; Rules = @((& $obRule @{} @('Direction'))) }
+    @{ Name = 'a rule without its Protocol field'; Want = 'off'; Rules = @((& $obRule @{} @('Protocol'))) }
+    @{ Name = 'a rule without its LocalPort field'; Want = 'off'; Rules = @((& $obRule @{} @('LocalPort'))) }
+    @{ Name = 'a rule whose Action is neither Block nor Allow (NotConfigured)'; Want = 'off'; Rules = @((& $obRule @{ Action = 'NotConfigured' })) }
+    @{ Name = 'a rule whose Enabled is neither True nor False (NotConfigured)'; Want = 'off'; Rules = @((& $obRule @{ Enabled = 'NotConfigured' })) }
+    @{ Name = 'a rule whose Direction is neither Inbound nor Outbound (NotConfigured)'; Want = 'off'; Rules = @((& $obRule @{ Direction = 'NotConfigured' })) }
+)
+$obSaid = @{}
+foreach ($obCase in $obCases) {
+    $obGot = Get-LaiOllamaBlockVerdict -Rules @($obCase.Rules) -RulesRead (-not $obCase.ContainsKey('Unread'))
+    $obSaid[[string]$obGot.State] = $obGot
+    Assert-That ([string]$obGot.State -ceq $obCase.Want) "the firewall verdict for $($obCase.Name): $($obGot.State) (want $($obCase.Want))"
+}
+$obTexts = @($obSaid.Values | ForEach-Object { [string]$_.Text })
+$obLeaks = @($obSaid.Values | ForEach-Object { [string]$_.Text; [string]$_.Fix } | Where-Object { $obWords = [string]$_; $obWords.Contains($obNic) -or @($obAddr | Where-Object { $obWords.Contains([string]$_) }).Count -gt 0 })
+Assert-That ($obSaid.Count -eq 5 -and @($obTexts | Where-Object { $_ }).Count -eq 5 -and @($obTexts | Select-Object -Unique).Count -eq 5 -and $obLeaks.Count -eq 0) "each of the five answers ($(@($obSaid.Keys | Sort-Object) -join ', ')) comes with words of its own for the row, and neither they nor the steps name an adapter or an address"
+# The step that goes with each answer (Fix). Update toolkit makes the rule only on a PC where the
+# installer opened the port itself, and a port that the Ollama app's own setting opened it neither
+# closes nor blocks. With Update toolkit as the one step for every answer, 'no rule' sent the owner
+# to an update that changed nothing while the port stayed open. So: no rule starts with the app's
+# setting and then names Update toolkit; a rule that is off names Update toolkit and, should the
+# row stay, the app's setting; the adapter rule names Update toolkit and says what is left to do
+# when the installer makes that rule again (it does where Docker does not get through the rule by
+# address); and a firewall that could not be asked names Windows Firewall, the check itself and
+# the app's setting, not an update, which makes no firewall readable. A block has no step.
+$obStep = 'Start menu > Local AI - Update toolkit'
+$obAppStep = 'turn off ''Expose Ollama to the network'' in the Ollama app''s Settings'
+$obAppName = 'Expose Ollama to the network'
+$obFix = @{}
+foreach ($obAnswer in @('blocked', 'adapters', 'off', 'none', 'unread')) { $obFix[$obAnswer] = ''; if ($obSaid.ContainsKey($obAnswer)) { $obFix[$obAnswer] = [string]$obSaid[$obAnswer].Fix } }
+Assert-That ($obSaid.ContainsKey('blocked') -and $obFix['blocked'] -ceq '' -and @('adapters', 'off', 'none', 'unread' | Where-Object { -not $obFix[$_] }).Count -eq 0 -and @($obFix.Values | Select-Object -Unique).Count -eq 5) "a block comes with no step, and each other answer with a step of its own (without one: $(@('adapters', 'off', 'none', 'unread' | Where-Object { -not $obFix[$_] }) -join ', '))"
+Assert-That ($obFix['none'].StartsWith($obAppStep) -and $obFix['none'].IndexOf($obStep) -gt $obFix['none'].IndexOf($obAppStep)) "no rule: the step starts with the Ollama app's own setting, which Update toolkit does not undo, and names Update toolkit after it ($($obFix['none']))"
+Assert-That ($obFix['off'].StartsWith("run $obStep") -and $obFix['off'].IndexOf($obAppStep) -gt $obFix['off'].IndexOf($obStep) -and $obFix['off'].Contains('if this row is the same afterwards')) "a rule that is off: Update toolkit first, and the Ollama app's setting for a row that stays ($($obFix['off']))"
+Assert-That ($obFix['adapters'].StartsWith("run $obStep") -and $obFix['adapters'].Contains('if this row is the same afterwards') -and $obFix['adapters'].Contains('VPN') -and $obFix['adapters'].Contains('tailnet') -and -not $obFix['adapters'].Contains($obAppName)) "the adapter rule: Update toolkit first, and for a row that stays (the installer makes this rule again where Docker does not get through the other) what is left to do, which is to keep the PC off a VPN or tailnet shared with others ($($obFix['adapters']))"
+Assert-That ($obFix['unread'].Contains('Windows Defender Firewall') -and $obFix['unread'].Contains('run this check again') -and $obFix['unread'].Contains($obAppName) -and -not $obFix['unread'].Contains('Update toolkit')) "a firewall that could not be asked: the step names Windows Firewall and its service, the check itself and the Ollama app's setting, and no update ($($obFix['unread']))"
+# The reader (Get-LaiOllamaBlockState) asks Windows Firewall and never throws. Asked for a rule
+# name nobody uses, Windows says 'no rule of that name', which is 'none'; where there is no Windows
+# Firewall to ask (this suite on Linux) nothing is known, which is 'unread'.
+$obWant = 'unread'; if ($onWindows) { $obWant = 'none' }
+$obNone = $null
+try { $obNone = Get-LaiOllamaBlockState -DisplayName 'LocalAI CI test - no rule of this name' } catch { Write-Host "  the reader threw: $($_.Exception.Message)" }
+Assert-That ($null -ne $obNone -and [string]$obNone.State -ceq $obWant -and [bool][string]$obNone.Text) "the reader, asked for a rule name nobody uses, answers '$obWant' here ('none' on Windows, 'unread' where there is no Windows Firewall to ask) and does not throw (got '$([string]$obNone.State)')"
+# The reader's other paths, which a real firewall cannot be made to take: stand-ins for the four
+# firewall cmdlets, inside the module, answer for Windows. Only 'no rule of that name' from the
+# question for the rule is 'none'. Rules that cannot be read are 'unread', and so is a rule whose
+# port, address or adapter filter cannot be read, also when that filter says 'not found': a rule
+# that lost a filter on the way is not a rule without one. Like the cmdlets they stand for, the
+# stand-ins stop only when asked with -ErrorAction Stop and hand back nothing otherwise: a reader
+# that asked quietly would take a firewall it could not read for one without the rule ('none'),
+# and a filter it could not read for an empty one ('off'). The module is loaded again afterwards,
+# so the stand-ins are gone before a real rule is read further down.
+$obStand = 'LocalAI CI test - stand-in'
+$obReads = [ordered]@{ 'the address rule' = 'blocked'; 'the rule switched off' = 'off'; 'the adapter rule' = 'adapters'; 'two rules, one of them good' = 'blocked'; 'no rule of that name' = 'none'
+    'rules that cannot be read' = 'unread'; 'a port filter that cannot be read' = 'unread'; 'an address filter that cannot be read' = 'unread'; 'an adapter filter that cannot be read' = 'unread' }
+$obAnswers = @{}; $obAsked = @()
+try {
+    & (Get-Module LocalAI) { param($Addr, $Nic)
+        $script:ObAddr = $Addr; $script:ObNic = $Nic; $script:ObCase = ''; $script:ObAsked = @()
+        # What a cmdlet that fails does: it stops under -ErrorAction Stop and hands back nothing otherwise.
+        function script:Get-NetFirewallRule { param($DisplayName, $ErrorAction)
+            $script:ObAsked += [string]$DisplayName
+            if ($script:ObCase -eq 'no rule of that name') { if ([string]$ErrorAction -eq 'Stop') { Write-Error -Message 'no rule of that name (unit)' -Category ObjectNotFound -ErrorAction Stop }; return }
+            if ($script:ObCase -eq 'rules that cannot be read') { if ([string]$ErrorAction -eq 'Stop') { Write-Error -Message 'access is denied (unit)' -Category PermissionDenied -ErrorAction Stop }; return }
+            $obOn = 'True'; if ($script:ObCase -eq 'the rule switched off') { $obOn = 'False' }
+            if ($script:ObCase -eq 'two rules, one of them good') { [pscustomobject]@{ Enabled = 'False'; Action = 'Block'; Direction = 'Inbound' } }
+            [pscustomobject]@{ Enabled = $obOn; Action = 'Block'; Direction = 'Inbound' }
+        }
+        function script:Get-NetFirewallPortFilter { param($AssociatedNetFirewallRule, $ErrorAction)
+            $null = $AssociatedNetFirewallRule
+            if ($script:ObCase -eq 'a port filter that cannot be read') { if ([string]$ErrorAction -eq 'Stop') { Write-Error -Message 'no port filter (unit)' -Category ObjectNotFound -ErrorAction Stop }; return }
+            [pscustomobject]@{ Protocol = 'TCP'; LocalPort = '11434' }
+        }
+        function script:Get-NetFirewallAddressFilter { param($AssociatedNetFirewallRule, $ErrorAction)
+            $null = $AssociatedNetFirewallRule
+            if ($script:ObCase -eq 'an address filter that cannot be read') { if ([string]$ErrorAction -eq 'Stop') { Write-Error -Message 'no address filter (unit)' -Category ObjectNotFound -ErrorAction Stop }; return }
+            $obFrom = $script:ObAddr; if ($script:ObCase -eq 'the adapter rule') { $obFrom = 'Any' }
+            [pscustomobject]@{ RemoteAddress = $obFrom }
+        }
+        function script:Get-NetFirewallInterfaceFilter { param($AssociatedNetFirewallRule, $ErrorAction)
+            $null = $AssociatedNetFirewallRule
+            if ($script:ObCase -eq 'an adapter filter that cannot be read') { if ([string]$ErrorAction -eq 'Stop') { Write-Error -Message 'no adapter filter (unit)' -Category ObjectNotFound -ErrorAction Stop }; return }
+            $obOver = 'Any'; if ($script:ObCase -eq 'the adapter rule') { $obOver = $script:ObNic }
+            [pscustomobject]@{ InterfaceAlias = $obOver }
+        }
+    } $obAddr $obNic
+    foreach ($obRead in @($obReads.Keys)) {
+        & (Get-Module LocalAI) { param($Case) $script:ObCase = $Case } $obRead
+        $obAnswers[$obRead] = [string](Get-LaiOllamaBlockState -DisplayName $obStand).State
+    }
+    $obAsked = @(& (Get-Module LocalAI) { $script:ObAsked })
+} catch { Write-Host "  the reader's stand-in cases stopped: $($_.Exception.Message)" }
+finally { Import-Module (Join-Path (Join-Path $src 'lib') 'LocalAI.psm1') -Force }
+$obWrong = @($obReads.Keys | Where-Object { [string]$obAnswers[$_] -cne [string]$obReads[$_] } | ForEach-Object { "$_ -> '$($obAnswers[$_])'" })
+Assert-That ($obAnswers.Count -eq $obReads.Count -and $obWrong.Count -eq 0) "the reader with stand-ins for the firewall cmdlets: a rule and its three filters become the verdict's answer (blocked, off, adapters), 'no rule of that name' is 'none', and rules that cannot be read are 'unread', as is a rule with a port, address or adapter filter that cannot be read (not so: $($obWrong -join '; '))"
+Assert-That ($obAsked.Count -eq $obReads.Count -and @($obAsked | Where-Object { $_ -cne $obStand }).Count -eq 0) "and it asks for the rule name it is given, once per reading ($($obAsked.Count) question(s) for $($obReads.Count) reading(s))"
+# The two module functions from their syntax trees. Test-PCSecurity.ps1 promises to change nothing,
+# and its own test of that looks at the commands the script runs, not at what a module function it
+# calls runs. So the reader is held to its list here: Get-Command, the question for the rule, the
+# three questions for its filters and the judge, and nothing called through a variable or as a
+# method. Each cmdlet is written with one -ErrorAction and the value it needs: SilentlyContinue for
+# Get-Command (no such cmdlet is an answer), Stop for the four questions to the firewall. Under
+# any other value a question that fails hands back nothing, which reads as 'no rule' or as a rule
+# without that filter. The judge runs nothing at all.
+$obModAst = [System.Management.Automation.Language.Parser]::ParseFile((Join-Path (Join-Path $src 'lib') 'LocalAI.psm1'), [ref]$null, [ref]$null)
+$obJudge = @($obModAst.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Get-LaiOllamaBlockVerdict' }, $true))
+$obReader = @($obModAst.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Get-LaiOllamaBlockState' }, $true))
+$obMay = @('Get-Command', 'Get-NetFirewallRule', 'Get-NetFirewallPortFilter', 'Get-NetFirewallAddressFilter', 'Get-NetFirewallInterfaceFilter', 'Get-LaiOllamaBlockVerdict')
+$obOnError = @{ 'Get-Command' = 'SilentlyContinue'; 'Get-NetFirewallRule' = 'Stop'; 'Get-NetFirewallPortFilter' = 'Stop'; 'Get-NetFirewallAddressFilter' = 'Stop'; 'Get-NetFirewallInterfaceFilter' = 'Stop' }
+# What a command says after -ErrorAction, one entry per -ErrorAction it carries: the word as it is
+# written, or 'not a plain word' for anything else (a variable, an expression, nothing at all).
+$obErrorActions = { param($Command)
+    $obEls = @($Command.CommandElements)
+    for ($obAt = 0; $obAt -lt $obEls.Count; $obAt++) {
+        if ($obEls[$obAt] -isnot [System.Management.Automation.Language.CommandParameterAst] -or $obEls[$obAt].ParameterName -ne 'ErrorAction') { continue }
+        $obValue = $obEls[$obAt].Argument
+        if ($null -eq $obValue -and ($obAt + 1) -lt $obEls.Count) { $obValue = $obEls[$obAt + 1] }
+        if ($obValue -is [System.Management.Automation.Language.StringConstantExpressionAst]) { [string]$obValue.Value } else { 'not a plain word' }
+    }
+}
+# That reading on four commands written for it: Stop, a quiet one, none, and a value from a variable.
+$obCanary = @([System.Management.Automation.Language.Parser]::ParseInput("Get-A -Name x -ErrorAction Stop`nGet-B -ErrorAction SilentlyContinue -Name x`nGet-C -Name x`nGet-D -ErrorAction `$how", [ref]$null, [ref]$null).FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] }, $true) |
+    ForEach-Object { "$($_.GetCommandName())=$(@(& $obErrorActions $_) -join '+')" })
+Assert-That (($obCanary -join ' ') -ceq 'Get-A=Stop Get-B=SilentlyContinue Get-C= Get-D=not a plain word') "the value a command gives -ErrorAction is read from its syntax tree: Stop, SilentlyContinue, none, and one that is not written out ($($obCanary -join ' '))"
+$obJudgeCalls = @('the function was not found'); $obOther = @('the function was not found'); $obMissing = @(); $obQuiet = @(); $obMethods = @(); $obDefault = ''
+if ($obJudge.Count -eq 1) {
+    $obJudgeCalls = @($obJudge[0].FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] -or $n -is [System.Management.Automation.Language.InvokeMemberExpressionAst] -or
+                ($n -is [System.Management.Automation.Language.MemberExpressionAst] -and $n.Static) }, $true))
+}
+if ($obReader.Count -eq 1) {
+    $obReaderCmds = @($obReader[0].FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] }, $true))
+    $obReaderNames = @($obReaderCmds | ForEach-Object { [string]$_.GetCommandName() })
+    $obOther = @($obReaderNames | Where-Object { $obMay -cnotcontains $_ })
+    $obMissing = @($obMay | Where-Object { $obReaderNames -cnotcontains $_ })
+    $obQuiet = @($obReaderCmds | Where-Object { $obOnError.ContainsKey([string]$_.GetCommandName()) } | ForEach-Object {
+            $obGiven = @(& $obErrorActions $_)
+            if ($obGiven.Count -ne 1 -or $obGiven[0] -cne $obOnError[[string]$_.GetCommandName()]) { "$($_.GetCommandName()) ($($obGiven -join ', '))" }
+        })
+    $obMethods = @($obReader[0].FindAll({ param($n) $n -is [System.Management.Automation.Language.InvokeMemberExpressionAst] }, $true))
+    $obParams = @(); if ($obReader[0].Body.ParamBlock) { $obParams = @($obReader[0].Body.ParamBlock.Parameters) }
+    if ($obParams.Count -eq 1 -and $obParams[0].DefaultValue -is [System.Management.Automation.Language.StringConstantExpressionAst]) { $obDefault = [string]$obParams[0].DefaultValue.Value }
+}
+Assert-That ($obJudge.Count -eq 1 -and $obJudgeCalls.Count -eq 0) "Get-LaiOllamaBlockVerdict is one function that runs no command, calls no method and reads no static member: it judges what it is handed ($($obJudgeCalls.Count) found)"
+Assert-That ($obReader.Count -eq 1 -and $obOther.Count -eq 0 -and $obMissing.Count -eq 0 -and $obQuiet.Count -eq 0 -and $obMethods.Count -eq 0 -and $obDefault -ceq 'LocalAI - Block Ollama from LAN') "Get-LaiOllamaBlockState only asks: Get-Command, Get-NetFirewallRule, the three filter cmdlets and the judge, Get-Command with -ErrorAction SilentlyContinue and each question to the firewall with -ErrorAction Stop (a question that fails then stops, and does not hand back nothing), no method call, and the rule it asks for unless told otherwise is the installer's (other commands: $($obOther -join ', '); not asked: $($obMissing -join ', '); not with that -ErrorAction: $($obQuiet -join ', '); method calls: $($obMethods.Count); default name '$obDefault')"
+# Both rows. From their syntax trees: each asks the reader once, with nothing passed (the
+# installer's own rule), runs no firewall command of its own, and gives a WARN only under the
+# answer 'blocked'; and neither script holds the old question, or a read of a test variable,
+# anywhere in its text. Then each row itself, run from its own text in a scope of its own, as
+# Add-Check runs it, with its script's own Pass, Fail, Warn and Skip. The case says what Windows
+# would answer: the ports that listen on every address, and the reader's answer, which is the
+# judge's own for that state from the cases above (its words and its step). A rule of the right
+# name is there in every case (the stand-in for the old question finds one), which is all the rows
+# used to ask for. The step a failure shows is the answer's and nothing else: a row that put
+# Update toolkit after every answer told the owner of a port the Ollama app had opened to run an
+# update that leaves it open.
+$obEvery = [string][System.Net.IPAddress]::Any
+$obRowRun = { param([string]$RowText, [object[]]$Functions, [object]$Verdict, [int[]]$Open)
+    foreach ($obFd in $Functions) { . ([scriptblock]::Create($obFd.Extent.Text)) }
+    $obCount = @{ Reader = 0; Own = 0 }
+    $null = $Verdict, $Open
+    function Get-LaiOllamaBlockState { $obCount['Reader']++; $Verdict }
+    function local:Get-NetFirewallRule { $obCount['Own']++; [pscustomobject]@{ DisplayName = 'a rule of the right name (unit)' } }
+    function local:Get-Process { }
+    function local:Get-NetTCPConnection { param($State, $LocalPort, $ErrorAction)
+        $null = $State, $ErrorAction
+        foreach ($obPort in $Open) { if ($null -eq $LocalPort -or [int]$LocalPort -eq $obPort) { [pscustomobject]@{ LocalAddress = $obEvery; LocalPort = $obPort; OwningProcess = -1 } } }
+    }
+    # What the rows read from the script around them, under the script's own names.
+    $onWindows = $true; $winOnly = 'Windows-only check (unit)'; $webPort = 39998; $searxPort = 39997; $researchPort = 0; $aiPorts = @(11434, 39998, 39997)
+    $null = $onWindows, $winOnly, $webPort, $searxPort, $researchPort, $aiPorts
+    $obOut = @{ Status = 'no verdict'; Detail = ''; Fix = ''; Reader = 0; Own = 0 }
+    try {
+        $obRowBody = & ([scriptblock]::Create($RowText))
+        $obVerdict = @(& $obRowBody | Where-Object { $_ -is [hashtable] -and $_['Status'] }) | Select-Object -Last 1
+        if ($null -ne $obVerdict) { $obOut['Status'] = [string]$obVerdict['Status']; $obOut['Detail'] = [string]$obVerdict['Detail']; $obOut['Fix'] = [string]$obVerdict['Fix'] }
+    } catch { $obOut['Status'] = 'threw'; $obOut['Detail'] = [string]$_.Exception.Message }
+    $obOut['Reader'] = [int]$obCount['Reader']; $obOut['Own'] = [int]$obCount['Own']
+    $obOut
+}
+foreach ($obFile in @(
+        @{ File = 'Test-LocalAI.ps1'; Row = 'Nothing exposed beyond localhost'; NextStep = $false }
+        @{ File = 'Test-PCSecurity.ps1'; Row = 'AI ports reachable only from this PC'; NextStep = $true }
+    )) {
+    $obAst = [System.Management.Automation.Language.Parser]::ParseFile((Join-Path $src $obFile.File), [ref]$null, [ref]$null)
+    $obRowName = [string]$obFile.Row
+    $obRows = @($obAst.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] -and $n.GetCommandName() -eq 'Add-Check' -and $n.CommandElements.Count -eq 3 -and
+                $n.CommandElements[2] -is [System.Management.Automation.Language.ScriptBlockExpressionAst] -and [string]$n.CommandElements[1].Extent.Text -ceq "'$obRowName'" }, $true))
+    $obFns = @($obAst.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and @('Pass', 'Fail', 'Warn', 'Skip', 'Get-PcsExposedPort') -contains $n.Name }, $true))
+    $obAsks = @(); $obOwn = @(); $obWarns = @(); $obStray = @(); $obVar = ''; $obRan = @{}; $obBoth = @{}
+    if ($obRows.Count -eq 1) {
+        $obBody = $obRows[0].CommandElements[2]
+        $obCmds = @($obBody.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] }, $true))
+        $obAsks = @($obCmds | Where-Object { $_.GetCommandName() -eq 'Get-LaiOllamaBlockState' })
+        $obOwn = @($obCmds | ForEach-Object { [string]$_.GetCommandName() } | Where-Object { $_ -match 'Firewall' })
+        # The variable the answer is kept in: '$x = Get-LaiOllamaBlockState', with nothing passed.
+        if ($obAsks.Count -eq 1 -and $obAsks[0].CommandElements.Count -eq 1 -and $obAsks[0].Parent.Parent -is [System.Management.Automation.Language.AssignmentStatementAst]) { $obVar = [string]$obAsks[0].Parent.Parent.Left.Extent.Text }
+        $obTest = '^' + [regex]::Escape($obVar) + '\.State -c?eq ''blocked''$'
+        $obWarns = @($obCmds | Where-Object { $_.GetCommandName() -eq 'Warn' })
+        $obStray = @($obWarns | Where-Object {
+                $obWarn = $_; $obUnder = $false
+                for ($obUp = $obWarn.Parent; $obUp; $obUp = $obUp.Parent) {
+                    if ($obUp -isnot [System.Management.Automation.Language.IfStatementAst]) { continue }
+                    foreach ($obClause in $obUp.Clauses) {
+                        if ([string]$obClause.Item1.Extent.Text -cmatch $obTest -and $obWarn.Extent.StartOffset -ge $obClause.Item2.Extent.StartOffset -and $obWarn.Extent.EndOffset -le $obClause.Item2.Extent.EndOffset) { $obUnder = $true }
+                    }
+                }
+                -not $obUnder
+            })
+        $obRowText = [string]$obBody.ScriptBlock.Extent.Text
+        foreach ($obAnswer in @('blocked', 'adapters', 'off', 'none', 'unread')) { if ($obSaid.ContainsKey($obAnswer)) { $obRan[$obAnswer] = & $obRowRun $obRowText $obFns ($obSaid[$obAnswer]) @(11434) } }
+        $obBoth = & $obRowRun $obRowText $obFns ([pscustomobject]@{ State = 'blocked'; Text = 'unit words'; Fix = 'unit step' }) @(11434, 39998)
+    }
+    # Under each answer that is no block: FAIL, with the judge's words for it and the judge's step.
+    # The security check has a field for the next step, and the step is all that is in it.
+    $obNot = @(); $obShown = @{}
+    foreach ($obAnswer in @('adapters', 'off', 'none', 'unread')) {
+        $obOne = $obRan[$obAnswer]; $obHas = $obSaid[$obAnswer]; $obShown[$obAnswer] = ''
+        if ($null -eq $obOne -or $null -eq $obHas -or -not [string]$obHas.Text -or -not [string]$obHas.Fix) { $obNot += "$obAnswer was not run"; continue }
+        $obShown[$obAnswer] = "$($obOne.Detail) $($obOne.Fix)"
+        if ($obOne.Status -cne 'FAIL' -or -not ([string]$obOne.Detail).Contains([string]$obHas.Text) -or -not $obShown[$obAnswer].Contains([string]$obHas.Fix) -or $obOne.Reader -ne 1 -or $obOne.Own -ne 0 -or
+            ($obFile.NextStep -and [string]$obOne.Fix -cne [string]$obHas.Fix)) { $obNot += "$obAnswer -> $($obOne.Status) $($obOne.Detail) | $($obOne.Fix)" }
+    }
+    $obBlocked = $obRan['blocked']
+    $obText = [string]$obAst.Extent.Text
+    Assert-That ($obRows.Count -eq 1 -and $obAsks.Count -eq 1 -and [bool]$obVar -and $obOwn.Count -eq 0 -and $obWarns.Count -ge 1 -and $obStray.Count -eq 0) "$($obFile.File): the row '$obRowName' asks Get-LaiOllamaBlockState once, with nothing passed, runs no firewall command of its own, and gives a WARN only under the answer 'blocked' ($($obAsks.Count) call(s); firewall commands of its own: $($obOwn -join ', '); WARN elsewhere: $($obStray.Count) of $($obWarns.Count))"
+    Assert-That ($obText -notmatch 'Get-NetFirewallRule' -and $obText -notmatch 'LOCALAI_TEST_') "and $($obFile.File) holds neither Get-NetFirewallRule nor LOCALAI_TEST_ anywhere in its text, a comment included"
+    Assert-That ($null -ne $obBlocked -and $obBlocked.Status -ceq 'WARN' -and $obBlocked.Reader -eq 1 -and $obBlocked.Own -eq 0) "the row run from its own text, with Ollama alone listening on every address and the rule a block: WARN, and the reader was asked once ($($obBlocked.Status) $($obBlocked.Detail))"
+    Assert-That ($obNot.Count -eq 0) "the same under each other answer (the adapter rule, a rule that is off, no rule, a firewall that could not be asked): FAIL with the verdict's words and the verdict's step for that answer, although a rule of the right name is there (not so: $($obNot -join ' || '))"
+    Assert-That ($obShown['none'].Contains($obAppStep) -and $obShown['none'].IndexOf($obStep) -gt $obShown['none'].IndexOf($obAppStep)) "with no rule the row names the Ollama app's own setting, which is what opens the port on a PC where the toolkit made no rule, and Update toolkit only after it ($($obShown['none']))"
+    Assert-That ($obShown['unread'].Contains($obAppName) -and $obShown['unread'].Contains('Windows Defender Firewall') -and -not $obShown['unread'].Contains('Update toolkit') -and $obShown['adapters'].Contains($obStep) -and $obShown['adapters'].Contains('if this row is the same afterwards')) "with a firewall that could not be asked the row names Windows Firewall and the app's setting and adds no update of its own, and under the adapter rule it says what is left to do when Update toolkit leaves the row as it is (unread: $($obShown['unread']) || adapters: $($obShown['adapters']))"
+    Assert-That ($obBoth.Status -ceq 'FAIL' -and $obBoth.Reader -eq 0 -and $obBoth.Own -eq 0 -and -not ("$($obBoth.Detail) $($obBoth.Fix)").Contains('unit ')) "and with another AI port listening on every address as well it is a FAIL whatever the rule says, and the firewall is not asked ($($obBoth.Status) $($obBoth.Detail))"
+}
+# The security check's row keeps what it read in a script variable, which here is this file's.
+Remove-Variable -Name listeners -Scope Script -ErrorAction SilentlyContinue
 if ($onWindows -and (Get-Command New-NetFirewallRule -ErrorAction SilentlyContinue)) {
     # The real cmdlet must accept the exact list the installer builds (IPv4 ranges + the IPv6 range).
     $ruleName = 'LocalAI CI test - block ranges'
@@ -958,6 +1232,36 @@ if ($onWindows -and (Get-Command New-NetFirewallRule -ErrorAction SilentlyContin
         Assert-That (@($filter.RemoteAddress).Count -eq $blockedList.Count) "Windows Firewall accepts the block ranges ($(@($filter.RemoteAddress) -join ', '))"
     } catch { Assert-That $false "Windows Firewall rejected the block ranges: $($_.Exception.Message)" }
     finally { Get-NetFirewallRule -DisplayName $ruleName -ErrorAction SilentlyContinue | Remove-NetFirewallRule -ErrorAction SilentlyContinue }
+    # The reader on real rules, read back from Windows Firewall with their filters. Under a name of
+    # this test's own, never the installer's: the address rule as the installer makes it (switched
+    # on, unlike the rule above), the same rule switched off, a rule on one network adapter as the
+    # installer falls back to, and no rule. Whatever happens, the rule is removed again.
+    $obName = 'LocalAI CI test - Ollama block verdict'
+    $obDrop = { Get-NetFirewallRule -DisplayName $obName -ErrorAction SilentlyContinue | Remove-NetFirewallRule -ErrorAction SilentlyContinue }
+    $obReal = @{ Address = 'not run'; Off = 'not run'; Adapter = 'not run'; Gone = 'not run'; Stopped = '' }
+    try {
+        & $obDrop
+        New-NetFirewallRule -DisplayName $obName -Direction Inbound -Protocol TCP -LocalPort 11434 -Action Block -RemoteAddress $obAddr -Profile Any | Out-Null
+        $obReal['Address'] = [string](Get-LaiOllamaBlockState -DisplayName $obName).State
+        Set-NetFirewallRule -DisplayName $obName -Enabled False
+        $obReal['Off'] = [string](Get-LaiOllamaBlockState -DisplayName $obName).State
+        & $obDrop
+        # The first network adapter of this machine that takes a rule. None is a failure, not a skip.
+        $obReal['Adapter'] = 'no network adapter of this machine took a rule'
+        foreach ($obAlias in @(Get-NetAdapter -ErrorAction SilentlyContinue | ForEach-Object { [string]$_.InterfaceAlias } | Where-Object { $_ })) {
+            try { New-NetFirewallRule -DisplayName $obName -Direction Inbound -Protocol TCP -LocalPort 11434 -Action Block -InterfaceAlias $obAlias -Profile Any -ErrorAction Stop | Out-Null }
+            catch { continue }
+            $obReal['Adapter'] = [string](Get-LaiOllamaBlockState -DisplayName $obName).State
+            break
+        }
+        & $obDrop
+        $obReal['Gone'] = [string](Get-LaiOllamaBlockState -DisplayName $obName).State
+    } catch { $obReal['Stopped'] = "stopped: $($_.Exception.Message)" }
+    finally { Get-NetFirewallRule -DisplayName $obName -ErrorAction SilentlyContinue | Remove-NetFirewallRule -ErrorAction SilentlyContinue }
+    Assert-That ($obReal['Address'] -ceq 'blocked') "the reader on a real rule: the address rule as the installer makes it, read back from Windows Firewall with its three filters, is 'blocked' ($($obReal['Address']) $($obReal['Stopped']))"
+    Assert-That ($obReal['Off'] -ceq 'off') "the same rule switched off is 'off': Windows hands Enabled back as a value that is true in an if for False as well, and the reader takes its text ($($obReal['Off']))"
+    Assert-That ($obReal['Adapter'] -ceq 'adapters') "a rule on one network adapter, as the installer falls back to, is 'adapters' ($($obReal['Adapter']))"
+    Assert-That ($obReal['Gone'] -ceq 'none') "and with the rule removed the answer is 'none' ($($obReal['Gone']))"
 } else { Skip 'Windows Firewall block ranges need New-NetFirewallRule' }
 
 Write-Host "`n=== image pull policy ===" -ForegroundColor Cyan

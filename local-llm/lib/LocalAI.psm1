@@ -303,6 +303,149 @@ function Get-LaiBlockRange {
     return $out
 }
 
+function Get-LaiOllamaBlockVerdict {
+    <#
+    .SYNOPSIS
+        Pure (unit-tested). Whether the installer's firewall rule keeps other computers away from
+        Ollama's port 11434: a State, the words for a check's row (Text) and the step that goes
+        with them (Fix), from the rules of that name as plain objects.
+    .DESCRIPTION
+        Ollama listens beyond 127.0.0.1 only where the containers cannot reach it otherwise. The
+        installer then blocks its port: by address (everything but this PC and Docker/WSL,
+        whichever adapter a connection arrives on) or, where Docker does not get through that
+        rule, on the physical network adapters only. A check that asks no more than whether a rule
+        of that name exists calls the port blocked under a rule that is switched off, and under the
+        adapter rule, which a VPN and Tailscale get past.
+
+        -Rules: one object per rule with Enabled, Action, Direction, Protocol, LocalPort,
+        RemoteAddress and InterfaceAlias as Windows shows them (Get-LaiOllamaBlockState reads
+        them). Every field is compared as text: Windows hands Enabled back as a value of its own
+        in which False is not 0, so 'if ($rule.Enabled)' is true for a rule that is switched off.
+        -RulesRead $false: the firewall could not be asked.
+
+          blocked   a rule that is on, says Block and Inbound, for TCP or every protocol, with
+                    11434 among its ports (the port, a range around it, or every port), a list of
+                    remote addresses that does not say Any, and no adapter named.
+          adapters  on, Block, Inbound, that protocol and that port, and an adapter is named: what
+                    arrives over another adapter is not blocked.
+          off       a rule is there and is neither of the two: switched off, Allow, Outbound,
+                    another protocol or port, every address on every adapter, or a field missing.
+          none      no rule.
+          unread    not known.
+
+        Only 'blocked' is a block, and a field that is missing never counts for one. Of several
+        rules the best one decides. The words name no adapter and no address.
+
+        Fix is the step for the row, empty for 'blocked'. It is not Update toolkit alone: the
+        installer makes this rule only on a PC where it opened the port itself (Docker could not
+        reach Ollama otherwise). A port that the Ollama app's own setting opened it neither closes
+        nor blocks, so 'none' starts with that setting. Where Docker does not get through the rule
+        by address the installer makes the adapter rule again, so 'adapters' also says what is left
+        to do when the row stays. And a firewall that cannot be asked is not made readable by an
+        update, so 'unread' names Windows Firewall and the check itself.
+
+        Not looked at: which network profiles a rule applies to, what its address list holds,
+        whether Windows Firewall itself is on, and every filter the reader does not ask for. A rule
+        of that name that was narrowed afterwards to a kind of adapter (wireless, wired, remote
+        access), to one program or service, to a local address or to a remote port still reads
+        'blocked', although it blocks only part of what arrives. Changing a rule takes
+        administrator rights.
+    #>
+    param([object[]]$Rules = @(), [bool]$RulesRead = $true)
+    $words = @{
+        blocked  = 'the firewall rule for Ollama''s port 11434 is on and blocks by address'
+        adapters = 'the firewall rule for Ollama''s port 11434 blocks only on the network adapters it names: what arrives over another one (typically a VPN or Tailscale) is not blocked'
+        off      = 'the firewall rule for Ollama''s port 11434 is switched off or is not set the way the toolkit sets it, so it does not count as a block'
+        none     = 'there is no firewall rule for Ollama''s port 11434 under the toolkit''s name'
+        unread   = 'Windows Firewall''s rules could not be read, so it is not known whether Ollama''s port 11434 is blocked'
+    }
+    $update = 'run Start menu > Local AI - Update toolkit'
+    $app = 'turn off ''Expose Ollama to the network'' in the Ollama app''s Settings'
+    $steps = @{
+        blocked  = ''
+        adapters = "$update, which tries the rule by address again where the toolkit opened the port itself; if this row is the same afterwards, the rule on the adapters is the one this PC keeps (the toolkit goes back to it where Docker does not get through the other): then keep this PC off any VPN or tailnet that others are on as well"
+        off      = "$update, which makes the rule again where the toolkit opened the port itself; if this row is the same afterwards, it was not the toolkit that opened it: $app"
+        none     = "$app (the toolkit does not undo that setting, and it makes the rule only where it opened the port itself), then $update"
+        unread   = "make sure Windows Firewall is running (Windows Security > Firewall & network protection; its service is called Windows Defender Firewall), then run this check again; if 'Expose Ollama to the network' is on in the Ollama app's Settings, turn that off as well"
+    }
+    if (-not $RulesRead) { return [pscustomobject]@{ State = 'unread'; Text = $words['unread']; Fix = $steps['unread'] } }
+    $rank = @{ none = 0; off = 1; adapters = 2; blocked = 3 }
+    $state = 'none'
+    foreach ($r in $Rules) {
+        if ($null -eq $r) { continue }
+        $live = ([string]$r.Enabled -eq 'True' -and [string]$r.Action -eq 'Block' -and [string]$r.Direction -eq 'Inbound' -and
+            @('TCP', '6', 'Any') -contains (([string]$r.Protocol) -replace '\s', ''))
+        $onPort = $false
+        foreach ($p in @($r.LocalPort)) {
+            $t = ([string]$p) -replace '\s', ''
+            if ($t -eq 'Any' -or $t -eq '11434') { $onPort = $true; continue }
+            $ends = @($t -split '-')
+            if ($ends.Count -eq 2 -and $ends[0] -match '^\d{1,5}$' -and $ends[1] -match '^\d{1,5}$' -and [int]$ends[0] -le 11434 -and [int]$ends[1] -ge 11434) { $onPort = $true }
+        }
+        # A field that is missing reads as one empty entry: it is neither a list nor 'Any'.
+        $addresses = 0; $everyAddress = $false
+        foreach ($a in @($r.RemoteAddress)) {
+            $t = ([string]$a) -replace '^\s+|\s+$', ''
+            if (-not $t) { continue }
+            $addresses++
+            if ($t -eq 'Any') { $everyAddress = $true }
+        }
+        $adapters = 0; $named = $false
+        foreach ($n in @($r.InterfaceAlias)) {
+            $t = ([string]$n) -replace '^\s+|\s+$', ''
+            if (-not $t) { continue }
+            $adapters++
+            if ($t -ne 'Any') { $named = $true }
+        }
+        $is = 'off'
+        if ($live -and $onPort) {
+            if ($named) { $is = 'adapters' }
+            elseif ($adapters -gt 0 -and $addresses -gt 0 -and -not $everyAddress) { $is = 'blocked' }
+        }
+        if ($rank[$is] -gt $rank[$state]) { $state = $is }
+    }
+    return [pscustomobject]@{ State = $state; Text = $words[$state]; Fix = $steps[$state] }
+}
+
+function Get-LaiOllamaBlockState {
+    <#
+    .SYNOPSIS
+        Asks Windows Firewall for the rules named -DisplayName (the installer's block rule for
+        Ollama's port) with their port, address and adapter filters, and returns what
+        Get-LaiOllamaBlockVerdict makes of them (State, Text, Fix). It reads only, and it never
+        throws.
+    .DESCRIPTION
+        'No rule of that name' is an answer (none). No firewall cmdlets here (the Linux test
+        machine), or anything else that goes wrong, with the rules or with one of their filters, is
+        'unread': a rule whose filter could not be read is not taken for a rule without one.
+        -ErrorAction Stop on every question: inside a module the caller's $ErrorActionPreference
+        does not apply, and an error that is only written would leave a list that looks complete.
+        It asks for those three filters only: not for the one by kind of adapter, by program or by
+        service (see 'Not looked at' in the judge's help).
+    #>
+    param([string]$DisplayName = 'LocalAI - Block Ollama from LAN')
+    $rules = @(); $read = $false
+    if (Get-Command Get-NetFirewallRule -ErrorAction SilentlyContinue) {
+        $found = @()
+        try { $found = @(Get-NetFirewallRule -DisplayName $DisplayName -ErrorAction Stop); $read = $true }
+        catch { $read = ([string]$_.CategoryInfo.Category -eq 'ObjectNotFound') }
+        try {
+            foreach ($rule in $found) {
+                if ($null -eq $rule) { continue }
+                $ports = Get-NetFirewallPortFilter -AssociatedNetFirewallRule $rule -ErrorAction Stop
+                $addresses = Get-NetFirewallAddressFilter -AssociatedNetFirewallRule $rule -ErrorAction Stop
+                $adapters = Get-NetFirewallInterfaceFilter -AssociatedNetFirewallRule $rule -ErrorAction Stop
+                $rules += [pscustomobject]@{
+                    Enabled = [string]$rule.Enabled; Action = [string]$rule.Action; Direction = [string]$rule.Direction
+                    Protocol = [string]$ports.Protocol; LocalPort = @($ports.LocalPort)
+                    RemoteAddress = @($addresses.RemoteAddress); InterfaceAlias = @($adapters.InterfaceAlias)
+                }
+            }
+        } catch { $read = $false }
+    }
+    return (Get-LaiOllamaBlockVerdict -Rules $rules -RulesRead $read)
+}
+
 function Get-LaiReparsePath {
     # The path itself or the first folder above it that is a junction or symbolic link, else $null.
     # The elevated installer works in C:\AI, which the user (and anything running as the user)

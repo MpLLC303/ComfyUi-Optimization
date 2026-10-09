@@ -55,7 +55,6 @@ $tuning = @{}
 if ($state.ContainsKey('tuning') -and $state['tuning']) { $tuning = $state['tuning'] }
 $selected = @()
 if ($config.ContainsKey('SelectedModels')) { $selected = @($config['SelectedModels']) }
-if (-not $CatalogPath -and $env:LOCALAI_TEST_CATALOG) { $CatalogPath = $env:LOCALAI_TEST_CATALOG }
 if (-not $CatalogPath) { $CatalogPath = Join-Path (Join-Path $PSScriptRoot 'config') 'models.psd1' }
 $catalog = Get-LaiCatalog -Path $CatalogPath -IncludeKeys $selected
 $ollamaUrl = 'http://127.0.0.1:11434'
@@ -855,8 +854,19 @@ Add-Check 'Nothing exposed beyond localhost' {
     }
     if ($bad.Count -eq 0) { return (Pass "$($ports -join ', ') bound to loopback only") }
     $onlyOllama = @($bad | Where-Object { $_ -notlike '11434@*' }).Count -eq 0
-    if ($onlyOllama -and (Get-NetFirewallRule -DisplayName 'LocalAI - Block Ollama from LAN' -ErrorAction SilentlyContinue)) {
-        return (Warn "Ollama listens on all interfaces (Docker fallback) but the LAN block rule is in place: $($bad -join ', ')")
+    if ($onlyOllama) {
+        # A rule of the right name is not yet a block. The module reads the rule and judges it, and
+        # one answer only keeps this a warning: a rule that is on and blocks by address. One that is
+        # switched off or was changed, the older one on the network adapters (a VPN and Tailscale
+        # get past it), no rule, and a firewall that could not be asked are failures, each in its
+        # own words and with the step that goes with it (the answer's Fix). That step is not Update
+        # toolkit alone: the installer makes the rule only where it opened the port itself, so with
+        # no rule the Ollama app's own setting comes first, as in the closing failure below.
+        $fw = Get-LaiOllamaBlockState
+        if ($fw.State -eq 'blocked') {
+            return (Warn "Ollama listens on all interfaces (Docker fallback) but the LAN block rule is in place: $($bad -join ', ')")
+        }
+        return (Fail "Ollama listens beyond loopback ($($bad -join ', ')) and $($fw.Text); $($fw.Fix)")
     }
     Fail "listening beyond loopback: $($bad -join ', ') - reachable from your network; run Start menu > Local AI - Update toolkit to restore the localhost-only settings (for 11434 also turn off 'Expose Ollama to the network' in the Ollama app's Settings, which overrides them)"
 }

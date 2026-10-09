@@ -1296,8 +1296,19 @@ Add-Check 'AI ports reachable only from this PC' {
     if (@($ports | Where-Object { @(8188, 8000) -contains $_ }).Count) { $fixes += 'ComfyUI (8188/8000): remove --listen from its start options (Comfy Desktop: Settings > Server-Config > Host 127.0.0.1)' }
     if ($ports -contains 2375) { $fixes += 'Docker (2375): Docker Desktop > Settings > General > untick Expose daemon on tcp://localhost:2375 without TLS' }
     $onlyOllama = @($ports | Where-Object { $_ -ne 11434 }).Count -eq 0
-    if ($onlyOllama -and (Get-NetFirewallRule -DisplayName 'LocalAI - Block Ollama from LAN' -ErrorAction SilentlyContinue)) {
-        return (Warn "Ollama listens on all network adapters ($($exp.Critical -join ', ')), but the toolkit's firewall rule blocks other computers" ($fixes -join '. '))
+    if ($onlyOllama) {
+        # A rule of the right name is not yet a block. The module reads the rule (it changes
+        # nothing) and judges it, and one answer only keeps this a warning: a rule that is on and
+        # blocks by address. One that is switched off or was changed, the older one on the network
+        # adapters (a VPN and Tailscale get past it), no rule, and a firewall that could not be
+        # asked are failures, each in its own words and with the step that goes with it (the
+        # answer's Fix). That step is not Update toolkit alone: the installer makes the rule only
+        # where it opened the port itself, so with no rule the Ollama app's own setting comes first.
+        $fw = Get-LaiOllamaBlockState
+        if ($fw.State -eq 'blocked') {
+            return (Warn "Ollama listens on all network adapters ($($exp.Critical -join ', ')), but the toolkit's firewall rule blocks other computers" ($fixes -join '. '))
+        }
+        return (Fail "Ollama listens beyond this PC itself ($($exp.Critical -join ', ')), and $($fw.Text)" ([string]$fw.Fix))
     }
     Fail "reachable from your network: $($exp.Critical -join ', ') - anyone on the same Wi-Fi or LAN can use them without a password" ($fixes -join '. ')
 }
