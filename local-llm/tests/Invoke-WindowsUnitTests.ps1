@@ -4002,6 +4002,50 @@ $fwE = Find-PcsInterpreterRule -Rules @($fwQuiet[4], 'v2.30|Action=Allow|Active=
 $fwF = Find-PcsInterpreterRule -Rules @()
 Assert-That ($fwC.Status -eq 'SKIP' -and $fwD.Status -eq 'SKIP' -and $fwD.Detail -match 'python\.exe' -and $fwE.Status -eq 'SKIP' -and $fwF.Status -eq 'SKIP') "firewall could not be read: an unreadable rule list, an action this check does not judge (ByPass), a rule without a direction, an empty rule list ($($fwC.Status) $($fwD.Status) $($fwE.Status) $($fwF.Status))"
 
+# What a good answer of Get-PcsAvProduct is, given whether this Windows has a Security Center (the
+# WMI namespace root/SecurityCenter2; Windows Server has none, and the Windows job runs on one).
+# Without the namespace: not read, and no product. With it: read, at least one product, and every
+# product with a name and a whole number for its state (what ConvertFrom-PcsAvState takes apart).
+# The assertion this stands in for took Read as it came, true or false, so on a Windows with a
+# Security Center a reader that failed passed it, and so did one that answered with nothing. The
+# block is asked about canned answers here, on both jobs; the Windows block below holds the real
+# reader to it.
+$avAnswerGood = {
+    param($Answer, [bool]$NamespaceThere)
+    if ($null -eq $Answer -or $Answer.Read -isnot [bool]) { return $false }
+    $products = @($Answer.Products)
+    if (-not $NamespaceThere) { return ($Answer.Read -eq $false -and $products.Count -eq 0) }
+    if (-not $Answer.Read -or $products.Count -lt 1) { return $false }
+    foreach ($product in $products) {
+        if ($null -eq $product -or -not ([string]$product.displayName).Trim()) { return $false }
+        if ($null -eq $product.productState -or @('Byte', 'SByte', 'Int16', 'UInt16', 'Int32', 'UInt32', 'Int64', 'UInt64') -cnotcontains $product.productState.GetType().Name) { return $false }
+    }
+    return $true
+}
+$avCanProduct = { param($Name, $State) [pscustomobject]@{ displayName = $Name; productState = $State; pathToSignedProductExe = 'C:\Program Files\Example\av.exe' } }
+# The state as Windows hands it over (an unsigned 32-bit number), and as the fixtures above write it.
+$avCanFine = @((& $avCanProduct 'Example Antivirus' ([uint32]397568)), $avOwn)
+$avCanCases = @(
+    @{ What = 'read, two products'; Want = $true; There = $true; Answer = [pscustomobject]@{ Read = $true; Products = $avCanFine } }
+    @{ What = 'not read where there is no namespace'; Want = $true; There = $false; Answer = [pscustomobject]@{ Read = $false; Products = @() } }
+    @{ What = 'not read while the namespace is there'; Want = $false; There = $true; Answer = [pscustomobject]@{ Read = $false; Products = @() } }
+    @{ What = 'read where there is no namespace'; Want = $false; There = $false; Answer = [pscustomobject]@{ Read = $true; Products = $avCanFine } }
+    @{ What = 'read, and no product'; Want = $false; There = $true; Answer = [pscustomobject]@{ Read = $true; Products = @() } }
+    @{ What = 'a product without a name'; Want = $false; There = $true; Answer = [pscustomobject]@{ Read = $true; Products = @($avOwn, (& $avCanProduct '' ([uint32]397568))) } }
+    @{ What = 'a product without a state'; Want = $false; There = $true; Answer = [pscustomobject]@{ Read = $true; Products = @($avOwn, (& $avCanProduct 'Example Antivirus' $null)) } }
+    @{ What = 'a state in words'; Want = $false; There = $true; Answer = [pscustomobject]@{ Read = $true; Products = @((& $avCanProduct 'Example Antivirus' 'on')) } }
+    @{ What = 'a state that is no whole number'; Want = $false; There = $true; Answer = [pscustomobject]@{ Read = $true; Products = @((& $avCanProduct 'Example Antivirus' 397568.5)) } }
+    @{ What = 'Read that is neither true nor false'; Want = $false; There = $true; Answer = [pscustomobject]@{ Read = 'yes'; Products = $avCanFine } }
+    @{ What = 'no answer'; Want = $false; There = $true; Answer = $null }
+)
+$avCanWrong = @()
+foreach ($avCanCase in $avCanCases) {
+    # One value, a true or a false, and the one wanted: two values of which one is true would pass as true.
+    $avCanOut = @(& $avAnswerGood $avCanCase.Answer $avCanCase.There)
+    if ($avCanOut.Count -ne 1 -or $avCanOut[0] -isnot [bool] -or $avCanOut[0] -ne $avCanCase.Want) { $avCanWrong += "$($avCanCase.What) -> $($avCanOut -join ',')" }
+}
+Assert-That ($avCanCases.Count -eq 11 -and $avCanWrong.Count -eq 0) "what a good answer of the Security Center reader is: with the namespace read and every product with a name and a whole-number state, without it not read and no product; not: unread while the namespace is there, read without one, no product, a product without a name, a state that is nothing, a word or no whole number, no answer ($($avCanCases.Count) answers; judged wrongly: $($avCanWrong -join ' | '))"
+
 if ($onWindows) {
     # The readers against this Windows itself. NUL is a device every program may open.
     $devNul = Test-PcsDeviceOpen -Device 'NUL'
@@ -4052,9 +4096,21 @@ if ($onWindows) {
     $fwShaped = @($fwReal.Rules | Where-Object { $_ -match '^v\d+\.\d+\|' } | Where-Object { $_ -match '\|Action=(Allow|Block)\|' } | Where-Object { $_ -match '\|Dir=(In|Out)\|' } | Where-Object { $_ -match '\|Active=(TRUE|FALSE)\|' })
     $fwRealVerdict = Find-PcsInterpreterRule -Rules $fwReal.Rules -RulesRead $fwReal.Read
     Assert-That ($fwReal.Read -and $fwShaped.Count -ge 10 -and @('PASS', 'WARN') -contains $fwRealVerdict.Status) "this Windows keeps its firewall rules in the form the check reads ($(@($fwReal.Rules).Count) rules, $($fwShaped.Count) with Action, Dir and Active; verdict $($fwRealVerdict.Status): $($fwRealVerdict.Detail))"
+    # What Get-PcsAvProduct is held to is what this Windows has, asked of WMI itself: whether root
+    # holds a namespace SecurityCenter2. A question that fails is not 'no Security Center': it fails
+    # the assertion, with its error.
+    $avNsAsked = $false; $avNsThere = $false; $avNsError = ''
+    try {
+        $avNsThere = (@(Get-CimInstance -Namespace 'root' -ClassName '__NAMESPACE' -Filter "Name='SecurityCenter2'" -OperationTimeoutSec 30 -ErrorAction Stop).Count -ge 1)
+        $avNsAsked = $true
+    } catch { $avNsError = '; the question to WMI failed: ' + [string]$_.Exception.Message }
     $avReal = Get-PcsAvProduct
+    $avHeld = @(& $avAnswerGood $avReal $avNsThere)
+    Assert-That ($avNsAsked -and $avHeld.Count -eq 1 -and $avHeld[0] -eq $true) "the Security Center reader is held to what this Windows has: without the namespace root/SecurityCenter2 not read and no product, with it read and every product with a name and a whole-number state (namespace there: $avNsThere; read: $($avReal.Read); products: $(@($avReal.Products).Count)$avNsError)"
     $syReal = @(Get-PcsSyncClient)
-    Assert-That ($avReal.Read -is [bool] -and $syReal.Count -eq 1 -and $syReal[0].Name -eq 'OneDrive' -and $syReal[0].StartRead -is [bool]) "the Security Center and cloud-sync readers answer without an error (Security Center read: $($avReal.Read); OneDrive folders: $(@($syReal[0].Folders).Count))"
+    # StartRead is true on every Windows: this account's own Run key is its to read, with or
+    # without a OneDrive entry in it. False is the reader failing, which the assertion here took.
+    Assert-That ($syReal.Count -eq 1 -and $syReal[0].Name -eq 'OneDrive' -and $syReal[0].StartRead -eq $true) "the cloud-sync reader names one program, OneDrive, and reads this account's start-with-Windows entries (programs: $($syReal.Count); entries read: $(@($syReal | ForEach-Object { $_.StartRead }) -join ','); OneDrive folders: $(@($syReal | ForEach-Object { @($_.Folders).Count }) -join ','))"
     # What the cloud-sync row does: every process Windows lists, cut down to this session's.
     $spSelf = [System.Diagnostics.Process]::GetCurrentProcess()
     $spAll = @(Get-Process)
@@ -4067,13 +4123,101 @@ if ($onWindows) {
     Assert-That ($spNumbered.Count -eq $spAll.Count -and $spReal.Read -eq $spDesktop -and $spFound -eq $spDesktop -and @($spReal.Names).Count -le $spAll.Count) "this Windows gives every process its session number, and the session filter finds this test's own process exactly when it runs in a desktop session ($(@($spReal.Names).Count) of $($spAll.Count) processes kept for session $($spSelf.SessionId); read: $($spReal.Read))"
 } else { Skip 'device-open, firewall, Security Center, cloud-sync and session readers: Windows only (the judges above ran on canned input)' }
 
-# Every command the script runs reads: none that sets, removes, starts or stops anything.
-$changeVerbs = @('Set', 'Remove', 'Enable', 'Disable', 'Clear', 'Start', 'Stop', 'Restart', 'Install', 'Uninstall', 'Register', 'Unregister', 'Update', 'Suspend', 'Resume',
-    'Rename', 'Move', 'Copy', 'Grant', 'Revoke', 'Reset', 'Repair', 'Mount', 'Dismount', 'Lock', 'Unlock', 'Invoke', 'Send', 'Publish', 'Initialize', 'Block', 'Unblock')
-$changeTools = @('icacls', 'reg', 'netsh', 'sc', 'schtasks', 'bcdedit', 'manage-bde', 'wmic', 'powercfg', 'dism', 'takeown', 'docker', 'wsl', 'winget', 'cmd', 'ollama')
-$pcsCmds = @($pcsAst.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] }, $true) | ForEach-Object { [string]$_.GetCommandName() } | Where-Object { $_ } | Select-Object -Unique)
-$changing = @($pcsCmds | Where-Object { ($_ -match '^([A-Za-z]+)-' -and $changeVerbs -contains $Matches[1]) -or $changeTools -contains ($_.ToLowerInvariant() -replace '\.exe$', '') })
-Assert-That ($pcsCmds.Count -gt 20 -and $changing.Count -eq 0) "Test-PCSecurity.ps1 runs no command that changes the PC ($($pcsCmds.Count) commands; changing: $($changing -join ', '))"
+# Every call the script makes is on one of three lists, taken from its syntax tree as it stands:
+# the commands it runs by name, the variables it calls through (& or .) and the static .NET members
+# it uses ([type]::Member). A call that is on none of them fails here and is named, so a new one is
+# a name somebody has to add and answer for; a listed name the script no longer calls is only said.
+# (The list of forbidden verbs and tools that stood here let every New-, Add- and Out- command,
+# every call through a variable and every .NET call pass.) Two listed calls write, both the
+# script's own report: New-Item makes its folder and [System.IO.File]::WriteAllText the file. Each
+# is held to one call. Two names stand here for one question, whether the Ollama firewall block is
+# there: Get-NetFirewallRule, and the module's reader Get-LaiOllamaBlockState, which takes its
+# place in that row. The one that is not called is said, like any other.
+# What the lists cannot see: a method called on an object ($key.SetValue(...), $file.Delete());
+# an argument (what New-Item makes and where, what New-Object creates, what whoami.exe is asked);
+# a redirection to a file (> report.txt); what a called variable holds; and the inside of a listed
+# command that is not the script's own. The script's own functions are part of the tree and are
+# read with it. The module's are not: Read-LaiState keeps a damaged config file as <file>.bad.
+$pcsCommandList = @(
+    # Windows PowerShell's own.
+    'Add-Type', 'Confirm-SecureBootUEFI', 'ConvertFrom-Json', 'ForEach-Object', 'Get-Acl', 'Get-BitLockerVolume', 'Get-ChildItem', 'Get-CimInstance', 'Get-Command',
+    'Get-Content', 'Get-Date', 'Get-HotFix', 'Get-Item', 'Get-ItemProperty', 'Get-MpComputerStatus', 'Get-MpPreference', 'Get-NetFirewallProfile', 'Get-NetFirewallRule',
+    'Get-NetTCPConnection', 'Get-Process', 'Get-SmbServerConfiguration', 'Get-Tpm', 'Import-Module', 'Join-Path', 'New-Item', 'New-Object', 'Out-Null', 'Resolve-Path',
+    'Select-Object', 'Sort-Object', 'Split-Path', 'Test-Path', 'Where-Object', 'Write-Host', 'Write-Verbose'
+    # One program of Windows.
+    'whoami.exe'
+    # The toolkit module's.
+    'Get-LaiOllamaBlockState', 'Read-LaiState', 'Write-LaiLog'
+    # The script's own functions.
+    'Add-Check', 'Add-ReportSection', 'Convert-Verdict', 'ConvertFrom-PcsAvState', 'ConvertFrom-PcsOpenStatus', 'Fail', 'Find-PcsComfyRoot', 'Find-PcsInterpreterRule',
+    'Find-PcsOpenDriver', 'Find-PcsRiskyDriver', 'Get-PcsAclVerdict', 'Get-PcsAvLeftoverNote', 'Get-PcsAvProduct', 'Get-PcsAvVerdict', 'Get-PcsDriveOf', 'Get-PcsExposedPort',
+    'Get-PcsFirewallRuleText', 'Get-PcsInstalledApp', 'Get-PcsJsonFlag', 'Get-PcsPickleFile', 'Get-PcsRegValue', 'Get-PcsSyncClient', 'Get-PcsSyncVerdict', 'Group-PcsAvProduct',
+    'Pass', 'Protect-Out', 'Protect-PcsText', 'Select-PcsSessionProcess', 'Skip', 'Test-PcsDeviceOpen', 'Test-PcsVersionBelow', 'Warn'
+)
+# Script blocks: three the script writes where it calls them, and two parameters its own code fills
+# ($Body, a row's code, and $Probe, the question to a driver's device).
+$pcsThroughList = @('$toVer', '$clean', '$Probe', '$Body', '$cell')
+$pcsStaticList = @(
+    '[Environment]::GetEnvironmentVariable', '[Environment]::MachineName', '[Environment]::UserName', '[Math]::Floor', '[PcsDevice]::TryOpen', '[regex]::Escape', '[regex]::Match', '[regex]::Replace',
+    '[Security.Principal.WindowsBuiltInRole]::Administrator', '[Security.Principal.WindowsIdentity]::GetCurrent', '[System.Diagnostics.Process]::GetCurrentProcess',
+    '[System.Diagnostics.Stopwatch]::StartNew', '[System.IO.File]::WriteAllText', '[System.IO.Path]::Combine', '[System.StringComparison]::OrdinalIgnoreCase'
+)
+$pcsReadCalls = {
+    # A syntax tree in. Out: how many different commands it calls by name (Commands), every call
+    # that is on none of the three lists, with its kind (Unlisted), every listed name it does not
+    # call (Uncalled), and each of the two writers it calls more than once (Twice).
+    param($Tree)
+    $byName = @(); $through = @(); $statics = @()
+    foreach ($call in @($Tree.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] }, $true))) {
+        # No name: what is run is not written there as a word (& $x, . $x, & (Join-Path $a 'b.exe')).
+        $name = [string]$call.GetCommandName()
+        if ($name) { $byName += $name } else { $through += [string]$call.CommandElements[0].Extent.Text }
+    }
+    foreach ($member in @($Tree.FindAll({ param($n) $n -is [System.Management.Automation.Language.MemberExpressionAst] -and $n.Static }, $true))) {
+        $statics += ([string]$member.Expression.Extent.Text + '::' + [string]$member.Member.Extent.Text)
+    }
+    $unlisted = @($byName | Select-Object -Unique | Where-Object { $pcsCommandList -notcontains $_ } | ForEach-Object { "command $_" })
+    $unlisted += @($through | Select-Object -Unique | Where-Object { $pcsThroughList -notcontains $_ } | ForEach-Object { "call through $_" })
+    $unlisted += @($statics | Select-Object -Unique | Where-Object { $pcsStaticList -notcontains $_ } | ForEach-Object { ".NET member $_" })
+    $uncalled = @($pcsCommandList | Where-Object { $byName -notcontains $_ }) + @($pcsThroughList | Where-Object { $through -notcontains $_ }) + @($pcsStaticList | Where-Object { $statics -notcontains $_ })
+    $twice = @()
+    foreach ($writer in @(@{ Name = 'New-Item'; Seen = $byName }, @{ Name = '[System.IO.File]::WriteAllText'; Seen = $statics })) {
+        $times = @($writer.Seen | Where-Object { $_ -eq $writer.Name }).Count
+        if ($times -gt 1) { $twice += "$($writer.Name) ($times calls)" }
+    }
+    [pscustomobject]@{ Commands = @($byName | Select-Object -Unique).Count; Unlisted = $unlisted; Uncalled = $uncalled; Twice = $twice }
+}
+$pcsScriptCalls = & $pcsReadCalls $pcsAst
+# More than 20 commands: a tree that was not read holds no call at all, and none of them is unlisted.
+Assert-That ($pcsScriptCalls.Commands -gt 20 -and @($pcsScriptCalls.Unlisted).Count -eq 0 -and @($pcsScriptCalls.Twice).Count -eq 0) "Test-PCSecurity.ps1 calls nothing that is not on its three lists (commands, variables it calls through, static .NET members), and the two calls that write its own report, New-Item and [System.IO.File]::WriteAllText, once each ($($pcsScriptCalls.Commands) commands; not on a list: $(@($pcsScriptCalls.Unlisted) -join ', '); called more than once: $(@($pcsScriptCalls.Twice) -join ', '); listed and not called: $(@($pcsScriptCalls.Uncalled) -join ', '))"
+# The same reader on snippets that are parsed and never run. A deleting command, a writing command
+# of a verb the old list let pass, a call through a variable, a dot-call of something that is no
+# word, a .NET call and a second call of either writer are each reported under their name, and
+# nothing else is. A snippet of listed calls reports nothing. Listed is how many listed names a
+# snippet calls: every other listed name must be said as not called, which is all that happens to
+# it. A call through a variable is no command by name, and an empty tree holds none (which the
+# assertion above fails). In single quotes: $cmd is a variable of this file.
+$pcsCanaries = @(
+    @{ Code = 'Remove-Item -LiteralPath $ReportPath -Force'; Commands = 1; Listed = 0; Unlisted = 'command Remove-Item'; Twice = '' }
+    @{ Code = 'Get-Date | Out-File -FilePath $ReportPath'; Commands = 2; Listed = 1; Unlisted = 'command Out-File'; Twice = '' }
+    @{ Code = '& $cmd'; Commands = 0; Listed = 0; Unlisted = 'call through $cmd'; Twice = '' }
+    @{ Code = '. (Join-Path $PSScriptRoot ''other.ps1'')'; Commands = 1; Listed = 1; Unlisted = 'call through (Join-Path $PSScriptRoot ''other.ps1'')'; Twice = '' }
+    @{ Code = '[System.IO.File]::Delete($ReportPath)'; Commands = 0; Listed = 0; Unlisted = '.NET member [System.IO.File]::Delete'; Twice = '' }
+    @{ Code = 'New-Item -ItemType Directory -Path $dir | Out-Null; New-Item -ItemType File -Path $ReportPath | Out-Null'; Commands = 2; Listed = 2; Unlisted = ''; Twice = 'New-Item (2 calls)' }
+    @{ Code = '[System.IO.File]::WriteAllText($ReportPath, $text); [System.IO.File]::WriteAllText($other, $text)'; Commands = 0; Listed = 1; Unlisted = ''; Twice = '[System.IO.File]::WriteAllText (2 calls)' }
+    @{ Code = 'if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }; $t = & $clean (Get-Date); [System.IO.File]::WriteAllText((Join-Path $dir ''r.md''), [regex]::Replace($t, ''a'', ''b'')); Get-LaiOllamaBlockState | Where-Object { $_ }'; Commands = 7; Listed = 10; Unlisted = ''; Twice = '' }
+    @{ Code = ''; Commands = 0; Listed = 0; Unlisted = ''; Twice = '' }
+)
+$pcsListed = $pcsCommandList.Count + $pcsThroughList.Count + $pcsStaticList.Count
+$pcsCanarySays = '{0} command(s); not on a list: {1}; more than once: {2}; listed and not called: {3}'
+$pcsCanaryWrong = @()
+foreach ($pcsCanary in $pcsCanaries) {
+    $pcsCanaryCalls = & $pcsReadCalls ([System.Management.Automation.Language.Parser]::ParseInput($pcsCanary.Code, [ref]$null, [ref]$null))
+    $pcsCanaryGot = $pcsCanarySays -f $pcsCanaryCalls.Commands, (@($pcsCanaryCalls.Unlisted) -join ', '), (@($pcsCanaryCalls.Twice) -join ', '), @($pcsCanaryCalls.Uncalled).Count
+    $pcsCanaryWant = $pcsCanarySays -f $pcsCanary.Commands, $pcsCanary.Unlisted, $pcsCanary.Twice, ($pcsListed - $pcsCanary.Listed)
+    if ($pcsCanaryGot -cne $pcsCanaryWant) { $pcsCanaryWrong += "'$($pcsCanary.Code)' -> $pcsCanaryGot" }
+}
+Assert-That ($pcsCanaries.Count -eq 9 -and $pcsCanaryWrong.Count -eq 0) "the same reader on parsed snippets names what is on no list (Remove-Item, Out-File, a call through `$cmd, a dot-call of a path, [System.IO.File]::Delete) and a second New-Item or WriteAllText, and reports nothing on a snippet of listed calls; a listed name that is not called is only said ($($pcsCanaries.Count) snippets; wrong: $($pcsCanaryWrong -join ' | '))"
 # That list sees command names only, not what the script's one piece of compiled code calls in Windows
 # itself (the C# in Test-PcsDeviceOpen). So what that code may do is pinned here: one Add-Type, given
 # $members; two imports under their own names, NtOpenFile from ntdll.dll and CloseHandle from
