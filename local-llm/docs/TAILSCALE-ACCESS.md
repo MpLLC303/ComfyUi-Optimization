@@ -379,7 +379,7 @@ scenarios `ok`, `needslogin`, `nohttps`, `noapply`, `hang`, the variable `LOCALA
 | The installer sets Ollama to all interfaces and the flag `ollamaLanFallback` | Install l.1725-1728 |
 | The address rule is rebuilt and tried first on every installer run | Install l.1731-1734 |
 | `Get-LaiOllamaServerConfig` / `Get-LaiOllamaLiveConfig` return `HostIsLoopback` | module l.1678-1701 |
-| The health check calls the fallback "the LAN block rule is in place" whichever rule it is | Test-LocalAI l.654-657 |
+| Superseded by batch 7: the health check says "the LAN block rule is in place" only under a rule that is on and blocks by address (the module's `Get-LaiOllamaBlockState`); under the adapter-only rule the row is a FAIL. It used to say so whichever rule it was | Test-LocalAI, the row "Nothing exposed beyond localhost" (was l.654-657) |
 | The shim answers unknown commands with exit code 2 and no output | unit tests l.431 |
 | The shim's normal status JSON has no `KeyExpiry` | unit tests l.423 |
 | The Windows job runs the static checks, `Invoke-WindowsUnitTests.ps1` and `Invoke-GetLocalAITest.ps1`; `Invoke-WatchTest.ps1` runs on Linux only | tests/README.md l.3 |
@@ -628,6 +628,16 @@ Read optional JSON properties the way Enable l.114 does (`PSObject.Properties.Na
 
 #### C7. Ollama beyond loopback under the adapter-only firewall rule (T3)
 
+- Superseded in part by batch 7 (IMPROVEMENTS.md, rows 134 and 169). Both check scripts now ask the
+  module's `Get-LaiOllamaBlockState`, which reads the rule with its port, address and adapter
+  filters, and under the adapter-only rule the health check's row "Nothing exposed beyond
+  localhost" is a FAIL with the verdict's own next step, not a warning. So the parts below that
+  plan for `Test-LocalAI.ps1` to warn under that rule are not to be built as written: the live
+  rule kind read in the health check, "the health check ... warns all the same", and the second
+  of the two places the message is printed. Built as written, T3 would turn the FAIL back into
+  a warning. What T3 still has to do: the record (`ollamaBlockRule`), the warning of
+  `Enable-TailscaleAccess.ps1`, and what the installer says about a rule it chose itself (row
+  169). Each superseded point is marked below.
 - The hole: under the adapter-only rule port 11434 is blocked on the physical adapters only. A VPN
   adapter and Tailscale's are not among them, Ollama listens on all interfaces, and Ollama has no
   login. For a tailnet: every device in it can use Ollama unless the access policy (Part 1,
@@ -636,7 +646,8 @@ Read optional JSON properties the way Enable l.114 does (`PSObject.Properties.Na
   instructions, not from `Enable-TailscaleAccess.ps1` having run. So the warning does not wait for
   the record of C4; a sign of Tailscale only adds a sentence to it.
 - Rule kind, two sources:
-  - Live, in `Test-LocalAI.ps1` (Windows): pipe the rule that l.655 already fetches to
+  - (Superseded by batch 7: the module's `Get-LaiOllamaBlockState` reads the rule and its filters
+    for both check scripts.) Live, in `Test-LocalAI.ps1` (Windows): pipe the rule that l.655 already fetches to
     `Get-NetFirewallInterfaceFilter`. An `InterfaceAlias` other than `Any` is the adapter-only rule
     (Install l.470), `Any` the address rule (l.479). This covers installs made before T3 and does
     not rest on a file the user can write.
@@ -646,7 +657,7 @@ Read optional JSON properties the way Enable l.114 does (`PSObject.Properties.Na
     proposed key `OllamaBlockRule` in the `$managed` table (Install l.1887-1895), so that scripts
     that do not run elevated can read it. An install made before T3 has no record until its next
     installer run: until then Enable prints nothing, and the health check, which reads the live
-    rule, warns all the same.
+    rule, warns all the same (superseded by batch 7: it fails the row).
 - Proposed pure function in the module: `Get-LaiOllamaTailnetWarning -BlockRule <string> -Live
   <hashtable or $null> -TailscaleSeen <bool>`, returns the message or `''`:
 
@@ -668,7 +679,9 @@ Read optional JSON properties the way Enable l.114 does (`PSObject.Properties.Na
     `-TailscaleSeen $true`: `Write-LaiLog WARN`.
   - `Test-LocalAI.ps1`, l.655-657, with the live kind and `-Live @{ HostIsLoopback = $false }`
     (l.648-654 has just seen the listener): when the function returns a message, `Warn` with it in
-    place of "the LAN block rule is in place".
+    place of "the LAN block rule is in place". (Superseded by batch 7, and not to be built: under
+    the adapter-only rule that row is a FAIL now, in the verdict's words and with its step; "the
+    LAN block rule is in place" is said only under a rule that is on and blocks by address.)
 - Message:
 
   ```text
