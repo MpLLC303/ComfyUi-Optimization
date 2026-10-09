@@ -1996,7 +1996,15 @@ Invoke-Stage 'Stack' {
         Write-LaiLog WARN 'Found an existing open-webui container from a manual install; migrating its data into the managed stack.'
         $envDump = Invoke-Native -File 'docker' -Arguments @('inspect', '--format', '{{range .Config.Env}}{{println .}}{{end}}', 'open-webui') -Capture -AllowFail
         $oldKey = ($envDump.Output | Where-Object { $_ -like 'WEBUI_SECRET_KEY=*' } | Select-Object -First 1)
-        if ($oldKey -and -not (Test-Path -LiteralPath $secretFile)) { Set-Content -LiteralPath $secretFile -Value $oldKey.Substring(17) -NoNewline -Encoding ascii }
+        # Its key is taken over only when it has one. A container started with the variable and
+        # nothing behind it (docker run -e WEBUI_SECRET_KEY=) used to leave a key file of 0 bytes
+        # here, which the check further down refuses: by then the old container was stopped and
+        # renamed, and the run ended over a file it had written itself a moment before.
+        if ($oldKey -and -not (Test-Path -LiteralPath $secretFile)) {
+            $oldKeyText = $oldKey.Substring(17)
+            if ($oldKeyText.Trim()) { Set-Content -LiteralPath $secretFile -Value $oldKeyText -NoNewline -Encoding ascii }
+            else { Write-LaiLog INFO 'The old container has WEBUI_SECRET_KEY with nothing behind it: no key is taken over from it.' }
+        }
         # Where did that container keep /app/backend/data? (No double quotes in the template: PS 5.1 mangles them for native args.)
         $mounts = Invoke-Native -File 'docker' -Arguments @('inspect', '--format', '{{range .Mounts}}{{.Type}}|{{.Name}}|{{.Source}}|{{.Destination}}{{println}}{{end}}', 'open-webui') -Capture -AllowFail
         $data = $mounts.Output | Where-Object { $_ -like '*|/app/backend/data' } | Select-Object -First 1
@@ -2061,21 +2069,30 @@ Invoke-Stage 'Stack' {
     $guideSecret = Join-Path $P.Root 'openwebui-secret.txt'
     if (-not (Test-Path -LiteralPath $secretFile)) {
         # Moved, not copied: the old file sits outside Secrets where other accounts could read it,
-        # and that key signs Open WebUI logins.
-        if (Test-Path -LiteralPath $guideSecret) { Move-Item -LiteralPath $guideSecret -Destination $secretFile }
-        else { Set-Content -LiteralPath $secretFile -Value (New-LaiSecret) -NoNewline -Encoding ascii }
+        # and that key signs Open WebUI logins. Only a file that holds a key is moved in: one of
+        # 0 bytes or of white space only has no key in it to keep, and moved in it would be the
+        # key file that is refused below. It is left where it is, a new key is written as on a PC
+        # that has no such file, and the run says so (a new key ends every session).
+        $guideThere = Test-Path -LiteralPath $guideSecret
+        if ($guideThere -and (Get-TrimmedFileText -Path $guideSecret)) { Move-Item -LiteralPath $guideSecret -Destination $secretFile }
+        else {
+            Set-Content -LiteralPath $secretFile -Value (New-LaiSecret) -NoNewline -Encoding ascii
+            if ($guideThere) { Write-LaiLog WARN "$guideSecret holds no key (0 bytes or white space only): it was left as it is, and a new key was written to $secretFile. With a new key everybody signs in to Open WebUI again." }
+        }
     }
     Protect-Path -Path $secretFile
-    # A key file that holds no key: 0 bytes or white space only (a run cut off between making the
-    # file and writing the key, the guide's own file moved in as it was, an old container that had
-    # the variable with nothing behind it). Stopped here, before .env is written: an empty key in
-    # .env makes compose refuse to start the stack with a message that points at .env, a file this
-    # installer writes itself, and the next run would write the same again. The file is not replaced
-    # without a word either: a new key ends every session, so the owner is told and does it.
+    # A key file that holds no key: 0 bytes or white space only. The lines above no longer make
+    # one (they used to: the guide's own file moved in as it was, an old container that had the
+    # variable with nothing behind it), so it is a file of an earlier version, of a run cut off
+    # between making the file and writing the key, or of the owner's own doing. Stopped here,
+    # before .env is written: an empty key in .env makes compose refuse to start the stack with a
+    # message that points at .env, a file this installer writes itself, and the next run would
+    # write the same again. A key file that is there is not replaced without a word either: a new
+    # key ends every session, so the owner is told and does it.
     # What the message promises is what the lines above do on the next run, once the file is gone.
     $secretKey = Get-TrimmedFileText -Path $secretFile
     if (-not $secretKey) {
-        throw "$secretFile is empty or holds white space only, and Open WebUI signs logins with the key in it. Delete that file and run the installer again: a new key is written (or $guideSecret is moved in, when that file is there), and with a new key everybody signs in to Open WebUI again."
+        throw "$secretFile is empty or holds white space only, and Open WebUI signs logins with the key in it. Delete that file and run the installer again: a new key is written (or $guideSecret is moved in, when that file holds a key), and with a new key everybody signs in to Open WebUI again."
     }
     $cred = Get-AdminCredential
     if (-not $cred) {

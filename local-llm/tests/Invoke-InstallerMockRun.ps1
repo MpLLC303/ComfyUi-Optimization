@@ -882,8 +882,10 @@ Assert-That (-not (Get-Command Get-ScheduledTask -ErrorAction SilentlyContinue))
 Write-Host "`n=== PHASE 6 (key file): an Open WebUI key file that holds no key ===" -ForegroundColor Cyan
 # Secrets\openwebui-secret.txt, the key Open WebUI signs logins with, as a file that holds no key:
 # of 0 bytes, then with a line break and nothing else (a run cut off between making the file and
-# writing the key, the guide's file moved in as it was, an old container with nothing behind
-# WEBUI_SECRET_KEY=). Two runs, one for each. The first used to end in a method called on nothing,
+# writing the key, or what an earlier version left: it moved the guide's file in as it was, and
+# wrote what an old container had behind WEBUI_SECRET_KEY=, also when that was nothing; phase 6d
+# asks that this one makes no such file). Two runs, one for each.
+# The first used to end in a method called on nothing,
 # a line that names no file. The second went on: the key was trimmed to nothing and written into
 # .env as 'WEBUI_SECRET_KEY=', which compose refuses with words that point at .env, a file the
 # installer writes itself, run after run. Now the Stack stage stops before .env is written and says
@@ -996,7 +998,12 @@ Write-Host "`n=== PHASE 6d: the copy of a manual install's data stops part-way; 
 & /usr/bin/docker volume rm open-webui owui-6d 2>$null | Out-Null
 & /usr/bin/docker volume create owui-6d | Out-Null
 & /usr/bin/docker run --rm -v owui-6d:/data alpine:3.20 sh -c 'head -c 65536 /dev/urandom > /data/webui.db; echo marker-6d > /data/marker.txt' | Out-Null
-& /usr/bin/docker create --name open-webui --label lai-test=1 -v owui-6d:/app/backend/data alpine:3.20 sleep 3600 | Out-Null
+# This manual install has the key variable with nothing behind it (docker run -e WEBUI_SECRET_KEY=).
+# The two runs that fail first have a key file in Secrets and never look at it; the run after them
+# has none (see there).
+& /usr/bin/docker create --name open-webui --label lai-test=1 -e 'WEBUI_SECRET_KEY=' -v owui-6d:/app/backend/data alpine:3.20 sleep 3600 | Out-Null
+$oldEnv6d = @(& /usr/bin/docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' open-webui)
+Assert-That ($oldEnv6d -ccontains 'WEBUI_SECRET_KEY=') 'the manual install of this phase has WEBUI_SECRET_KEY with nothing behind it, as the installer will read it'
 $legacyBefore6d = @(& /usr/bin/docker ps -a --filter 'name=^/open-webui-legacy-' --format '{{.Names}}')
 $preCompose6d = @(Get-ChildItem (Join-Path $aiRoot 'Backups') -Filter 'open-webui-*-pre-compose.tar.gz').Count
 # First with a Backups drive that is full: the archive of the old data cannot be written. The copy,
@@ -1047,6 +1054,22 @@ if ($baselineKept6d) { Copy-Item -LiteralPath $baseline6d -Destination $baseline
 # The stand-in also shows the catalog it is handed: the installer passes the one its run used
 # (-CatalogPath), so the health check needs no variable of the user's to find it.
 Set-Content -LiteralPath $realTest6d -Value @('param([string]$AIRoot, [string]$CatalogPath)', "Write-Host ('12:00:00 [FAIL] FAIL Stand-in check: one of three that fail in ' + `$AIRoot + ' (catalog: ' + `$CatalogPath + ')') -ForegroundColor Red", 'exit 3')
+# And it takes over the manual install with no key file in Secrets, which is when the installer
+# looks for a key to keep: behind WEBUI_SECRET_KEY= of the old container, then in the guide's own
+# file (openwebui-secret.txt in the AI folder). Here both are there and neither holds a key: the
+# container has the variable with nothing behind it, the file a line break and nothing else. The
+# installer used to make its key file of the first of them (0 bytes written from the container,
+# or the guide's file moved in as it was) and then refuses that file: the run ended in the Stack
+# stage over a file it had written itself a moment before, the old container already stopped and
+# renamed, and Open WebUI stayed down until the owner deleted the file. Now neither is taken: a
+# new key is written, as on a PC that has neither, and the run says so.
+# The good key is taken out of Secrets for this run and put back after it, in its file and in
+# .env (that one line only: the rest of .env stays as this run wrote it). No key is ever printed.
+$keyAside6d = Join-Path $Work 'openwebui-key-aside-6d'
+Copy-Item -LiteralPath $managedKey6 -Destination $keyAside6d -Force
+Remove-Item -LiteralPath $managedKey6 -Force
+[System.IO.File]::WriteAllBytes($rootKey6, [byte[]]@(13, 10))
+$log6dNext = ''; $newKey6d = ''; $rootLen6d = -1; $envKeys6d = @()
 $screen6d = @()
 try {
     $screen6d = @(& (Join-Path $aiRoot 'Scripts/Install-LocalAI.ps1') -AIRoot $aiRoot 6>&1 | ForEach-Object {
@@ -1056,10 +1079,33 @@ try {
             [pscustomobject]@{ Text = $line6d; Colour = $colour6d }
         })
     $c6d2 = $LASTEXITCODE
+    # The key files and .env as the run left them, read before anything is put back.
+    $log6dNext = & $newestLog6
+    $keyRead6d = $null
+    if (Test-Path -LiteralPath $managedKey6) { $keyRead6d = Get-Content -Raw -Encoding UTF8 -LiteralPath $managedKey6 }
+    if ($null -ne $keyRead6d) { $newKey6d = [string]$keyRead6d }
+    if (Test-Path -LiteralPath $rootKey6) { $rootLen6d = (Get-Item -LiteralPath $rootKey6).Length }
+    $envKeys6d = @(Get-Content -Encoding UTF8 -LiteralPath $envFile6 | Where-Object { $_ -like 'WEBUI_SECRET_KEY=*' })
 } finally {
     Copy-Item -LiteralPath $testAside6d -Destination $realTest6d -Force
     if ($baselineKept6d) { Copy-Item -LiteralPath $baselineAside6d -Destination $baseline6d -Force }
+    Copy-Item -LiteralPath $keyAside6d -Destination $managedKey6 -Force
+    Remove-Item -LiteralPath $rootKey6 -Force -ErrorAction SilentlyContinue
+    if ($newKey6d -match '^[0-9a-f]{64}$') {
+        $goodKey6d = (Get-Content -Raw -Encoding UTF8 -LiteralPath $keyAside6d).Trim()
+        $envText6d = [System.IO.File]::ReadAllText($envFile6)
+        [System.IO.File]::WriteAllText($envFile6, $envText6d.Replace('WEBUI_SECRET_KEY=' + $newKey6d, 'WEBUI_SECRET_KEY=' + $goodKey6d))
+    }
+    Remove-Item -LiteralPath $keyAside6d -Force -ErrorAction SilentlyContinue
 }
+Assert-That ($log6dNext -match 'The old container has WEBUI_SECRET_KEY with nothing behind it: no key is taken over from it') 'a manual install that has WEBUI_SECRET_KEY with nothing behind it: the run says that no key is taken over from it (it used to write a key file of 0 bytes there)'
+Assert-That ($log6dNext -match 'openwebui-secret\.txt holds no key \(0 bytes or white space only\): it was left as it is, and a new key was written to' -and $rootLen6d -eq 2) "the guide's key file with a line break and nothing else is not moved into Secrets: the run says that it holds no key and that a new one was written, and the file is left as it was (bytes in it after the run: $rootLen6d, -1 when it is gone)"
+Assert-That ($newKey6d -match '^[0-9a-f]{64}$' -and $envKeys6d.Count -eq 1 -and $envKeys6d[0] -ceq ('WEBUI_SECRET_KEY=' + $newKey6d)) "with no key to keep, the run writes a new one into Secrets (64 hex digits) and that one into .env ($($newKey6d.Length) characters in the key file, $($envKeys6d.Count) key line(s) in .env)"
+Assert-That ($log6dNext -notmatch 'is empty or holds white space only' -and $log6dNext -notmatch 'null-valued' -and $log6dNext -match '=+ Configure =+') 'and it does not stop over a key file it made itself, with the old container already stopped and renamed: the Stack stage ends and Configure begins'
+$envKeysBack6d = @(Get-Content -Encoding UTF8 -LiteralPath $envFile6 | Where-Object { $_ -like 'WEBUI_SECRET_KEY=*' })
+$keyBack6d = (Get-FileHash -LiteralPath $managedKey6).Hash -eq $keyHash6
+$envBack6d = $keyBack6d -and $envKeysBack6d.Count -eq 1 -and $envKeysBack6d[0] -ceq ('WEBUI_SECRET_KEY=' + (Get-Content -Raw -Encoding UTF8 -LiteralPath $managedKey6).Trim())
+Assert-That ($keyBack6d -and $envBack6d -and -not (Test-Path -LiteralPath $rootKey6)) "the good key is back in Secrets as it was saved and in .env in place of the new one, with no key file left in the AI folder, for the phases that follow (key file: $keyBack6d, .env: $envBack6d)"
 $copied6d = (& /usr/bin/docker run --rm -v open-webui:/d:ro alpine:3.20 sh -c 'cat /d/marker.txt; ls /d') -join ' '
 $legacyNow6d = @(& /usr/bin/docker ps -a --filter 'name=^/open-webui-legacy-' --format '{{.Names}}')
 Assert-That ($copied6d -match '^marker-6d ' -and $copied6d -notmatch 'half-copied' -and $legacyNow6d.Count -eq $legacyBefore6d.Count + 1) "the next run copies the old data into a new volume, with nothing of the half copy in it, and keeps the old container under another name ($copied6d)"
