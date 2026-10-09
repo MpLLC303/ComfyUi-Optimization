@@ -27,7 +27,10 @@
 
     A backup carries the settings of its day, so once Open WebUI is back this install's own are
     applied again: its Ollama connection, sign-up off, and on the toolkit's presets no past-chat
-    search, no code execution and (uncensored ones) no web search without being asked. An archive
+    search, no code execution, none of the seven writing tools (notes, tasks, automations,
+    calendar, notifications, channels, sub-agents) and (uncensored ones) no web search without
+    being asked. Any other preset in the restored data that has one of these on is named in a
+    warning with where to switch it off, and is not changed. An archive
     the nightly backup marked -EMPTY (made after the data was wiped) is never picked by itself, and
     until that mark is settled the pick is the last good backup, not the newest; naming an -EMPTY
     one with -Archive asks first.
@@ -67,11 +70,15 @@ param(
     [ValidateRange(1, [int]::MaxValue)][int]$WebUIWaitSec = 300,
     # Test only (tests/Invoke-UpdateWebUITest.ps1; no shortcut and no scheduled task passes it):
     # setting this install's Ollama connection after the restore counts as failed, the way an
-    # error from Open WebUI ends it.
+    # error from Open WebUI ends it. A run that gets it says so in a warning at its start.
     [switch]$TestFailOllamaUrl
 )
 $ErrorActionPreference = 'Stop'
 Import-Module (Join-Path (Join-Path $PSScriptRoot 'lib') 'LocalAI.psm1') -Force
+# Said at the start of every run that got it, before anything is asked, checked or changed, as
+# Update-Models.ps1 says -TestAllowCpu. It used to be named only in the failure it causes, minutes
+# later and only when the restore came that far.
+if ($TestFailOllamaUrl) { Write-LaiLog WARN 'Test run: -TestFailOllamaUrl was passed, so the step that puts this install''s Ollama connection back after a restore of Open WebUI''s data counts as failed, and that data keeps the connection it came with. Only tests/Invoke-UpdateWebUITest.ps1 passes it (no shortcut, no scheduled task): if you did not mean to, run Start menu > Local AI - Update toolkit after the restore, which sets the connection.' }
 $img = $HelperImage
 # -CatalogPath is looked at before anything is asked or changed (the step that reads the catalog
 # runs minutes later, once the data is swapped) and kept as a full path. $catalogGiven: said in
@@ -663,50 +670,67 @@ if ($stoppedContainers.Count -gt 0) {
             }
             # The same goes for what keeps your chats on this PC. A backup from before the toolkit
             # turned them off brings back sign-up for anyone who reaches the page, presets whose model
-            # can search and read every past chat or run code, and uncensored presets that search the
-            # web without being asked. A try of its own: an error here is not a failed sign-in.
+            # can search and read every past chat, run code or use the seven writing tools (notes,
+            # tasks, automations, calendar, notifications, channels, sub-agents), and uncensored presets
+            # that search the web without being asked. A try of its own: an error here is not a failed
+            # sign-in.
             try {
                 $base = "http://127.0.0.1:$port"
                 Set-LaiWebUIAdminConfig -BaseUrl $base -Token $token -Changes @{ ENABLE_SIGNUP = $false } | Out-Null
                 if ((Invoke-LaiApi -Uri "$base/api/v1/auths/admin/config" -Token $token).ENABLE_SIGNUP -ne $false) { throw "Open WebUI did not keep 'sign-up off'" }
                 # $CatalogPath: config\models.psd1 next to this script, unless -CatalogPath named another.
                 if ($catalogGiven) { Write-LaiLog INFO "The presets to look at are those of the catalog given with -CatalogPath: $CatalogPath" }
-                $changed = @()
-                $found = 0
-                foreach ($m in (Get-LaiCatalog -Path $CatalogPath -IncludeTrials).Models) {
-                    $existing = Get-LaiWebUIModel -BaseUrl $base -Token $token -Id $m.Preset
-                    # Not in the restored data (never set up, or deleted): nothing to make safe, and
-                    # Set-LaiWebUIModel would create it.
-                    if (-not $existing) { continue }
-                    $found++
-                    # The whole preset as Open WebUI returned it, so everything else on it is kept.
-                    $form = ConvertTo-LaiHashtable $existing
-                    if ($form['meta'] -isnot [hashtable]) { $form['meta'] = @{} }
-                    $meta = $form['meta']
-                    # Open WebUI takes a missing switch as ON, so a missing set of them is made.
-                    foreach ($set in 'builtinTools', 'capabilities') { if ($meta[$set] -isnot [hashtable]) { $meta[$set] = @{} } }
-                    $was = @()
-                    if ($meta['builtinTools']['chats'] -ne $false) { $was += 'past-chat search' }
-                    if ($meta['builtinTools']['code_interpreter'] -ne $false -or $meta['capabilities']['code_interpreter'] -ne $false) { $was += 'code execution' }
-                    # The official presets search by default (the installer sets that); the others only when asked.
-                    $auto = @($meta['defaultFeatureIds'] | Where-Object { $_ })
-                    if (-not $m.Official -and $auto.Count -gt 0) { $was += 'on by default: ' + ($auto -join ', ') }
-                    if ($was.Count -eq 0) { continue }
-                    $meta['builtinTools']['chats'] = $false
-                    $meta['builtinTools']['code_interpreter'] = $false
-                    $meta['capabilities']['code_interpreter'] = $false
-                    if (-not $m.Official) { $meta['defaultFeatureIds'] = @() }
-                    $form['id'] = $m.Preset
-                    if ($null -eq $form['params']) { $form['params'] = @{} }
-                    Set-LaiWebUIModel -BaseUrl $base -Token $token -Model $form | Out-Null
-                    $changed += "$($m.Display) ($($was -join ', '))"
+                # The module's walk, the one the installer runs, over that catalog's entries: each preset
+                # that is in the restored data is judged (past chats, code, the writing tools and, on a
+                # preset that is not an official one, what is on by default for every chat), written safe
+                # when it leaves anything on, and read back. One that is not there is passed over (nothing
+                # is created). A write that fails, or that Open WebUI does not keep, is an error: it ends
+                # this step, and the warning at the end says the settings were not put back. This script
+                # used to have a loop of its own here, which knew nothing of the writing tools and logged
+                # the settings as put back with those still on.
+                $walked = @(Invoke-LaiPresetSafety -BaseUrl $base -Token $token -Entries @((Get-LaiCatalog -Path $CatalogPath -IncludeTrials).Models))
+                # What else Open WebUI holds, asked also when the walk found none: a preset no entry of
+                # the catalog names (one you made, one of another catalog, one the toolkit has retired)
+                # came back with the backup too, and a chat can be started on it. Each one is held to the
+                # same judge and named when it leaves anything on. None is changed: it is not the
+                # toolkit's, and the switches on it may be meant. A try of its own, which only warns:
+                # what the walk did stands, and a list that cannot be read must not turn it into 'the
+                # settings could not be applied', or end a restore that worked as failed.
+                $whose = "the toolkit's presets"
+                if ($catalogGiven) { $whose = 'the presets of the catalog given with -CatalogPath' }
+                try {
+                    $covered = @($walked | ForEach-Object { [string]$_.Preset })
+                    foreach ($pm in @(Invoke-LaiApi -Uri "$base/api/v1/models/export" -Token $token | ForEach-Object { $_ })) {
+                        # An answer that is not a list of entries with an id (a text, an object around
+                        # the list) cannot be read here and is said as that: passed over, it would look
+                        # like an Open WebUI that holds no other preset.
+                        if ($null -eq $pm -or -not $pm.PSObject.Properties['id']) { throw 'what it sent is not a list of presets' }
+                        # No base model: Open WebUI's entry for one of Ollama's own models, not a preset.
+                        if (-not $pm.base_model_id) { continue }
+                        # Held against the ids the walk covered character for character (IndexOf, as the
+                        # walk does it): a look-alike id must not pass for a preset that was made safe.
+                        if ([array]::IndexOf($covered, [string]$pm.id) -ge 0) { continue }
+                        # No skip for a preset without meta: Open WebUI takes every switch that is not
+                        # written out as off for on, and the judge counts it that way.
+                        $risks = @(Get-LaiPresetToolRisk $pm.meta)
+                        if ($risks.Count -eq 0) { continue }
+                        # The name is text from the restored data: on one line, whatever it holds (line
+                        # breaks and control characters become a blank). A preset without one goes by its id.
+                        $presetName = ([string]$pm.name -replace '[\s\x00-\x1f\x7f]+', ' ').Trim()
+                        if (-not $presetName) { $presetName = ([string]$pm.id -replace '[\s\x00-\x1f\x7f]+', ' ').Trim() }
+                        Write-LaiLog WARN "The restored data holds the preset '$presetName', which is not one of ${whose}: the assistant can $($risks -join ' and ') there. It was left as it is. If that is not what you want, switch it off in Open WebUI: Workspace > Models > $presetName"
+                    }
+                } catch {
+                    Write-LaiLog WARN "Could not read the list of presets from Open WebUI ($(Get-LaiHttpErrorText $_)), so the presets in the restored data that are not among $whose were not all looked at: one of them may let the assistant read past chats, run code or use the writing tools. Look through them in Open WebUI: Workspace > Models"
                 }
                 # None of them there (a backup of another install, presets since retired): no preset was
                 # looked at, so nothing may say the presets are fine. The warning below gives the way.
-                if ($found -eq 0) { throw "sign-up is off again, but none of the toolkit's presets is in the restored data, so no preset was checked" }
-                $what = 'all had past-chat search and code execution off already'
+                if ($walked.Count -eq 0) { throw "sign-up is off again, but none of the toolkit's presets is in the restored data, so no preset was checked" }
+                $what = 'all had past-chat search, code execution and the writing tools off already'
+                # What the walk wrote, in its words: the preset's name and what the assistant could do there.
+                $changed = @($walked | Where-Object { $_.Written } | ForEach-Object { "$($_.Display) ($($_.On -join ' and '))" })
                 if ($changed.Count -gt 0) { $what = 'turned off on the restored presets: ' + ($changed -join '; ') }
-                Write-LaiLog OK "Re-applied this install's safety settings to the restored data: sign-up off; $found toolkit preset(s) checked, $what"
+                Write-LaiLog OK "Re-applied this install's safety settings to the restored data: sign-up off; $($walked.Count) toolkit preset(s) checked, $what"
                 $notReapplied = ''
             } catch { $notReapplied = $_.Exception.Message }
         } catch {
@@ -717,7 +741,7 @@ if ($stoppedContainers.Count -gt 0) {
     }
 }
 if ($notReapplied) {
-    Write-LaiLog WARN ("The restored data has the settings from when the backup was taken, and this install's safety settings (sign-up off; past-chat search, code execution and unasked web search off on the presets) were not put back: $notReapplied. " +
+    Write-LaiLog WARN ("The restored data has the settings from when the backup was taken, and this install's safety settings (sign-up off; past-chat search, code execution, the writing tools and unasked web search off on the presets) were not put back: $notReapplied. " +
         'To put them back, run Start menu > Local AI - Update toolkit')
 }
 exit 0
