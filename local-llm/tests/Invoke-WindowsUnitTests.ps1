@@ -4373,57 +4373,79 @@ $fwE = Find-PcsInterpreterRule -Rules @($fwQuiet[4], 'v2.30|Action=Allow|Active=
 $fwF = Find-PcsInterpreterRule -Rules @()
 Assert-That ($fwC.Status -eq 'SKIP' -and $fwD.Status -eq 'SKIP' -and $fwD.Detail -match 'python\.exe' -and $fwE.Status -eq 'SKIP' -and $fwF.Status -eq 'SKIP') "firewall could not be read: an unreadable rule list, an action this check does not judge (ByPass), a rule without a direction, an empty rule list ($($fwC.Status) $($fwD.Status) $($fwE.Status) $($fwF.Status))"
 
-# What a good answer of Get-PcsAvProduct is, given whether this Windows has a Security Center (the
-# WMI namespace root/SecurityCenter2; Windows Server has none, and the Windows job runs on one).
-# Without the namespace: not read, and no product. With it: read, at least one product, and every
-# product with a name and a whole number for its state (what ConvertFrom-PcsAvState takes apart).
-# The assertion this stands in for took Read as it came, true or false, so on a Windows with a
-# Security Center a reader that failed passed it, and so did one that answered with nothing. The
-# block is asked about canned answers here, on both jobs. The reader is then held to it twice: on
-# both jobs with a stand-in for Get-CimInstance, and in the Windows block below against this Windows
-# itself.
+# What a good answer of Get-PcsAvProduct is, given what the Windows it was asked on has: whether
+# there is a Security Center (the WMI namespace root/SecurityCenter2) and, where there is, the names
+# of the antivirus products WMI itself names in it, which may be none. Without the namespace: not
+# read, and no product. With it: read, and exactly the products of those names, as many and no
+# other, in whatever order, every one with a name and a whole number for its state (what
+# ConvertFrom-PcsAvState takes apart). A namespace that holds no product is a state Windows has (a
+# Windows Server, a PC no antivirus registered on): 'read, no product' is the true answer there and
+# a good one, and what the check then says about such a PC is Get-PcsAvVerdict's, judged above.
+# The rule that stood here wanted at least one product wherever the namespace is, on the premise
+# that the Windows job's Windows Server has no namespace. It has one, with no product in it, and
+# the reader's true answer failed there. The assertion before that took Read as it came, true or
+# false, so on a Windows with a Security Center a reader that failed passed it, and so did one that
+# answered with nothing: against the names WMI gives, one that answers with nothing where there is
+# a product still fails, and so does one that hands on a product WMI does not name. The block is
+# asked about canned answers here, on both jobs. The reader is then held to it twice: on both jobs
+# with a stand-in for Get-CimInstance, and in the Windows block below against this Windows itself.
 $avAnswerGood = {
-    param($Answer, [bool]$NamespaceThere)
+    param($Answer, [bool]$NamespaceThere, [string[]]$Names)
     if ($null -eq $Answer -or $Answer.Read -isnot [bool]) { return $false }
     $products = @($Answer.Products)
     if (-not $NamespaceThere) { return ($Answer.Read -eq $false -and $products.Count -eq 0) }
-    if (-not $Answer.Read -or $products.Count -lt 1) { return $false }
+    $wanted = @($Names | Where-Object { $null -ne $_ })
+    if (-not $Answer.Read -or $products.Count -ne $wanted.Count) { return $false }
     foreach ($product in $products) {
         if ($null -eq $product -or -not ([string]$product.displayName).Trim()) { return $false }
         if ($null -eq $product.productState -or @('Byte', 'SByte', 'Int16', 'UInt16', 'Int32', 'UInt32', 'Int64', 'UInt64') -cnotcontains $product.productState.GetType().Name) { return $false }
+    }
+    # As many products as names, and every name as often among the products as among the names: the
+    # same names, in whatever order.
+    $given = @($products | ForEach-Object { [string]$_.displayName })
+    foreach ($name in $wanted) {
+        if (@($given | Where-Object { $_ -ceq $name }).Count -ne @($wanted | Where-Object { $_ -ceq $name }).Count) { return $false }
     }
     return $true
 }
 $avCanProduct = { param($Name, $State) [pscustomobject]@{ displayName = $Name; productState = $State; pathToSignedProductExe = 'C:\Program Files\Example\av.exe' } }
 # The state as Windows hands it over (an unsigned 32-bit number), and as the fixtures above write it.
 $avCanFine = @((& $avCanProduct 'Example Antivirus' ([uint32]397568)), $avOwn)
+# Names: what WMI itself names on that Windows. Where an answer is wrong for one reason only (a
+# name or a state it lacks), the names are those of its own products, so that reason alone decides.
+$avCanNames = @('Example Antivirus', 'Windows Defender')
 $avCanCases = @(
-    @{ What = 'read, two products'; Want = $true; There = $true; Answer = [pscustomobject]@{ Read = $true; Products = $avCanFine } }
-    @{ What = 'not read where there is no namespace'; Want = $true; There = $false; Answer = [pscustomobject]@{ Read = $false; Products = @() } }
-    @{ What = 'not read while the namespace is there'; Want = $false; There = $true; Answer = [pscustomobject]@{ Read = $false; Products = @() } }
-    @{ What = 'read where there is no namespace'; Want = $false; There = $false; Answer = [pscustomobject]@{ Read = $true; Products = $avCanFine } }
-    @{ What = 'read, and no product'; Want = $false; There = $true; Answer = [pscustomobject]@{ Read = $true; Products = @() } }
-    @{ What = 'a product without a name'; Want = $false; There = $true; Answer = [pscustomobject]@{ Read = $true; Products = @($avOwn, (& $avCanProduct '' ([uint32]397568))) } }
-    @{ What = 'a product without a state'; Want = $false; There = $true; Answer = [pscustomobject]@{ Read = $true; Products = @($avOwn, (& $avCanProduct 'Example Antivirus' $null)) } }
-    @{ What = 'a state in words'; Want = $false; There = $true; Answer = [pscustomobject]@{ Read = $true; Products = @((& $avCanProduct 'Example Antivirus' 'on')) } }
-    @{ What = 'a state that is no whole number'; Want = $false; There = $true; Answer = [pscustomobject]@{ Read = $true; Products = @((& $avCanProduct 'Example Antivirus' 397568.5)) } }
-    @{ What = 'Read that is neither true nor false'; Want = $false; There = $true; Answer = [pscustomobject]@{ Read = 'yes'; Products = $avCanFine } }
-    @{ What = 'no answer'; Want = $false; There = $true; Answer = $null }
+    @{ What = 'read, the two products WMI names'; Want = $true; There = $true; Names = $avCanNames; Answer = [pscustomobject]@{ Read = $true; Products = $avCanFine } }
+    @{ What = 'read, the two in another order than WMI names them in'; Want = $true; There = $true; Names = @('Windows Defender', 'Example Antivirus'); Answer = [pscustomobject]@{ Read = $true; Products = $avCanFine } }
+    @{ What = 'read, no product, where WMI names none'; Want = $true; There = $true; Names = @(); Answer = [pscustomobject]@{ Read = $true; Products = @() } }
+    @{ What = 'not read where there is no namespace'; Want = $true; There = $false; Names = @(); Answer = [pscustomobject]@{ Read = $false; Products = @() } }
+    @{ What = 'not read while the namespace is there'; Want = $false; There = $true; Names = @(); Answer = [pscustomobject]@{ Read = $false; Products = @() } }
+    @{ What = 'read where there is no namespace'; Want = $false; There = $false; Names = @(); Answer = [pscustomobject]@{ Read = $true; Products = $avCanFine } }
+    @{ What = 'read, no product, where WMI names two'; Want = $false; There = $true; Names = $avCanNames; Answer = [pscustomobject]@{ Read = $true; Products = @() } }
+    @{ What = 'read, a product where WMI names none'; Want = $false; There = $true; Names = @(); Answer = [pscustomobject]@{ Read = $true; Products = @($avOwn) } }
+    @{ What = 'read, one of the two under another name'; Want = $false; There = $true; Names = $avCanNames; Answer = [pscustomobject]@{ Read = $true; Products = @((& $avCanProduct 'Another Antivirus' ([uint32]397568)), $avOwn) } }
+    @{ What = 'read, one of the two twice and the other not'; Want = $false; There = $true; Names = $avCanNames; Answer = [pscustomobject]@{ Read = $true; Products = @($avOwn, $avOwn) } }
+    @{ What = 'a product without a name'; Want = $false; There = $true; Names = @('Windows Defender', ''); Answer = [pscustomobject]@{ Read = $true; Products = @($avOwn, (& $avCanProduct '' ([uint32]397568))) } }
+    @{ What = 'a product without a state'; Want = $false; There = $true; Names = $avCanNames; Answer = [pscustomobject]@{ Read = $true; Products = @($avOwn, (& $avCanProduct 'Example Antivirus' $null)) } }
+    @{ What = 'a state in words'; Want = $false; There = $true; Names = @('Example Antivirus'); Answer = [pscustomobject]@{ Read = $true; Products = @((& $avCanProduct 'Example Antivirus' 'on')) } }
+    @{ What = 'a state that is no whole number'; Want = $false; There = $true; Names = @('Example Antivirus'); Answer = [pscustomobject]@{ Read = $true; Products = @((& $avCanProduct 'Example Antivirus' 397568.5)) } }
+    @{ What = 'Read that is neither true nor false'; Want = $false; There = $true; Names = $avCanNames; Answer = [pscustomobject]@{ Read = 'yes'; Products = $avCanFine } }
+    @{ What = 'no answer'; Want = $false; There = $true; Names = @(); Answer = $null }
 )
 $avCanWrong = @()
 foreach ($avCanCase in $avCanCases) {
     # One value, a true or a false, and the one wanted: two values of which one is true would pass as true.
-    $avCanOut = @(& $avAnswerGood $avCanCase.Answer $avCanCase.There)
+    $avCanOut = @(& $avAnswerGood $avCanCase.Answer $avCanCase.There $avCanCase.Names)
     if ($avCanOut.Count -ne 1 -or $avCanOut[0] -isnot [bool] -or $avCanOut[0] -ne $avCanCase.Want) { $avCanWrong += "$($avCanCase.What) -> $($avCanOut -join ',')" }
 }
-Assert-That ($avCanCases.Count -eq 11 -and $avCanWrong.Count -eq 0) "what a good answer of the Security Center reader is: with the namespace read and every product with a name and a whole-number state, without it not read and no product; not: unread while the namespace is there, read without one, no product, a product without a name, a state that is nothing, a word or no whole number, no answer ($($avCanCases.Count) answers; judged wrongly: $($avCanWrong -join ' | '))"
+Assert-That ($avCanCases.Count -eq 16 -and $avCanWrong.Count -eq 0) "what a good answer of the Security Center reader is: without the namespace not read and no product; with it read and exactly the products WMI names there, in whatever order, none where it names none, each with a name and a whole-number state; not: unread while the namespace is there, read without one, no product where WMI names two, a product where it names none, another name, one name twice for two, a product without a name, a state that is nothing, a word or no whole number, no answer ($($avCanCases.Count) answers; judged wrongly: $($avCanWrong -join ' | '))"
 
-# The reader itself, on both jobs. The Windows job has no Security Center, so there the real reader
-# only ever answers 'not read', and its lines that read (the question to WMI, and what is kept of
-# each product) ran on no job: a reader that asked for a class that does not exist, or that handed
-# on a product without its name or with its state as text, passed both. Here Get-PcsAvProduct runs
-# as the script has it, with a stand-in for Get-CimInstance that is a function of a child scope only
-# (made through the function drive: this file holds no function statement under a cmdlet's name).
+# The reader itself, on both jobs. The Windows job's Security Center holds no product, so there the
+# real reader only ever answers 'read, no product', and what it keeps of each product ran on no
+# job: a reader that handed on a product without its name or with its state as text passed both.
+# Here Get-PcsAvProduct runs as the script has it, with a stand-in for Get-CimInstance that is a
+# function of a child scope only (made through the function drive: this file holds no function
+# statement under a cmdlet's name).
 # The stand-in answers one question, the namespace root/SecurityCenter2 and the class
 # AntiVirusProduct, with two products as Windows hands them over (the state an unsigned 32-bit
 # number, and more properties than the three the reader keeps). Any other question fails as it does
@@ -4468,8 +4490,9 @@ $avStandInWant = & $avStandInSay $avStandInList
 $avStandInGot = ''; $avStandInDownSays = 'no answer'
 if ($null -ne $avStandInRead) { $avStandInGot = & $avStandInSay $avStandInRead.Products }
 if ($null -ne $avStandInDown) { $avStandInDownSays = 'read {0}, {1} product(s)' -f $avStandInDown.Read, @($avStandInDown.Products).Count }
-$avStandInGood = @(& $avAnswerGood $avStandInRead $true)
-$avStandInDownGood = @(& $avAnswerGood $avStandInDown $false)
+$avStandInNames = @($avStandInList | ForEach-Object { [string]$_.displayName })
+$avStandInGood = @(& $avAnswerGood $avStandInRead $true $avStandInNames)
+$avStandInDownGood = @(& $avAnswerGood $avStandInDown $false @())
 Assert-That ($avStandInAskedRead.Count -ge 1 -and $avStandInAskedDown.Count -ge 1 -and $avStandInQuestions -eq 'root/SecurityCenter2 AntiVirusProduct' -and $avStandInGood.Count -eq 1 -and $avStandInGood[0] -eq $true -and $avStandInGot -ceq $avStandInWant) "the Security Center reader itself, run on a stand-in for Get-CimInstance: it asks for the namespace root/SecurityCenter2 and the class AntiVirusProduct and hands on every product with its name, its state as the number Windows gave and its program's path, which is a good answer where the namespace is there (asked: $avStandInQuestions; got: $avStandInGot)"
 Assert-That ($avStandInDownGood.Count -eq 1 -and $avStandInDownGood[0] -eq $true -and $avStandInGone) "and where that question fails it answers not read and no product, which is the good answer of a Windows without the namespace; the stand-in is gone afterwards ($avStandInDownSays; stand-in gone: $avStandInGone)"
 
@@ -4523,17 +4546,23 @@ if ($onWindows) {
     $fwShaped = @($fwReal.Rules | Where-Object { $_ -match '^v\d+\.\d+\|' } | Where-Object { $_ -match '\|Action=(Allow|Block)\|' } | Where-Object { $_ -match '\|Dir=(In|Out)\|' } | Where-Object { $_ -match '\|Active=(TRUE|FALSE)\|' })
     $fwRealVerdict = Find-PcsInterpreterRule -Rules $fwReal.Rules -RulesRead $fwReal.Read
     Assert-That ($fwReal.Read -and $fwShaped.Count -ge 10 -and @('PASS', 'WARN') -contains $fwRealVerdict.Status) "this Windows keeps its firewall rules in the form the check reads ($(@($fwReal.Rules).Count) rules, $($fwShaped.Count) with Action, Dir and Active; verdict $($fwRealVerdict.Status): $($fwRealVerdict.Detail))"
-    # What Get-PcsAvProduct is held to is what this Windows has, asked of WMI itself: whether root
-    # holds a namespace SecurityCenter2. A question that fails is not 'no Security Center': it fails
-    # the assertion, with its error.
-    $avNsAsked = $false; $avNsThere = $false; $avNsError = ''
+    # What Get-PcsAvProduct is held to is what this Windows has, asked of WMI here and not through
+    # the reader: whether root holds a namespace SecurityCenter2 and, where it does, the names of
+    # the antivirus products in it. (The Windows Server 2025 of the Windows job has the namespace
+    # and no product in it.) The reader must then have read, and hand on exactly the products WMI
+    # names: one that answers with nothing where there is a product, hands on one WMI does not
+    # name or answers 'not read' fails. A question that fails is not 'no Security Center' and not
+    # 'no product': it fails the assertion, with its error. The line says how many products there
+    # are, never a product's name.
+    $avNsAsked = $false; $avNsThere = $false; $avNsNames = @(); $avNsError = ''
     try {
         $avNsThere = (@(Get-CimInstance -Namespace 'root' -ClassName '__NAMESPACE' -Filter "Name='SecurityCenter2'" -OperationTimeoutSec 30 -ErrorAction Stop).Count -ge 1)
+        if ($avNsThere) { $avNsNames = @(Get-CimInstance -Namespace 'root/SecurityCenter2' -ClassName AntiVirusProduct -OperationTimeoutSec 30 -ErrorAction Stop | ForEach-Object { [string]$_.displayName }) }
         $avNsAsked = $true
     } catch { $avNsError = '; the question to WMI failed: ' + [string]$_.Exception.Message }
     $avReal = Get-PcsAvProduct
-    $avHeld = @(& $avAnswerGood $avReal $avNsThere)
-    Assert-That ($avNsAsked -and $avHeld.Count -eq 1 -and $avHeld[0] -eq $true) "the Security Center reader is held to what this Windows has: without the namespace root/SecurityCenter2 not read and no product, with it read and every product with a name and a whole-number state (namespace there: $avNsThere; read: $($avReal.Read); products: $(@($avReal.Products).Count)$avNsError)"
+    $avHeld = @(& $avAnswerGood $avReal $avNsThere $avNsNames)
+    Assert-That ($avNsAsked -and $avHeld.Count -eq 1 -and $avHeld[0] -eq $true) "the Security Center reader is held to what this Windows has, asked of WMI in this test: without the namespace root/SecurityCenter2 not read and no product, with it read and exactly the products WMI names there, none where it names none, each with a name and a whole-number state (namespace there: $avNsThere; products WMI names: $($avNsNames.Count); read: $($avReal.Read); products: $(@($avReal.Products).Count)$avNsError)"
     $syReal = @(Get-PcsSyncClient)
     # StartRead is true on every Windows: this account's own Run key is its to read, with or
     # without a OneDrive entry in it. False is the reader failing, which the assertion here took.
