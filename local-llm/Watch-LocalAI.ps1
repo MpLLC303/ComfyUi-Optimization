@@ -19,7 +19,11 @@
     runs in a row (and once when it recovers), so neither a slow Docker start nor a lasting outage
     spams you. Only a check that ran and passed counts as recovered: one that could not run (Docker
     is down, Open WebUI is stopped for a backup) keeps what was reported about it, with no
-    notification either way. Log: <AIRoot>\Logs\watch.log.
+    notification either way. Open WebUI or deep research found down while the volume lock is held (a
+    backup, restore or update at work) is left alone and not judged for 45 minutes, longer than any
+    of them normally takes. Found so on every run after that, it is reported as not working like
+    any other check, and is still never started while the lock is held.
+    Log: <AIRoot>\Logs\watch.log.
     When Ollama has updated itself since the presets were tuned, the nightly LocalAI-Recheck-Models task
     (Update-Models.ps1 -RecheckOnly -Scheduled) measures them again; the watch notifies only when a
     preset could not be put back fully on the GPU, or the re-check could not run for 3 days (once per
@@ -101,6 +105,17 @@ $healAllowed = -not $NoHeal
 # A problem that persists is announced again after this many hours (a single toast is easy to miss:
 # Focus Assist during a game, a busy morning), until it is fixed.
 $remindHours = 24
+# Open WebUI or deep research found down while the volume lock is held is left alone for this many
+# minutes, longer than a backup, restore or update normally takes. After that it counts as failed on
+# every run, and is still never started under the lock: any program of this user can hold that lock
+# and stop the container, and the watch would otherwise stay quiet about it for good. Since when is
+# a stamp for each of the two in watch-state.json (webuiLockedSince, researchLockedSince), written
+# by the first run that sees it and removed by the first one that finds the lock free or the service
+# answering. A stamp that is no time, or lies in the future, counts as overdue.
+# Not closed, and it ships open: that file is one any program of this user can write as well. One
+# that removes the stamp, or sets it to a time less than this many minutes ago, before each run
+# keeps the watch quiet as before.
+$lockBoundMinutes = 45
 # The integrity comparison (hash every installed file, read the tasks and the listeners) runs when
 # the last one is this old: on every 15-minute run it would be the slowest thing the watch does.
 $integrityMinutes = 60
@@ -134,6 +149,22 @@ function Get-WatchStamp($Value) {
     $d = ConvertTo-WatchDate $Value
     if ($d) { return $d.ToString('s') }
     return ([string]$Value -replace '\s+', ' ').Trim()
+}
+function Get-WatchLockSeen {
+    # What the stamp says that the watch keeps for a service found down under a held volume lock (see
+    # $lockBoundMinutes). First: no stamp, this is the first run that sees it. Since: the stamp when
+    # it is a time not after -Now. Overdue: that time is -BoundMinutes or more ago, or the stamp is
+    # anything else (empty, no text, not a time, a time in the future). The state file is one any
+    # program of this user can write, and a stamp the watch cannot read must not keep it quiet. Asked
+    # with ContainsKey, never by the value: an empty stamp is a stamp. Only Since, the parsed time, is
+    # ever printed; what the file held is not.
+    param([hashtable]$State, [string]$Key, [datetime]$Now, [int]$BoundMinutes)
+    if (-not $State.ContainsKey($Key)) { return @{ First = $true; Overdue = $false; Since = $null } }
+    $since = $null
+    # The watch writes text, and PowerShell 7 reads that back as a date. A list or a table is neither.
+    if ($State[$Key] -is [string] -or $State[$Key] -is [datetime]) { $since = ConvertTo-WatchDate $State[$Key] }
+    if ($null -ne $since -and $since -le $Now) { return @{ First = $false; Overdue = (($Now - $since).TotalMinutes -ge $BoundMinutes); Since = $since } }
+    return @{ First = $false; Overdue = $true; Since = $null }
 }
 
 # Every docker call has a time limit: a Docker Desktop that stopped answering (it can after sleep)
@@ -283,6 +314,13 @@ $results = [ordered]@{}
 $details = @{}
 $healed = @()
 $maintenance = $false
+# Open WebUI and deep research down under a held volume lock ($lockBoundMinutes): which of them this
+# run left alone and did not judge, which it counts as failed because that has lasted too long, and
+# what becomes of the stamp each has in watch-state.json when this run is saved (no entry: it stays
+# as it is, '': it is removed, else the time to keep).
+$leftAlone = @()
+$lockOverdue = @()
+$lockStamps = @{}
 
 $ollamaVer = ''
 try { $ollamaVer = [string](Invoke-LaiApi -Uri "$ollamaUrl/api/version" -TimeoutSec 5).version; $results['Ollama'] = $true } catch { $results['Ollama'] = $false }
@@ -305,21 +343,53 @@ if ($engine -eq 'down' -or $engine -eq 'hung') {
     # as working again (only a check that ran and passed is; see the report below). Without a docker
     # CLI ('missing') it was not looked at, and nothing is recorded.
     if ($engine -eq 'ok') { $results['Docker'] = $true }
-    $watched = @(@{ Name = 'open-webui'; Url = "http://127.0.0.1:$webPort/health"; Key = 'Open WebUI' },
+    # LockKey: the two that a backup, restore or update stops (or pauses) under the volume lock, and
+    # the name of the stamp each has in watch-state.json for it.
+    $watched = @(@{ Name = 'open-webui'; Url = "http://127.0.0.1:$webPort/health"; Key = 'Open WebUI'; LockKey = 'webuiLockedSince' },
                  @{ Name = 'searxng'; Url = "http://127.0.0.1:$searxPort/healthz"; Key = 'SearXNG' })
-    # The optional research agent, healed like the others.
-    if ($researchPort -gt 0) {
-        $watched += @{ Name = 'deep-research'; Url = "http://127.0.0.1:$researchPort/api/v1/health"; Key = 'Deep research' }
-    }
+    # The optional research agent, healed like the others. Where it is no part of this install, a
+    # stamp it once left is owed nothing: it would count against a later install of it.
+    $research = @{ Name = 'deep-research'; Url = "http://127.0.0.1:$researchPort/api/v1/health"; Key = 'Deep research'; LockKey = 'researchLockedSince' }
+    if ($researchPort -gt 0) { $watched += $research } else { $lockStamps[$research.LockKey] = '' }
+    # The stamps as the run before this one left them. Read once, here: nothing above needs the file.
+    $lockState = Read-LaiState -Path $statePath
     foreach ($c in $watched) {
         $ok = Test-Url $c.Url
         $hold = $null; if ($c.Name -eq 'open-webui') { $hold = Get-LaiWebUIHold -AIRoot $AIRoot }
-        if (-not $ok -and @('open-webui', 'deep-research') -contains $c.Name -and (Test-LaiVolumeLockBusy)) {
+        if (-not $ok -and $c.ContainsKey('LockKey') -and (Test-LaiVolumeLockBusy)) {
             # A backup, restore or update is running and stopped (or paused) it on purpose (checked
             # before the hold: a restore in progress has written its hold already, but has not failed).
             # That is 'not checked', not 'working': no result is recorded, so nothing is reported as
             # failed and nothing as recovered, and what was reported before stays as it was.
+            # For $lockBoundMinutes, counted from the first run that saw it so. Found so on every run
+            # after that, it is a failure like any other, with two differences: it is still not
+            # started (whatever holds the lock may be at work on the volume), and no docker command
+            # is run for it. In either case this is maintenance for the rest of the run: the chat
+            # path is not tried and the banner is not written.
             $maintenance = $true
+            $lookedAt = Get-Date
+            $lockSeen = Get-WatchLockSeen -State $lockState -Key $c.LockKey -Now $lookedAt -BoundMinutes $lockBoundMinutes
+            # The stamp to save: this run's time on a first sighting, the time on record (in the
+            # watch's own spelling) while that reads as one. A stamp that does not is left as it is,
+            # so that it counts as overdue on the next run too.
+            if ($lockSeen.First) { $lockStamps[$c.LockKey] = $lookedAt.ToString('s') }
+            elseif ($null -ne $lockSeen.Since) { $lockStamps[$c.LockKey] = $lockSeen.Since.ToString('s') }
+            if ($lockSeen.Overdue) {
+                # The words claim what the watch has on record and no more. Who holds the lock is not
+                # known, and the watch looks every 15 minutes: held each time it looked, not held
+                # throughout. 'By the watch's record', because the stamp is in a file another program
+                # can write, and a run that is ended early leaves it as it was. The time printed is
+                # the parsed one, never what the file held.
+                $results[$c.Key] = $false
+                $lockOverdue += $c.Key
+                if ($null -ne $lockSeen.Since) {
+                    $details[$c.Key] = "down, and by the watch's record the volume lock was held each time it looked since $($lockSeen.Since.ToString('yyyy-MM-dd HH:mm')), longer than a backup, restore or update normally takes; not started while the lock is held"
+                } else {
+                    $details[$c.Key] = "down with the volume lock held, and the watch's record of since when cannot be read as a time that has passed, which counts as longer than a backup, restore or update normally takes; not started while the lock is held"
+                }
+            } else {
+                $leftAlone += $c.Key
+            }
             continue
         } elseif (-not $ok -and $hold) {
             # Left stopped on purpose by a failed or interrupted restore: starting it could run on a damaged volume.
@@ -337,6 +407,8 @@ if ($engine -eq 'down' -or $engine -eq 'hung') {
             }
         }
         $results[$c.Key] = $ok
+        # Looked at, and it answers or the lock is free: the count of $lockBoundMinutes starts over.
+        if ($c.ContainsKey('LockKey')) { $lockStamps[$c.LockKey] = '' }
     }
 
     # The render guard has no host port (only Open WebUI talks to it); if it is down, chats fail.
@@ -861,6 +933,9 @@ if ($previous.ContainsKey('pendingRecovered') -and $previous['pendingRecovered']
 # is left alone, and the chat path is not tried without Open WebUI. Counting those as recovered sent
 # 'recovered Open WebUI' the moment Docker stopped. What was reported and did not run stays reported,
 # with no notification, until its check runs again.
+# Left alone under the volume lock is 'did not run' for $lockBoundMinutes minutes only. Found so on
+# every run after that, Open WebUI (or deep research) has a result, failed, and goes the way of every
+# failed check: a notification when a second run in a row finds it, and the reminders.
 # What is no longer part of this install is owed nothing: deep research removed, or a mirror no longer
 # configured, would stay 'not checked' for good, and no later notice could say 'back to normal'.
 $retired = @()
@@ -874,7 +949,9 @@ $recoveryFailed = $false
 
 $failedText = @($failed | ForEach-Object { if ($details.ContainsKey($_)) { '{0} ({1})' -f $_, $details[$_] } else { $_ } }) -join ', '
 $line = '{0} {1}{2}' -f (Get-Date -Format 's'), $(if ($failed.Count) { 'FAIL ' + $failedText } else { 'OK' }), $(if ($healed.Count) { ' (restarted: ' + ($healed -join ', ') + ')' } else { '' })
-if ($maintenance) { $line += ' (Open WebUI stopped for a backup/restore/update; left alone)' }
+# Said of what this run left alone and did not judge, by name. One that has been down under the lock
+# for too long stands in the FAIL part with its own words, and is not called left alone.
+if ($leftAlone.Count) { $line += ' (' + ($leftAlone -join ', ') + ' stopped for a backup/restore/update; left alone)' }
 Write-WatchLog $line
 Write-Verbose $line
 
@@ -882,7 +959,15 @@ function Get-WatchHint([string[]]$Failed) {
     # One concrete next step, using the Start-menu shortcuts (typed commands may be blocked by policy).
     $hint = 'Start menu > Local AI - Health check shows details.'
     $heldNow = Get-LaiWebUIHold -AIRoot $AIRoot
-    if ($heldNow -and $failed -contains 'Open WebUI') {
+    if (@($failed | Where-Object { $lockOverdue -contains $_ }).Count) {
+        # Down under a volume lock that stays held ($lockBoundMinutes). The shortcut that starts the
+        # stack waits for the same lock, and the Recover line of a hold is not the step either: a
+        # restore that is still running has written its hold already. The step is the health check's
+        # (Get-WebUIStopReason in Test-LocalAI.ps1): a window that is still working is left to finish,
+        # and the PC is restarted only when there is none (a restore cut off by a restart leaves the
+        # volume half-swapped).
+        $hint = 'If a Local AI window is still at work on a backup, restore or update, let it finish. If none is, restart the PC, which ends whatever holds the lock.'
+    } elseif ($heldNow -and $failed -contains 'Open WebUI') {
         # Start again would refuse; the only fix is the recovery restore (the command is in the details).
         $hint = 'Open WebUI is stopped on purpose after a failed restore. The fix is the Recover line in ' + (Join-Path $AIRoot 'open-webui-hold.json') + ': paste it into PowerShell.'
     } elseif ($engine -eq 'hung' -and $failed -contains 'Docker') {
@@ -993,6 +1078,10 @@ if ($script:toastSetting) { if ($script:toastSetting -ne 'Enabled') { $final['to
 if ($null -ne $ollamaNotice) { if ($ollamaNotice) { $final['ollamaNotifiedFor'] = $ollamaNotice } else { $final.Remove('ollamaNotifiedFor') } }
 if ($null -ne $driftSince) { if ($driftSince) { $final['ollamaDriftSince'] = $driftSince } else { $final.Remove('ollamaDriftSince') } }
 if ($recheckNotice) { $final['recheckNotifiedFor'] = $recheckNotice }
+# Since when Open WebUI and deep research have been seen down under a held volume lock
+# ($lockBoundMinutes): written and removed here and nowhere else. A stamp without an entry stays as
+# it is: its service was not looked at (Docker down), or the stamp is one this run could not read.
+foreach ($k in @($lockStamps.Keys)) { if ($lockStamps[$k]) { $final[$k] = $lockStamps[$k] } else { $final.Remove($k) } }
 # (A baseline accepted while this run was busy has another id: the next run starts over with it.)
 if ($null -ne $integrityState) { $final['integrity'] = $integrityState }
 Save-LaiState -State $final -Path $statePath
