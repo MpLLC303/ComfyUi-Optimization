@@ -12,7 +12,10 @@
     name/SID, OS build, drive free space) and, only in a phase that asks for it, the user's
     environment variables ($global:MockUserEnv), a system-wide OLLAMA_MODELS
     ($global:MockMachineModels) and what Preflight is told of the running Ollama's list of models
-    ($global:MockOllamaListed). Nothing else in the installer is changed.
+    ($global:MockOllamaListed). The same copy gets the reads of this test's own variables, which
+    the installer as it ships does not have: LOCALAI_TEST_CATALOG (the catalog, and no 20 second
+    wait about the official models), LOCALAI_TEST_ALLOW_CPU, LOCALAI_TEST_FAIL_STAGE and
+    LOCALAI_TEST_WEBUI_OLLAMA_URL. Nothing else in the installer is changed.
 
     Prerequisites: same as Invoke-IntegrationTest.ps1, plus a running SearXNG container is optional.
 #>
@@ -125,6 +128,25 @@ if (@(& /usr/bin/docker ps -a --filter 'name=^/searxng$' --format '{{.Names}}') 
 # ---- patched installer copy ----------------------------------------------------------------
 $inst = Join-Path $copy 'Install-LocalAI.ps1'
 $text = Get-Content -Raw $inst
+# The installer as it ships takes nothing from a test. It runs as administrator, and a variable of
+# the user's can be set for good by any program of theirs: it used to read four of them, and one
+# replaced the Ollama address that Open WebUI is given (chats could go elsewhere while the health
+# check passed), another the catalog. Asked of the text as it ships, before this test writes
+# anything into its copy: no such name is left, in code or comment, no stage is failed on request,
+# and the acceptance checks are handed the catalog the run used, so that they need no variable either.
+Assert-That ($text -notmatch 'LOCALAI_TEST_' -and $text -notmatch 'Test hook: stage') 'the installer as it ships names no test variable and fails no stage on request, in code or comment (read before this test writes its own reads into its copy)'
+Assert-That ($text.Contains("& (Join-Path `$SourceRoot 'Test-LocalAI.ps1') -AIRoot `$AIRoot -CatalogPath `$CatalogPath")) 'the installer hands the catalog its run used to the acceptance checks (-CatalogPath), run from its own copy'
+# What the phases below need of those reads is written into this test's own copy, as the stand-ins
+# for Windows are: the last five entries of $patches. Each is a line of the installer as it ships
+# and, on that same line, the read that was taken out of it. Their third field ('once') says that
+# the line must be in the shipped text exactly one time, which is asked below, before anything is
+# replaced: a line found twice would get the read twice. The installer waits 20 seconds in two
+# places, and only the wait about the official models (twelve spaces in) was ever skipped for a
+# test; the one in Preflight about a folder that cannot be looked at (eight) must stay a wait.
+$stageLine = 'Write-LaiLog STEP (''='' * 12 + " $Name " + ''='' * 12)'
+$catalogLine = '$CatalogPath = Join-Path $SourceRoot ''config\models.psd1'''
+$waitLine = (' ' * 12) + 'Start-Sleep -Seconds 20'
+$urlLine = '$WebUIUrl = "http://127.0.0.1:$($script:WebUIPortEffective)"'
 $patches = @(
     @('$p = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())', '$p = $null'),
     @('return $p.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)', 'return (-not $env:LOCALAI_MOCK_NOT_ADMIN)'),
@@ -148,8 +170,22 @@ $patches = @(
     # with models: a phase that sets $global:MockOllamaListed to an answer (Content and Listed, as
     # Get-OllamaListedContent gives them) has an Ollama that lists none, or does not answer. While
     # it is $null the installer's own code asks the real one.
-    @('$byList = Get-OllamaListedContent -OllamaUrl $OllamaUrl', '$byList = $(if ($null -ne $global:MockOllamaListed) { $global:MockOllamaListed } else { Get-OllamaListedContent -OllamaUrl $OllamaUrl })')
+    @('$byList = Get-OllamaListedContent -OllamaUrl $OllamaUrl', '$byList = $(if ($null -ne $global:MockOllamaListed) { $global:MockOllamaListed } else { Get-OllamaListedContent -OllamaUrl $OllamaUrl })'),
+    # The reads the installer no longer has (see above). A stage that fails on request:
+    @($stageLine, ($stageLine + '; if ($env:LOCALAI_TEST_FAIL_STAGE -and $env:LOCALAI_TEST_FAIL_STAGE -eq $Name) { throw "Test hook: stage $Name failed" }'), 'once'),
+    # the catalog of small stand-in models, and no 20 second wait about the official models with it:
+    @($catalogLine, ($catalogLine + '; if ($env:LOCALAI_TEST_CATALOG) { $CatalogPath = $env:LOCALAI_TEST_CATALOG }'), 'once'),
+    @($waitLine, ((' ' * 12) + 'if (-not $env:LOCALAI_TEST_CATALOG) { Start-Sleep -Seconds 20 }'), 'once'),
+    # a model that is not on a GPU (this machine has none):
+    @('$AllowCpu = $false', '$AllowCpu = ($env:LOCALAI_TEST_ALLOW_CPU -eq ''1'')', 'once'),
+    # and the address of this run's own render guard for Open WebUI (after the Stack stage, whose last line it was).
+    @($urlLine, ('if ($env:LOCALAI_TEST_WEBUI_OLLAMA_URL) { $script:WebUIOllamaUrl = $env:LOCALAI_TEST_WEBUI_OLLAMA_URL }; ' + $urlLine), 'once')
 )
+foreach ($entry in $patches) {
+    if ($entry.Count -lt 3) { continue }
+    $seen = [regex]::Matches($text, [regex]::Escape($entry[0])).Count
+    Assert-That ($seen -eq 1) "the installer as it ships holds the line this test writes a read into exactly once ($seen time(s)): $($entry[0].Trim())"
+}
 foreach ($p in $patches) {
     if (-not $text.Contains($p[0])) { throw "patch target not found: $($p[0])" }
     $text = $text.Replace($p[0], $p[1])
@@ -605,9 +641,10 @@ $askedOn = ''; if ($askedTrial.Count -eq 1) { $askedOn = @($askedTrial[0].On) -j
 Assert-That ($askedTrial.Count -eq 1 -and $askedOn -ceq $writing4a -and -not $askedTrial[0].Written -and @($asked4a | Where-Object { $_.Preset -like '*-missing' }).Count -eq 0 -and @(& $switchNames (Get-LaiWebUIModel -BaseUrl $owui -Token $tok4 -Id 'trial-standin')).Count -eq 7) "asked with -ReadOnly, the real Open WebUI's unselected trial preset is found open (the assistant can $askedOn), presets that were never set up are not listed, and nothing is written"
 # The health check itself, the copy in AI\Scripts, in a process of its own; only the row of this
 # preset is read (this simulated PC has no GPU and no containers of its own, so other rows fail).
+# It is told its catalog the way the installer's Verify stage tells it: with -CatalogPath.
 $healthRow = { param([string]$Check)
     $prevPref = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
-    $hcLines = @(& pwsh -NoProfile -File (Join-Path $aiRoot 'Scripts/Test-LocalAI.ps1') -AIRoot $aiRoot -Quick -NoContainers 2>&1 | ForEach-Object { "$_" })
+    $hcLines = @(& pwsh -NoProfile -File (Join-Path $aiRoot 'Scripts/Test-LocalAI.ps1') -AIRoot $aiRoot -CatalogPath $env:LOCALAI_TEST_CATALOG -Quick -NoContainers 2>&1 | ForEach-Object { "$_" })
     $ErrorActionPreference = $prevPref
     $hcRow = @($hcLines | Where-Object { $_ -match (' (PASS|WARN|FAIL|SKIP) ' + [regex]::Escape($Check) + ': ') } | Select-Object -Last 1)
     if ($hcRow.Count -eq 1) { return [string]$hcRow[0] }
@@ -795,11 +832,19 @@ $oldCopy = Join-Path $aiRoot 'Installer/ComfyUi-Optimization-main/local-llm'
 New-Item -ItemType Directory -Force -Path (Join-Path $oldCopy 'lib') | Out-Null
 Set-Content -LiteralPath (Join-Path $oldCopy 'Install-LocalAI.ps1') -Value '# old'; Set-Content -LiteralPath (Join-Path $oldCopy 'lib/LocalAI.psm1') -Value '# old'
 Copy-Item -LiteralPath (Join-Path $aiRoot 'Secrets/openwebui-secret.txt') -Destination (Join-Path $aiRoot 'openwebui-secret.txt')
+# The two key files of this phase, the good key as a hash (its text is never printed), and the log
+# of the installer run that ended last.
+$rootKey6 = Join-Path $aiRoot 'openwebui-secret.txt'; $managedKey6 = Join-Path $aiRoot 'Secrets/openwebui-secret.txt'
+$keyHash6 = (Get-FileHash -LiteralPath $managedKey6).Hash
+$newestLog6 = { Get-Content -Raw -Encoding UTF8 -LiteralPath (Get-ChildItem (Join-Path $aiRoot 'Logs') -Filter 'install-*.log' | Sort-Object LastWriteTime | Select-Object -Last 1).FullName }  # lai-ok: objects
 $env:LOCALAI_TEST_FAIL_STAGE = 'Preflight'
 & (Join-Path $aiRoot 'Scripts/Install-LocalAI.ps1') -AIRoot $aiRoot -SkipTests
 $c6 = $LASTEXITCODE
 $env:LOCALAI_TEST_FAIL_STAGE = ''
 Assert-That ($c6 -ne 0) "the run stops at the first stage (exit $c6)"
+# Asked here, right after the run and before this test touches that file itself. (It used to be
+# asked further down, behind the test's own Remove-Item of the file, where it could not fail.)
+Assert-That (-not (Test-Path -LiteralPath $rootKey6) -and (Test-Path -LiteralPath $managedKey6) -and (Get-FileHash -LiteralPath $managedKey6).Hash -eq $keyHash6) 'the second copy of the secret key outside Secrets is removed by the run, and the key in Secrets is left as it was'
 Assert-That ([string]$global:TaskPrincipals['LocalAI-Backup-OpenWebUI'] -match 'Limited' -and [string]$global:TaskPrincipals['LocalAI-Backup-OpenWebUI'] -notmatch 'Highest') 'an elevated backup task from an early version is made non-elevated before anything can fail'
 Assert-That (-not $global:Tasks.ContainsKey('LocalAI-Install-Resume')) "an elevated after-reboot task from an early version is removed"
 Assert-That ([string]$global:TaskPrincipals['LocalAI-Watch'] -match 'Limited') 'an elevated health-watch task is made non-elevated too'
@@ -809,10 +854,20 @@ Assert-That ($p6 -and [int]$p6['GpuOverheadMiB'] -eq 600 -and [string]$p6['Backu
 Assert-That (-not (Test-Path -LiteralPath (Join-Path $aiRoot 'Installer'))) 'the outdated AI\Installer toolkit copy is removed'
 # A folder of the user's that happens to be called Installer is not ours to delete.
 New-Item -ItemType Directory -Force -Path (Join-Path $aiRoot 'Installer') | Out-Null; Set-Content -LiteralPath (Join-Path $aiRoot 'Installer/my-notes.txt') -Value 'mine'
+# In the same run, a key file in the AI folder that holds nothing (0 bytes) beside the good one in
+# Secrets. The compare of the two called Trim() on what was read, and an empty file is read as
+# nothing at all: the run ended there, before Preflight, with 'You cannot call a method on a
+# null-valued expression', which names no file, and so did every run after it. An empty file is no
+# second copy of a key: both files stay, and the run goes on to the stage that is failed on request.
+[System.IO.File]::WriteAllBytes($rootKey6, [byte[]]@())
 $env:LOCALAI_TEST_FAIL_STAGE = 'Preflight'
 & (Join-Path $aiRoot 'Scripts/Install-LocalAI.ps1') -AIRoot $aiRoot -SkipTests
 $env:LOCALAI_TEST_FAIL_STAGE = ''
+$log6Empty = & $newestLog6
 Assert-That (Test-Path -LiteralPath (Join-Path $aiRoot 'Installer/my-notes.txt')) "a user's own folder named Installer is left alone"
+$rootLen6 = -1; if (Test-Path -LiteralPath $rootKey6) { $rootLen6 = (Get-Item -LiteralPath $rootKey6).Length }
+Assert-That ($rootLen6 -eq 0 -and (Test-Path -LiteralPath $managedKey6) -and (Get-FileHash -LiteralPath $managedKey6).Hash -eq $keyHash6) "an empty key file outside Secrets is no second copy of the key: it stays, still empty, and the key in Secrets is left as it was (bytes in the empty one: $rootLen6, -1 when it is gone)"
+Assert-That ($log6Empty -notmatch 'null-valued' -and $log6Empty -match 'Test hook: stage Preflight failed') 'and the run does not end in a method called on nothing: it gets to Preflight, the stage this test fails'
 Remove-Item -LiteralPath (Join-Path $aiRoot 'Installer') -Recurse -Force
 # A second key file that DIFFERS from the managed one is not a duplicate: deleting it could lose a key.
 Set-Content -LiteralPath (Join-Path $aiRoot 'openwebui-secret.txt') -Value 'some-other-key' -NoNewline
@@ -821,9 +876,49 @@ $env:LOCALAI_TEST_FAIL_STAGE = 'Preflight'
 $env:LOCALAI_TEST_FAIL_STAGE = ''
 Assert-That ((Test-Path -LiteralPath (Join-Path $aiRoot 'openwebui-secret.txt')) -and (Test-Path -LiteralPath (Join-Path $aiRoot 'Secrets/openwebui-secret.txt'))) 'a different key file outside Secrets is kept'
 Remove-Item -LiteralPath (Join-Path $aiRoot 'openwebui-secret.txt') -Force
-Assert-That (-not (Test-Path -LiteralPath (Join-Path $aiRoot 'openwebui-secret.txt')) -and (Test-Path -LiteralPath (Join-Path $aiRoot 'Secrets/openwebui-secret.txt'))) 'the second copy of the secret key outside Secrets is removed'
 Remove-Item -Path 'function:Get-ScheduledTask', 'function:Set-ScheduledTask' -ErrorAction SilentlyContinue
 Assert-That (-not (Get-Command Get-ScheduledTask -ErrorAction SilentlyContinue)) 'task mocks removed for the next phase'
+
+Write-Host "`n=== PHASE 6 (key file): an Open WebUI key file that holds no key ===" -ForegroundColor Cyan
+# Secrets\openwebui-secret.txt, the key Open WebUI signs logins with, as a file that holds no key:
+# of 0 bytes, then with a line break and nothing else (a run cut off between making the file and
+# writing the key, the guide's file moved in as it was, an old container with nothing behind
+# WEBUI_SECRET_KEY=). Two runs, one for each. The first used to end in a method called on nothing,
+# a line that names no file. The second went on: the key was trimmed to nothing and written into
+# .env as 'WEBUI_SECRET_KEY=', which compose refuses with words that point at .env, a file the
+# installer writes itself, run after run. Now the Stack stage stops before .env is written and says
+# which file it is and what to do about it.
+# Beside it, in the AI folder, lies a good copy of the key, as an early version left one: with the
+# key in Secrets empty it is no second copy, so the installer removes neither file.
+# The stage failed on request is Configure: it only ends a run that gets past the Stack stage after
+# all, and its line in the log is then what says so.
+$envFile6 = Join-Path $aiRoot 'Stack/.env'
+$envHash6 = (Get-FileHash -LiteralPath $envFile6).Hash
+$envAside6 = Join-Path $Work 'stack-env-aside-6'; $keyAside6 = Join-Path $Work 'openwebui-key-aside-6'
+Copy-Item -LiteralPath $envFile6 -Destination $envAside6 -Force
+Copy-Item -LiteralPath $managedKey6 -Destination $keyAside6 -Force
+Copy-Item -LiteralPath $managedKey6 -Destination $rootKey6 -Force
+try {
+    foreach ($case6 in @(@{ What = 'of 0 bytes'; Bytes = [byte[]]@() }, @{ What = 'that holds a line break and nothing else'; Bytes = [byte[]]@(13, 10) })) {
+        [System.IO.File]::WriteAllBytes($managedKey6, $case6.Bytes)
+        $env:LOCALAI_TEST_FAIL_STAGE = 'Configure'
+        try { & (Join-Path $aiRoot 'Scripts/Install-LocalAI.ps1') -AIRoot $aiRoot -SkipTests } finally { $env:LOCALAI_TEST_FAIL_STAGE = '' }
+        $cKey6 = $LASTEXITCODE
+        $logKey6 = & $newestLog6
+        $saidKey6 = $logKey6 -match 'openwebui-secret\.txt is empty or holds white space only' -and $logKey6 -match 'Delete that file and run the installer again: a new key is written' -and $logKey6 -match 'with a new key everybody signs in to Open WebUI again'
+        Assert-That ($cKey6 -ne 0 -and $saidKey6 -and $logKey6 -match '=+ Stack =+') "a key file $($case6.What): the run stops in the Stack stage and says which file is empty and the way on (delete it, run the installer again: a new key, and everybody signs in again) (exit $cKey6)"
+        Assert-That ($logKey6 -notmatch 'null-valued' -and $logKey6 -notmatch 'Test hook' -and $logKey6 -notmatch '=+ Configure =+') "a key file $($case6.What): no method called on nothing, and the run does not get past the Stack stage (the stage this test fails, Configure, is never begun)"
+        $managedLen6 = -1; if (Test-Path -LiteralPath $managedKey6) { $managedLen6 = (Get-Item -LiteralPath $managedKey6).Length }
+        Assert-That ($managedLen6 -eq $case6.Bytes.Length -and (Test-Path -LiteralPath $rootKey6) -and (Get-FileHash -LiteralPath $rootKey6).Hash -eq $keyHash6) "a key file $($case6.What): both key files are left as they were, the empty one in Secrets and the good copy in the AI folder (bytes in Secrets: $managedLen6, -1 when it is gone)"
+        Assert-That ((Test-Path -LiteralPath $envFile6) -and (Get-FileHash -LiteralPath $envFile6).Hash -eq $envHash6) "a key file $($case6.What): .env is as it was before the run, so no empty key was written into it"
+    }
+} finally {
+    # The good key and .env go back whatever the runs did, and the copies of them are removed.
+    Copy-Item -LiteralPath $keyAside6 -Destination $managedKey6 -Force
+    Copy-Item -LiteralPath $envAside6 -Destination $envFile6 -Force
+    Remove-Item -LiteralPath $rootKey6, $keyAside6, $envAside6 -Force -ErrorAction SilentlyContinue
+}
+Assert-That ((Get-FileHash -LiteralPath $managedKey6).Hash -eq $keyHash6 -and -not (Test-Path -LiteralPath $rootKey6) -and (Get-FileHash -LiteralPath $envFile6).Hash -eq $envHash6) 'the good key is back in Secrets as it was saved, with no copy of it left in the AI folder, and .env is as it was, for the phases that follow'
 
 Write-Host "`n=== PHASE 6a: a folder in the install root replaced by a link ===" -ForegroundColor Cyan
 # Anything running as the user can swap C:\AI\Logs for a link; the elevated installer must not write
@@ -949,7 +1044,9 @@ $baseline6d = Get-LaiIntegrityPath -AIRoot $aiRoot
 $baselineAside6d = Join-Path $Work 'integrity-baseline-aside-6d.json'
 $baselineKept6d = Test-Path -LiteralPath $baseline6d
 if ($baselineKept6d) { Copy-Item -LiteralPath $baseline6d -Destination $baselineAside6d -Force }
-Set-Content -LiteralPath $realTest6d -Value @('param([string]$AIRoot)', "Write-Host ('12:00:00 [FAIL] FAIL Stand-in check: one of three that fail in ' + `$AIRoot) -ForegroundColor Red", 'exit 3')
+# The stand-in also shows the catalog it is handed: the installer passes the one its run used
+# (-CatalogPath), so the health check needs no variable of the user's to find it.
+Set-Content -LiteralPath $realTest6d -Value @('param([string]$AIRoot, [string]$CatalogPath)', "Write-Host ('12:00:00 [FAIL] FAIL Stand-in check: one of three that fail in ' + `$AIRoot + ' (catalog: ' + `$CatalogPath + ')') -ForegroundColor Red", 'exit 3')
 $screen6d = @()
 try {
     $screen6d = @(& (Join-Path $aiRoot 'Scripts/Install-LocalAI.ps1') -AIRoot $aiRoot 6>&1 | ForEach-Object {
@@ -969,6 +1066,8 @@ Assert-That ($copied6d -match '^marker-6d ' -and $copied6d -notmatch 'half-copie
 $shown6d = @($screen6d | Where-Object { $_.Text.Trim() })
 $last6d = $null; if ($shown6d.Count) { $last6d = $shown6d[-1] }
 Assert-That ($c6d2 -eq 3 -and $last6d -and $last6d.Colour -eq 'Red' -and $last6d.Text -match '^3 of the acceptance checks FAILED' -and $last6d.Text -match 'run the installer again') "three failed acceptance checks: the installer exits 3, and the last line on the screen is red, with the count and what to do (exit $c6d2; last line $($last6d.Colour): $($last6d.Text))"
+$standIn6d = @($screen6d | Where-Object { $_.Text -match 'Stand-in check: one of three that fail' } | ForEach-Object { [string]$_.Text })
+Assert-That ($standIn6d.Count -ge 1 -and @($standIn6d | Where-Object { -not $_.Contains('(catalog: ' + $env:LOCALAI_TEST_CATALOG + ')') }).Count -eq 0) "the Verify stage hands the acceptance checks the catalog the run used: the stand-in was given $($env:LOCALAI_TEST_CATALOG) as -CatalogPath ($($standIn6d -join ' / '))"
 $block6d = @($shown6d | Where-Object { $_.Text -match '^(Open WebUI|Login|Password): ' })
 Assert-That ($block6d.Count -eq 3 -and @($block6d | Where-Object { $_.Colour -ne 'Yellow' }).Count -eq 0 -and @($shown6d | Where-Object { $_.Colour -eq 'Green' -and $_.Text -match '^(Open WebUI|Login|Password|Research): ' }).Count -eq 0) "and the address, login and password lines above it are yellow, not the green of an install that passed ($(@($block6d | ForEach-Object { $_.Colour }) -join ', '))"
 # As phase 6c left the simulated PC: no managed volume, no manual install, the health check itself.
